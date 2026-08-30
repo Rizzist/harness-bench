@@ -1,0 +1,188 @@
+[identity]
+schema = 1
+id = "ahrb-mock"
+name = "AHRB built-in reference harness"
+revision = "1"
+
+[availability]
+exec_paths = ["target/debug/ahrb-mock-harness"]
+version_probe = ["target/debug/ahrb-mock-harness", "--help"]
+version_pattern = "ahrb-mock-harness"
+
+[fake_model]
+dialect = "open-ai-chat-completions"
+base_url_env = "AHRB_MOCK_BASE_URL"
+credential_env = "AHRB_MOCK_API_KEY"
+model = "ahrb-fake-v1"
+allowed_paths = ["/v1/chat/completions"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[model_roles.planner]
+model = "ahrb-fake-v1"
+required = false
+
+[model_roles.title]
+model = "ahrb-fake-v1"
+required = false
+
+[model_roles.compaction]
+model = "ahrb-fake-v1"
+required = false
+
+[model_roles.reviewer]
+model = "ahrb-fake-v1"
+required = false
+
+[model_roles.child]
+model = "ahrb-fake-v1"
+required = false
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+
+[isolation]
+generated_files = []
+forbidden_roots = ["~/.ahrb-mock"]
+
+[daemon]
+persistent = true
+start = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000"]
+pid_locator = "{{profile}}/state/daemon.pid"
+shutdown = ["harness.shutdown"]
+grace_ms = 2000
+
+[daemon.readiness]
+kind = "file"
+target = "{{profile}}/state/daemon.pid"
+timeout_ms = 10000
+
+[transport]
+kind = "stdin-rpc"
+command = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000"]
+endpoint = ""
+timeout_ms = 30000
+
+[sessions]
+create = ["session.create"]
+submit = ["session.submit"]
+attach = ["session.attach"]
+resume = ["session.resume"]
+close_delete = ["session.close"]
+list = []
+id_pointer = "/session_id"
+
+[next_input]
+steer = ["session.steer"]
+subturn = ["session.subturn"]
+queue = ["session.queue"]
+
+[agents]
+create = ["session.create"]
+spawn = ["agent.spawn"]
+status = ["session.attach"]
+cancel = ["session.cancel"]
+collect = ["session.attach"]
+child_id_pointer = "/session_id"
+
+[concurrency]
+topology = "shared-daemon-sessions"
+max_agents = 32
+fanout_mode = "native-sibling-fanout"
+barrier_evidence = "barrier-reached"
+
+[tools.aliases]
+write = "write_fixture"
+read = "read_fixture"
+fail = "fail_fixture"
+barrier = "barrier"
+
+[tools.bindings]
+path = "path"
+content = "content"
+call_id = "id"
+child_marker = "marker"
+
+[tools.fixtures]
+write = ["write_fixture"]
+read = ["read_fixture"]
+fail = ["fail_fixture"]
+barrier = ["barrier"]
+
+[events]
+source = "journal"
+framing = "jsonl"
+id_pointer = "/id"
+cursor_pointer = "/cursor"
+
+[[events.rules]]
+matches = "turn-accepted"
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "tool-call"
+event = "tool-call"
+
+[[events.rules]]
+matches = "tool-result"
+event = "tool-result"
+
+[[events.rules]]
+matches = "terminal-success"
+event = "terminal-success"
+
+[[events.rules]]
+matches = "terminal-failure"
+event = "terminal-failure"
+
+[exit]
+success = 0
+
+[exit.failures]
+denied = 10
+invalid = 11
+timeout = 12
+cancel = 13
+provider = 14
+
+[process]
+pid_files = ["{{profile}}/state/daemon.pid"]
+executable_names = ["ahrb-mock-harness"]
+
+[resources]
+turn_timeout_ms = 10000
+idle_timeout_ms = 1000
+max_output_bytes = 1048576
+
+[hooks]
+acceptance = ["target/debug/ahrb-mock-harness", "hook", "--path", "{{profile}}/state/hooks.jsonl"]
+completion = ["target/debug/ahrb-mock-harness", "hook", "--path", "{{profile}}/state/hooks.jsonl"]
+
+[cleanup]
+command = ["harness.shutdown"]
+paths = ["{{profile}}"]
+
+[capture]
+redact_env = ["AHRB_MOCK_API_KEY"]
+max_bytes = 1048576
+
+[capabilities.required]
+headless = "reference harness never reads interactive input"
+sessions = "fsync-backed per-session journals"
+resume = "accepted turns are reconstructed from the journal"
+steer = "safe-boundary injected input"
+queue = "distinct queued turns"
+durable_journal = "append-only fsync-backed JSONL source of truth"
+
+[capabilities.optional]
+parallel_tool_execution = "concurrent fixture calls expose durable reverse-release checkpoints"
+native_delegation = "agent.spawn creates stable child sessions"
+pre_tool_intervention = "session.subturn injects before the next model boundary"
+hooks = "argv hooks configured through JSON environment bindings"

@@ -1,0 +1,681 @@
+//! Data-only adapter manifest schema and validation.
+
+use crate::{AhrbError, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// A complete harness adapter manifest.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Manifest {
+    /// Schema and adapter identity.
+    pub identity: Identity,
+    /// Harness availability checks.
+    pub availability: Availability,
+    /// Fake-model routing configuration.
+    pub fake_model: FakeModelBinding,
+    /// Logical model roles.
+    #[serde(default)]
+    pub model_roles: BTreeMap<String, ModelRole>,
+    /// Per-run profile isolation.
+    pub isolation: Isolation,
+    /// Daemon lifecycle operations.
+    pub daemon: DaemonLifecycle,
+    /// Automation transport.
+    pub transport: TransportConfig,
+    /// Session operations.
+    pub sessions: SessionOps,
+    /// Inputs injected into an active or queued turn.
+    pub next_input: NextInputOps,
+    /// Native agent operations.
+    pub agents: AgentOps,
+    /// Concurrency capabilities.
+    pub concurrency: Concurrency,
+    /// Tool schema and fixture commands.
+    pub tools: ToolSemantics,
+    /// Event stream mappings.
+    pub events: EventMapping,
+    /// Process exit contract.
+    pub exit: ExitContract,
+    /// Whole-tree ownership hints.
+    pub process: ProcessOwnership,
+    /// Resource control limits.
+    pub resources: ResourceControls,
+    /// Lifecycle hooks.
+    #[serde(default)]
+    pub hooks: Hooks,
+    /// Cleanup operations.
+    pub cleanup: Cleanup,
+    /// Evidence capture policy.
+    #[serde(default)]
+    pub capture: CapturePolicy,
+    /// Declared required and optional capabilities.
+    pub capabilities: Capabilities,
+}
+
+/// Schema version and human-readable adapter identity.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Identity {
+    /// Manifest schema version.
+    pub schema: u32,
+    /// Stable adapter identifier.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Optional adapter revision.
+    #[serde(default)]
+    pub revision: String,
+}
+
+/// Executable discovery and version probing.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Availability {
+    /// Candidate executable paths.
+    pub exec_paths: Vec<String>,
+    /// Version probe argv.
+    #[serde(default)]
+    pub version_probe: Vec<String>,
+    /// Required substring in the version output.
+    #[serde(default)]
+    pub version_pattern: String,
+}
+
+/// Supported fake-model HTTP dialect.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtocolDialect {
+    /// OpenAI `/v1/chat/completions`.
+    OpenAiChatCompletions,
+    /// OpenAI `/v1/responses`.
+    OpenAiResponses,
+    /// Anthropic `/v1/messages`.
+    AnthropicMessages,
+}
+
+/// Fake-model endpoint, credential, and provider configuration binding.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FakeModelBinding {
+    /// HTTP protocol dialect.
+    pub dialect: ProtocolDialect,
+    /// Environment variable receiving the base URL.
+    pub base_url_env: String,
+    /// Environment variable receiving the credential.
+    pub credential_env: String,
+    /// Model ID expected by the fake server.
+    pub model: String,
+    /// HTTP request paths the harness may use.
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    /// Provider configuration templates.
+    #[serde(default)]
+    pub provider_templates: Vec<GeneratedFile>,
+}
+
+/// A logical model role and its configured model ID.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ModelRole {
+    /// Expected model ID.
+    pub model: String,
+    /// Whether the role must reach the fake server.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Per-run environment roots and generated configuration files.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Isolation {
+    /// Environment roots rendered relative to the run profile.
+    #[serde(default)]
+    pub roots: BTreeMap<String, String>,
+    /// Files generated inside isolated roots.
+    #[serde(default)]
+    pub generated_files: Vec<GeneratedFile>,
+    /// Historical state locations that must remain untouched.
+    #[serde(default)]
+    pub forbidden_roots: Vec<String>,
+}
+
+/// A generated configuration file.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GeneratedFile {
+    /// Destination path template.
+    pub path: String,
+    /// File content template.
+    pub content: String,
+    /// Unix mode, conventionally written as an octal string.
+    #[serde(default = "default_file_mode")]
+    pub mode: String,
+}
+
+fn default_file_mode() -> String {
+    "0600".to_owned()
+}
+
+/// Daemon topology and lifecycle commands.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DaemonLifecycle {
+    /// Whether the controller persists between turns.
+    pub persistent: bool,
+    /// Start command argv.
+    #[serde(default)]
+    pub start: Vec<String>,
+    /// Readiness probe.
+    #[serde(default)]
+    pub readiness: Probe,
+    /// PID locator description or path.
+    #[serde(default)]
+    pub pid_locator: String,
+    /// Graceful shutdown command argv.
+    #[serde(default)]
+    pub shutdown: Vec<String>,
+    /// Shutdown grace period.
+    #[serde(default = "default_grace_ms")]
+    pub grace_ms: u64,
+}
+
+fn default_grace_ms() -> u64 {
+    2_000
+}
+
+/// A readiness probe.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Probe {
+    /// Probe kind: process, file, socket, or HTTP.
+    #[serde(default)]
+    pub kind: String,
+    /// Probe target.
+    #[serde(default)]
+    pub target: String,
+    /// Maximum wait.
+    #[serde(default = "default_ready_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_ready_ms() -> u64 {
+    10_000
+}
+
+/// Transport protocol selected by the adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportKind {
+    /// One process per operation.
+    Exec,
+    /// JSON records over child stdin/stdout.
+    StdinRpc,
+    /// JSON-RPC over a Unix-domain socket.
+    SocketJsonrpc,
+    /// HTTP request/response transport.
+    Http,
+}
+
+/// Automation transport configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TransportConfig {
+    /// Transport kind.
+    pub kind: TransportKind,
+    /// Executable plus arguments for exec and stdin-RPC.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Socket path or HTTP URL template.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Request timeout.
+    #[serde(default = "default_request_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_request_ms() -> u64 {
+    30_000
+}
+
+/// Commands and extractors for session lifecycle operations.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SessionOps {
+    /// Create operation name or argv template.
+    #[serde(default)]
+    pub create: Vec<String>,
+    /// Submit operation name or argv template.
+    #[serde(default)]
+    pub submit: Vec<String>,
+    /// Attach operation name or argv template.
+    #[serde(default)]
+    pub attach: Vec<String>,
+    /// Resume operation name or argv template.
+    #[serde(default)]
+    pub resume: Vec<String>,
+    /// Close/delete operation name or argv template.
+    #[serde(default)]
+    pub close_delete: Vec<String>,
+    /// List operation name or argv template.
+    #[serde(default)]
+    pub list: Vec<String>,
+    /// JSON pointer used to extract a new session ID.
+    #[serde(default)]
+    pub id_pointer: String,
+}
+
+/// Operations for steer, subturn, and queued input.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NextInputOps {
+    /// Safe-boundary steer operation.
+    #[serde(default)]
+    pub steer: Vec<String>,
+    /// Pre-tool intervention operation.
+    #[serde(default)]
+    pub subturn: Vec<String>,
+    /// Queue-next-turn operation.
+    #[serde(default)]
+    pub queue: Vec<String>,
+}
+
+/// Native delegation operations.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AgentOps {
+    /// Create operation.
+    #[serde(default)]
+    pub create: Vec<String>,
+    /// Native child spawn operation.
+    #[serde(default)]
+    pub spawn: Vec<String>,
+    /// Status operation.
+    #[serde(default)]
+    pub status: Vec<String>,
+    /// Cancellation operation.
+    #[serde(default)]
+    pub cancel: Vec<String>,
+    /// Result collection operation.
+    #[serde(default)]
+    pub collect: Vec<String>,
+    /// Child ID JSON pointer.
+    #[serde(default)]
+    pub child_id_pointer: String,
+}
+
+/// Harness concurrency topology and limits.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Concurrency {
+    /// Reported topology label.
+    pub topology: String,
+    /// Maximum simultaneous agents.
+    pub max_agents: usize,
+    /// Fan-out mode.
+    pub fanout_mode: String,
+    /// Event evidence used to establish barrier presence.
+    #[serde(default)]
+    pub barrier_evidence: String,
+}
+
+/// Tool aliases, schema bindings, and safe fixture commands.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ToolSemantics {
+    /// Semantic tool name to harness alias.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+    /// Semantic field to harness schema binding.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, String>,
+    /// Safe argv fixture templates.
+    #[serde(default)]
+    pub fixtures: BTreeMap<String, Vec<String>>,
+}
+
+/// Event source/framing and table-driven extraction rules.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventMapping {
+    /// stdout, stderr, journal, socket, or HTTP.
+    pub source: String,
+    /// jsonl, JSON sequence, or SSE.
+    pub framing: String,
+    /// Stable event identity pointer.
+    #[serde(default)]
+    pub id_pointer: String,
+    /// Resume cursor pointer.
+    #[serde(default)]
+    pub cursor_pointer: String,
+    /// Ordered normalization rules.
+    #[serde(default)]
+    pub rules: Vec<EventRule>,
+}
+
+/// One table-driven event normalization rule.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventRule {
+    /// Source event type or predicate value.
+    pub matches: String,
+    /// AHRB normalized event name.
+    pub event: String,
+    /// Optional JSON pointer for payload extraction.
+    #[serde(default)]
+    pub payload_pointer: String,
+}
+
+/// Stable exit-code mapping.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExitContract {
+    /// Success exit code.
+    pub success: i32,
+    /// Failure category to exit code.
+    #[serde(default)]
+    pub failures: BTreeMap<String, i32>,
+}
+
+/// Process roots and reparented-worker ownership hints.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ProcessOwnership {
+    /// Declared PID-file templates.
+    #[serde(default)]
+    pub pid_files: Vec<String>,
+    /// Executable basenames that may be reparented.
+    #[serde(default)]
+    pub executable_names: Vec<String>,
+}
+
+/// Limits requested from the harness.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceControls {
+    /// Maximum turn duration.
+    pub turn_timeout_ms: u64,
+    /// Client-side idle deadline.
+    pub idle_timeout_ms: u64,
+    /// Maximum captured output bytes.
+    pub max_output_bytes: usize,
+}
+
+/// Acceptance and completion hook argv templates.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Hooks {
+    /// Acceptance hook.
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    /// Completion hook.
+    #[serde(default)]
+    pub completion: Vec<String>,
+}
+
+/// Cleanup commands and paths.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Cleanup {
+    /// Cleanup command argv.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Run-local paths eligible for deletion.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// Redaction and evidence-size policy.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CapturePolicy {
+    /// Environment names whose values are redacted.
+    #[serde(default)]
+    pub redact_env: Vec<String>,
+    /// Maximum bytes captured per stream.
+    #[serde(default)]
+    pub max_bytes: usize,
+}
+
+/// Required and optional capability declarations.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Capabilities {
+    /// Required capability name to rationale.
+    #[serde(default)]
+    pub required: BTreeMap<String, String>,
+    /// Optional capability name to rationale.
+    #[serde(default)]
+    pub optional: BTreeMap<String, String>,
+}
+
+/// Load and parse a manifest from disk.
+pub fn load(path: &Path) -> Result<Manifest> {
+    let text = std::fs::read_to_string(path)?;
+    let manifest: Manifest = toml::from_str(&text)?;
+    validate(&manifest)?;
+    Ok(manifest)
+}
+
+/// Result of checking adapter availability on the current host.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DoctorReport {
+    /// Stable adapter ID.
+    pub adapter: String,
+    /// Resolved executable, if one was found.
+    pub executable: Option<PathBuf>,
+    /// Captured version output, with surrounding whitespace removed.
+    pub version: Option<String>,
+    /// Canonical manifest SHA-256.
+    pub manifest_sha256: String,
+    /// Non-fatal diagnostics in deterministic order.
+    pub diagnostics: Vec<String>,
+    /// Whether all required checks passed.
+    pub ready: bool,
+}
+
+/// Validate invariants that can be checked without starting a harness.
+pub fn validate(manifest: &Manifest) -> Result<()> {
+    if manifest.identity.schema != 1 {
+        return Err(AhrbError::Validation(format!(
+            "unsupported manifest schema {} (expected 1)",
+            manifest.identity.schema
+        )));
+    }
+    validate_identifier("identity.id", &manifest.identity.id)?;
+    if manifest.identity.name.trim().is_empty() {
+        return Err(AhrbError::Validation(
+            "identity.name must not be empty".to_owned(),
+        ));
+    }
+    if manifest.availability.exec_paths.is_empty() {
+        return Err(AhrbError::Validation(
+            "availability.exec_paths must not be empty".to_owned(),
+        ));
+    }
+    if manifest.fake_model.base_url_env.trim().is_empty()
+        || manifest.fake_model.credential_env.trim().is_empty()
+        || manifest.fake_model.model.trim().is_empty()
+    {
+        return Err(AhrbError::Validation(
+            "fake-model URL env, credential env, and model are required".to_owned(),
+        ));
+    }
+    if manifest.fake_model.allowed_paths.is_empty() {
+        return Err(AhrbError::Validation(
+            "fake_model.allowed_paths must not be empty".to_owned(),
+        ));
+    }
+    if manifest.transport.command.is_empty()
+        && matches!(
+            manifest.transport.kind,
+            TransportKind::Exec | TransportKind::StdinRpc
+        )
+    {
+        return Err(AhrbError::Validation(
+            "exec and stdin-rpc transports require an argv command".to_owned(),
+        ));
+    }
+    if manifest.transport.timeout_ms == 0
+        || manifest.resources.turn_timeout_ms == 0
+        || manifest.resources.idle_timeout_ms == 0
+    {
+        return Err(AhrbError::Validation(
+            "transport, turn, and idle timeouts must be positive".to_owned(),
+        ));
+    }
+    if manifest.resources.idle_timeout_ms >= manifest.resources.turn_timeout_ms {
+        return Err(AhrbError::Validation(
+            "idle timeout must be strictly less than turn timeout".to_owned(),
+        ));
+    }
+    if manifest.concurrency.max_agents == 0 {
+        return Err(AhrbError::Validation(
+            "concurrency.max_agents must be positive".to_owned(),
+        ));
+    }
+    if manifest
+        .exit
+        .failures
+        .values()
+        .any(|code| *code == manifest.exit.success)
+    {
+        return Err(AhrbError::Validation(
+            "failure exit codes must differ from success".to_owned(),
+        ));
+    }
+    let secret_name = manifest.fake_model.credential_env.as_str();
+    for (label, argv) in command_vectors(manifest) {
+        if argv.iter().any(|arg| arg.contains(secret_name)) {
+            return Err(AhrbError::Validation(format!(
+                "{label} embeds the credential binding in argv"
+            )));
+        }
+        if argv
+            .iter()
+            .any(|arg| arg == "sh" || arg == "bash" || arg == "zsh")
+        {
+            return Err(AhrbError::Validation(format!(
+                "{label} invokes a shell; commands must be direct argv arrays"
+            )));
+        }
+    }
+    for file in manifest
+        .isolation
+        .generated_files
+        .iter()
+        .chain(manifest.fake_model.provider_templates.iter())
+    {
+        let mode = u32::from_str_radix(file.mode.trim_start_matches('0'), 8).map_err(|_| {
+            AhrbError::Validation(format!("invalid generated-file mode {:?}", file.mode))
+        })?;
+        if mode & 0o077 != 0 {
+            return Err(AhrbError::Validation(format!(
+                "generated credential/config file {:?} must not be group/world accessible",
+                file.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identifier(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(AhrbError::Validation(format!(
+            "{label} must contain only lowercase ASCII letters, digits, and hyphens"
+        )));
+    }
+    Ok(())
+}
+
+fn command_vectors(manifest: &Manifest) -> Vec<(&'static str, &[String])> {
+    vec![
+        (
+            "availability.version_probe",
+            &manifest.availability.version_probe,
+        ),
+        ("daemon.start", &manifest.daemon.start),
+        ("daemon.shutdown", &manifest.daemon.shutdown),
+        ("transport.command", &manifest.transport.command),
+        ("sessions.create", &manifest.sessions.create),
+        ("sessions.submit", &manifest.sessions.submit),
+        ("sessions.attach", &manifest.sessions.attach),
+        ("sessions.resume", &manifest.sessions.resume),
+        ("sessions.close_delete", &manifest.sessions.close_delete),
+        ("sessions.list", &manifest.sessions.list),
+        ("next_input.steer", &manifest.next_input.steer),
+        ("next_input.subturn", &manifest.next_input.subturn),
+        ("next_input.queue", &manifest.next_input.queue),
+        ("agents.create", &manifest.agents.create),
+        ("agents.spawn", &manifest.agents.spawn),
+        ("agents.status", &manifest.agents.status),
+        ("agents.cancel", &manifest.agents.cancel),
+        ("agents.collect", &manifest.agents.collect),
+        ("hooks.acceptance", &manifest.hooks.acceptance),
+        ("hooks.completion", &manifest.hooks.completion),
+        ("cleanup.command", &manifest.cleanup.command),
+    ]
+}
+
+/// Canonical SHA-256 of a parsed manifest.
+pub fn hash(manifest: &Manifest) -> Result<String> {
+    let canonical = serde_json::to_vec(manifest)?;
+    let digest = Sha256::digest(canonical);
+    Ok(format!("{digest:x}"))
+}
+
+/// Render `{{name}}` tokens from a deterministic variable map.
+pub fn render_template(template: &str, variables: &BTreeMap<String, String>) -> Result<String> {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let close = after_open.find("}}").ok_or_else(|| {
+            AhrbError::Validation(format!("unterminated template token in {template:?}"))
+        })?;
+        let name = after_open[..close].trim();
+        let value = variables
+            .get(name)
+            .ok_or_else(|| AhrbError::Validation(format!("unknown template variable {name:?}")))?;
+        output.push_str(value);
+        rest = &after_open[close + 2..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+/// Run non-mutating manifest and executable availability checks.
+pub fn doctor(path: &Path) -> Result<DoctorReport> {
+    let manifest = load(path)?;
+    let executable = manifest
+        .availability
+        .exec_paths
+        .iter()
+        .find_map(|candidate| resolve_executable(candidate));
+    let mut diagnostics = Vec::new();
+    if executable.is_none() {
+        diagnostics.push("no candidate executable exists".to_owned());
+    }
+    let version = match (&executable, manifest.availability.version_probe.as_slice()) {
+        (Some(program), [_first, rest @ ..]) => {
+            let output = std::process::Command::new(program).args(rest).output()?;
+            let mut text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if text.is_empty() {
+                text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            }
+            if !output.status.success() {
+                diagnostics.push(format!("version probe exited with {}", output.status));
+            } else if !manifest.availability.version_pattern.is_empty()
+                && !text.contains(&manifest.availability.version_pattern)
+            {
+                diagnostics.push("version output does not match the required pattern".to_owned());
+            }
+            Some(text)
+        }
+        _ => None,
+    };
+    diagnostics.sort();
+    Ok(DoctorReport {
+        adapter: manifest.identity.id.clone(),
+        executable,
+        version,
+        manifest_sha256: hash(&manifest)?,
+        ready: diagnostics.is_empty(),
+        diagnostics,
+    })
+}
+
+fn resolve_executable(candidate: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(candidate);
+    if path.components().count() > 1 {
+        return path.is_file().then_some(path);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(candidate))
+            .find(|possible| possible.is_file())
+    })
+}

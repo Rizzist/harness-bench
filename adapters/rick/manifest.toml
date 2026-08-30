@@ -1,0 +1,53 @@
+[identity]
+schema = 1
+id = "rick"
+name = "Rick"
+revision = "v1"
+[availability]
+exec_paths = ["rick"]
+version_probe = ["rick", "--version"]
+version_pattern = "rick"
+[fake_model]
+dialect = "open-ai-chat-completions"
+base_url_env = "OPENAI_BASE_URL"
+credential_env = "OPENAI_API_KEY"
+model = "ahrb-fake-v1"
+allowed_paths = ["/v1/chat/completions"]
+[isolation]
+roots = { HOME = "{{profile}}/home", XDG_CONFIG_HOME = "{{profile}}/config", XDG_DATA_HOME = "{{profile}}/data", XDG_STATE_HOME = "{{profile}}/state", XDG_RUNTIME_DIR = "{{profile}}/runtime", TMPDIR = "{{profile}}/tmp" }
+forbidden_roots = ["~/.rick"]
+[daemon]
+persistent = false
+[transport]
+kind = "exec"
+command = ["rick"]
+timeout_ms = 30000
+[sessions]
+[next_input]
+[agents]
+[concurrency]
+topology = "client-process-fanout"
+max_agents = 8
+fanout_mode = "client"
+[tools]
+[events]
+source = "stdout"
+framing = "jsonl"
+[exit]
+success = 0
+failures = { provider = 20, timeout = 21, cancelled = 22, invalid = 23 }
+[process]
+executable_names = ["rick"]
+[resources]
+turn_timeout_ms = 30000
+idle_timeout_ms = 2000
+max_output_bytes = 1048576
+[hooks]
+[cleanup]
+[capture]
+redact_env = ["OPENAI_API_KEY"]
+max_bytes = 1048576
+[capabilities]
+required = { routing = "core", headless = "core", sessions = "core" }
+optional = { native_delegation = "facet", hooks = "facet", subturn = "facet" }
+
