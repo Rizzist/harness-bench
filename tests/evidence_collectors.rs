@@ -29,6 +29,7 @@ fn model_record(actor: &str) -> ModelRequestRecord {
     ModelRequestRecord {
         request: ModelRequest {
             dialect: "openai-chat-completions".to_owned(),
+            endpoint: "/v1/chat/completions".to_owned(),
             model: "ahrb-fake-v1".to_owned(),
             scenario: "matrix".to_owned(),
             actor: actor.to_owned(),

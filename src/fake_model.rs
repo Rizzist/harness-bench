@@ -39,6 +39,8 @@ pub(crate) static LOCAL_SERVER_TEST_LOCK: tokio::sync::Mutex<()> =
 pub struct ModelRequest {
     /// HTTP protocol dialect.
     pub dialect: String,
+    /// Validated endpoint path the peer addressed (e.g. `/v1/chat/completions`).
+    pub endpoint: String,
     /// Requested model ID.
     pub model: String,
     /// Scenario route marker.
@@ -584,6 +586,7 @@ fn parse_request(
     let canonical = canonicalize_json(&raw);
     Ok(ModelRequest {
         dialect: dialect.to_owned(),
+        endpoint: expected_path.to_owned(),
         model,
         scenario: marker.scenario,
         actor: marker.actor,

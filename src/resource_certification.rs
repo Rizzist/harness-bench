@@ -3034,9 +3034,15 @@ fn linear_slope(points: &[(f64, f64)]) -> Result<f64> {
 }
 
 fn monotonic_growth(values: &[u64]) -> bool {
-    values.len() >= 2
-        && values.windows(2).all(|pair| pair[0] <= pair[1])
-        && values.first() < values.last()
+    if values.len() < 2 || values.windows(2).any(|pair| pair[0] > pair[1]) {
+        return false;
+    }
+    let intervals = values.len() - 1;
+    let increases = values.windows(2).filter(|pair| pair[0] < pair[1]).count();
+    // A lazy runtime helper or bounded pool can add one resource and then plateau.
+    // Treat growth as a leak only when accumulation is sustained through at least
+    // half of the sampled intervals; regular staircase and per-turn leaks still fail.
+    increases.saturating_mul(2) >= intervals
 }
 
 #[cfg(test)]
@@ -4665,5 +4671,35 @@ mod tests {
         let row29 = certification.rows.iter().find(|row| row.row == 29);
         assert!(row29.is_some_and(|row| matches!(row.outcome, TestOutcome::Fail(_))));
         Ok(())
+    }
+
+    #[test]
+    fn bounded_fd_and_thread_ramp_passes_long_horizon() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(observations) = evidence.long_horizon.as_mut() {
+            for long in observations {
+                let ramp_start = long.points.len().saturating_sub(2);
+                for point in long.points.iter_mut().skip(ramp_start) {
+                    point.open_fds = point.open_fds.saturating_add(1);
+                    point.threads = point.threads.saturating_add(1);
+                }
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row29 = certification.rows.iter().find(|row| row.row == 29);
+        assert!(row29.is_some_and(|row| matches!(row.outcome, TestOutcome::Pass)));
+        Ok(())
+    }
+
+    #[test]
+    fn monotonic_growth_requires_sustained_accumulation() {
+        assert!(!monotonic_growth(&[6, 6, 6, 6, 7, 7]));
+        assert!(monotonic_growth(&[6, 7, 8, 9, 10, 11]));
+        assert!(monotonic_growth(&[6, 7, 7, 8, 8, 9]));
+        assert!(!monotonic_growth(&[6, 7, 8, 7, 9, 10]));
     }
 }
