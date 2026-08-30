@@ -4,7 +4,9 @@
 //! semantic driver independent from process and wire framing, while the monotonically
 //! increasing request ID makes recordings deterministic.
 
-use crate::events::{EventNormalizer, EventVocab, NormalizedEvent, rule_matches};
+use crate::events::{
+    EventNormalizer, EventVocab, NATIVE_FIXTURE_METADATA_PREFIX, NormalizedEvent, rule_matches,
+};
 use crate::manifest::{EventMapping, ExitContract, Probe};
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
@@ -808,6 +810,170 @@ struct ExecSession {
     active: Option<ActiveInvocation>,
 }
 
+#[derive(Clone, Debug)]
+struct AbstractFixtureCall {
+    call_id: String,
+    name: String,
+    arguments: Value,
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_fixture_metadata(text: &str) -> Option<Value> {
+    let token = text
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_hexdigit())
+        .copied()
+        .collect::<Vec<_>>();
+    if token.is_empty() || token.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(token.len() / 2);
+    for pair in token.chunks_exact(2) {
+        decoded.push(hex_nibble(pair[0])?.checked_mul(16)? + hex_nibble(pair[1])?);
+    }
+    serde_json::from_slice(&decoded).ok()
+}
+
+fn embedded_fixture_call(value: &Value) -> Option<AbstractFixtureCall> {
+    match value {
+        Value::String(text) => {
+            if matches!(text.as_bytes().first(), Some(b'{') | Some(b'[')) {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    if let Some(call) = embedded_fixture_call(&parsed) {
+                        return Some(call);
+                    }
+                }
+            }
+            let mut offsets = text
+                .match_indices(NATIVE_FIXTURE_METADATA_PREFIX)
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            while let Some(offset) = offsets.pop() {
+                let encoded = &text[offset + NATIVE_FIXTURE_METADATA_PREFIX.len()..];
+                let Some(metadata) = decode_fixture_metadata(encoded) else {
+                    continue;
+                };
+                let Some(call_id) = metadata.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(name) = metadata.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(arguments) = metadata.get("arguments").cloned() else {
+                    continue;
+                };
+                if !arguments.is_object() {
+                    continue;
+                }
+                return Some(AbstractFixtureCall {
+                    call_id: call_id.to_owned(),
+                    name: name.to_owned(),
+                    arguments,
+                });
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(embedded_fixture_call),
+        Value::Object(object) => object.values().find_map(embedded_fixture_call),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
+}
+
+fn nested_value<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(object) => object
+            .get(field)
+            .or_else(|| object.values().find_map(|value| nested_value(value, field))),
+        Value::Array(values) => values.iter().find_map(|value| nested_value(value, field)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
+}
+
+fn canonical_native_result(native: Value) -> Value {
+    let mut result = match native {
+        Value::Object(object) => object,
+        value => BTreeMap::from([("native".to_owned(), value)])
+            .into_iter()
+            .collect(),
+    };
+    if !result.contains_key("ok") {
+        let value = Value::Object(result.clone());
+        let exit_code = nested_value(&value, "exit_code").and_then(Value::as_i64);
+        let status = nested_value(&value, "status").and_then(Value::as_str);
+        let ok = exit_code.map(|code| code == 0).or_else(|| {
+            status.and_then(|status| match status {
+                "completed" | "success" | "succeeded" => Some(true),
+                "failed" | "failure" | "error" | "cancelled" => Some(false),
+                _ => None,
+            })
+        });
+        if let Some(ok) = ok {
+            result.insert("ok".to_owned(), Value::Bool(ok));
+        }
+    }
+    Value::Object(result)
+}
+
+fn canonicalize_native_fixture_event(
+    event: &mut NormalizedEvent,
+    calls_by_native_id: &BTreeMap<String, AbstractFixtureCall>,
+) -> Option<(String, AbstractFixtureCall)> {
+    if !matches!(event.event, EventVocab::ToolCall | EventVocab::ToolResult) {
+        return None;
+    }
+    let native_call_id = event
+        .payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let call = embedded_fixture_call(&event.payload).or_else(|| {
+        native_call_id
+            .as_ref()
+            .and_then(|call_id| calls_by_native_id.get(call_id))
+            .cloned()
+    })?;
+    let payload = event.payload.as_object_mut()?;
+    if let Some(native_call_id) = &native_call_id {
+        payload.insert(
+            "native_call_id".to_owned(),
+            Value::String(native_call_id.clone()),
+        );
+    }
+    if let Some(native_name) = payload.get("name").cloned() {
+        payload.insert("native_name".to_owned(), native_name);
+    }
+    payload.insert("call_id".to_owned(), Value::String(call.call_id.clone()));
+    payload.insert("name".to_owned(), Value::String(call.name.clone()));
+    match event.event {
+        EventVocab::ToolCall => {
+            if let Some(native_arguments) = payload.get("arguments").cloned() {
+                payload.insert("native_arguments".to_owned(), native_arguments);
+            }
+            payload.insert("arguments".to_owned(), call.arguments.clone());
+        }
+        EventVocab::ToolResult => {
+            payload.insert("arguments".to_owned(), call.arguments.clone());
+            let native_result = payload
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(payload.clone()));
+            payload.insert("native_result".to_owned(), native_result.clone());
+            payload.insert("result".to_owned(), canonical_native_result(native_result));
+        }
+        _ => {}
+    }
+    native_call_id.map(|native_call_id| (native_call_id, call))
+}
+
 /// Driver for ordinary CLIs that start a new OS process for each workflow turn.
 ///
 /// Unlike RPC transports, this driver never invents `session.create` or
@@ -1091,6 +1257,28 @@ impl PerInvocationDriver {
     ) -> Result<Vec<NormalizedEvent>> {
         let mut output = Vec::new();
         let mut normalizer = EventNormalizer::default();
+        let mut fixture_calls = existing
+            .values()
+            .filter(|event| event.event == EventVocab::ToolCall)
+            .filter_map(|event| {
+                let native_call_id = event
+                    .payload
+                    .get("native_call_id")
+                    .or_else(|| event.payload.get("call_id"))
+                    .and_then(Value::as_str)?;
+                let call_id = event.payload.get("call_id").and_then(Value::as_str)?;
+                let name = event.payload.get("name").and_then(Value::as_str)?;
+                let arguments = event.payload.get("arguments")?.clone();
+                Some((
+                    native_call_id.to_owned(),
+                    AbstractFixtureCall {
+                        call_id: call_id.to_owned(),
+                        name: name.to_owned(),
+                        arguments,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut effective = mapping.clone();
         effective.id_pointer = "/_ahrb_id".to_owned();
         effective.cursor_pointer = "/_ahrb_cursor".to_owned();
@@ -1174,7 +1362,12 @@ impl PerInvocationDriver {
                         .or_insert_with(|| Value::String(session.marker.clone()));
                     effective.rules.clear();
                     effective.rules.push(rule.clone());
-                    if let Some(event) = normalizer.normalize(&prepared, &effective)? {
+                    if let Some(mut event) = normalizer.normalize(&prepared, &effective)? {
+                        if let Some((native_call_id, call)) =
+                            canonicalize_native_fixture_event(&mut event, &fixture_calls)
+                        {
+                            fixture_calls.insert(native_call_id, call);
+                        }
                         session.next_cursor = session.next_cursor.saturating_add(1);
                         output.push(event);
                     }
@@ -2520,6 +2713,7 @@ mod tests {
                     expand_pointer: "/content".to_owned(),
                     event: "tool-call".to_owned(),
                     payload_pointer: "/_ahrb_expanded".to_owned(),
+                    payload_bindings: BTreeMap::new(),
                 },
                 EventRule {
                     matches: "message".to_owned(),
@@ -2530,6 +2724,7 @@ mod tests {
                     expand_pointer: "/content".to_owned(),
                     event: "tool-result".to_owned(),
                     payload_pointer: "/_ahrb_expanded".to_owned(),
+                    payload_bindings: BTreeMap::new(),
                 },
             ],
         };
@@ -2585,13 +2780,30 @@ mod tests {
         .enumerate()
         {
             let id = format!("tool-{index}");
+            let command = if index == 0 {
+                let metadata = serde_json::to_vec(&json!({
+                    "call_id": "call-fail",
+                    "name": "fail_fixture",
+                    "arguments": {"message": "expected failure"}
+                }))
+                .expect("serialize test fixture metadata")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+                format!(
+                    "/bin/zsh -lc '/bin/false # {}{}'",
+                    NATIVE_FIXTURE_METADATA_PREFIX, metadata
+                )
+            } else {
+                "/bin/false".to_owned()
+            };
             records.push(json!({
                 "type": "item.started",
-                "item": {"id": id, "type": item_type}
+                "item": {"id": id, "type": item_type, "command": command}
             }));
             records.push(json!({
                 "type": "item.completed",
-                "item": {"id": id, "type": item_type}
+                "item": {"id": id, "type": item_type, "command": command, "exit_code": 1, "aggregated_output": "fixture failure"}
             }));
         }
         records.extend([
@@ -2634,6 +2846,55 @@ mod tests {
                 .filter(|event| event.event == EventVocab::ToolResult)
                 .count(),
             5
+        );
+        for event in events
+            .iter()
+            .filter(|event| matches!(event.event, EventVocab::ToolCall | EventVocab::ToolResult))
+        {
+            if event.payload.get("native_call_id").is_none() {
+                assert_eq!(
+                    event.payload.get("call_id").and_then(Value::as_str),
+                    event.payload.get("id").and_then(Value::as_str)
+                );
+            }
+            let bound = if event.event == EventVocab::ToolCall {
+                event.payload.get("arguments")
+            } else {
+                event.payload.get("result")
+            };
+            assert!(bound.is_some(), "Codex tool payload was not correlated");
+        }
+        let failed_result = events
+            .iter()
+            .find(|event| {
+                event.event == EventVocab::ToolResult
+                    && event.payload.get("call_id").and_then(Value::as_str) == Some("call-fail")
+            })
+            .expect("correlated command result");
+        assert_eq!(
+            failed_result
+                .payload
+                .get("native_call_id")
+                .and_then(Value::as_str),
+            Some("tool-0")
+        );
+        assert_eq!(
+            failed_result.payload.get("name").and_then(Value::as_str),
+            Some("fail_fixture")
+        );
+        assert_eq!(
+            failed_result
+                .payload
+                .pointer("/result/ok")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            failed_result
+                .payload
+                .pointer("/result/exit_code")
+                .and_then(Value::as_i64),
+            Some(1)
         );
         assert_eq!(
             events

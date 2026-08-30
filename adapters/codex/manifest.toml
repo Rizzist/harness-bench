@@ -2,7 +2,7 @@
 schema = 1
 id = "codex"
 name = "OpenAI Codex CLI"
-revision = "exec-jsonl-v1"
+revision = "exec-jsonl-native-tools-v2"
 
 [availability]
 exec_paths = ["codex"]
@@ -82,12 +82,14 @@ fanout_mode = "client"
 # TODO(orchestrator): revalidate these known Codex tool item variants when the
 # probed CLI changes its exec JSONL schema.
 [tools.aliases]
-write = "shell"
-read = "shell"
-fail = "shell"
+write = ["shell_command", "exec_command", "shell"]
+read = ["shell_command", "exec_command", "shell"]
+fail = ["shell_command", "exec_command", "shell"]
 
 [tools.bindings]
-command_argv = "command"
+"shell_command.command" = "command"
+"exec_command.command" = "cmd"
+"shell.command_argv" = "command"
 
 [tools.fixtures]
 write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
@@ -112,60 +114,70 @@ matches = "item.started"
 match_fields = { "/item/type" = "command_execution" }
 event = "tool-call"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", arguments = "/item" }
 
 [[events.rules]]
 matches = "item.started"
 match_fields = { "/item/type" = "function_call" }
 event = "tool-call"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", arguments = "/item" }
 
 [[events.rules]]
 matches = "item.started"
 match_fields = { "/item/type" = "local_shell_call" }
 event = "tool-call"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", arguments = "/item" }
 
 [[events.rules]]
 matches = "item.started"
 match_fields = { "/item/type" = "file_change" }
 event = "tool-call"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", arguments = "/item" }
 
 [[events.rules]]
 matches = "item.started"
 match_fields = { "/item/type" = "patch_apply" }
 event = "tool-call"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", arguments = "/item" }
 
 [[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "command_execution" }
 event = "tool-result"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", result = "/item" }
 
 [[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "function_call" }
 event = "tool-result"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", result = "/item" }
 
 [[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "local_shell_call" }
 event = "tool-result"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", result = "/item" }
 
 [[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "file_change" }
 event = "tool-result"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", result = "/item" }
 
 [[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "patch_apply" }
 event = "tool-result"
 payload_pointer = "/item"
+payload_bindings = { call_id = "/item/id", result = "/item" }
 
 [[events.rules]]
 matches = "item.completed"

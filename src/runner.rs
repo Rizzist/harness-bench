@@ -793,6 +793,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         &request_records,
         &manifest,
         &resource_certification,
+        &profile_root,
     );
     results.sort_by_key(|result| result.row);
     let mut resource_metric_values = resource_certification.metrics.clone();
@@ -1628,78 +1629,48 @@ fn mapped_tool_call(
     call_id: String,
     semantic_arguments: Value,
 ) -> Result<Value> {
-    let name = manifest
-        .tools
-        .aliases
-        .get(semantic)
-        .cloned()
-        .unwrap_or_else(|| format!("{semantic}_fixture"));
+    let abstract_name = format!("{semantic}_fixture");
     let object = semantic_arguments.as_object().ok_or_else(|| {
         AhrbError::Validation(format!(
             "semantic tool {semantic:?} arguments are not an object"
         ))
     })?;
-    let arguments = if let Some(command_field) = manifest.tools.bindings.get("command") {
-        let template = manifest.tools.fixtures.get(semantic).ok_or_else(|| {
-            AhrbError::Validation(format!(
-                "tool {semantic:?} binds a command field but has no fixture argv"
-            ))
-        })?;
-        let mut variables = BTreeMap::from([
-            ("ahrb_fixture".to_owned(), fixture_program()?),
-            ("workspace".to_owned(), ".".to_owned()),
-        ]);
-        for (key, value) in object {
-            if let Some(value) = value.as_str() {
-                variables.insert(key.clone(), value.to_owned());
-            }
-        }
-        let argv = template
-            .iter()
-            .map(|argument| crate::manifest::render_template(argument, &variables))
-            .collect::<Result<Vec<_>>>()?;
-        let mut mapped = serde_json::Map::new();
-        mapped.insert(command_field.clone(), Value::String(shell_join(&argv)));
-        Value::Object(mapped)
-    } else if let Some(command_field) = manifest.tools.bindings.get("command_argv") {
-        let template = manifest.tools.fixtures.get(semantic).ok_or_else(|| {
-            AhrbError::Validation(format!(
-                "tool {semantic:?} binds an argv command field but has no fixture argv"
-            ))
-        })?;
-        let mut variables = BTreeMap::from([
-            ("ahrb_fixture".to_owned(), fixture_program()?),
-            ("workspace".to_owned(), ".".to_owned()),
-        ]);
-        for (key, value) in object {
-            if let Some(value) = value.as_str() {
-                variables.insert(key.clone(), value.to_owned());
-            }
-        }
-        let argv = template
-            .iter()
-            .map(|argument| crate::manifest::render_template(argument, &variables))
-            .collect::<Result<Vec<_>>>()?;
-        let mut mapped = serde_json::Map::new();
-        mapped.insert(
-            command_field.clone(),
-            Value::Array(argv.into_iter().map(Value::String).collect()),
-        );
-        Value::Object(mapped)
-    } else {
-        let mut mapped = serde_json::Map::new();
-        for (key, value) in object {
-            let target = manifest
-                .tools
-                .bindings
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| key.clone());
-            mapped.insert(target, value.clone());
-        }
-        Value::Object(mapped)
+    let Some(alias) = manifest.tools.aliases.get(semantic) else {
+        return Ok(json!({
+            "id": call_id,
+            "name": abstract_name,
+            "arguments": semantic_arguments
+        }));
     };
-    Ok(json!({"id":call_id, "name":name, "arguments":arguments}))
+    let template = manifest.tools.fixtures.get(semantic).ok_or_else(|| {
+        AhrbError::Validation(format!(
+            "tool {semantic:?} declares a native alias but has no fixture argv"
+        ))
+    })?;
+    let mut variables = BTreeMap::from([
+        ("ahrb_fixture".to_owned(), fixture_program()?),
+        ("workspace".to_owned(), ".".to_owned()),
+    ]);
+    for (key, value) in object {
+        if let Some(value) = value.as_str() {
+            variables.insert(key.clone(), value.to_owned());
+        }
+    }
+    let argv = template
+        .iter()
+        .map(|argument| crate::manifest::render_template(argument, &variables))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "id": call_id,
+        "name": abstract_name,
+        "arguments": semantic_arguments,
+        "_ahrb_native": {
+            "semantic": semantic,
+            "aliases": alias.candidates(),
+            "bindings": manifest.tools.bindings,
+            "argv": argv
+        }
+    }))
 }
 
 fn fixture_program() -> Result<String> {
@@ -1711,13 +1682,6 @@ fn fixture_program() -> Result<String> {
         }
     }
     Ok("ahrb-fixture".to_owned())
-}
-
-fn shell_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|argument| format!("'{}'", argument.replace('\'', "'\"'\"'")))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn scripted_row(
@@ -2000,12 +1964,47 @@ fn is_terminal(event: &EventVocab) -> bool {
     )
 }
 
+fn fixture_effect_matches(
+    profile_root: &Path,
+    state: &RunState,
+    row: u8,
+    relative: &str,
+    expected: &str,
+) -> bool {
+    state
+        .sessions
+        .get(&row)
+        .into_iter()
+        .flatten()
+        .any(|session| {
+            [
+                profile_root
+                    .join("ahrb-exec-sessions")
+                    .join(&session.0)
+                    .join("workspace")
+                    .join(relative),
+                profile_root
+                    .join("state")
+                    .join("workspaces")
+                    .join(&session.0)
+                    .join(relative),
+            ]
+            .iter()
+            .any(|path| {
+                std::fs::read_to_string(path)
+                    .map(|content| content == expected)
+                    .unwrap_or(false)
+            })
+        })
+}
+
 fn evaluate_rows(
     selected: &[&crate::scenarios::TestDefinition],
     state: &RunState,
     requests: &[crate::fake_model::ModelRequestRecord],
     manifest: &Manifest,
     resources: &ResourceCertification,
+    profile_root: &Path,
 ) -> Vec<TestResult> {
     selected
         .iter()
@@ -2091,14 +2090,121 @@ fn evaluate_rows(
                         row_requests.max(1)
                     ),
                 ),
-                2 => (
-                    tool_calls == 1 && tool_results == 1 && success_count == 1,
-                    format!("observed {tool_calls} correlated call and {tool_results} result"),
-                ),
-                3 => (
-                    tool_calls == 2 && tool_results == 2 && success_count == 1,
-                    format!("observed A/B order with {tool_calls} calls and {tool_results} results"),
-                ),
+                2 => {
+                    let call = events.iter().find(|event| {
+                        event.event == EventVocab::ToolCall
+                            && event.payload.get("call_id").and_then(Value::as_str)
+                                == Some("call-r2")
+                    });
+                    let result = events.iter().find(|event| {
+                        event.event == EventVocab::ToolResult
+                            && event.payload.get("call_id").and_then(Value::as_str)
+                                == Some("call-r2")
+                    });
+                    let content = call
+                        .and_then(|event| event.payload.pointer("/arguments/content"))
+                        .and_then(Value::as_str);
+                    let exact_call = call.is_some_and(|event| {
+                        event.payload.get("name").and_then(Value::as_str)
+                            == Some("write_fixture")
+                            && event
+                                .payload
+                                .pointer("/arguments/path")
+                                .and_then(Value::as_str)
+                                == Some("row-2.txt")
+                    });
+                    let correlated = result.is_some_and(|event| {
+                        event.payload.pointer("/result/ok").and_then(Value::as_bool) == Some(true)
+                    });
+                    let effect = content.is_some_and(|content| {
+                        fixture_effect_matches(profile_root, state, 2, "row-2.txt", content)
+                    });
+                    (
+                        tool_calls == 1
+                            && tool_results == 1
+                            && success_count == 1
+                            && exact_call
+                            && correlated
+                            && effect,
+                        format!(
+                            "observed {tool_calls} exact abstract call, {tool_results} correlated result, filesystem effect={effect}"
+                        ),
+                    )
+                }
+                3 => {
+                    let positions = [
+                        (EventVocab::ToolCall, "call-a"),
+                        (EventVocab::ToolResult, "call-a"),
+                        (EventVocab::ToolCall, "call-b"),
+                        (EventVocab::ToolResult, "call-b"),
+                    ]
+                    .map(|(kind, call_id)| {
+                        events.iter().position(|event| {
+                            event.event == kind
+                                && event.payload.get("call_id").and_then(Value::as_str)
+                                    == Some(call_id)
+                        })
+                    });
+                    let ordered = positions
+                        .iter()
+                        .all(Option::is_some)
+                        && positions
+                            .windows(2)
+                            .all(|pair| pair[0].zip(pair[1]).is_some_and(|(a, b)| a < b));
+                    let write = positions[0].and_then(|position| events.get(position));
+                    let read = positions[2].and_then(|position| events.get(position));
+                    let read_result = positions[3].and_then(|position| events.get(position));
+                    let semantic = write.is_some_and(|event| {
+                        event.payload.get("name").and_then(Value::as_str)
+                            == Some("write_fixture")
+                            && event
+                                .payload
+                                .pointer("/arguments/path")
+                                .and_then(Value::as_str)
+                                == Some("a.txt")
+                            && event
+                                .payload
+                                .pointer("/arguments/content")
+                                .and_then(Value::as_str)
+                                == Some("A")
+                    }) && read.is_some_and(|event| {
+                        event.payload.get("name").and_then(Value::as_str) == Some("read_fixture")
+                            && event
+                                .payload
+                                .pointer("/arguments/path")
+                                .and_then(Value::as_str)
+                                == Some("a.txt")
+                            && event
+                                .payload
+                                .pointer("/arguments/expected_from_a")
+                                .and_then(Value::as_str)
+                                == Some("A")
+                    });
+                    let dependency = read_result.is_some_and(|event| {
+                        ["content", "stdout", "aggregated_output"]
+                            .iter()
+                            .any(|field| {
+                                event
+                                    .payload
+                                    .pointer(&format!("/result/{field}"))
+                                    .and_then(Value::as_str)
+                                    == Some("A")
+                            })
+                    });
+                    let effect = fixture_effect_matches(profile_root, state, 3, "a.txt", "A");
+                    (
+                        tool_calls == 2
+                            && tool_results == 2
+                            && success_count == 1
+                            && ordered
+                            && semantic
+                            && dependency
+                            && effect,
+                        format!(
+                            "observed exact A/result/B/result order={ordered}, dependency={dependency}, filesystem effect={effect}"
+                        ),
+                    )
+                }
                 4 => {
                     let first_result = events
                         .iter()
@@ -2191,13 +2297,36 @@ fn evaluate_rows(
                         "journal recovery trial produced no validation evidence".to_owned()
                     }),
                 ),
+                6 => {
+                    let call = events.iter().find(|event| {
+                        event.event == EventVocab::ToolCall
+                            && event.payload.get("call_id").and_then(Value::as_str)
+                                == Some("call-fail")
+                            && event.payload.get("name").and_then(Value::as_str)
+                                == Some("fail_fixture")
+                    });
+                    let result = events.iter().find(|event| {
+                        event.event == EventVocab::ToolResult
+                            && event.payload.get("call_id").and_then(Value::as_str)
+                                == Some("call-fail")
+                    });
+                    let structured_failure = result.is_some_and(|event| {
+                        event.payload.pointer("/result/ok").and_then(Value::as_bool) == Some(false)
+                    });
+                    (
+                        call.is_some()
+                            && structured_failure
+                            && tool_calls == 1
+                            && tool_results == 1
+                            && success_count == 1,
+                        format!(
+                            "observed one exact fail_fixture call with correlated structured failure={structured_failure}"
+                        ),
+                    )
+                }
                 _ => {
-                    let expected_failure = matches!(definition.row, 6);
-                    let terminal_ok = if expected_failure {
-                        success_count == 1 && tool_results == 1
-                    } else {
-                        success_count == state.sessions.get(&definition.row).map_or(1, Vec::len)
-                    };
+                    let terminal_ok =
+                        success_count == state.sessions.get(&definition.row).map_or(1, Vec::len);
                     (
                         terminal_ok,
                         format!(
@@ -4401,7 +4530,7 @@ mod resource_sampler_tests {
     }
 
     #[test]
-    fn codex_fixture_tools_map_to_executable_shell_argv() {
+    fn codex_fixture_scripts_defer_native_selection_with_executable_argv() {
         let manifest = crate::manifest::load(Path::new("adapters/codex/manifest.toml"))
             .expect("load Codex manifest");
         let write = mapped_tool_call(
@@ -4411,11 +4540,20 @@ mod resource_sampler_tests {
             json!({"path": "fixture.txt", "content": "fixture payload"}),
         )
         .expect("map Codex fixture write");
-        assert_eq!(write.get("name").and_then(Value::as_str), Some("shell"));
+        assert_eq!(
+            write.get("name").and_then(Value::as_str),
+            Some("write_fixture")
+        );
+        assert_eq!(
+            write
+                .pointer("/_ahrb_native/aliases/0")
+                .and_then(Value::as_str),
+            Some("shell_command")
+        );
         let command = write
-            .pointer("/arguments/command")
+            .pointer("/_ahrb_native/argv")
             .and_then(Value::as_array)
-            .expect("Codex shell command is argv-shaped");
+            .expect("deferred Codex shell command keeps argv");
         let command: Vec<_> = command.iter().filter_map(Value::as_str).collect();
         assert!(command.first().is_some_and(|program| {
             program.ends_with("ahrb-fixture") || *program == "ahrb-fixture"
@@ -4438,11 +4576,14 @@ mod resource_sampler_tests {
             json!({"path": "fixture.txt"}),
         )
         .expect("map Codex fixture read");
-        assert_eq!(read.get("name").and_then(Value::as_str), Some("shell"));
+        assert_eq!(
+            read.get("name").and_then(Value::as_str),
+            Some("read_fixture")
+        );
         let read_command: Vec<_> = read
-            .pointer("/arguments/command")
+            .pointer("/_ahrb_native/argv")
             .and_then(Value::as_array)
-            .expect("Codex read command is argv-shaped")
+            .expect("deferred Codex read command keeps argv")
             .iter()
             .filter_map(Value::as_str)
             .collect();
@@ -4455,11 +4596,14 @@ mod resource_sampler_tests {
             json!({"message": "expected failure"}),
         )
         .expect("map Codex fixture failure");
-        assert_eq!(fail.get("name").and_then(Value::as_str), Some("shell"));
+        assert_eq!(
+            fail.get("name").and_then(Value::as_str),
+            Some("fail_fixture")
+        );
         let fail_command: Vec<_> = fail
-            .pointer("/arguments/command")
+            .pointer("/_ahrb_native/argv")
             .and_then(Value::as_array)
-            .expect("Codex fail command is argv-shaped")
+            .expect("deferred Codex fail command keeps argv")
             .iter()
             .filter_map(Value::as_str)
             .collect();

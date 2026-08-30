@@ -145,23 +145,33 @@ fn codex_manifest_maps_all_known_exec_tool_items_and_terminals() -> Result<()> {
 }
 
 #[test]
-fn codex_manifest_binds_fixture_semantics_to_shell_argv() -> Result<()> {
+fn codex_manifest_binds_fixture_semantics_to_declared_shell_variants() -> Result<()> {
     let manifest = ahrb::manifest::load(Path::new("adapters/codex/manifest.toml"))?;
     for semantic in ["write", "read", "fail"] {
         assert_eq!(
-            manifest.tools.aliases.get(semantic).map(String::as_str),
-            Some("shell")
+            manifest
+                .tools
+                .aliases
+                .get(semantic)
+                .map(|alias| alias.candidates()),
+            Some(
+                ["shell_command", "exec_command", "shell"]
+                    .map(str::to_owned)
+                    .as_slice()
+            )
         );
         assert!(manifest.tools.fixtures.contains_key(semantic));
     }
-    assert_eq!(
-        manifest
-            .tools
-            .bindings
-            .get("command_argv")
-            .map(String::as_str),
-        Some("command")
-    );
+    for (binding, field) in [
+        ("shell_command.command", "command"),
+        ("exec_command.command", "cmd"),
+        ("shell.command_argv", "command"),
+    ] {
+        assert_eq!(
+            manifest.tools.bindings.get(binding).map(String::as_str),
+            Some(field)
+        );
+    }
     Ok(())
 }
 

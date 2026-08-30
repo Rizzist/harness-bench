@@ -336,15 +336,40 @@ pub fn topology_family(topology: &str) -> Option<TopologyFamily> {
 /// Tool aliases, schema bindings, and safe fixture commands.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ToolSemantics {
-    /// Semantic tool name to harness alias.
+    /// Semantic tool name to one or more harness-native aliases, in preference order.
     #[serde(default)]
-    pub aliases: BTreeMap<String, String>,
+    pub aliases: BTreeMap<String, ToolAlias>,
     /// Semantic field to harness schema binding.
     #[serde(default)]
     pub bindings: BTreeMap<String, String>,
     /// Safe argv fixture templates.
     #[serde(default)]
     pub fixtures: BTreeMap<String, Vec<String>>,
+}
+
+/// One preferred native tool name or an ordered set of version-compatible names.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolAlias {
+    /// One exact native tool name.
+    One(String),
+    /// Ordered exact native tool names; the request declaration selects one.
+    Candidates(Vec<String>),
+}
+
+impl ToolAlias {
+    /// Return native tool names in adapter preference order.
+    pub fn candidates(&self) -> &[String] {
+        match self {
+            Self::One(name) => std::slice::from_ref(name),
+            Self::Candidates(names) => names,
+        }
+    }
+
+    /// Return the preferred native tool name, when one was declared.
+    pub fn primary(&self) -> Option<&str> {
+        self.candidates().first().map(String::as_str)
+    }
 }
 
 /// Event source/framing and table-driven extraction rules.
@@ -387,6 +412,9 @@ pub struct EventRule {
     /// Optional JSON pointer for payload extraction.
     #[serde(default)]
     pub payload_pointer: String,
+    /// Additional normalized payload fields sourced from the unmodified record.
+    #[serde(default)]
+    pub payload_bindings: BTreeMap<String, String>,
 }
 
 /// Stable exit-code mapping.
@@ -582,6 +610,20 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         return Err(AhrbError::Validation(
             "concurrency.max_agents must be positive".to_owned(),
         ));
+    }
+    for (semantic, alias) in &manifest.tools.aliases {
+        let candidates = alias.candidates();
+        if candidates.is_empty() || candidates.iter().any(|name| name.trim().is_empty()) {
+            return Err(AhrbError::Validation(format!(
+                "tools.aliases.{semantic} must declare at least one non-empty native tool name"
+            )));
+        }
+        let unique: std::collections::BTreeSet<_> = candidates.iter().collect();
+        if unique.len() != candidates.len() {
+            return Err(AhrbError::Validation(format!(
+                "tools.aliases.{semantic} repeats a native tool name"
+            )));
+        }
     }
     let topology_family = topology_family(&manifest.concurrency.topology);
     let topology_matches_lifecycle = matches!(

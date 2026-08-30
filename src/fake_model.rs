@@ -241,6 +241,7 @@ impl FakeModelEngine {
             self.barriers.arrive(barrier, &marker).await?;
             self.barriers.wait_for_release(barrier).await?;
         }
+        let value = adapt_scripted_tool_calls(&accepted.response.response, &request.canonical)?;
 
         Ok(ModelResponse {
             model: request.model,
@@ -248,7 +249,7 @@ impl FakeModelEngine {
             actor: marker.actor,
             checkpoint: marker.checkpoint,
             request_hash,
-            value: accepted.response.response,
+            value,
             fault: accepted.response.fault,
             retry: accepted.retry,
             stream: request.stream,
@@ -264,6 +265,334 @@ impl FakeModelEngine {
     pub async fn request_records(&self) -> Vec<ModelRequestRecord> {
         self.requests.lock().await.values().cloned().collect()
     }
+}
+
+#[derive(Clone, Debug)]
+struct DeclaredTool {
+    name: String,
+    schema: Value,
+}
+
+fn adapt_scripted_tool_calls(value: &Value, request: &Value) -> Result<Value> {
+    let Some(calls) = value.get("tool_calls").and_then(Value::as_array) else {
+        return Ok(value.clone());
+    };
+    if !calls.iter().any(|call| call.get("_ahrb_native").is_some()) {
+        return Ok(value.clone());
+    }
+    let declared = declared_tools(request)?;
+    let mut adapted = value.clone();
+    let adapted_calls = adapted
+        .get_mut("tool_calls")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| AhrbError::Protocol("semantic tool_calls must be an array".to_owned()))?;
+    for call in adapted_calls {
+        adapt_scripted_tool_call(call, &declared)?;
+    }
+    Ok(adapted)
+}
+
+fn declared_tools(request: &Value) -> Result<BTreeMap<String, DeclaredTool>> {
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut declared = BTreeMap::new();
+    for tool in tools {
+        let object = tool.as_object().ok_or_else(|| {
+            AhrbError::Protocol("request tools entries must be objects".to_owned())
+        })?;
+        let function = object.get("function").and_then(Value::as_object);
+        let source = function.unwrap_or(object);
+        let name = source.get("name").and_then(Value::as_str).or_else(|| {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|kind| *kind != "function")
+        });
+        let Some(name) = name else {
+            continue;
+        };
+        let schema = source
+            .get("parameters")
+            .or_else(|| source.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let declaration = DeclaredTool {
+            name: name.to_owned(),
+            schema,
+        };
+        if declared.insert(name.to_owned(), declaration).is_some() {
+            return Err(AhrbError::Protocol(format!(
+                "request declares native tool {name:?} more than once"
+            )));
+        }
+    }
+    Ok(declared)
+}
+
+fn adapt_scripted_tool_call(
+    call: &mut Value,
+    declared: &BTreeMap<String, DeclaredTool>,
+) -> Result<()> {
+    let object = call.as_object_mut().ok_or_else(|| {
+        AhrbError::Protocol("semantic tool_calls entries must be objects".to_owned())
+    })?;
+    let Some(adapter) = object.remove("_ahrb_native") else {
+        return Ok(());
+    };
+    let adapter = adapter.as_object().ok_or_else(|| {
+        AhrbError::Protocol("_ahrb_native tool adapter must be an object".to_owned())
+    })?;
+    let aliases = adapter
+        .get("aliases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AhrbError::Protocol("native tool adapter lacks aliases[]".to_owned()))?;
+    let bindings = adapter
+        .get("bindings")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AhrbError::Protocol("native tool adapter lacks bindings".to_owned()))?;
+    let argv = adapter
+        .get("argv")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AhrbError::Protocol("native tool adapter lacks argv[]".to_owned()))?
+        .iter()
+        .map(|argument| {
+            argument.as_str().map(str::to_owned).ok_or_else(|| {
+                AhrbError::Protocol("native tool adapter argv must contain strings".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let abstract_call_id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AhrbError::Protocol("abstract fixture call lacks id".to_owned()))?
+        .to_owned();
+    let abstract_name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AhrbError::Protocol("abstract fixture call lacks name".to_owned()))?
+        .to_owned();
+    let semantic_arguments = object
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AhrbError::Protocol("abstract fixture arguments must be an object".to_owned())
+        })?;
+
+    let mut declared_candidates = Vec::new();
+    let mut shape_errors = Vec::new();
+    for alias in aliases {
+        let name = alias.as_str().ok_or_else(|| {
+            AhrbError::Protocol("native tool adapter aliases must be strings".to_owned())
+        })?;
+        let Some(tool) = declared.get(name) else {
+            continue;
+        };
+        declared_candidates.push(name);
+        match render_native_arguments(
+            tool,
+            &abstract_call_id,
+            &abstract_name,
+            semantic_arguments,
+            &argv,
+            bindings,
+        ) {
+            Ok(arguments) => {
+                object.insert("name".to_owned(), Value::String(tool.name.clone()));
+                object.insert("arguments".to_owned(), arguments);
+                return Ok(());
+            }
+            Err(error) => shape_errors.push(format!("{name}: {error}")),
+        }
+    }
+    if declared_candidates.is_empty() {
+        let aliases = aliases
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let available = declared
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AhrbError::Protocol(format!(
+            "none of the adapter native tools [{aliases}] were declared by the harness; declared tools: [{available}]"
+        )));
+    }
+    Err(AhrbError::Protocol(format!(
+        "declared native tools did not match adapter bindings: {}",
+        shape_errors.join("; ")
+    )))
+}
+
+fn render_native_arguments(
+    tool: &DeclaredTool,
+    abstract_call_id: &str,
+    abstract_name: &str,
+    semantic_arguments: &Map<String, Value>,
+    argv: &[String],
+    bindings: &Map<String, Value>,
+) -> Result<Value> {
+    for (style, expected_type) in [("command", "string"), ("command_argv", "array")] {
+        let Some(field) = binding_for(bindings, &tool.name, style)? else {
+            continue;
+        };
+        require_schema_property_type(&tool.schema, &field, expected_type)?;
+        let metadata =
+            native_fixture_metadata(abstract_call_id, abstract_name, semantic_arguments)?;
+        let script = shell_command(argv, semantic_arguments, &metadata);
+        let command = if style == "command" {
+            Value::String(script)
+        } else {
+            json!(["/bin/sh", "-c", script])
+        };
+        let mut arguments = Map::new();
+        arguments.insert(field.clone(), command);
+        copy_allowed_semantic_arguments(
+            &mut arguments,
+            semantic_arguments,
+            &tool.name,
+            bindings,
+            &tool.schema,
+            Some(&field),
+        )?;
+        return Ok(Value::Object(arguments));
+    }
+
+    let mut arguments = Map::new();
+    copy_allowed_semantic_arguments(
+        &mut arguments,
+        semantic_arguments,
+        &tool.name,
+        bindings,
+        &tool.schema,
+        None,
+    )?;
+    if arguments.is_empty() && !semantic_arguments.is_empty() {
+        return Err(AhrbError::Protocol(format!(
+            "native tool {:?} accepts none of the abstract fixture fields",
+            tool.name
+        )));
+    }
+    Ok(Value::Object(arguments))
+}
+
+fn binding_for(
+    bindings: &Map<String, Value>,
+    native_name: &str,
+    semantic_field: &str,
+) -> Result<Option<String>> {
+    let qualified = format!("{native_name}.{semantic_field}");
+    bindings
+        .get(&qualified)
+        .or_else(|| bindings.get(semantic_field))
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "native tool binding {qualified:?} must be a string"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn copy_allowed_semantic_arguments(
+    output: &mut Map<String, Value>,
+    semantic_arguments: &Map<String, Value>,
+    native_name: &str,
+    bindings: &Map<String, Value>,
+    schema: &Value,
+    command_field: Option<&str>,
+) -> Result<()> {
+    for (field, value) in semantic_arguments {
+        let target = binding_for(bindings, native_name, field)?.unwrap_or_else(|| field.clone());
+        if command_field == Some(target.as_str()) || !schema_allows_property(schema, &target) {
+            continue;
+        }
+        output.insert(target, value.clone());
+    }
+    Ok(())
+}
+
+fn schema_allows_property(schema: &Value, field: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key(field))
+        || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+}
+
+fn require_schema_property_type(schema: &Value, field: &str, expected: &str) -> Result<()> {
+    let property = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(field))
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "declared schema has no property {field:?} for the configured command binding"
+            ))
+        })?;
+    let matches = match property.get("type") {
+        Some(Value::String(kind)) => kind == expected,
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some(expected)),
+        _ => false,
+    };
+    if !matches {
+        return Err(AhrbError::Protocol(format!(
+            "declared schema property {field:?} is not type {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn native_fixture_metadata(
+    abstract_call_id: &str,
+    abstract_name: &str,
+    semantic_arguments: &Map<String, Value>,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(&json!({
+        "call_id": abstract_call_id,
+        "name": abstract_name,
+        "arguments": semantic_arguments
+    }))?;
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").map_err(|error| {
+            AhrbError::Protocol(format!("encode native fixture metadata: {error}"))
+        })?;
+    }
+    Ok(format!(
+        "{}{}",
+        crate::events::NATIVE_FIXTURE_METADATA_PREFIX,
+        encoded
+    ))
+}
+
+fn shell_command(
+    argv: &[String],
+    semantic_arguments: &Map<String, Value>,
+    metadata: &str,
+) -> String {
+    let mut command = argv
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    command.push_str(" # ");
+    for context in semantic_arguments
+        .values()
+        .filter_map(Value::as_str)
+        .filter(|value| value.contains(crate::workflow::MARKER_PREFIX))
+    {
+        command.push_str(&context.replace(['\n', '\r'], " "));
+        command.push(' ');
+    }
+    command.push_str(metadata);
+    command
 }
 
 /// OpenAI Chat Completions (`POST /v1/chat/completions`) frontend.
@@ -1862,6 +2191,164 @@ mod tests {
             canonical_request_hash(&left)?,
             canonical_request_hash(&right)?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scripted_write_fixture_uses_the_shell_tool_declared_by_the_request() -> Result<()> {
+        let scripted = json!({
+            "tool_calls": [{
+                "id": "call-write",
+                "name": "write_fixture",
+                "arguments": {
+                    "path": "nested/fixture.txt",
+                    "content": "fixture payload",
+                    "route": "[[AHRB:scenario=native;actor=root;checkpoint=next]]"
+                },
+                "_ahrb_native": {
+                    "semantic": "write",
+                    "aliases": ["missing_shell", "request_shell"],
+                    "bindings": {"request_shell.command": "command"},
+                    "argv": [
+                        "/tmp/ahrb-fixture",
+                        "write",
+                        "--path",
+                        "nested/fixture.txt",
+                        "--content",
+                        "fixture payload"
+                    ]
+                }
+            }]
+        });
+        let request = json!({
+            "model": "ahrb-fake-v1",
+            "tools": [{
+                "type": "function",
+                "name": "request_shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            }]
+        });
+        let adapted = adapt_scripted_tool_calls(&scripted, &request)?;
+        assert_eq!(
+            adapted
+                .pointer("/tool_calls/0/name")
+                .and_then(Value::as_str),
+            Some("request_shell")
+        );
+        let command = adapted
+            .pointer("/tool_calls/0/arguments/command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AhrbError::Protocol("adapted command is absent".to_owned()))?;
+        assert!(command.contains("'/tmp/ahrb-fixture' 'write'"));
+        assert!(command.contains("'nested/fixture.txt'"));
+        assert!(command.contains("'fixture payload'"));
+        assert!(command.contains("checkpoint=next"));
+        assert!(adapted.pointer("/tool_calls/0/_ahrb_native").is_none());
+        assert!(adapted.pointer("/tool_calls/0/arguments/path").is_none());
+        let rendered = OpenAiResponsesFrontend.render(&ModelResponse {
+            model: "ahrb-fake-v1".to_owned(),
+            scenario: "native".to_owned(),
+            actor: "root".to_owned(),
+            checkpoint: "next".to_owned(),
+            request_hash: "request-hash".to_owned(),
+            value: adapted.clone(),
+            fault: None,
+            retry: false,
+            stream: false,
+        })?;
+        let body: Value = serde_json::from_slice(&rendered.body)?;
+        assert_eq!(
+            body.pointer("/output/0/name").and_then(Value::as_str),
+            Some("request_shell")
+        );
+        let rendered_arguments = body
+            .pointer("/output/0/arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AhrbError::Protocol("rendered arguments are absent".to_owned()))?;
+        assert_eq!(
+            serde_json::from_str::<Value>(rendered_arguments)?
+                .get("command")
+                .and_then(Value::as_str),
+            Some(command)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_tool_translation_honors_chat_and_anthropic_schema_locations() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("ahrb-native-argv-{}", std::process::id()));
+        if directory.exists() {
+            std::fs::remove_dir_all(&directory)?;
+        }
+        std::fs::create_dir_all(&directory)?;
+        for request in [
+            json!({
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "native_exec",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "array"}},
+                            "additionalProperties": false
+                        }
+                    }
+                }]
+            }),
+            json!({
+                "tools": [{
+                    "name": "native_exec",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "array"}},
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        ] {
+            let scripted = json!({
+                "tool_calls": [{
+                    "id": "call-read",
+                    "name": "read_fixture",
+                    "arguments": {"path": "fixture.txt"},
+                    "_ahrb_native": {
+                        "semantic": "read",
+                        "aliases": ["native_exec"],
+                        "bindings": {"native_exec.command_argv": "command"},
+                        "argv": ["/bin/sh", "-c", "printf argv-ok > argv-effect.txt"]
+                    }
+                }]
+            });
+            let adapted = adapt_scripted_tool_calls(&scripted, &request)?;
+            let command = adapted
+                .pointer("/tool_calls/0/arguments/command")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AhrbError::Protocol("native argv is absent".to_owned()))?;
+            assert_eq!(command.first().and_then(Value::as_str), Some("/bin/sh"));
+            assert_eq!(command.get(1).and_then(Value::as_str), Some("-c"));
+            let script = command
+                .get(2)
+                .and_then(Value::as_str)
+                .ok_or_else(|| AhrbError::Protocol("native shell script is absent".to_owned()))?;
+            assert!(script.contains("printf argv-ok > argv-effect.txt"));
+            assert!(script.contains(crate::events::NATIVE_FIXTURE_METADATA_PREFIX));
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .current_dir(&directory)
+                .status()?;
+            assert!(status.success());
+        }
+        assert_eq!(
+            std::fs::read_to_string(directory.join("argv-effect.txt"))?,
+            "argv-ok"
+        );
+        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 

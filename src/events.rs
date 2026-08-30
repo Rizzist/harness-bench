@@ -7,6 +7,10 @@ use std::collections::BTreeSet;
 use crate::manifest::EventMapping;
 use crate::{AhrbError, Result};
 
+/// Inert command/argv annotation used to recover abstract fixture semantics from
+/// a harness-native tool event.
+pub(crate) const NATIVE_FIXTURE_METADATA_PREFIX: &str = "AHRB_FIXTURE_HEX=";
+
 /// AHRB's normalized event vocabulary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -92,7 +96,7 @@ impl EventNormalizer {
         let cursor = cursor_value
             .as_u64()
             .ok_or_else(|| AhrbError::Protocol("event cursor is not u64".to_owned()))?;
-        let payload = if rule.payload_pointer.is_empty() {
+        let mut payload = if rule.payload_pointer.is_empty() {
             raw.clone()
         } else {
             raw.pointer(&rule.payload_pointer).cloned().ok_or_else(|| {
@@ -102,6 +106,21 @@ impl EventNormalizer {
                 ))
             })?
         };
+        if !rule.payload_bindings.is_empty() {
+            let object = payload.as_object_mut().ok_or_else(|| {
+                AhrbError::Protocol(
+                    "event payload bindings require an extracted JSON object".to_owned(),
+                )
+            })?;
+            for (field, pointer) in &rule.payload_bindings {
+                let value = raw.pointer(pointer).cloned().ok_or_else(|| {
+                    AhrbError::Protocol(format!(
+                        "event payload binding {field:?} is missing at {pointer:?}"
+                    ))
+                })?;
+                object.insert(field.clone(), value);
+            }
+        }
         Ok(Some(NormalizedEvent {
             id,
             cursor,

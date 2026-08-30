@@ -129,6 +129,7 @@ struct MockConfig {
     session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
+    declare_native_shell: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -650,7 +651,8 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             ));
         }
     };
-    let config = parse_config(&config_args)?;
+    let mut config = parse_config(&config_args)?;
+    config.declare_native_shell = true;
     let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
     let turn = PendingTurn { prompt, key };
     let (session_id, journal, after) = {
@@ -868,6 +870,7 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
+        declare_native_shell: false,
     })
 }
 
@@ -1242,7 +1245,7 @@ async fn execute_turn(
         let request = json!({
             "model": config.model,
             "messages": messages,
-            "tools": fixture_tools(),
+            "tools": fixture_tools(config.declare_native_shell),
             "stream": false
         });
         let mut headers = BTreeMap::new();
@@ -1421,6 +1424,9 @@ async fn execute_prepared_tool_call(
 
     let prepared_result = match duplicate {
         Some(_) => None,
+        None if name == "native_shell" => {
+            Some(native_shell_result(&config.state_dir, &session_id, &args).await?)
+        }
         None => Some(fixture_result(
             &config.state_dir,
             &session_id,
@@ -1889,13 +1895,41 @@ async fn model_http_post(
     http_post(&endpoint, headers, body, config.idle_timeout).await
 }
 
-fn fixture_tools() -> Value {
-    json!([
+fn fixture_tools(declare_native_shell: bool) -> Value {
+    let mut tools = json!([
         {"type":"function","function":{"name":"write_fixture","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"ahrb_checkpoint":{"$ref":"#/$defs/ahrb_checkpoint"}},"required":["path","content"],"$defs":{"ahrb_checkpoint":{"type":"object","properties":{"name":{"type":"string"},"phase":{"type":"string","enum":["before-effect","after-commit"]}},"required":["name"]}}}}},
         {"type":"function","function":{"name":"read_fixture","parameters":{"type":"object","properties":{"path":{"type":"string"},"ahrb_checkpoint":{"$ref":"#/$defs/ahrb_checkpoint"}},"required":["path"],"$defs":{"ahrb_checkpoint":{"type":"object","properties":{"name":{"type":"string"},"phase":{"type":"string","enum":["before-effect","after-commit"]}},"required":["name"]}}}}},
         {"type":"function","function":{"name":"fail_fixture","parameters":{"type":"object","properties":{"message":{"type":"string"}}}}},
+        {"type":"function","function":{"name":"native_shell","parameters":{"type":"object","properties":{"command":{"type":"string"},"route":{"type":"string"},"expected_from_a":{"type":"string"},"ahrb_checkpoint":{"$ref":"#/$defs/ahrb_checkpoint"}},"required":["command"],"additionalProperties":false,"$defs":{"ahrb_checkpoint":{"type":"object","properties":{"name":{"type":"string"},"phase":{"type":"string","enum":["before-effect","after-commit"]}},"required":["name"]}}}}},
         {"type":"function","function":{"name":"barrier","parameters":{"type":"object","properties":{"name":{"type":"string"},"wait_for_release":{"type":"boolean"}},"required":["name"]}}}
-    ])
+    ]);
+    if !declare_native_shell {
+        if let Some(tools) = tools.as_array_mut() {
+            tools.remove(3);
+        }
+    }
+    tools
+}
+
+async fn native_shell_result(state_dir: &Path, session: &str, args: &Value) -> Result<Value> {
+    let command = required_str(args, "command")?;
+    let workspace = state_dir.join("workspaces").join(session);
+    fs::create_dir_all(&workspace)?;
+    let output = tokio::process::Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(&workspace)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    Ok(json!({
+        "ok": output.status.success(),
+        "exit_code": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr)
+    }))
 }
 
 fn fixture_result(state_dir: &Path, session: &str, name: &str, args: &Value) -> Result<Value> {
@@ -2381,6 +2415,7 @@ mod tests {
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
+            declare_native_shell: false,
         }
     }
 
@@ -3367,6 +3402,7 @@ mod tests {
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
+            declare_native_shell: false,
         };
         let harness =
             Arc::new(Mutex::new(MockHarness::open(config).map_err(|error| {

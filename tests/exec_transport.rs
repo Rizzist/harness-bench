@@ -88,6 +88,182 @@ fn per_invocation_cli_runs_against_fake_model_and_extracts_own_stdout() {
     std::fs::remove_dir_all(output).expect("remove exec transport output");
 }
 
+#[test]
+fn per_invocation_mock_executes_request_declared_native_tool_translation() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = std::env::temp_dir().join(format!("ahrb-exec-native-tool-{}", std::process::id()));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove stale native-tool run");
+    }
+    std::fs::create_dir(&root).expect("create native-tool run directory");
+    let source = std::fs::read_to_string(repository.join("adapters/mock-exec/manifest.toml"))
+        .expect("read mock-exec manifest");
+    let native_tools = r#"[tools.aliases]
+write = "native_shell"
+read = "native_shell"
+fail = "native_shell"
+
+[tools.bindings]
+command = "command"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+"#;
+    let manifest_source = source.replacen("[tools]\n", native_tools, 1);
+    assert_ne!(
+        manifest_source, source,
+        "mock-exec [tools] section not found"
+    );
+    let manifest = root.join("manifest.toml");
+    std::fs::write(&manifest, manifest_source).expect("write native-tool manifest");
+    let output = root.join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(repository)
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&output)
+        .arg("--profile")
+        .arg("quick")
+        .arg("--tests")
+        .arg("2,3,6,8")
+        .output()
+        .expect("run native-tool translation scenario");
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &result,
+        &report_path,
+        "native-tool translation scenario did not produce a report",
+    );
+    let report: Report = serde_json::from_slice(&report_bytes).expect("parse native-tool report");
+    assert_eq!(result.status.code(), Some(0));
+    assert_eq!(report.results.len(), 4);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|row| matches!(row.outcome, TestOutcome::Pass))
+    );
+
+    let call = report
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("tool-call")
+                && event
+                    .pointer("/payload/call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("call-r2")
+        })
+        .expect("native tool-call event");
+    assert_eq!(
+        call.pointer("/payload/name")
+            .and_then(serde_json::Value::as_str),
+        Some("write_fixture")
+    );
+    assert_eq!(
+        call.pointer("/payload/native_name")
+            .and_then(serde_json::Value::as_str),
+        Some("native_shell")
+    );
+    assert_eq!(
+        call.pointer("/payload/arguments/path")
+            .and_then(serde_json::Value::as_str),
+        Some("row-2.txt")
+    );
+    let command = call
+        .pointer("/payload/native_arguments/command")
+        .and_then(serde_json::Value::as_str)
+        .expect("native shell command argument");
+    assert!(command.contains("ahrb-fixture"));
+    assert!(command.contains("row-2.txt"));
+    let call_id = call
+        .pointer("/payload/call_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("native call ID");
+    let tool_result = report
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("tool-result")
+                && event
+                    .pointer("/payload/call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("call-r2")
+        })
+        .expect("native tool-result event");
+    assert_eq!(
+        tool_result
+            .pointer("/payload/call_id")
+            .and_then(serde_json::Value::as_str),
+        Some(call_id)
+    );
+    assert_eq!(
+        tool_result
+            .pointer("/payload/result/ok")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let failed_result = report
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event").and_then(serde_json::Value::as_str) == Some("tool-result")
+                && event
+                    .pointer("/payload/call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("call-fail")
+        })
+        .expect("native failed tool-result event");
+    assert_eq!(
+        failed_result
+            .pointer("/payload/result/ok")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        failed_result
+            .pointer("/payload/result/exit_code")
+            .and_then(serde_json::Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        failed_result
+            .pointer("/payload/name")
+            .and_then(serde_json::Value::as_str),
+        Some("fail_fixture")
+    );
+
+    let mut profiles = std::fs::read_dir(&output)
+        .expect("read native-tool output")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("profile-"))
+        })
+        .collect::<Vec<_>>();
+    profiles.sort();
+    let workspaces = profiles
+        .first()
+        .expect("native-tool profile")
+        .join("state/workspaces");
+    let effect = std::fs::read_dir(workspaces)
+        .expect("read native-tool workspaces")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path().join("row-2.txt"))
+        .find(|path| path.is_file())
+        .expect("native shell filesystem effect");
+    let content = std::fs::read_to_string(effect).expect("read native shell effect");
+    assert!(content.contains("row-2"));
+    std::fs::remove_dir_all(root).expect("remove native-tool run");
+}
+
 fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvocationDriver {
     let manifest = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
         .expect("load per-invocation reference manifest");
