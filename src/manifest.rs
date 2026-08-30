@@ -305,6 +305,9 @@ pub struct Concurrency {
     /// Event evidence used to establish barrier presence.
     #[serde(default)]
     pub barrier_evidence: String,
+    /// Operation used to release a durable state barrier token.
+    #[serde(default)]
+    pub release: Vec<String>,
 }
 
 /// Tool aliases, schema bindings, and safe fixture commands.

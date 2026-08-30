@@ -1,6 +1,9 @@
 //! Linux cgroup-v2 and procfs whole-tree sampler.
 
-use crate::process::{ProcIdentity, ProcOwnership, ProcessInfo, ProcessTree, Sample, Sampler};
+use crate::process::{
+    ProcIdentity, ProcOwnership, ProcessInfo, ProcessSample, ProcessTree, Sample, Sampler,
+    TreeCpuTracker,
+};
 use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -17,6 +20,8 @@ pub struct LinuxSampler {
     cgroup: Option<PathBuf>,
     known: BTreeSet<ProcIdentity>,
     clock_ticks_per_second: u64,
+    cpu: TreeCpuTracker,
+    last_cgroup_cpu_ns: Option<u64>,
 }
 
 impl Default for LinuxSampler {
@@ -27,6 +32,8 @@ impl Default for LinuxSampler {
             cgroup: None,
             known: BTreeSet::new(),
             clock_ticks_per_second: clock_ticks_per_second(),
+            cpu: TreeCpuTracker::default(),
+            last_cgroup_cpu_ns: None,
         }
     }
 }
@@ -130,10 +137,13 @@ impl Sampler for LinuxSampler {
         let mut rss_bytes = 0_u64;
         let mut pss_bytes = 0_u64;
         let mut private_bytes = 0_u64;
-        let mut cpu_ns = 0_u64;
-        let mut processes = Vec::new();
+        let mut open_fds = 0_u64;
+        let mut thread_count = 0_u64;
+        let mut counters = Vec::new();
+        let mut live_cpu = BTreeMap::new();
         let mut complete_pss = true;
         let mut complete_private = true;
+        let mut complete_open_fds = true;
 
         for (identity, process) in &tree.members {
             let stat_path = self.proc_root.join(identity.pid.to_string()).join("stat");
@@ -162,12 +172,28 @@ impl Sampler for LinuxSampler {
                 Some(value) => private_bytes = private_bytes.saturating_add(value),
                 None => complete_private = false,
             }
-            cpu_ns = cpu_ns.saturating_add(ticks_to_ns(
+            let process_cpu_ns = ticks_to_ns(
                 current.user_ticks.saturating_add(current.system_ticks),
                 self.clock_ticks_per_second,
-            ));
-            processes.push(process.clone());
+            );
+            live_cpu.insert(*identity, process_cpu_ns);
+            let process_open_fds =
+                read_fd_count(&self.proc_root.join(identity.pid.to_string()).join("fd"))?;
+            match process_open_fds {
+                Some(value) => open_fds = open_fds.saturating_add(value),
+                None => complete_open_fds = false,
+            }
+            thread_count = thread_count.saturating_add(current.thread_count);
+            counters.push(LinuxProcessCounters {
+                process: current.to_info(process.ownership.clone()),
+                memory,
+                cpu_ns: process_cpu_ns,
+                open_fds: process_open_fds,
+                thread_count: current.thread_count,
+            });
         }
+
+        let tracked_cpu_ns = self.cpu.update(&live_cpu)?;
 
         let cgroup_memory_bytes = self
             .cgroup
@@ -181,16 +207,50 @@ impl Sampler for LinuxSampler {
             .map(|path| read_u64_file(&path.join("memory.peak")))
             .transpose()?
             .flatten();
-        if let Some(path) = &self.cgroup {
-            if let Some(cgroup_cpu) = read_cpu_stat(&path.join("cpu.stat"))? {
-                cpu_ns = cgroup_cpu;
+        let cgroup_cpu_ns = match &self.cgroup {
+            Some(path) => read_cpu_stat(&path.join("cpu.stat"))?,
+            None => None,
+        };
+        if let (Some(previous), Some(current)) = (self.last_cgroup_cpu_ns, cgroup_cpu_ns) {
+            if current < previous {
+                return Err(AhrbError::Protocol(format!(
+                    "cgroup cumulative CPU regressed from {previous} to {current}"
+                )));
             }
         }
+        if let Some(current) = cgroup_cpu_ns {
+            self.last_cgroup_cpu_ns = Some(current);
+        }
+        let cpu_ns = cgroup_cpu_ns.unwrap_or(tracked_cpu_ns);
+        let elapsed_ns = duration_ns(self.started.elapsed());
+        let wall_time = SystemTime::now();
+        let phase = phase.to_owned();
+        let processes = counters
+            .iter()
+            .map(|counter| counter.process.clone())
+            .collect();
+        let process_samples = counters
+            .into_iter()
+            .map(|counter| ProcessSample {
+                elapsed_ns,
+                wall_time,
+                phase: phase.clone(),
+                process: counter.process,
+                rss_bytes: counter.memory.rss_bytes,
+                pss_bytes: counter.memory.pss_bytes,
+                private_bytes: counter.memory.private_bytes,
+                footprint_bytes: None,
+                rss_crosscheck_bytes: None,
+                cpu_ns: counter.cpu_ns,
+                open_fds: counter.open_fds,
+                thread_count: Some(counter.thread_count),
+            })
+            .collect();
 
         Ok(Sample {
-            elapsed_ns: duration_ns(self.started.elapsed()),
-            wall_time: SystemTime::now(),
-            phase: phase.to_owned(),
+            elapsed_ns,
+            wall_time,
+            phase,
             rss_bytes,
             pss_bytes: complete_pss.then_some(pss_bytes),
             private_bytes: complete_private.then_some(private_bytes),
@@ -199,8 +259,12 @@ impl Sampler for LinuxSampler {
             cgroup_memory_bytes,
             cgroup_peak_bytes,
             cpu_ns,
+            open_fds: complete_open_fds.then_some(open_fds),
+            thread_count: Some(thread_count),
             collection_ns: duration_ns(collection_started.elapsed()),
+            collection_wall_ns: duration_ns(collection_started.elapsed()),
             processes,
+            process_samples,
         })
     }
 }
@@ -213,6 +277,15 @@ struct LinuxProcess {
     start_ticks: u64,
     user_ticks: u64,
     system_ticks: u64,
+    thread_count: u64,
+}
+
+struct LinuxProcessCounters {
+    process: ProcessInfo,
+    memory: SmapsRollup,
+    cpu_ns: u64,
+    open_fds: Option<u64>,
+    thread_count: u64,
 }
 
 impl LinuxProcess {
@@ -288,6 +361,7 @@ fn parse_stat(pid: u32, text: &str) -> Result<LinuxProcess> {
         command,
         user_ticks: parse_stat_number(pid, "utime", fields[11])?,
         system_ticks: parse_stat_number(pid, "stime", fields[12])?,
+        thread_count: parse_stat_number(pid, "num_threads", fields[17])?,
         start_ticks: parse_stat_number(pid, "starttime", fields[19])?,
     })
 }
@@ -442,6 +516,37 @@ fn read_transient_text(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn read_fd_count(path: &Path) -> Result<Option<u64>> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut count = 0_u64;
+    for entry in entries {
+        match entry {
+            Ok(_) => count = count.saturating_add(1),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(count))
+}
+
 fn clock_ticks_per_second() -> u64 {
     // SAFETY: `_SC_CLK_TCK` is a read-only process-global system query.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
@@ -477,7 +582,40 @@ mod tests {
     }
 
     fn stat(pid: u32, command: &str, ppid: u32, start: u64) -> String {
-        format!("{pid} ({command}) S {ppid} 0 0 0 0 0 0 0 0 0 11 13 0 0 0 0 0 0 {start} 0 0")
+        stat_with_cpu(pid, command, ppid, start, 11, 13, 1)
+    }
+
+    fn stat_with_cpu(
+        pid: u32,
+        command: &str,
+        ppid: u32,
+        start: u64,
+        user_ticks: u64,
+        system_ticks: u64,
+        threads: u64,
+    ) -> String {
+        format!(
+            "{pid} ({command}) S {ppid} 0 0 0 0 0 0 0 0 0 {user_ticks} {system_ticks} 0 0 0 0 {threads} 0 {start} 0 0"
+        )
+    }
+
+    fn write_sample_process(
+        proc_root: &Path,
+        pid: u32,
+        stat_text: &str,
+        fd_count: u64,
+    ) -> Result<()> {
+        let directory = proc_root.join(pid.to_string());
+        fs::create_dir_all(directory.join("fd"))?;
+        fs::write(directory.join("stat"), stat_text)?;
+        fs::write(
+            directory.join("smaps_rollup"),
+            "Rss: 100 kB\nPss: 50 kB\nPrivate_Clean: 3 kB\nPrivate_Dirty: 4 kB\n",
+        )?;
+        for descriptor in 0..fd_count {
+            fs::write(directory.join("fd").join(descriptor.to_string()), "")?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -487,6 +625,7 @@ mod tests {
         assert_eq!(parsed.ppid, 3);
         assert_eq!(parsed.user_ticks, 11);
         assert_eq!(parsed.system_ticks, 13);
+        assert_eq!(parsed.thread_count, 1);
         assert_eq!(parsed.start_ticks, 99);
         Ok(())
     }
@@ -525,6 +664,53 @@ mod tests {
             worker.map(|value| &value.ownership),
             Some(ProcOwnership::CgroupMember)
         ));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn samples_per_process_counters_and_keeps_cpu_after_worker_exit() -> Result<()> {
+        let root = fixture_dir("cpu-exit")?;
+        let proc_root = root.join("proc");
+        fs::create_dir_all(&proc_root)?;
+        write_sample_process(
+            &proc_root,
+            100,
+            &stat_with_cpu(100, "root", 1, 10, 11, 13, 2),
+            3,
+        )?;
+        write_sample_process(
+            &proc_root,
+            200,
+            &stat_with_cpu(200, "worker", 100, 20, 11, 13, 4),
+            5,
+        )?;
+
+        let mut sampler = LinuxSampler::with_roots(proc_root.clone(), None);
+        let first_tree = sampler.discover(&[100])?;
+        let first = sampler.sample(&first_tree, "active")?;
+        assert_eq!(first.process_samples.len(), 2);
+        assert_eq!(first.open_fds, Some(8));
+        assert_eq!(first.thread_count, Some(6));
+        assert!(first.process_samples.windows(2).all(|pair| {
+            pair[0].process.identity < pair[1].process.identity
+                && pair[0].elapsed_ns == pair[1].elapsed_ns
+                && pair[0].phase == pair[1].phase
+        }));
+
+        fs::remove_dir_all(proc_root.join("200"))?;
+        write_sample_process(
+            &proc_root,
+            100,
+            &stat_with_cpu(100, "root", 1, 10, 12, 13, 2),
+            3,
+        )?;
+        let second_tree = sampler.discover(&[100])?;
+        let second = sampler.sample(&second_tree, "post-exit")?;
+        assert!(second.cpu_ns > first.cpu_ns);
+        assert_eq!(second.process_samples.len(), 1);
+        assert_eq!(second.open_fds, Some(3));
+        assert_eq!(second.thread_count, Some(2));
         fs::remove_dir_all(root)?;
         Ok(())
     }

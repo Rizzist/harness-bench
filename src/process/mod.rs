@@ -5,7 +5,7 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-use crate::Result;
+use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -46,6 +46,42 @@ pub struct ProcessInfo {
     pub ownership: ProcOwnership,
 }
 
+/// Timestamped resource counters for one owned process identity.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProcessSample {
+    /// Monotonic nanoseconds since sampler start.
+    pub elapsed_ns: u64,
+    /// Wall-clock timestamp for evidence correlation.
+    pub wall_time: SystemTime,
+    /// Workflow phase label.
+    pub phase: String,
+    /// Process membership and ownership evidence.
+    #[serde(flatten)]
+    pub process: ProcessInfo,
+    /// Resident bytes for this process.
+    pub rss_bytes: u64,
+    /// Proportional-set bytes for this process, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pss_bytes: Option<u64>,
+    /// Private bytes for this process, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_bytes: Option<u64>,
+    /// Physical footprint for this process, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_bytes: Option<u64>,
+    /// Resident-byte cross-check for this process, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_crosscheck_bytes: Option<u64>,
+    /// Cumulative user plus system CPU nanoseconds for this process.
+    pub cpu_ns: u64,
+    /// Open file descriptors for this process, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_fds: Option<u64>,
+    /// Live threads for this process, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_count: Option<u64>,
+}
+
 /// Complete process membership at one instant.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProcessTree {
@@ -84,11 +120,67 @@ pub struct Sample {
     pub cgroup_peak_bytes: Option<u64>,
     /// Cumulative user plus system CPU nanoseconds.
     pub cpu_ns: u64,
-    /// Time spent collecting this sample, used to detect sampler overload.
+    /// Aggregate number of open file descriptors, when exposed by the platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_fds: Option<u64>,
+    /// Aggregate number of live threads, when exposed by the platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_count: Option<u64>,
+    /// Calling-thread CPU spent collecting this sample.
     #[serde(default)]
     pub collection_ns: u64,
+    /// Wall time spent collecting this sample, used to detect overruns.
+    #[serde(default)]
+    pub collection_wall_ns: u64,
     /// Owned membership.
     pub processes: Vec<ProcessInfo>,
+    /// Timestamped, per-process resource observations in deterministic identity order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process_samples: Vec<ProcessSample>,
+}
+
+/// Monotonic cumulative CPU accounting across owned-process lifecycles.
+///
+/// A process that disappears contributes its last observed cumulative counter to
+/// `retired_ns`; this prevents whole-tree CPU from dropping when workers exit.
+#[derive(Debug, Default)]
+pub(crate) struct TreeCpuTracker {
+    live: BTreeMap<ProcIdentity, u64>,
+    retired: BTreeSet<ProcIdentity>,
+    retired_ns: u64,
+}
+
+impl TreeCpuTracker {
+    pub(crate) fn update(&mut self, current: &BTreeMap<ProcIdentity, u64>) -> Result<u64> {
+        for (identity, cpu_ns) in current {
+            if self.retired.contains(identity) {
+                return Err(AhrbError::Protocol(format!(
+                    "retired process identity ({},{}) reappeared in CPU accounting",
+                    identity.pid, identity.start_time
+                )));
+            }
+            if let Some(previous) = self.live.get(identity) {
+                if cpu_ns < previous {
+                    return Err(AhrbError::Protocol(format!(
+                        "process ({},{}) cumulative CPU regressed from {previous} to {cpu_ns}",
+                        identity.pid, identity.start_time
+                    )));
+                }
+            }
+        }
+
+        for (identity, cpu_ns) in &self.live {
+            if !current.contains_key(identity) {
+                self.retired_ns = self.retired_ns.saturating_add(*cpu_ns);
+                self.retired.insert(*identity);
+            }
+        }
+        self.live = current.clone();
+        Ok(self
+            .live
+            .values()
+            .fold(self.retired_ns, |total, value| total.saturating_add(*value)))
+    }
 }
 
 /// Supplemental terminal resource usage collected while reaping a direct child.
@@ -165,4 +257,49 @@ fn normalize_max_rss(value: libc::c_long) -> u64 {
 #[cfg(target_os = "linux")]
 fn normalize_max_rss(value: libc::c_long) -> u64 {
     u64::try_from(value).map_or(0, |number| number.saturating_mul(1_024))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(pid: u32) -> ProcIdentity {
+        ProcIdentity {
+            pid,
+            start_time: u64::from(pid).saturating_mul(10),
+        }
+    }
+
+    #[test]
+    fn tree_cpu_remains_monotonic_when_a_member_exits() -> Result<()> {
+        let root = identity(10);
+        let worker = identity(20);
+        let mut tracker = TreeCpuTracker::default();
+        assert_eq!(
+            tracker.update(&BTreeMap::from([(root, 100), (worker, 50)]))?,
+            150
+        );
+        assert_eq!(tracker.update(&BTreeMap::from([(root, 120)]))?, 170);
+        assert_eq!(tracker.update(&BTreeMap::from([(root, 130)]))?, 180);
+        Ok(())
+    }
+
+    #[test]
+    fn tree_cpu_rejects_counter_regression_and_retired_reappearance() -> Result<()> {
+        let root = identity(10);
+        let worker = identity(20);
+        let mut tracker = TreeCpuTracker::default();
+        tracker.update(&BTreeMap::from([(root, 100), (worker, 50)]))?;
+        let regression = tracker
+            .update(&BTreeMap::from([(root, 99), (worker, 50)]))
+            .expect_err("same-identity CPU regression must be rejected");
+        assert!(regression.to_string().contains("CPU regressed"));
+
+        tracker.update(&BTreeMap::from([(root, 120)]))?;
+        let reappearance = tracker
+            .update(&BTreeMap::from([(root, 130), (worker, 60)]))
+            .expect_err("retired identity must not reappear");
+        assert!(reappearance.to_string().contains("reappeared"));
+        Ok(())
+    }
 }

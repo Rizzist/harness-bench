@@ -54,7 +54,7 @@ forbidden_roots = ["~/.ahrb-mock"]
 
 [daemon]
 persistent = true
-start = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000"]
+start = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4"]
 pid_locator = "{{profile}}/state/daemon.pid"
 shutdown = ["harness.shutdown"]
 grace_ms = 2000
@@ -66,7 +66,7 @@ timeout_ms = 10000
 
 [transport]
 kind = "stdin-rpc"
-command = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000"]
+command = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4"]
 endpoint = ""
 timeout_ms = 30000
 
@@ -97,6 +97,7 @@ topology = "shared-daemon-sessions"
 max_agents = 32
 fanout_mode = "native-sibling-fanout"
 barrier_evidence = "barrier-reached"
+release = ["checkpoint.release"]
 
 [tools.aliases]
 write = "write_fixture"

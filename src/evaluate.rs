@@ -130,7 +130,9 @@ pub fn certify(
     parallel_width: usize,
     marginal_bytes: f64,
 ) -> Option<Badge> {
-    if parallel_width < 8 || !mandatory_passes(results) {
+    // Quick certification uses the required N=1,2,4 sweep; the full certification
+    // profile reports N=8. The width remains explicit in every badge label.
+    if parallel_width < 4 || !mandatory_passes(results) {
         return None;
     }
     let mib = marginal_bytes / (1024.0 * 1024.0);

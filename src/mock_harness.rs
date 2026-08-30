@@ -17,16 +17,26 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Default client-side model idle deadline used by the reference adapter.
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_000;
+
+/// Resident memory committed for each live mock session.
+///
+/// The reservation is intentionally small enough for the v1 reference envelope while
+/// remaining large enough for the process sampler to distinguish N=1,2,4,8. It is
+/// backed by an anonymous mapping (rather than the allocator) so `session.close` can
+/// deterministically return the pages to the operating system.
+pub const DEFAULT_SESSION_MEMORY_MIB: u64 = 4;
+
+const MIB: u64 = 1024 * 1024;
 
 /// Durable append-only event storage for one session.
 #[derive(Clone, Debug)]
@@ -61,19 +71,23 @@ impl DurableJournal {
     /// A non-newline-terminated final record is treated as a torn tail and ignored. Any
     /// malformed record before that tail is corruption and therefore an error.
     pub fn read_after(&self, after: Option<u64>) -> Result<Vec<NormalizedEvent>> {
-        let mut bytes = Vec::new();
-        File::open(&self.path)?.read_to_end(&mut bytes)?;
-        let complete_len = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map(|position| position + 1)
-            .unwrap_or(0);
+        let mut reader = StdBufReader::new(File::open(&self.path)?);
         let mut events = Vec::new();
-        for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 {
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                break;
+            }
+            line.pop();
             if line.is_empty() {
                 continue;
             }
-            let event: NormalizedEvent = serde_json::from_slice(line).map_err(|error| {
+            let event: NormalizedEvent = serde_json::from_slice(&line).map_err(|error| {
                 AhrbError::Protocol(format!(
                     "corrupt durable journal {}: {error}",
                     self.path.display()
@@ -108,6 +122,7 @@ struct MockConfig {
     api_key: Option<String>,
     model: String,
     idle_timeout: Duration,
+    session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
 }
@@ -156,6 +171,7 @@ struct CompletedToolCall {
 struct SessionState {
     meta: SessionMeta,
     journal: DurableJournal,
+    next_cursor: u64,
     keys: BTreeSet<String>,
     pending: Option<PendingTurn>,
     queued: VecDeque<PendingTurn>,
@@ -163,11 +179,130 @@ struct SessionState {
     active: bool,
     cancelled: bool,
     closed: bool,
+    resource_reservation: Option<ResourceReservation>,
+}
+
+/// Page-backed memory owned by one live simulated agent/session.
+///
+/// Keeping the mapping independent of Rust's process allocator matters for the reclaim
+/// rows: dropping a `Vec` only returns memory to the allocator and need not reduce the
+/// process footprint. `munmap` gives the reference harness a deterministic close/delete
+/// surface without adding worker processes or a busy background loop.
+#[derive(Debug)]
+struct ResourceReservation {
+    #[cfg(unix)]
+    address: Option<usize>,
+    #[cfg(not(unix))]
+    allocation: Option<Box<[u8]>>,
+    len: usize,
+}
+
+impl ResourceReservation {
+    fn new(bytes: u64, seed: u8) -> Result<Self> {
+        let len = usize::try_from(bytes).map_err(|_| {
+            AhrbError::Validation("mock session memory exceeds address space".to_owned())
+        })?;
+        if len == 0 {
+            return Ok(Self {
+                #[cfg(unix)]
+                address: None,
+                #[cfg(not(unix))]
+                allocation: None,
+                len,
+            });
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: the mapping is anonymous, private, and has a checked nonzero
+            // length. Its address is retained exclusively by this RAII value and is
+            // unmapped exactly once by `release` or `Drop`.
+            let pointer = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if pointer == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let address = pointer as usize;
+            let page_size = {
+                // SAFETY: `sysconf` has no memory-safety preconditions for
+                // `_SC_PAGESIZE` and does not retain pointers.
+                let queried = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                usize::try_from(queried)
+                    .ok()
+                    .filter(|size| *size > 0)
+                    .unwrap_or(4096)
+            };
+            // Touch every page with a session-specific nonzero byte. This commits the
+            // pages and avoids counting an untouched virtual reservation as footprint.
+            for offset in (0..len).step_by(page_size) {
+                // SAFETY: `offset` is strictly below `len`, and the mapping is writable
+                // for the full `[address, address + len)` range.
+                unsafe {
+                    std::ptr::write_volatile((address as *mut u8).add(offset), seed.max(1));
+                }
+            }
+            Ok(Self {
+                address: Some(address),
+                len,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let mut allocation = vec![seed.max(1); len].into_boxed_slice();
+            std::hint::black_box(&mut allocation);
+            Ok(Self {
+                allocation: Some(allocation),
+                len,
+            })
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.len as u64
+    }
+
+    fn release(mut self) -> Result<u64> {
+        let released = self.len();
+        #[cfg(unix)]
+        if let Some(address) = self.address {
+            // SAFETY: this is the same address and length returned by `mmap`. Ownership
+            // is cleared only after success; on failure `Drop` retains it and retries.
+            if unsafe { libc::munmap(address as *mut libc::c_void, self.len) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            self.address = None;
+        }
+        #[cfg(not(unix))]
+        {
+            self.allocation.take();
+        }
+        Ok(released)
+    }
+}
+
+impl Drop for ResourceReservation {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(address) = self.address.take() {
+            // SAFETY: this is the still-owned mapping returned by `mmap`. Drop cannot
+            // report an OS error, but it still provides the no-leak fallback for every
+            // path other than the explicit close operation.
+            let _ = unsafe { libc::munmap(address as *mut libc::c_void, self.len) };
+        }
+    }
 }
 
 struct MockHarness {
     config: MockConfig,
     sessions: BTreeMap<String, SessionState>,
+    checkpoint_waiters: BTreeMap<String, Arc<Notify>>,
     shutting_down: bool,
 }
 
@@ -175,11 +310,6 @@ impl MockHarness {
     fn open(config: MockConfig) -> Result<Self> {
         fs::create_dir_all(config.state_dir.join("sessions"))?;
         fs::create_dir_all(config.state_dir.join("workspaces"))?;
-        write_replace_synced(
-            &config.state_dir.join("daemon.pid"),
-            std::process::id().to_string().as_bytes(),
-        )?;
-        sync_directory(&config.state_dir)?;
         let mut sessions = BTreeMap::new();
         let mut entries: Vec<_> = fs::read_dir(config.state_dir.join("sessions"))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -203,11 +333,16 @@ impl MockHarness {
                 .map(str::to_owned)
                 .collect();
             let pending = recover_pending(&events);
+            let next_cursor = events
+                .last()
+                .map(|event| event.cursor.saturating_add(1))
+                .unwrap_or(1);
             sessions.insert(
                 meta.id.clone(),
                 SessionState {
                     meta,
                     journal,
+                    next_cursor,
                     keys,
                     pending,
                     queued: VecDeque::new(),
@@ -215,12 +350,22 @@ impl MockHarness {
                     active: false,
                     cancelled: false,
                     closed: false,
+                    resource_reservation: None,
                 },
             );
         }
+        // Publish readiness only after durable session recovery and fixture-effect
+        // reconciliation have completed. The same file is the sampler's verified PID
+        // locator, so a visible PID always denotes a daemon ready to accept RPCs.
+        write_replace_synced(
+            &config.state_dir.join("daemon.pid"),
+            std::process::id().to_string().as_bytes(),
+        )?;
+        sync_directory(&config.state_dir)?;
         Ok(Self {
             config,
             sessions,
+            checkpoint_waiters: BTreeMap::new(),
             shutting_down: false,
         })
     }
@@ -250,6 +395,7 @@ impl MockHarness {
             SessionState {
                 meta,
                 journal,
+                next_cursor: 1,
                 keys: BTreeSet::new(),
                 pending: None,
                 queued: VecDeque::new(),
@@ -257,6 +403,7 @@ impl MockHarness {
                 active: false,
                 cancelled: false,
                 closed: false,
+                resource_reservation: None,
             },
         );
         Ok(id)
@@ -264,12 +411,10 @@ impl MockHarness {
 
     fn append(&mut self, session_id: &str, event: EventVocab, payload: Value) -> Result<u64> {
         let session = self.session_mut(session_id)?;
-        let cursor = session
-            .journal
-            .all()?
-            .last()
-            .map(|event| event.cursor.saturating_add(1))
-            .unwrap_or(1);
+        let cursor = session.next_cursor;
+        let next_cursor = cursor.checked_add(1).ok_or_else(|| {
+            AhrbError::Validation(format!("session {session_id:?} exhausted its cursor space"))
+        })?;
         let normalized = NormalizedEvent {
             id: format!("{session_id}:{cursor}"),
             cursor,
@@ -279,6 +424,7 @@ impl MockHarness {
             payload,
         };
         session.journal.append(&normalized)?;
+        session.next_cursor = next_cursor;
         Ok(cursor)
     }
 
@@ -386,7 +532,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "hook" => hook_command(&args[1..]),
         "--help" | "help" => {
             println!(
-                "ahrb-mock-harness serve|rpc --state-dir PATH [--idle-timeout-ms N]\n\
+                "ahrb-mock-harness serve|rpc --state-dir PATH [--idle-timeout-ms N] \
+                 [--session-memory-mib N]\n\
                  model endpoint comes from AHRB_MOCK_BASE_URL or AHRB_MOCK_UNIX_SOCKET; \
                  key/model come from AHRB_MOCK_API_KEY and AHRB_MOCK_MODEL"
             );
@@ -401,6 +548,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
 fn parse_config(args: &[String]) -> Result<MockConfig> {
     let mut state_dir = None;
     let mut idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS;
+    let mut session_memory_mib = DEFAULT_SESSION_MEMORY_MIB;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -416,6 +564,16 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
                     .parse()
                     .map_err(|_| AhrbError::Usage("invalid idle timeout".to_owned()))?;
             }
+            "--session-memory-mib" => {
+                index += 1;
+                session_memory_mib = args
+                    .get(index)
+                    .ok_or_else(|| {
+                        AhrbError::Usage("--session-memory-mib needs a value".to_owned())
+                    })?
+                    .parse()
+                    .map_err(|_| AhrbError::Usage("invalid session memory size".to_owned()))?;
+            }
             option => {
                 return Err(AhrbError::Usage(format!("unknown option {option:?}")));
             }
@@ -430,6 +588,9 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
             "mock state directory must be absolute".to_owned(),
         ));
     }
+    let session_memory_bytes = session_memory_mib.checked_mul(MIB).ok_or_else(|| {
+        AhrbError::Validation("mock session memory size overflows bytes".to_owned())
+    })?;
     let base_url = std::env::var("AHRB_MOCK_BASE_URL")
         .ok()
         .map(|url| url.trim_end_matches('/').to_owned());
@@ -448,6 +609,7 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         api_key: std::env::var("AHRB_MOCK_API_KEY").ok(),
         model: std::env::var("AHRB_MOCK_MODEL").unwrap_or_else(|_| "ahrb-fake-v1".to_owned()),
         idle_timeout: Duration::from_millis(idle_timeout_ms),
+        session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
     })
@@ -617,21 +779,64 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
         "session.cancel" => {
             let id = required_str(&request.params, "session_id")?.to_owned();
             let mut guard = harness.lock().await;
-            guard.session_mut(&id)?.cancelled = true;
+            let (reservation, waiters) = {
+                let session = guard.session_mut(&id)?;
+                session.cancelled = true;
+                session.active = false;
+                session.pending = None;
+                session.queued.clear();
+                session.queued.shrink_to_fit();
+                session.injected.clear();
+                session.injected.shrink_to_fit();
+                let reservation = session.resource_reservation.take();
+                let waiters = checkpoint_waiters_for_session(&guard, &id);
+                (reservation, waiters)
+            };
             guard.append_terminal(
                 &id,
                 EventVocab::TerminalCancelled,
                 json!({ "status": "cancelled" }),
             )?;
-            Ok(json!({ "cancelled": true }))
+            for waiter in waiters {
+                waiter.notify_one();
+            }
+            let released_bytes = match reservation {
+                Some(reservation) => reservation.release()?,
+                None => 0,
+            };
+            Ok(json!({ "cancelled": true, "released_bytes": released_bytes }))
         }
         "session.close" => {
             let id = required_str(&request.params, "session_id")?;
             let mut guard = harness.lock().await;
-            let session = guard.session_mut(id)?;
-            session.cancelled = true;
-            session.closed = true;
-            Ok(json!({ "closed": true }))
+            let (reservation, waiters) = {
+                let session = guard.session_mut(id)?;
+                session.cancelled = true;
+                session.closed = true;
+                session.active = false;
+                session.pending = None;
+                session.queued.clear();
+                session.queued.shrink_to_fit();
+                session.injected.clear();
+                session.injected.shrink_to_fit();
+                session.keys.clear();
+                let reservation = session.resource_reservation.take();
+                let waiters = checkpoint_waiters_for_session(&guard, id);
+                (reservation, waiters)
+            };
+            for waiter in waiters {
+                waiter.notify_one();
+            }
+            let released_bytes = match reservation {
+                Some(reservation) => reservation.release()?,
+                None => 0,
+            };
+            Ok(json!({ "closed": true, "released_bytes": released_bytes }))
+        }
+        "checkpoint.release" => {
+            let session_id = required_str(&request.params, "session_id")?.to_owned();
+            let release_token = required_str(&request.params, "release_token")?.to_owned();
+            release_checkpoint(&harness, &session_id, &release_token).await
         }
         "harness.shutdown" => {
             harness.lock().await.shutting_down = true;
@@ -649,6 +854,7 @@ async fn accept_turn(
 ) -> Result<bool> {
     let hook = {
         let mut guard = harness.lock().await;
+        let reservation_bytes = guard.config.session_memory_bytes;
         let session = guard.session_mut(id)?;
         if session.closed {
             return Err(AhrbError::Protocol("session is closed".to_owned()));
@@ -660,6 +866,10 @@ async fn accept_turn(
             return Err(AhrbError::Protocol(
                 "session already has an active turn".to_owned(),
             ));
+        }
+        if session.resource_reservation.is_none() {
+            let seed = Sha256::digest(session.meta.id.as_bytes())[0];
+            session.resource_reservation = Some(ResourceReservation::new(reservation_bytes, seed)?);
         }
         session.keys.insert(turn.key.clone());
         session.pending = Some(turn.clone());
@@ -1120,25 +1330,198 @@ async fn record_checkpoint_and_wait(
     if !checkpoint.wait_for_release {
         return Ok(true);
     }
-    loop {
-        {
-            let mut guard = harness.lock().await;
-            if session_should_stop(guard.session_mut(session_id)?)? {
-                return Ok(false);
-            }
+    let notify = {
+        let mut guard = harness.lock().await;
+        if session_should_stop(guard.session_mut(session_id)?)? {
+            return Ok(false);
         }
-        match fs::metadata(&release_path) {
-            Ok(metadata) if metadata.is_file() => return Ok(true),
-            Ok(_) => {
-                return Err(AhrbError::Protocol(format!(
+        Arc::clone(
+            guard
+                .checkpoint_waiters
+                .entry(release_relative.clone())
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    };
+    // The durable token is checked after registering the waiter. A release racing this
+    // check either leaves the file visible or stores a `notify_one` permit, so wakeups
+    // cannot be lost and no cadence polling is needed.
+    if release_token_exists(&release_path)? {
+        remove_checkpoint_waiter(harness, &release_relative, &notify).await;
+        return Ok(true);
+    }
+    notify.notified().await;
+    let stopped = {
+        let mut guard = harness.lock().await;
+        session_should_stop(guard.session_mut(session_id)?)?
+    };
+    if stopped {
+        remove_checkpoint_waiter(harness, &release_relative, &notify).await;
+        return Ok(false);
+    }
+    let released = release_token_exists(&release_path)?;
+    remove_checkpoint_waiter(harness, &release_relative, &notify).await;
+    if !released {
+        return Err(AhrbError::Protocol(format!(
+            "checkpoint was notified without a durable release token: {}",
+            release_path.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn checkpoint_waiters_for_session(harness: &MockHarness, session_id: &str) -> Vec<Arc<Notify>> {
+    let prefix = format!("checkpoints/{session_id}/");
+    harness
+        .checkpoint_waiters
+        .iter()
+        .filter(|(release_token, _)| release_token.starts_with(&prefix))
+        .map(|(_, notify)| Arc::clone(notify))
+        .collect()
+}
+
+async fn release_checkpoint(
+    harness: &Arc<Mutex<MockHarness>>,
+    session_id: &str,
+    release_token: &str,
+) -> Result<Value> {
+    let release_path = {
+        let guard = harness.lock().await;
+        if !guard.sessions.contains_key(session_id) {
+            return Err(AhrbError::Protocol(format!(
+                "unknown session {session_id:?}"
+            )));
+        }
+        validate_release_token_path(&guard.config.state_dir, session_id, release_token)?
+    };
+    validate_reached_checkpoint(&release_path, session_id, release_token)?;
+    let newly_created = write_release_token(&release_path)?;
+    let notify = {
+        let guard = harness.lock().await;
+        guard.checkpoint_waiters.get(release_token).cloned()
+    };
+    // The file is created before looking up the waiter. A worker that registers after
+    // this lookup observes the durable token in its post-registration check; a worker
+    // already registered is woken here. Therefore no notification can be lost.
+    if let Some(notify) = notify {
+        notify.notify_one();
+    }
+    Ok(json!({
+        "released": true,
+        "idempotent": !newly_created,
+        "release_token": release_token
+    }))
+}
+
+fn validate_reached_checkpoint(
+    release_path: &Path,
+    session_id: &str,
+    release_token: &str,
+) -> Result<()> {
+    let reached_path = release_path
+        .parent()
+        .ok_or_else(|| AhrbError::Validation("release token has no parent".to_owned()))?
+        .join("reached.json");
+    let reached: Value = match fs::read(&reached_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AhrbError::Protocol(format!(
+                "checkpoint has not been reached for token {release_token:?}"
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if reached.get("session_id").and_then(Value::as_str) != Some(session_id)
+        || reached.get("release_token").and_then(Value::as_str) != Some(release_token)
+    {
+        return Err(AhrbError::Protocol(
+            "checkpoint evidence does not match the release request".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn remove_checkpoint_waiter(
+    harness: &Arc<Mutex<MockHarness>>,
+    release_token: &str,
+    notify: &Arc<Notify>,
+) {
+    let mut guard = harness.lock().await;
+    let same_waiter = guard
+        .checkpoint_waiters
+        .get(release_token)
+        .is_some_and(|registered| Arc::ptr_eq(registered, notify));
+    if same_waiter {
+        guard.checkpoint_waiters.remove(release_token);
+    }
+}
+
+fn release_token_exists(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(AhrbError::Protocol(format!(
+            "checkpoint release token is not a file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_release_token_path(
+    state_dir: &Path,
+    session_id: &str,
+    release_token: &str,
+) -> Result<PathBuf> {
+    let relative = safe_relative(release_token)?;
+    let components: Vec<_> = relative.components().collect();
+    let valid = components.len() == 5
+        && components[0].as_os_str() == "checkpoints"
+        && components[1].as_os_str() == session_id
+        && components[4].as_os_str() == "release.token";
+    if !valid {
+        return Err(AhrbError::Validation(
+            "release token does not belong to the requested session".to_owned(),
+        ));
+    }
+    let checkpoint_name = components[2]
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| AhrbError::Validation("checkpoint name is not Unicode".to_owned()))?;
+    validate_checkpoint_name(checkpoint_name)?;
+    let token = components[3]
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| AhrbError::Validation("checkpoint token is not Unicode".to_owned()))?;
+    if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AhrbError::Validation(
+            "checkpoint token must be 32 hexadecimal characters".to_owned(),
+        ));
+    }
+    Ok(state_dir.join(relative))
+}
+
+fn write_release_token(path: &Path) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match OpenOptions::new().create_new(true).write(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(b"released\n")?;
+            file.sync_all()?;
+            sync_parent(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if release_token_exists(path)? {
+                Ok(false)
+            } else {
+                Err(AhrbError::Protocol(format!(
                     "checkpoint release token is not a file: {}",
-                    release_path.display()
-                )));
+                    path.display()
+                )))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1677,6 +2060,7 @@ mod tests {
             api_key: None,
             model: "ahrb-fake-v1".to_owned(),
             idle_timeout: Duration::from_millis(250),
+            session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
         }
@@ -1716,6 +2100,23 @@ mod tests {
         assert!(safe_relative("safe/file.txt").is_ok());
         assert!(safe_relative("../outside").is_err());
         assert!(safe_relative("/absolute").is_err());
+    }
+
+    #[test]
+    fn checkpoint_release_tokens_are_session_scoped() {
+        let state = Path::new("/tmp/mock-state");
+        let valid = "checkpoints/session-a/steady/0123456789abcdef0123456789abcdef/release.token";
+        assert!(validate_release_token_path(state, "session-a", valid).is_ok());
+        assert!(validate_release_token_path(state, "session-b", valid).is_err());
+        assert!(
+            validate_release_token_path(
+                state,
+                "session-a",
+                "checkpoints/session-a/steady/not-hex/release.token"
+            )
+            .is_err()
+        );
+        assert!(validate_release_token_path(state, "session-a", "../release.token").is_err());
     }
 
     #[test]
@@ -1980,15 +2381,22 @@ mod tests {
         .map_err(|_| AhrbError::Timeout("waiting for fixture checkpoints".to_owned()))?
     }
 
-    fn release_checkpoint(state_dir: &Path, event: &NormalizedEvent) -> Result<()> {
-        let relative = safe_relative(
-            event
-                .payload
-                .get("release_token")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AhrbError::Protocol("barrier omitted release token".to_owned()))?,
-        )?;
-        write_replace_synced(&state_dir.join(relative), b"released")
+    async fn release_checkpoint_event(
+        harness: &Arc<Mutex<MockHarness>>,
+        event: &NormalizedEvent,
+    ) -> Result<()> {
+        let release_token = event
+            .payload
+            .get("release_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AhrbError::Protocol("barrier omitted release token".to_owned()))?;
+        let result = release_checkpoint(harness, &event.session_id, release_token).await?;
+        if result.get("released").and_then(Value::as_bool) != Some(true) {
+            return Err(AhrbError::Protocol(
+                "checkpoint release was not acknowledged".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -2043,7 +2451,7 @@ mod tests {
                 event.payload.get("call_id").and_then(Value::as_str) == Some("call-second")
             })
             .ok_or_else(|| AhrbError::Protocol("second barrier missing".to_owned()))?;
-        release_checkpoint(&directory, second_barrier)?;
+        release_checkpoint_event(&shared, second_barrier).await?;
         let after_second = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let events = {
@@ -2077,7 +2485,7 @@ mod tests {
                 event.payload.get("call_id").and_then(Value::as_str) == Some("call-first")
             })
             .ok_or_else(|| AhrbError::Protocol("first barrier missing".to_owned()))?;
-        release_checkpoint(&directory, first_barrier)?;
+        release_checkpoint_event(&shared, first_barrier).await?;
         first
             .await
             .map_err(|error| AhrbError::Protocol(format!("first fixture task: {error}")))??;
@@ -2098,6 +2506,77 @@ mod tests {
             .filter_map(|event| event.payload.get("call_id").and_then(Value::as_str))
             .collect();
         assert_eq!(result_ids, vec!["call-second", "call-first"]);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closing_a_held_checkpoint_wakes_without_file_polling() -> Result<()> {
+        let directory = temporary_dir("close-held-checkpoint");
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = test_config(directory.clone());
+        config.session_memory_bytes = MIB;
+        let mut harness = MockHarness::open(config.clone())?;
+        let session = harness.create_session("close-held-actor")?;
+        harness.append(
+            &session,
+            EventVocab::TurnAccepted,
+            json!({ "prompt": "held", "key": "turn-1" }),
+        )?;
+        {
+            let state = harness.session_mut(&session)?;
+            state.active = true;
+            state.resource_reservation = Some(ResourceReservation::new(MIB, 1)?);
+        }
+        let args = json!({
+            "path": "held.txt",
+            "content": "committed",
+            "ahrb_checkpoint": { "name": "held-close", "phase": "after-commit" }
+        });
+        let checkpoint = fixture_checkpoint("write_fixture", &args)?
+            .ok_or_else(|| AhrbError::Protocol("held-close checkpoint missing".to_owned()))?;
+        let shared = Arc::new(Mutex::new(harness));
+        let worker = tokio::spawn(execute_prepared_tool_call(
+            Arc::clone(&shared),
+            config,
+            session.clone(),
+            "call-held-close".to_owned(),
+            "write_fixture".to_owned(),
+            args,
+            None,
+            Some(checkpoint),
+        ));
+        let reached = wait_for_barriers(&shared, &session, 1).await?;
+        assert!(reached.iter().any(|event| {
+            event.event == EventVocab::BarrierReached
+                && event.payload.get("phase").and_then(Value::as_str) == Some("after-commit")
+        }));
+        let closed = handle_rpc(
+            Arc::clone(&shared),
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(1),
+                method: "session.close".to_owned(),
+                params: json!({ "session_id": session }),
+            },
+        )
+        .await?;
+        assert_eq!(closed["released_bytes"], MIB);
+        let outcome = tokio::time::timeout(Duration::from_millis(100), worker)
+            .await
+            .map_err(|_| AhrbError::Timeout("closing held checkpoint task".to_owned()))?
+            .map_err(|error| AhrbError::Protocol(format!("held checkpoint task: {error}")))??;
+        assert!(outcome.is_none());
+        assert!(
+            reached.iter().all(|event| {
+                event
+                    .payload
+                    .get("release_token")
+                    .and_then(Value::as_str)
+                    .is_none_or(|relative| !directory.join(relative).exists())
+            }),
+            "close must wake the task without fabricating release evidence"
+        );
         fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -2170,7 +2649,7 @@ mod tests {
             .iter()
             .find(|event| event.event == EventVocab::BarrierReached)
             .ok_or_else(|| AhrbError::Protocol("recovered barrier missing".to_owned()))?;
-        release_checkpoint(&directory, barrier)?;
+        release_checkpoint_event(&recovered, barrier).await?;
         resumed
             .await
             .map_err(|error| AhrbError::Protocol(format!("resumed fixture task: {error}")))??;
@@ -2205,6 +2684,237 @@ mod tests {
             )?,
             "once"
         );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_do_fixture_work_hold_and_reclaim() -> Result<()> {
+        use crate::workflow::{Actor, Barrier, ScriptedResponse, WORKFLOW_SCHEMA_VERSION};
+
+        const AGENTS: usize = 4;
+        const TEST_RESERVATION_BYTES: u64 = 2 * MIB;
+
+        let directory = temporary_dir("resource-surface");
+        let _ = fs::remove_dir_all(&directory);
+        let scenario = "mock-resource-surface";
+        let marker = |actor: &str, checkpoint: &str| {
+            format!("[[AHRB:scenario={scenario};actor={actor};checkpoint={checkpoint}]]")
+        };
+        let mut actors = BTreeMap::new();
+        let mut responses = Vec::new();
+        let mut actor_ids = Vec::new();
+        for index in 1..=AGENTS {
+            let actor = format!("agent-{index}");
+            actor_ids.push(actor.clone());
+            actors.insert(
+                actor.clone(),
+                Actor {
+                    id: actor.clone(),
+                    parent: None,
+                    prompt: marker(&actor, "start"),
+                    workspace: actor.clone(),
+                },
+            );
+            responses.push(ScriptedResponse {
+                scenario: scenario.to_owned(),
+                actor: actor.clone(),
+                checkpoint: "start".to_owned(),
+                request_hash: String::new(),
+                response: json!({
+                    "tool_calls": [{
+                        "id": format!("resource-call-{index}"),
+                        "name": "write_fixture",
+                        "arguments": {
+                            "path": "resource-fixture.txt",
+                            "content": format!(
+                                "agent-{index} {}",
+                                marker(&actor, "held")
+                            ),
+                            "ahrb_checkpoint": {
+                                "name": "resource-steady",
+                                "phase": "after-commit"
+                            }
+                        }
+                    }]
+                }),
+                fault: None,
+                barrier: None,
+            });
+            responses.push(ScriptedResponse {
+                scenario: scenario.to_owned(),
+                actor,
+                checkpoint: "held".to_owned(),
+                request_hash: String::new(),
+                response: json!({ "text": "AHRB_SUCCESS resource surface" }),
+                fault: None,
+                barrier: Some("resource-steady".to_owned()),
+            });
+        }
+        let workflow = Workflow {
+            version: WORKFLOW_SCHEMA_VERSION,
+            scenario: scenario.to_owned(),
+            actors,
+            barriers: BTreeMap::from([(
+                "resource-steady".to_owned(),
+                Barrier {
+                    name: "resource-steady".to_owned(),
+                    actors: actor_ids.clone(),
+                    checkpoint: "held".to_owned(),
+                },
+            )]),
+            responses,
+        };
+        let engine = Arc::new(FakeModelEngine::new(&workflow)?);
+        let mut config = test_config(directory.clone());
+        config.embedded_model = Some(Arc::clone(&engine));
+        config.idle_timeout = Duration::from_secs(2);
+        config.session_memory_bytes = TEST_RESERVATION_BYTES;
+        let harness = Arc::new(Mutex::new(MockHarness::open(config)?));
+
+        let mut sessions = Vec::new();
+        for actor in &actor_ids {
+            let id = harness.lock().await.create_session(actor)?;
+            let prompt = workflow
+                .actors
+                .get(actor)
+                .ok_or_else(|| AhrbError::Protocol("resource actor missing".to_owned()))?
+                .prompt
+                .clone();
+            assert!(
+                accept_turn(
+                    &harness,
+                    &id,
+                    PendingTurn {
+                        prompt,
+                        key: "resource-turn".to_owned(),
+                    },
+                    false,
+                )
+                .await?
+            );
+            spawn_worker(Arc::clone(&harness), id.clone());
+            sessions.push(id);
+        }
+
+        // This first state barrier belongs to the harness and works even when the
+        // runner and daemon each host a separate embedded fake-model engine. Every
+        // reached event is durable and includes the run-local release-token path.
+        let mut checkpoint_events = Vec::new();
+        for id in &sessions {
+            let events = wait_for_barriers(&harness, id, 1).await?;
+            let checkpoint = events
+                .iter()
+                .find(|event| event.event == EventVocab::BarrierReached)
+                .cloned()
+                .ok_or_else(|| {
+                    AhrbError::Protocol("resource checkpoint event missing".to_owned())
+                })?;
+            let tool_result_cursor = events
+                .iter()
+                .find(|event| event.event == EventVocab::ToolResult)
+                .map(|event| event.cursor)
+                .ok_or_else(|| AhrbError::Protocol("resource tool result missing".to_owned()))?;
+            assert!(tool_result_cursor < checkpoint.cursor);
+            checkpoint_events.push(checkpoint);
+        }
+        {
+            let guard = harness.lock().await;
+            for id in &sessions {
+                let session = guard.sessions.get(id).ok_or_else(|| {
+                    AhrbError::Protocol("resource session disappeared".to_owned())
+                })?;
+                assert!(
+                    session.active,
+                    "agent must remain live at the model barrier"
+                );
+                assert_eq!(
+                    session.resource_reservation.as_ref().map(|item| item.len()),
+                    Some(TEST_RESERVATION_BYTES)
+                );
+                let events = session.journal.all()?;
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.event == EventVocab::ToolResult)
+                        .count(),
+                    1,
+                    "every agent must finish its fixture op before the shared hold"
+                );
+                assert!(
+                    directory
+                        .join("workspaces")
+                        .join(id)
+                        .join("resource-fixture.txt")
+                        .is_file()
+                );
+            }
+        }
+
+        for checkpoint in &checkpoint_events {
+            release_checkpoint_event(&harness, checkpoint).await?;
+        }
+        // The same sessions can then reach a fake-model-owned shared barrier when the
+        // engine is in-process. This exercises both resource-runner integration modes.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.barriers().wait_until_ready("resource-steady"),
+        )
+        .await
+        .map_err(|_| AhrbError::Timeout("resource agents reaching model barrier".to_owned()))??;
+        {
+            let guard = harness.lock().await;
+            assert!(sessions.iter().all(|id| {
+                guard
+                    .sessions
+                    .get(id)
+                    .is_some_and(|session| session.resource_reservation.is_some())
+            }));
+        }
+
+        engine.barriers().release("resource-steady").await?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let complete = {
+                    let guard = harness.lock().await;
+                    sessions.iter().try_fold(true, |complete, id| {
+                        let session = guard.sessions.get(id).ok_or_else(|| {
+                            AhrbError::Protocol("resource session disappeared".to_owned())
+                        })?;
+                        Ok::<_, AhrbError>(complete && session_is_terminal(session)?)
+                    })?
+                };
+                if complete {
+                    return Ok::<_, AhrbError>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| AhrbError::Timeout("resource agents terminalizing".to_owned()))??;
+
+        for (request_id, id) in sessions.iter().enumerate() {
+            let result = handle_rpc(
+                Arc::clone(&harness),
+                RpcRequest {
+                    jsonrpc: "2.0".to_owned(),
+                    id: json!(request_id),
+                    method: "session.close".to_owned(),
+                    params: json!({ "session_id": id }),
+                },
+            )
+            .await?;
+            assert_eq!(result["released_bytes"], TEST_RESERVATION_BYTES);
+        }
+        {
+            let guard = harness.lock().await;
+            assert!(
+                guard
+                    .sessions
+                    .values()
+                    .all(|session| { session.closed && session.resource_reservation.is_none() })
+            );
+        }
         fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -2272,6 +2982,7 @@ mod tests {
             api_key: Some("unix-secret".to_owned()),
             model: "ahrb-fake-v1".to_owned(),
             idle_timeout: Duration::from_secs(2),
+            session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
         };

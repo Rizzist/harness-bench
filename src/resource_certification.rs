@@ -7,8 +7,10 @@
 //! inventing evidence: a missing observation becomes `ERROR`, never `PASS`.
 
 use crate::evaluate::{Assertion, Pillar, TestResult, classify};
+use crate::process::ProcIdentity;
 use crate::sampler::{
-    MemoryMetric, Plateau, SampleSeries, SamplingHealth, SweepMetrics, SweepPoint,
+    MemoryMetric, PhaseCoverage, Plateau, SampleSeries, SamplingHealth, SweepMetrics, SweepPoint,
+    cadence_quality,
 };
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
@@ -63,30 +65,49 @@ pub struct ResourceTimingPlan {
 impl ResourceTimingPlan {
     /// Return the deterministic plan for a profile.
     pub fn for_profile(profile: ResourceProfile) -> Self {
-        let (repetitions, idle_drift_ms, long_horizon_turns) = match profile {
-            ResourceProfile::Quick => (3, 30_000, 1_000),
-            ResourceProfile::Cert => (7, 120_000, 1_000),
-        };
-        Self {
-            profile,
-            repetitions,
-            warmup_turns: 1,
-            sweep_widths: vec![1, 2, 4, 8],
-            load_guard_ms: 5_000,
-            load_guard_timeout_ms: 60_000,
-            idle_baseline_ms: 3_000,
-            idle_cpu_ms: 10_000,
-            idle_drift_ms,
-            barrier_hold_ms: 3_000,
-            barrier_discard_ms: 1_000,
-            barrier_steady_ms: 2_000,
-            reclaim_deadline_ms: 10_000,
-            membership_cadence_ms: 10,
-            macos_rusage_cadence_ms: 20,
-            linux_cgroup_cadence_ms: 10,
-            linux_smaps_cadence_ms: 50,
-            long_horizon_turns,
-            long_horizon_sample_turns: 100,
+        match profile {
+            ResourceProfile::Quick => Self {
+                profile,
+                repetitions: 3,
+                warmup_turns: 1,
+                sweep_widths: vec![1, 2, 4],
+                load_guard_ms: 1_000,
+                load_guard_timeout_ms: 10_000,
+                idle_baseline_ms: 500,
+                idle_cpu_ms: 1_000,
+                idle_drift_ms: 4_000,
+                barrier_hold_ms: 500,
+                barrier_discard_ms: 100,
+                barrier_steady_ms: 400,
+                reclaim_deadline_ms: 10_000,
+                membership_cadence_ms: 10,
+                macos_rusage_cadence_ms: 20,
+                linux_cgroup_cadence_ms: 10,
+                linux_smaps_cadence_ms: 50,
+                long_horizon_turns: 100,
+                long_horizon_sample_turns: 10,
+            },
+            ResourceProfile::Cert => Self {
+                profile,
+                repetitions: 7,
+                warmup_turns: 1,
+                sweep_widths: vec![1, 2, 4, 8],
+                load_guard_ms: 5_000,
+                load_guard_timeout_ms: 60_000,
+                idle_baseline_ms: 3_000,
+                idle_cpu_ms: 10_000,
+                idle_drift_ms: 120_000,
+                barrier_hold_ms: 3_000,
+                barrier_discard_ms: 1_000,
+                barrier_steady_ms: 2_000,
+                reclaim_deadline_ms: 10_000,
+                membership_cadence_ms: 10,
+                macos_rusage_cadence_ms: 20,
+                linux_cgroup_cadence_ms: 10,
+                linux_smaps_cadence_ms: 50,
+                long_horizon_turns: 1_000,
+                long_horizon_sample_turns: 100,
+            },
         }
     }
 }
@@ -173,6 +194,11 @@ pub struct ResourcePhases {
     pub idle_cpu: String,
     /// Untouched idle drift window.
     pub idle_drift: String,
+    /// Explicit fresh-profile idle phases, one entry per required repetition.
+    #[serde(default)]
+    pub repetitions: Vec<IdlePhaseRepetition>,
+    /// Split membership/counter cadence and raw membership-refresh evidence.
+    pub cadence: Option<ResourceCadenceEvidence>,
 }
 
 impl Default for ResourcePhases {
@@ -181,8 +207,88 @@ impl Default for ResourcePhases {
             warm_idle: "warm-idle".to_owned(),
             idle_cpu: "idle-cpu".to_owned(),
             idle_drift: "idle-drift".to_owned(),
+            repetitions: Vec::new(),
+            cadence: None,
         }
     }
+}
+
+/// Identity proving a measurement came from the selected profile and a fresh isolation root.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepetitionIdentity {
+    /// Zero-based repetition index.
+    pub repetition: u32,
+    /// Profile used for this measurement.
+    pub profile: ResourceProfile,
+    /// Opaque fresh HOME/profile/isolation token, unique across repetitions.
+    pub isolation_token: String,
+}
+
+/// Unmeasured warm-up evidence required before a repetition's baseline.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WarmupObservation {
+    /// Fresh-profile identity shared by the measured repetition.
+    pub identity: RepetitionIdentity,
+    /// Number of scripted warm-up turns completed.
+    pub completed_turns: u32,
+    /// Whether every warm-up turn reached a structural terminal.
+    pub terminalized: bool,
+    /// Whether every warm-up session was officially closed/deleted.
+    pub closed: bool,
+}
+
+/// Platform counter whose cadence is represented by the resource samples.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceCounterKind {
+    /// macOS `proc_pid_rusage` resource counters.
+    MacOsRusage,
+    /// Linux cgroup-v2 memory/cpu counters.
+    LinuxCgroup,
+    /// Linux per-process smaps-rollup counters.
+    LinuxSmapsRollup,
+}
+
+/// Timing for one recursive process-membership refresh.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MembershipRefreshEvidence {
+    /// Monotonic observation-start time since resource collection began.
+    pub elapsed_ns: u64,
+    /// Wall time consumed by recursive membership discovery.
+    pub discovery_wall_ns: u64,
+    /// Calling-thread CPU consumed by recursive membership discovery.
+    pub discovery_cpu_ns: u64,
+    /// Deterministic staggered sampler lane.
+    pub lane: u32,
+}
+
+/// Separate cadence evidence for process membership and resource counters.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceCadenceEvidence {
+    /// Requested recursive ownership-membership refresh cadence.
+    pub membership_cadence_ns: u64,
+    /// Requested platform resource-counter cadence.
+    pub counter_cadence_ns: u64,
+    /// Counter implementation used by the samples.
+    pub counter_kind: ResourceCounterKind,
+    /// Raw membership refresh timestamps grouped by phase.
+    pub membership_samples_by_phase: BTreeMap<String, Vec<u64>>,
+    /// Auditable membership discovery timing grouped by phase.
+    #[serde(default)]
+    pub membership_refreshes_by_phase: BTreeMap<String, Vec<MembershipRefreshEvidence>>,
+}
+
+/// Phase labels proving that idle measurements were repeated on a fresh profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IdlePhaseRepetition {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
+    /// Warm idle baseline phase in this repetition.
+    pub warm_idle: String,
+    /// Quiet CPU phase in this repetition.
+    pub idle_cpu: String,
+    /// Untouched drift phase in this repetition.
+    pub idle_drift: String,
 }
 
 /// The process model observed while the harness is not executing a turn.
@@ -212,11 +318,97 @@ pub struct IdleObservation {
     pub final_threads: Option<u64>,
 }
 
+/// Detect an ungated, approximately half-second idle polling loop from sampled
+/// whole-tree CPU counters.
+///
+/// A poll is represented by a short CPU burst followed by quiescence. Adjacent
+/// active samples are coalesced into one burst, then at least three consecutive
+/// burst intervals must fall within 500 ms +/- 150 ms. Continuous CPU activity is
+/// handled by the independent idle-CPU ceiling rather than mislabeled as polling.
+pub fn detect_busy_polling(
+    series: &SampleSeries,
+    repetitions: &[IdlePhaseRepetition],
+    counter_cadence_ns: u64,
+) -> Result<bool> {
+    if counter_cadence_ns == 0 {
+        return Err(AhrbError::Validation(
+            "busy-poll detector cadence must be nonzero".to_owned(),
+        ));
+    }
+    let phases: BTreeSet<&str> = repetitions
+        .iter()
+        .flat_map(|repetition| {
+            [
+                repetition.warm_idle.as_str(),
+                repetition.idle_cpu.as_str(),
+                repetition.idle_drift.as_str(),
+            ]
+        })
+        .collect();
+    if phases.is_empty() {
+        return Err(AhrbError::Validation(
+            "busy-poll detector has no idle phases".to_owned(),
+        ));
+    }
+    let coalesce_ns = counter_cadence_ns.saturating_mul(2);
+    const NOMINAL_POLL_NS: u64 = 500_000_000;
+    const POLL_TOLERANCE_NS: u64 = 150_000_000;
+    for phase in phases {
+        let samples: Vec<_> = series
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .collect();
+        if samples.len() < 2 {
+            return Err(AhrbError::Validation(format!(
+                "busy-poll detector phase {phase:?} needs at least two samples"
+            )));
+        }
+        let mut burst_times = Vec::new();
+        let mut last_active = None;
+        for pair in samples.windows(2) {
+            if pair[1].cpu_ns < pair[0].cpu_ns {
+                return Err(AhrbError::Validation(format!(
+                    "busy-poll detector phase {phase:?} CPU counter regressed"
+                )));
+            }
+            if pair[1].cpu_ns == pair[0].cpu_ns {
+                continue;
+            }
+            let active_at = pair[1].elapsed_ns;
+            if last_active.is_none_or(|previous| active_at.saturating_sub(previous) > coalesce_ns) {
+                burst_times.push(active_at);
+            }
+            last_active = Some(active_at);
+        }
+        let gaps: Vec<_> = burst_times
+            .windows(2)
+            .map(|pair| pair[1].saturating_sub(pair[0]))
+            .collect();
+        let matching = gaps
+            .iter()
+            .filter(|gap| gap.abs_diff(NOMINAL_POLL_NS) <= POLL_TOLERANCE_NS)
+            .count();
+        if matching >= 3 && matching.saturating_mul(4) >= gaps.len().saturating_mul(3) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Phase references and membership requirements for one fresh-profile N point.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SweepObservation {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
     /// Simultaneous agents at the shared state barrier.
     pub agents: u32,
+    /// Logical actor IDs required to reach the named barrier.
+    pub expected_barrier_actors: BTreeSet<String>,
+    /// Logical actor IDs actually observed at the same validated transition.
+    pub observed_barrier_actors: BTreeSet<String>,
+    /// Stable fake-model barrier/checkpoint name shared by those actors.
+    pub barrier_checkpoint: String,
     /// Fresh-profile warm baseline phase.
     pub baseline_phase: String,
     /// Complete workload phase, used for peak P_n.
@@ -237,11 +429,19 @@ pub struct SweepObservation {
     pub minimum_post_turn_processes: usize,
     /// Minimum membership required after official close/delete.
     pub minimum_post_close_processes: usize,
+    /// Time from official close/delete until the stable post-close window.
+    pub post_close_settled_after_ms: u64,
+    /// Seed used to rotate width order deterministically.
+    pub width_rotation_seed: u64,
+    /// Zero-based position of this width in the seeded repetition order.
+    pub width_order_index: u32,
 }
 
 /// Ordinary workflow return-to-idle evidence for row 23.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReturnToIdleObservation {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
     /// Baseline phase before the workflow.
     pub baseline_phase: String,
     /// Active workflow phase.
@@ -261,10 +461,14 @@ pub struct ReturnToIdleObservation {
 /// Cold start and steady-readiness evidence for row 24.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ColdStartObservation {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
     /// Launch-to-ready phase, including the cold peak.
     pub cold_phase: String,
     /// Ready idle phase.
     pub ready_idle_phase: String,
+    /// Delay from launch initiation until the first sampled cold boundary.
+    pub sampling_started_after_launch_ms: u64,
     /// Observed launch-to-readiness duration.
     pub readiness_ms: u64,
     /// Adapter-declared startup bound.
@@ -276,6 +480,8 @@ pub struct ColdStartObservation {
 /// CPU evidence for one scripted single-agent workload.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SingleAgentObservation {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
     /// Phase spanning the complete scripted turns.
     pub turn_phase: String,
     /// Number of scripted turns represented by the CPU delta.
@@ -287,10 +493,24 @@ pub struct SingleAgentObservation {
 /// Cleanup evidence after every session has been officially closed and deleted.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CleanupObservation {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
     /// Time until reclaim was sampled.
     pub reclaim_after_ms: u64,
     /// Owned session workers remaining after cleanup grace.
     pub remaining_workers: usize,
+    /// Exact actor-to-session set created for the maximum-width group.
+    pub expected_actor_sessions: BTreeMap<String, String>,
+    /// Exact actor-to-session set successfully closed through the official surface.
+    pub closed_actor_sessions: BTreeMap<String, String>,
+    /// Owned process identities at the pre-workload baseline.
+    pub baseline_processes: BTreeSet<ProcIdentity>,
+    /// Owned process identities after close/delete and reclaim settling.
+    pub post_close_processes: BTreeSet<ProcIdentity>,
+    /// Whole-tree thread count at the pre-workload baseline.
+    pub baseline_threads: Option<u64>,
+    /// Whole-tree thread count after close/delete and reclaim settling.
+    pub post_close_threads: Option<u64>,
 }
 
 /// One resource checkpoint in the long-horizon workload.
@@ -306,22 +526,62 @@ pub struct LongHorizonPoint {
     pub threads: u64,
 }
 
+/// One durable fixture result attributed to a specific long-horizon turn.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct LongHorizonToolResult {
+    /// Stable normalized event identity.
+    pub event_id: String,
+    /// Durable journal cursor, used to distinguish duplicate result events.
+    pub cursor: u64,
+    /// Tool-call identity emitted by the scripted model response.
+    pub call_id: String,
+    /// Canonical fixture tool name.
+    pub name: String,
+}
+
 /// Long-horizon memory and descriptor/thread evidence for row 29.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LongHorizonObservation {
+    /// Fresh-profile identity.
+    pub identity: RepetitionIdentity,
+    /// Stable warm baseline phase before the long session is created.
+    pub baseline_phase: String,
+    /// Stable post-close phase after the long session is officially deleted.
+    pub final_post_close_phase: String,
     /// Ordered checkpoints, conventionally every 100 turns.
     pub points: Vec<LongHorizonPoint>,
+    /// Number of turns that reached a durable terminal event.
+    pub completed_turns: u32,
+    /// Every turn mapped to its distinct durable tool-result events.
+    pub tool_results_by_turn: BTreeMap<u32, Vec<LongHorizonToolResult>>,
+    /// Session created for the long-horizon workload.
+    pub expected_session_id: String,
+    /// Session successfully closed through the official surface.
+    pub closed_session_id: Option<String>,
     /// Warm baseline before the first turn.
     pub baseline_bytes: u64,
     /// Stable memory after the final close/delete.
     pub final_post_close_bytes: u64,
+    /// Whole-tree FD count before creating the long session.
+    pub baseline_open_fds: u64,
+    /// Whole-tree FD count after final close/delete.
+    pub final_post_close_open_fds: u64,
+    /// Whole-tree thread count before creating the long session.
+    pub baseline_threads: u64,
+    /// Whole-tree thread count after final close/delete.
+    pub final_post_close_threads: u64,
+    /// Owned process identities before creating the long session.
+    pub baseline_processes: BTreeSet<ProcIdentity>,
+    /// Owned process identities after final close/delete.
+    pub final_post_close_processes: BTreeSet<ProcIdentity>,
 }
 
 /// Complete collection input for resource rows.  Optional fields are intentional:
 /// absence is reported as infrastructure `ERROR`, not inferred success.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ResourceEvidence {
-    /// Complete fresh-profile repetitions represented by the evidence.
+    /// Legacy diagnostic count reported by collectors. Certification derives
+    /// completeness from explicit repetition IDs and never trusts this scalar.
     pub completed_repetitions: u32,
     /// Phase-aware whole-tree samples.
     pub series: SampleSeries,
@@ -334,19 +594,21 @@ pub struct ResourceEvidence {
     pub sampler_cadence_ns: Option<u64>,
     /// Idle topology, polling, worker, and thread observations.
     pub idle: Option<IdleObservation>,
+    /// One completed, closed, unmeasured warm-up per fresh repetition.
+    pub warmup: Option<Vec<WarmupObservation>>,
     /// N=1,2,4,8 fresh-profile observations.
     #[serde(default)]
     pub sweep: Vec<SweepObservation>,
     /// Ordinary workflow return-to-idle observation.
-    pub ordinary_return: Option<ReturnToIdleObservation>,
+    pub ordinary_return: Option<Vec<ReturnToIdleObservation>>,
     /// Cold start observation.
-    pub cold_start: Option<ColdStartObservation>,
+    pub cold_start: Option<Vec<ColdStartObservation>>,
     /// Single-agent CPU observation.
-    pub single_agent: Option<SingleAgentObservation>,
+    pub single_agent: Option<Vec<SingleAgentObservation>>,
     /// Post-close worker cleanup observation.
-    pub cleanup: Option<CleanupObservation>,
+    pub cleanup: Option<Vec<CleanupObservation>>,
     /// Long-horizon memory/FD/thread observation.
-    pub long_horizon: Option<LongHorizonObservation>,
+    pub long_horizon: Option<Vec<LongHorizonObservation>>,
 }
 
 /// Derived certification evidence and row outcomes.
@@ -387,6 +649,8 @@ struct Analysis<'a> {
     sampling_health: Option<SamplingHealth>,
     sweep_metrics: Option<SweepMetrics>,
     sweep_points: BTreeMap<u32, SweepPoint>,
+    sweep_repetition_points: BTreeMap<(u32, u32), SweepPoint>,
+    sweep_reclaim_after_ms: BTreeMap<u32, u64>,
     metrics: BTreeMap<String, f64>,
     sampler_error: Option<String>,
     sweep_error: Option<String>,
@@ -407,6 +671,8 @@ impl<'a> Analysis<'a> {
             sampling_health: None,
             sweep_metrics: None,
             sweep_points: BTreeMap::new(),
+            sweep_repetition_points: BTreeMap::new(),
+            sweep_reclaim_after_ms: BTreeMap::new(),
             metrics: BTreeMap::new(),
             sampler_error: None,
             sweep_error: None,
@@ -421,6 +687,11 @@ impl<'a> Analysis<'a> {
         self.evaluate_single_agent();
         self.evaluate_parallel_rows();
         self.evaluate_long_horizon();
+        if let Some(error) = self.sampler_error.clone() {
+            for row in 20..=29 {
+                self.insert_error(row, error.clone());
+            }
+        }
         for row in 20..=29 {
             if !self.rows.contains_key(&row) {
                 self.insert_error(row, "resource row was not evaluated".to_owned());
@@ -429,29 +700,60 @@ impl<'a> Analysis<'a> {
     }
 
     fn evaluate_sampler_health(&mut self) {
-        if self.evidence.completed_repetitions < self.timing.repetitions {
-            self.sampler_error = Some(format!(
-                "only {} of {} required fresh-profile repetitions were collected",
-                self.evidence.completed_repetitions, self.timing.repetitions
-            ));
-        }
-        let Some(cadence) = self.evidence.sampler_cadence_ns else {
-            if self.sampler_error.is_none() {
-                self.sampler_error = Some("sampler cadence evidence is absent".to_owned());
-            }
+        let Some(cadence) = self.evidence.phases.cadence.as_ref() else {
+            self.sampler_error = Some("split sampler cadence evidence is absent".to_owned());
             return;
         };
-        match self.evidence.series.sampling_health(cadence) {
+        let expected_membership_ns = self.timing.membership_cadence_ms.saturating_mul(1_000_000);
+        let (expected_kind, expected_counter_ns) = self.expected_counter_cadence();
+        if cadence.membership_cadence_ns != expected_membership_ns
+            || cadence.counter_kind != expected_kind
+            || cadence.counter_cadence_ns != expected_counter_ns
+        {
+            self.sampler_error = Some(format!(
+                "sampler cadence mismatch: membership={} ns expected={} ns, counter={:?}/{} ns expected={:?}/{} ns",
+                cadence.membership_cadence_ns,
+                expected_membership_ns,
+                cadence.counter_kind,
+                cadence.counter_cadence_ns,
+                expected_kind,
+                expected_counter_ns
+            ));
+        }
+        if self
+            .evidence
+            .series
+            .samples
+            .iter()
+            .any(|sample| sample.collection_ns == 0 || sample.collection_wall_ns == 0)
+            && self.sampler_error.is_none()
+        {
+            self.sampler_error = Some(
+                "sampler collection-duration evidence is absent from one or more samples"
+                    .to_owned(),
+            );
+        }
+        if let Err(error) = validate_membership_cadence(cadence) {
+            if self.sampler_error.is_none() {
+                self.sampler_error = Some(error.to_string());
+            }
+        }
+        match self
+            .evidence
+            .series
+            .sampling_health(cadence.counter_cadence_ns)
+        {
             Ok(health) => {
                 self.metrics.insert(
-                    "sampler_overhead_one_core".to_owned(),
-                    health.overhead_one_core,
+                    "sampler_collection_cpu_fraction".to_owned(),
+                    health.collection_cpu_fraction,
                 );
                 if health.overloaded && self.sampler_error.is_none() {
                     self.sampler_error = Some(format!(
-                        "sampler overload: {:.3}% of one core, {} cadence overruns",
-                        health.overhead_one_core * 100.0,
-                        health.cadence_overruns
+                        "sampler overload: {:.3}% aggregate sampler thread CPU, {} collection wall overruns, {} bounded-jitter cadence gaps",
+                        health.collection_cpu_fraction * 100.0,
+                        health.cadence_overruns,
+                        health.cadence_gaps
                     ));
                 }
                 self.sampling_health = Some(health);
@@ -462,6 +764,57 @@ impl<'a> Analysis<'a> {
                 }
             }
         }
+    }
+
+    fn expected_counter_cadence(&self) -> (ResourceCounterKind, u64) {
+        #[cfg(target_os = "macos")]
+        {
+            return (
+                ResourceCounterKind::MacOsRusage,
+                self.timing
+                    .macos_rusage_cadence_ms
+                    .saturating_mul(1_000_000),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let (kind, cadence_ms) = match self.evidence.memory_metric {
+                Some(MemoryMetric::Cgroup) => (
+                    ResourceCounterKind::LinuxCgroup,
+                    self.timing.linux_cgroup_cadence_ms,
+                ),
+                _ => (
+                    ResourceCounterKind::LinuxSmapsRollup,
+                    self.timing.linux_smaps_cadence_ms,
+                ),
+            };
+            return (kind, cadence_ms.saturating_mul(1_000_000));
+        }
+        #[allow(unreachable_code)]
+        (
+            ResourceCounterKind::LinuxSmapsRollup,
+            self.timing.linux_smaps_cadence_ms.saturating_mul(1_000_000),
+        )
+    }
+
+    fn validate_repetition_component(
+        &self,
+        component: &str,
+        identities: &[&RepetitionIdentity],
+    ) -> Result<()> {
+        let (_, expected_tokens) = complete_idle_repetitions(
+            &self.evidence.phases.repetitions,
+            self.timing.repetitions,
+            self.timing.profile,
+        )?;
+        validate_component_identities(
+            component,
+            identities,
+            self.timing.profile,
+            self.timing.repetitions,
+            Some(&expected_tokens),
+        )?;
+        Ok(())
     }
 
     fn evaluate_idle_rows(&mut self) {
@@ -477,137 +830,250 @@ impl<'a> Analysis<'a> {
             }
             return;
         };
+        let (repetitions, _) = match complete_idle_repetitions(
+            &self.evidence.phases.repetitions,
+            self.timing.repetitions,
+            self.timing.profile,
+        ) {
+            Ok(repetitions) => repetitions,
+            Err(error) => {
+                for row in 20..=22 {
+                    self.insert_error(row, error.to_string());
+                }
+                return;
+            }
+        };
         let minimum = match idle.declared_model {
             IdleProcessModel::PersistentTree => 1,
             IdleProcessModel::ZeroProcessBetweenTurns => 0,
         };
-        let baseline = self.plateau(
-            "idle-baseline",
-            &self.evidence.phases.warm_idle,
-            metric,
-            minimum,
-            None,
-        );
-        match baseline {
-            Ok(plateau) => {
-                let samples: Vec<_> = self
-                    .evidence
-                    .series
-                    .samples
+        let mut baseline_medians = Vec::new();
+        let mut baseline_checks = Vec::new();
+        let mut baseline_error = None;
+        for repetition in &repetitions {
+            let result = self
+                .require_phase_coverage(&repetition.warm_idle, self.timing.idle_baseline_ms)
+                .and_then(|()| {
+                    self.plateau(
+                        &format!("rep{}-idle-baseline", repetition.identity.repetition),
+                        &repetition.warm_idle,
+                        metric,
+                        minimum,
+                        Some(self.timing.idle_baseline_ms.saturating_mul(1_000_000)),
+                    )
+                });
+            match result {
+                Ok(plateau) => {
+                    let samples: Vec<_> = self
+                        .evidence
+                        .series
+                        .samples
+                        .iter()
+                        .filter(|sample| sample.phase == repetition.warm_idle)
+                        .collect();
+                    let topology_matches = match idle.declared_model {
+                        IdleProcessModel::PersistentTree => {
+                            !samples.is_empty()
+                                && samples.iter().all(|sample| !sample.processes.is_empty())
+                        }
+                        IdleProcessModel::ZeroProcessBetweenTurns => {
+                            !samples.is_empty()
+                                && samples.iter().all(|sample| sample.processes.is_empty())
+                        }
+                    };
+                    baseline_medians.push(plateau.median_bytes);
+                    baseline_checks.push(check(
+                        &format!("rep{}-idle-topology", repetition.identity.repetition),
+                        topology_matches,
+                        format!("declared and observed {:?}", idle.declared_model),
+                    ));
+                    baseline_checks.push(check(
+                        &format!("rep{}-idle-plateau", repetition.identity.repetition),
+                        plateau.trustworthy
+                            && plateau.relative_spread <= self.envelope.maximum_plateau_spread,
+                        format!(
+                            "median={} spread={:.3}% processes>={}",
+                            plateau.median_bytes,
+                            plateau.relative_spread * 100.0,
+                            plateau.minimum_observed_processes
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    baseline_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(error) = baseline_error {
+            self.insert_error(20, error);
+        } else if let Some(median) = median_u64_values(&baseline_medians) {
+            self.metrics
+                .insert("idle_median_bytes".to_owned(), median as f64);
+            record_distribution(
+                &mut self.metrics,
+                "idle_baseline_bytes",
+                &baseline_medians
                     .iter()
-                    .filter(|sample| sample.phase == self.evidence.phases.warm_idle)
-                    .collect();
-                let topology_matches = match idle.declared_model {
-                    IdleProcessModel::PersistentTree => {
-                        !samples.is_empty()
-                            && samples.iter().all(|sample| !sample.processes.is_empty())
-                    }
-                    IdleProcessModel::ZeroProcessBetweenTurns => {
-                        !samples.is_empty()
-                            && samples.iter().all(|sample| sample.processes.is_empty())
-                    }
-                };
-                self.metrics
-                    .insert("idle_median_bytes".to_owned(), plateau.median_bytes as f64);
-                self.insert_checks(
-                    20,
-                    vec![
-                        check(
-                            "idle-topology",
-                            topology_matches,
-                            format!("declared and observed {:?}", idle.declared_model),
-                        ),
-                        check(
-                            "idle-plateau",
-                            plateau.trustworthy
-                                && plateau.relative_spread <= self.envelope.maximum_plateau_spread,
-                            format!(
-                                "median={} spread={:.3}% processes>={}",
-                                plateau.median_bytes,
-                                plateau.relative_spread * 100.0,
-                                plateau.minimum_observed_processes
-                            ),
-                        ),
-                    ],
-                );
-            }
-            Err(error) => self.insert_error(20, error.to_string()),
+                    .map(|value| *value as f64)
+                    .collect::<Vec<_>>(),
+            );
+            self.insert_checks(20, baseline_checks);
+        } else {
+            self.insert_error(20, "idle baseline repetitions are absent".to_owned());
         }
 
-        match (
-            self.evidence
-                .series
-                .phase_cpu(&self.evidence.phases.idle_cpu),
-            idle.busy_polling_detected,
-        ) {
-            (Ok(cpu), Some(busy_polling_detected)) => {
-                self.metrics
-                    .insert("idle_cpu_one_core".to_owned(), cpu.one_core_fraction);
-                self.insert_checks(
-                    21,
-                    vec![
-                        check(
-                            "idle-cpu",
-                            cpu.one_core_fraction <= self.envelope.maximum_idle_cpu_fraction,
-                            format!("{:.3}% of one core", cpu.one_core_fraction * 100.0),
-                        ),
-                        check(
-                            "busy-polling",
-                            !busy_polling_detected,
-                            format!("detected={busy_polling_detected}"),
-                        ),
-                    ],
-                );
+        let mut cpu_values = Vec::new();
+        let mut cpu_checks = Vec::new();
+        let mut cpu_error = None;
+        for repetition in &repetitions {
+            let result = self
+                .require_phase_coverage(&repetition.idle_cpu, self.timing.idle_cpu_ms)
+                .and_then(|()| self.evidence.series.phase_cpu(&repetition.idle_cpu));
+            match result {
+                Ok(cpu) => {
+                    cpu_values.push(cpu.one_core_fraction);
+                    cpu_checks.push(check(
+                        &format!("rep{}-idle-cpu", repetition.identity.repetition),
+                        cpu.one_core_fraction <= self.envelope.maximum_idle_cpu_fraction,
+                        format!("{:.3}% of one core", cpu.one_core_fraction * 100.0),
+                    ));
+                }
+                Err(error) => {
+                    cpu_error = Some(error.to_string());
+                    break;
+                }
             }
-            (Err(error), _) => self.insert_error(21, error.to_string()),
+        }
+        match (cpu_error, idle.busy_polling_detected) {
+            (Some(error), _) => self.insert_error(21, error),
             (_, None) => self.insert_error(21, "busy-polling evidence is absent".to_owned()),
+            (None, Some(busy_polling_detected)) => {
+                cpu_checks.push(check(
+                    "busy-polling",
+                    !busy_polling_detected,
+                    format!("detected={busy_polling_detected}"),
+                ));
+                if let Some(median) = median_f64_values(&cpu_values) {
+                    self.metrics.insert("idle_cpu_one_core".to_owned(), median);
+                }
+                record_distribution(&mut self.metrics, "idle_cpu_one_core", &cpu_values);
+                self.insert_checks(21, cpu_checks);
+            }
         }
 
-        let drift = self
-            .evidence
-            .series
-            .drift_bytes_per_minute(&self.evidence.phases.idle_drift, metric);
-        let net = phase_net_growth(
-            &self.evidence.series,
-            &self.evidence.phases.idle_drift,
-            metric,
-        );
-        match (drift, net, idle.initial_threads, idle.final_threads) {
-            (Ok(slope), Ok(net_growth), Some(initial_threads), Some(final_threads)) => {
+        let mut slopes = Vec::new();
+        let mut net_growths = Vec::new();
+        let mut drift_checks = Vec::new();
+        let mut drift_error = None;
+        for repetition in &repetitions {
+            let result = self
+                .require_phase_coverage(&repetition.idle_drift, self.timing.idle_drift_ms)
+                .and_then(|()| {
+                    let samples: Vec<_> = self
+                        .evidence
+                        .series
+                        .samples
+                        .iter()
+                        .filter(|sample| sample.phase == repetition.idle_drift)
+                        .collect();
+                    let first = samples.first().copied().ok_or_else(|| {
+                        AhrbError::Validation(format!(
+                            "idle drift phase {:?} has no first sample",
+                            repetition.idle_drift
+                        ))
+                    })?;
+                    let last = samples.last().copied().ok_or_else(|| {
+                        AhrbError::Validation(format!(
+                            "idle drift phase {:?} has no last sample",
+                            repetition.idle_drift
+                        ))
+                    })?;
+                    let persistent_root = usize::from(matches!(
+                        idle.declared_model,
+                        IdleProcessModel::PersistentTree
+                    ));
+                    let initial_threads = first.thread_count.ok_or_else(|| {
+                        AhrbError::Validation(format!(
+                            "idle drift phase {:?} has no initial thread count",
+                            repetition.idle_drift
+                        ))
+                    })?;
+                    let final_threads = last.thread_count.ok_or_else(|| {
+                        AhrbError::Validation(format!(
+                            "idle drift phase {:?} has no final thread count",
+                            repetition.idle_drift
+                        ))
+                    })?;
+                    Ok((
+                        self.evidence
+                            .series
+                            .drift_bytes_per_minute(&repetition.idle_drift, metric)?,
+                        phase_net_growth(&self.evidence.series, &repetition.idle_drift, metric)?,
+                        first.processes.len().saturating_sub(persistent_root),
+                        last.processes.len().saturating_sub(persistent_root),
+                        initial_threads,
+                        final_threads,
+                    ))
+                });
+            match result {
+                Ok((
+                    slope,
+                    net_growth,
+                    initial_workers,
+                    final_workers,
+                    initial_threads,
+                    final_threads,
+                )) => {
+                    slopes.push(slope);
+                    net_growths.push(net_growth);
+                    drift_checks.push(check(
+                        &format!("rep{}-idle-drift", repetition.identity.repetition),
+                        slope <= self.envelope.maximum_idle_drift_bytes_per_minute,
+                        format!("{slope:.3} bytes/minute"),
+                    ));
+                    drift_checks.push(check(
+                        &format!("rep{}-idle-net-growth", repetition.identity.repetition),
+                        net_growth <= self.envelope.maximum_idle_net_growth_bytes,
+                        format!("{net_growth} bytes"),
+                    ));
+                    drift_checks.push(check(
+                        &format!("rep{}-worker-growth", repetition.identity.repetition),
+                        final_workers <= initial_workers,
+                        format!("{initial_workers} -> {final_workers}"),
+                    ));
+                    drift_checks.push(check(
+                        &format!("rep{}-thread-growth", repetition.identity.repetition),
+                        final_threads <= initial_threads,
+                        format!("{initial_threads} -> {final_threads}"),
+                    ));
+                }
+                Err(error) => {
+                    drift_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        match drift_error {
+            None => {
+                let slope = median_f64_values(&slopes).unwrap_or(f64::INFINITY);
+                let net_growth = median_u64_values(&net_growths).unwrap_or(u64::MAX);
                 self.metrics
                     .insert("idle_drift_bytes_per_minute".to_owned(), slope);
                 self.metrics
                     .insert("idle_net_growth_bytes".to_owned(), net_growth as f64);
-                self.insert_checks(
-                    22,
-                    vec![
-                        check(
-                            "idle-drift",
-                            slope <= self.envelope.maximum_idle_drift_bytes_per_minute,
-                            format!("{slope:.3} bytes/minute"),
-                        ),
-                        check(
-                            "idle-net-growth",
-                            net_growth <= self.envelope.maximum_idle_net_growth_bytes,
-                            format!("{net_growth} bytes"),
-                        ),
-                        check(
-                            "worker-growth",
-                            idle.final_workers <= idle.initial_workers,
-                            format!("{} -> {}", idle.initial_workers, idle.final_workers),
-                        ),
-                        check(
-                            "thread-growth",
-                            final_threads <= initial_threads,
-                            format!("{initial_threads} -> {final_threads}"),
-                        ),
-                    ],
+                record_distribution(&mut self.metrics, "idle_drift_bytes_per_minute", &slopes);
+                record_distribution(
+                    &mut self.metrics,
+                    "idle_net_growth_bytes",
+                    &net_growths
+                        .iter()
+                        .map(|value| *value as f64)
+                        .collect::<Vec<_>>(),
                 );
+                self.insert_checks(22, drift_checks);
             }
-            (Err(error), _, _, _) | (_, Err(error), _, _) => {
-                self.insert_error(22, error.to_string())
-            }
-            (_, _, _, _) => self.insert_error(22, "thread-count evidence is absent".to_owned()),
+            Some(error) => self.insert_error(22, error),
         }
     }
 
@@ -615,30 +1081,115 @@ impl<'a> Analysis<'a> {
         let Some(metric) = self.evidence.memory_metric else {
             return;
         };
+        let Some(cadence) = self.evidence.phases.cadence.as_ref() else {
+            return;
+        };
+        let expected_tokens = match complete_idle_repetitions(
+            &self.evidence.phases.repetitions,
+            self.timing.repetitions,
+            self.timing.profile,
+        ) {
+            Ok((_, tokens)) => tokens,
+            Err(error) => {
+                self.sweep_error = Some(error.to_string());
+                return;
+            }
+        };
+        if let Err(error) = validate_warmups(
+            self.evidence.warmup.as_deref(),
+            &self.timing,
+            &expected_tokens,
+        ) {
+            self.sweep_error = Some(error.to_string());
+            return;
+        }
+        if let Err(error) =
+            validate_sweep_structure(&self.evidence.sweep, &self.timing, &expected_tokens)
+        {
+            self.sweep_error = Some(error.to_string());
+            return;
+        }
+        let expected_repetitions: BTreeSet<u32> = (0..self.timing.repetitions).collect();
+        let mut grouped: BTreeMap<u32, BTreeMap<u32, SweepPoint>> = BTreeMap::new();
         for observation in &self.evidence.sweep {
             match derive_sweep_point(
                 &self.evidence.series,
                 observation,
                 metric,
-                self.timing.barrier_steady_ms.saturating_mul(1_000_000),
+                &self.timing,
+                cadence,
                 self.envelope.maximum_plateau_spread,
             ) {
                 Ok((point, named_plateaus)) => {
-                    if self.sweep_points.insert(point.agents, point).is_some() {
-                        self.sweep_error = Some(format!(
-                            "duplicate resource observation for N={}",
-                            point.agents
-                        ));
+                    if !expected_repetitions.contains(&observation.identity.repetition) {
+                        self.sweep_error.get_or_insert_with(|| {
+                            format!(
+                                "resource observation N={} has out-of-range repetition {}",
+                                point.agents, observation.identity.repetition
+                            )
+                        });
+                        continue;
                     }
+                    if grouped
+                        .entry(point.agents)
+                        .or_default()
+                        .insert(observation.identity.repetition, point)
+                        .is_some()
+                    {
+                        self.sweep_error.get_or_insert_with(|| {
+                            format!(
+                                "duplicate resource observation for N={} repetition {}",
+                                point.agents, observation.identity.repetition
+                            )
+                        });
+                    }
+                    self.sweep_repetition_points
+                        .insert((point.agents, observation.identity.repetition), point);
+                    self.sweep_reclaim_after_ms
+                        .entry(point.agents)
+                        .and_modify(|value| {
+                            *value = (*value).max(observation.post_close_settled_after_ms);
+                        })
+                        .or_insert(observation.post_close_settled_after_ms);
                     for (name, plateau) in named_plateaus {
                         self.plateaus.insert(name, plateau);
                     }
                 }
                 Err(error) => {
-                    self.sweep_error = Some(format!(
-                        "could not derive N={}: {error}",
-                        observation.agents
-                    ));
+                    self.sweep_error.get_or_insert_with(|| {
+                        format!(
+                            "could not derive N={} repetition {}: {error}",
+                            observation.agents, observation.identity.repetition
+                        )
+                    });
+                }
+            }
+        }
+        let required_widths: BTreeSet<u32> = self.timing.sweep_widths.iter().copied().collect();
+        let observed_widths: BTreeSet<u32> = grouped.keys().copied().collect();
+        if observed_widths != required_widths {
+            self.sweep_error.get_or_insert_with(|| {
+                format!(
+                    "resource sweep widths incomplete: required={required_widths:?} observed={observed_widths:?}"
+                )
+            });
+        }
+        for (agents, repetitions) in grouped {
+            let observed: BTreeSet<u32> = repetitions.keys().copied().collect();
+            if observed != expected_repetitions {
+                self.sweep_error.get_or_insert_with(|| {
+                    format!(
+                        "N={agents} fresh-profile repetitions incomplete: required={expected_repetitions:?} observed={observed:?}"
+                    )
+                });
+                continue;
+            }
+            match aggregate_sweep_points(repetitions.values().copied()) {
+                Ok(point) => {
+                    self.sweep_points.insert(agents, point);
+                }
+                Err(error) => {
+                    self.sweep_error.get_or_insert_with(|| error.to_string());
                 }
             }
         }
@@ -650,6 +1201,10 @@ impl<'a> Analysis<'a> {
                         self.metrics
                             .insert("parallel_beta_bytes_per_agent".to_owned(), beta);
                     }
+                    if let Some(beta) = metrics.headline_beta_mib_per_agent {
+                        self.metrics
+                            .insert("parallel_beta_mib_per_agent".to_owned(), beta);
+                    }
                     if let Some(alpha) = metrics.scaling_exponent_alpha {
                         self.metrics
                             .insert("parallel_scaling_exponent".to_owned(), alpha);
@@ -658,6 +1213,17 @@ impl<'a> Analysis<'a> {
                         "maximum_cold_peak_bytes".to_owned(),
                         metrics.maximum_cold_peak_bytes as f64,
                     );
+                    self.metrics.insert(
+                        "maximum_workload_peak_bytes".to_owned(),
+                        metrics.maximum_workload_peak_bytes as f64,
+                    );
+                    for (point, derived) in &metrics.points {
+                        self.record_sweep_point_metrics(*point, *derived);
+                    }
+                    if let Err(error) = self.record_sweep_repetition_distributions() {
+                        self.sweep_error = Some(error.to_string());
+                        return;
+                    }
                     self.sweep_metrics = Some(metrics);
                 }
                 Err(error) => self.sweep_error = Some(error.to_string()),
@@ -671,160 +1237,327 @@ impl<'a> Analysis<'a> {
             self.insert_error(24, "preferred memory metric is absent".to_owned());
             return;
         };
-        let n8_return = self.sweep_points.get(&8).copied();
-        if n8_return.is_none() {
-            self.insert_error(23, "N=8 return-to-idle observation is absent".to_owned());
-        }
-        match &self.evidence.ordinary_return {
-            Some(observation) => {
-                match (
-                    derive_recovery(&self.evidence.series, observation, metric),
-                    n8_return,
-                ) {
-                    (Ok(recovery), Some(n8)) => {
-                        let n8_active = n8.steady_bytes.saturating_sub(n8.baseline_bytes);
-                        let n8_residual = n8.post_close_bytes.saturating_sub(n8.baseline_bytes);
-                        self.insert_checks(
-                            23,
-                            vec![
-                                check(
-                                    "ordinary-residual",
-                                    recovery.residual_bytes
-                                        <= recovery.residual_limit_bytes(self.envelope),
-                                    format!(
-                                        "residual={} limit={}",
-                                        recovery.residual_bytes,
-                                        recovery.residual_limit_bytes(self.envelope)
-                                    ),
-                                ),
-                                check(
-                                    "return-deadline",
-                                    observation.settled_after_ms <= self.timing.reclaim_deadline_ms,
-                                    format!("{} ms", observation.settled_after_ms),
-                                ),
-                                check(
-                                    "ordinary-cleanup",
-                                    observation.remaining_workers == 0,
-                                    format!("{} workers", observation.remaining_workers),
-                                ),
-                                check(
-                                    "n8-residual",
-                                    n8_residual <= residual_limit(n8_active, self.envelope),
-                                    format!(
-                                        "residual={} limit={}",
-                                        n8_residual,
-                                        residual_limit(n8_active, self.envelope)
-                                    ),
-                                ),
-                            ],
-                        );
-                    }
-                    (Err(error), _) => self.insert_error(23, error.to_string()),
-                    (_, None) => {}
-                }
-            }
-            None => self.insert_error(
+        let target_agents = self.timing.sweep_widths.last().copied().unwrap_or(0);
+        let target_return = self.sweep_points.get(&target_agents).copied();
+        if target_return.is_none() {
+            self.insert_error(
                 23,
-                "ordinary return-to-idle observation is absent".to_owned(),
-            ),
+                format!("N={target_agents} return-to-idle observation is absent"),
+            );
+        }
+        let ordinary_result = (|| -> Result<(Vec<Assertion>, Vec<f64>, Vec<f64>)> {
+            let observations = self.evidence.ordinary_return.as_ref().ok_or_else(|| {
+                AhrbError::Validation("ordinary return-to-idle observations are absent".to_owned())
+            })?;
+            let identities: Vec<&RepetitionIdentity> =
+                observations.iter().map(|item| &item.identity).collect();
+            self.validate_repetition_component("ordinary-return", &identities)?;
+            let mut assertions = Vec::new();
+            let mut residuals = Vec::new();
+            let mut settled = Vec::new();
+            for observation in observations {
+                self.require_phase_coverage(
+                    &observation.baseline_phase,
+                    self.timing.idle_baseline_ms,
+                )?;
+                self.require_phase_coverage(
+                    &observation.returned_phase,
+                    self.timing.barrier_steady_ms,
+                )?;
+                let recovery = derive_recovery(&self.evidence.series, observation, metric)?;
+                residuals.push(recovery.residual_bytes as f64);
+                settled.push(observation.settled_after_ms as f64);
+                assertions.extend([
+                    check(
+                        &format!("rep{}-ordinary-residual", observation.identity.repetition),
+                        recovery.residual_bytes <= recovery.residual_limit_bytes(self.envelope),
+                        format!("{} bytes", recovery.residual_bytes),
+                    ),
+                    check(
+                        &format!("rep{}-return-deadline", observation.identity.repetition),
+                        observation.settled_after_ms <= self.timing.reclaim_deadline_ms,
+                        format!("{} ms", observation.settled_after_ms),
+                    ),
+                    check(
+                        &format!("rep{}-ordinary-cleanup", observation.identity.repetition),
+                        observation.remaining_workers == 0,
+                        format!("{} workers", observation.remaining_workers),
+                    ),
+                ]);
+            }
+            Ok((assertions, residuals, settled))
+        })();
+        match (ordinary_result, target_return) {
+            (Ok((mut assertions, residuals, settled)), Some(target)) => {
+                let target_active = target.steady_bytes.saturating_sub(target.baseline_bytes);
+                let target_residual = target
+                    .post_close_bytes
+                    .saturating_sub(target.baseline_bytes);
+                let target_reclaim_after_ms =
+                    self.sweep_reclaim_after_ms.get(&target_agents).copied();
+                assertions.extend([
+                    check(
+                        &format!("n{target_agents}-residual"),
+                        target_residual <= residual_limit(target_active, self.envelope),
+                        format!("{target_residual} bytes"),
+                    ),
+                    check(
+                        &format!("n{target_agents}-return-deadline"),
+                        target_reclaim_after_ms
+                            .is_some_and(|value| value <= self.timing.reclaim_deadline_ms),
+                        format!("{} ms", target_reclaim_after_ms.unwrap_or(u64::MAX)),
+                    ),
+                ]);
+                record_distribution(&mut self.metrics, "ordinary_residual_bytes", &residuals);
+                record_distribution(&mut self.metrics, "ordinary_settled_ms", &settled);
+                self.insert_checks(23, assertions);
+            }
+            (Err(error), _) => self.insert_error(23, error.to_string()),
+            (_, None) => {}
         }
 
-        match &self.evidence.cold_start {
-            Some(observation) => {
-                let peak = phase_peak(&self.evidence.series, &observation.cold_phase, metric);
+        let cold_result = (|| -> Result<(Vec<Assertion>, Vec<f64>, Vec<f64>)> {
+            let observations = self.evidence.cold_start.as_ref().ok_or_else(|| {
+                AhrbError::Validation("cold-start observations are absent".to_owned())
+            })?;
+            let identities: Vec<&RepetitionIdentity> =
+                observations.iter().map(|item| &item.identity).collect();
+            self.validate_repetition_component("cold-start", &identities)?;
+            let mut assertions = Vec::new();
+            let mut peaks = Vec::new();
+            let mut readiness = Vec::new();
+            for observation in observations {
+                let cadence = self.evidence.phases.cadence.as_ref().ok_or_else(|| {
+                    AhrbError::Validation("cold-start cadence evidence is absent".to_owned())
+                })?;
+                let counter_ms = cadence.counter_cadence_ns / 1_000_000;
+                let sampled_cold_ms = observation
+                    .readiness_ms
+                    .saturating_sub(observation.sampling_started_after_launch_ms)
+                    .max(1);
+                let cold_coverage = self.evidence.series.phase_coverage(
+                    &observation.cold_phase,
+                    cadence.counter_cadence_ns,
+                    sampled_cold_ms.saturating_mul(1_000_000),
+                )?;
+                let cold_membership = membership_phase_coverage(
+                    cadence,
+                    &observation.cold_phase,
+                    sampled_cold_ms.saturating_mul(1_000_000),
+                )?;
+                if !cold_coverage.trustworthy || !cold_membership.trustworthy {
+                    return Err(AhrbError::Validation(format!(
+                        "repetition {} cold-start samples do not cover launch-to-readiness",
+                        observation.identity.repetition
+                    )));
+                }
+                self.require_phase_coverage(
+                    &observation.ready_idle_phase,
+                    self.timing.idle_baseline_ms,
+                )?;
+                let peak = phase_peak(&self.evidence.series, &observation.cold_phase, metric)?;
                 let plateau = self.plateau(
-                    "cold-ready-idle",
+                    &format!("rep{}-cold-ready-idle", observation.identity.repetition),
                     &observation.ready_idle_phase,
                     metric,
                     observation.minimum_idle_processes,
-                    None,
-                );
-                match (peak, plateau) {
-                    (Ok(peak), Ok(plateau)) => self.insert_checks(
-                        24,
-                        vec![
-                            check(
-                                "startup-bound",
-                                observation.readiness_ms <= observation.startup_bound_ms,
-                                format!(
-                                    "{} ms <= {} ms",
-                                    observation.readiness_ms, observation.startup_bound_ms
-                                ),
-                            ),
-                            check(
-                                "cold-peak",
-                                peak <= self.envelope.maximum_peak_bytes,
-                                format!("{peak} bytes"),
-                            ),
-                            check(
-                                "ready-plateau",
-                                plateau.trustworthy
-                                    && plateau.relative_spread
-                                        <= self.envelope.maximum_plateau_spread,
-                                format!("spread={:.3}%", plateau.relative_spread * 100.0),
-                            ),
-                        ],
+                    Some(self.timing.idle_baseline_ms.saturating_mul(1_000_000)),
+                )?;
+                peaks.push(peak as f64);
+                readiness.push(observation.readiness_ms as f64);
+                assertions.extend([
+                    check(
+                        &format!("rep{}-startup-bound", observation.identity.repetition),
+                        observation.readiness_ms <= observation.startup_bound_ms,
+                        format!(
+                            "{} <= {} ms",
+                            observation.readiness_ms, observation.startup_bound_ms
+                        ),
                     ),
-                    (Err(error), _) | (_, Err(error)) => self.insert_error(24, error.to_string()),
-                }
+                    check(
+                        &format!("rep{}-cold-peak", observation.identity.repetition),
+                        peak <= self.envelope.maximum_peak_bytes,
+                        format!("{peak} bytes"),
+                    ),
+                    check(
+                        &format!("rep{}-cold-sampling-start", observation.identity.repetition),
+                        observation.sampling_started_after_launch_ms <= counter_ms,
+                        format!(
+                            "{} <= {counter_ms} ms after launch",
+                            observation.sampling_started_after_launch_ms
+                        ),
+                    ),
+                    check(
+                        &format!("rep{}-ready-plateau", observation.identity.repetition),
+                        plateau.trustworthy
+                            && plateau.relative_spread <= self.envelope.maximum_plateau_spread,
+                        format!("spread={:.3}%", plateau.relative_spread * 100.0),
+                    ),
+                ]);
             }
-            None => self.insert_error(24, "cold-start observation is absent".to_owned()),
+            Ok((assertions, peaks, readiness))
+        })();
+        match cold_result {
+            Ok((assertions, peaks, readiness)) => {
+                record_distribution(&mut self.metrics, "cold_peak_bytes", &peaks);
+                record_distribution(&mut self.metrics, "cold_readiness_ms", &readiness);
+                self.insert_checks(24, assertions);
+            }
+            Err(error) => self.insert_error(24, error.to_string()),
         }
     }
 
     fn evaluate_single_agent(&mut self) {
-        let Some(observation) = &self.evidence.single_agent else {
-            self.insert_error(25, "single-agent CPU observation is absent".to_owned());
-            return;
-        };
-        if observation.scripted_turns == 0 {
-            self.insert_error(25, "single-agent scripted turn count is zero".to_owned());
-            return;
-        }
-        let cpu = self.evidence.series.phase_cpu(&observation.turn_phase);
-        let barrier_cpu = self.evidence.series.phase_cpu(&observation.barrier_phase);
         let n1 = self.sweep_points.get(&1).copied();
-        match (cpu, barrier_cpu, n1) {
-            (Ok(cpu), Ok(barrier_cpu), Some(point)) => {
-                let cpu_per_turn = cpu.cpu_ns / u64::from(observation.scripted_turns);
+        let result = (|| -> Result<(Vec<Assertion>, Vec<f64>, Vec<f64>)> {
+            let observations = self.evidence.single_agent.as_ref().ok_or_else(|| {
+                AhrbError::Validation("single-agent observations are absent".to_owned())
+            })?;
+            let identities: Vec<&RepetitionIdentity> =
+                observations.iter().map(|item| &item.identity).collect();
+            self.validate_repetition_component("single-agent", &identities)?;
+            let mut assertions = Vec::new();
+            let mut cpu_per_turns = Vec::new();
+            let mut barrier_fractions = Vec::new();
+            for observation in observations {
+                if observation.scripted_turns == 0 {
+                    return Err(AhrbError::Validation(format!(
+                        "single-agent repetition {} scripted turn count is zero",
+                        observation.identity.repetition
+                    )));
+                }
+                self.require_phase_coverage(
+                    &observation.barrier_phase,
+                    self.timing.barrier_hold_ms,
+                )?;
+                let turn_samples: Vec<_> = self
+                    .evidence
+                    .series
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.phase == observation.turn_phase)
+                    .collect();
+                let barrier_samples: Vec<_> = self
+                    .evidence
+                    .series
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.phase == observation.barrier_phase)
+                    .collect();
+                let turn_first = turn_samples.first().copied().ok_or_else(|| {
+                    AhrbError::Validation(format!(
+                        "single-agent repetition {} has no turn-start boundary",
+                        observation.identity.repetition
+                    ))
+                })?;
+                let turn_last = turn_samples.last().copied().ok_or_else(|| {
+                    AhrbError::Validation(format!(
+                        "single-agent repetition {} has no turn-end boundary",
+                        observation.identity.repetition
+                    ))
+                })?;
+                let barrier_first = barrier_samples.first().copied().ok_or_else(|| {
+                    AhrbError::Validation(format!(
+                        "single-agent repetition {} has no barrier-start sample",
+                        observation.identity.repetition
+                    ))
+                })?;
+                let barrier_last = barrier_samples.last().copied().ok_or_else(|| {
+                    AhrbError::Validation(format!(
+                        "single-agent repetition {} has no barrier-end sample",
+                        observation.identity.repetition
+                    ))
+                })?;
+                let turn_first_identities: BTreeSet<_> = turn_first
+                    .processes
+                    .iter()
+                    .map(|process| process.identity)
+                    .collect();
+                let turn_last_identities: BTreeSet<_> = turn_last
+                    .processes
+                    .iter()
+                    .map(|process| process.identity)
+                    .collect();
+                let cpu = self.evidence.series.phase_cpu(&observation.turn_phase)?;
+                let barrier_cpu = self.evidence.series.phase_cpu(&observation.barrier_phase)?;
+                let cpu_per_turn = cpu.cpu_ns as f64 / f64::from(observation.scripted_turns);
+                cpu_per_turns.push(cpu_per_turn);
+                barrier_fractions.push(barrier_cpu.one_core_fraction);
+                assertions.extend([
+                    check(
+                        &format!(
+                            "rep{}-complete-turn-boundaries",
+                            observation.identity.repetition
+                        ),
+                        turn_first.elapsed_ns <= barrier_first.elapsed_ns
+                            && turn_last.elapsed_ns >= barrier_last.elapsed_ns
+                            && turn_first_identities == turn_last_identities
+                            && !turn_first_identities.is_empty(),
+                        format!(
+                            "turn={}..{} barrier={}..{} processes={}->{}",
+                            turn_first.elapsed_ns,
+                            turn_last.elapsed_ns,
+                            barrier_first.elapsed_ns,
+                            barrier_last.elapsed_ns,
+                            turn_first.processes.len(),
+                            turn_last.processes.len()
+                        ),
+                    ),
+                    check(
+                        &format!("rep{}-cpu-per-turn", observation.identity.repetition),
+                        cpu_per_turn <= self.envelope.maximum_cpu_ns_per_turn as f64,
+                        format!("{cpu_per_turn:.3} ns/turn"),
+                    ),
+                    check(
+                        &format!("rep{}-barrier-idle-cpu", observation.identity.repetition),
+                        barrier_cpu.one_core_fraction < self.envelope.maximum_barrier_cpu_fraction,
+                        format!("{:.3}%", barrier_cpu.one_core_fraction * 100.0),
+                    ),
+                ]);
+            }
+            Ok((assertions, cpu_per_turns, barrier_fractions))
+        })();
+        match (result, n1) {
+            (Ok((mut assertions, cpu_per_turns, barrier_fractions)), Some(point)) => {
+                assertions.extend([
+                    check(
+                        "single-agent-footprint",
+                        point.steady_bytes >= point.baseline_bytes,
+                        format!("B={} S1={}", point.baseline_bytes, point.steady_bytes),
+                    ),
+                    check(
+                        "single-agent-cold-peak",
+                        point.cold_peak_bytes <= self.envelope.maximum_peak_bytes,
+                        format!("{} bytes", point.cold_peak_bytes),
+                    ),
+                    check(
+                        "single-agent-workload-peak",
+                        point.workload_peak_bytes <= self.envelope.maximum_peak_bytes,
+                        format!("{} bytes", point.workload_peak_bytes),
+                    ),
+                ]);
+                record_distribution(
+                    &mut self.metrics,
+                    "single_agent_cpu_ns_per_turn",
+                    &cpu_per_turns,
+                );
+                record_distribution(
+                    &mut self.metrics,
+                    "single_agent_barrier_idle_cpu_one_core",
+                    &barrier_fractions,
+                );
                 self.metrics.insert(
                     "single_agent_cpu_ns_per_turn".to_owned(),
-                    cpu_per_turn as f64,
+                    median_f64_values(&cpu_per_turns).unwrap_or(f64::INFINITY),
                 );
                 self.metrics.insert(
-                    "single_agent_added_bytes".to_owned(),
-                    point.steady_bytes.saturating_sub(point.baseline_bytes) as f64,
+                    "single_agent_barrier_idle_cpu_one_core".to_owned(),
+                    median_f64_values(&barrier_fractions).unwrap_or(f64::INFINITY),
                 );
-                self.insert_checks(
-                    25,
-                    vec![
-                        check(
-                            "cpu-per-turn",
-                            cpu_per_turn <= self.envelope.maximum_cpu_ns_per_turn,
-                            format!("{cpu_per_turn} ns/turn"),
-                        ),
-                        check(
-                            "barrier-idle-cpu",
-                            barrier_cpu.one_core_fraction
-                                < self.envelope.maximum_barrier_cpu_fraction,
-                            format!("{:.3}%", barrier_cpu.one_core_fraction * 100.0),
-                        ),
-                        check(
-                            "single-agent-footprint",
-                            point.steady_bytes >= point.baseline_bytes,
-                            format!(
-                                "B={} S1={} P1={} C1={}",
-                                point.baseline_bytes,
-                                point.steady_bytes,
-                                point.workload_peak_bytes,
-                                point.cold_peak_bytes
-                            ),
-                        ),
-                    ],
-                );
+                self.insert_checks(25, assertions);
             }
-            (Err(error), _, _) | (_, Err(error), _) => self.insert_error(25, error.to_string()),
-            (_, _, None) => self.insert_error(25, "N=1 sweep point is absent".to_owned()),
+            (Err(error), _) => self.insert_error(25, error.to_string()),
+            (_, None) => self.insert_error(25, "N=1 sweep point is absent".to_owned()),
         }
     }
 
@@ -844,10 +1577,11 @@ impl<'a> Analysis<'a> {
             return;
         };
         let beta = metrics.headline_beta_bytes_per_agent;
-        let n8 = metrics
+        let target_agents = self.timing.sweep_widths.last().copied().unwrap_or(0);
+        let target = metrics
             .points
             .iter()
-            .find(|(point, _)| point.agents == 8)
+            .find(|(point, _)| point.agents == target_agents)
             .copied();
         let maximum_workload_peak = metrics
             .points
@@ -865,9 +1599,9 @@ impl<'a> Analysis<'a> {
                     format!("required={required:?} observed={observed:?}"),
                 ),
                 check(
-                    "n8-completes",
-                    n8.is_some(),
-                    format!("N8 present={}", n8.is_some()),
+                    &format!("n{target_agents}-completes"),
+                    target.is_some(),
+                    format!("N{target_agents} present={}", target.is_some()),
                 ),
                 check(
                     "total-peak",
@@ -904,57 +1638,162 @@ impl<'a> Analysis<'a> {
             ],
         );
 
-        let cleanup = self.evidence.cleanup.as_ref();
-        match n8 {
+        let cleanup_result = (|| -> Result<(Vec<Assertion>, Vec<f64>)> {
+            let observations = self.evidence.cleanup.as_ref().ok_or_else(|| {
+                AhrbError::Validation("cleanup observations are absent".to_owned())
+            })?;
+            let identities: Vec<&RepetitionIdentity> =
+                observations.iter().map(|item| &item.identity).collect();
+            self.validate_repetition_component("cleanup", &identities)?;
+            let mut assertions = Vec::new();
+            let mut deadlines = Vec::new();
+            for observation in observations {
+                deadlines.push(observation.reclaim_after_ms as f64);
+                let expected_sessions: BTreeSet<&str> = observation
+                    .expected_actor_sessions
+                    .values()
+                    .map(String::as_str)
+                    .collect();
+                let expected_width = usize::try_from(target_agents).unwrap_or(usize::MAX);
+                assertions.extend([
+                    check(
+                        &format!("rep{}-cleanup-deadline", observation.identity.repetition),
+                        observation.reclaim_after_ms <= self.timing.reclaim_deadline_ms,
+                        format!("{} ms", observation.reclaim_after_ms),
+                    ),
+                    check(
+                        &format!("rep{}-no-owned-worker", observation.identity.repetition),
+                        observation.remaining_workers == 0,
+                        format!("{} workers", observation.remaining_workers),
+                    ),
+                    check(
+                        &format!(
+                            "rep{}-expected-cleanup-set",
+                            observation.identity.repetition
+                        ),
+                        observation.expected_actor_sessions.len() == expected_width
+                            && expected_sessions.len() == expected_width,
+                        format!(
+                            "{} actors, {} unique sessions, expected {expected_width}",
+                            observation.expected_actor_sessions.len(),
+                            expected_sessions.len()
+                        ),
+                    ),
+                    check(
+                        &format!("rep{}-official-close-set", observation.identity.repetition),
+                        observation.closed_actor_sessions == observation.expected_actor_sessions,
+                        format!(
+                            "expected={:?} closed={:?}",
+                            observation.expected_actor_sessions, observation.closed_actor_sessions
+                        ),
+                    ),
+                    check(
+                        &format!(
+                            "rep{}-process-identity-reclaim",
+                            observation.identity.repetition
+                        ),
+                        !observation.baseline_processes.is_empty()
+                            && observation.post_close_processes == observation.baseline_processes,
+                        format!(
+                            "baseline={:?} post-close={:?}",
+                            observation.baseline_processes, observation.post_close_processes
+                        ),
+                    ),
+                    check(
+                        &format!("rep{}-thread-reclaim", observation.identity.repetition),
+                        observation.baseline_threads.is_some()
+                            && observation.post_close_threads == observation.baseline_threads,
+                        format!(
+                            "baseline={:?} post-close={:?}",
+                            observation.baseline_threads, observation.post_close_threads
+                        ),
+                    ),
+                ]);
+            }
+            Ok((assertions, deadlines))
+        })();
+        match target {
             Some((point, derived)) => {
                 let active = point.steady_bytes.saturating_sub(point.baseline_bytes);
                 let residual_limit = residual_limit(active, self.envelope);
-                self.insert_checks(
-                    28,
-                    vec![
-                        check(
-                            "reclaim-ratio",
-                            derived.reclaim_ratio >= self.envelope.minimum_reclaim_ratio,
-                            format!("{:.3}", derived.reclaim_ratio),
-                        ),
-                        check(
-                            "post-close-residual",
-                            derived.post_close_residual_bytes <= residual_limit,
-                            format!("{} <= {residual_limit}", derived.post_close_residual_bytes),
-                        ),
-                        check(
-                            "cleanup-deadline",
-                            cleanup.is_some_and(|value| {
-                                value.reclaim_after_ms <= self.timing.reclaim_deadline_ms
-                            }),
-                            format!(
-                                "{} ms",
-                                cleanup.map_or(u64::MAX, |value| value.reclaim_after_ms)
-                            ),
-                        ),
-                        check(
-                            "no-owned-worker",
-                            cleanup.is_some_and(|value| value.remaining_workers == 0),
-                            format!(
-                                "{} workers",
-                                cleanup.map_or(usize::MAX, |value| value.remaining_workers)
-                            ),
-                        ),
-                    ],
+                let repetition_reclaim_ok = self
+                    .sweep_repetition_points
+                    .iter()
+                    .filter(|((agents, _), _)| *agents == target_agents)
+                    .all(|(_, point)| {
+                        point_reclaim_ratio(*point) >= self.envelope.minimum_reclaim_ratio
+                    });
+                let measured_reclaim_after_ms =
+                    self.sweep_reclaim_after_ms.get(&target_agents).copied();
+                let (mut cleanup_assertions, cleanup_deadlines) = match cleanup_result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.insert_error(28, error.to_string());
+                        return;
+                    }
+                };
+                record_distribution(
+                    &mut self.metrics,
+                    "cleanup_reclaim_after_ms",
+                    &cleanup_deadlines,
                 );
+                cleanup_assertions.extend([
+                    check(
+                        "post-close-residual",
+                        derived.post_close_residual_bytes <= residual_limit,
+                        format!("{} <= {residual_limit}", derived.post_close_residual_bytes),
+                    ),
+                    check(
+                        "reclaim-ratio",
+                        derived.reclaim_ratio >= self.envelope.minimum_reclaim_ratio
+                            && repetition_reclaim_ok,
+                        format!("{:.3}", derived.reclaim_ratio),
+                    ),
+                    check(
+                        "measured-reclaim-deadline",
+                        measured_reclaim_after_ms
+                            .is_some_and(|value| value <= self.timing.reclaim_deadline_ms),
+                        format!("{} ms", measured_reclaim_after_ms.unwrap_or(u64::MAX)),
+                    ),
+                ]);
+                self.insert_checks(28, cleanup_assertions);
             }
-            None => self.insert_error(28, "N=8 sweep point is absent".to_owned()),
+            None => self.insert_error(28, format!("N={target_agents} sweep point is absent")),
         }
     }
 
     fn evaluate_long_horizon(&mut self) {
-        let Some(observation) = &self.evidence.long_horizon else {
-            self.insert_error(29, "long-horizon observation is absent".to_owned());
-            return;
-        };
-        match long_horizon_metrics(observation) {
-            Ok(metrics) => {
-                let expected_turns = self.timing.long_horizon_turns;
+        let result = (|| -> Result<(Vec<Assertion>, Vec<f64>, Vec<f64>)> {
+            let metric = self.evidence.memory_metric.ok_or_else(|| {
+                AhrbError::Validation("long-horizon memory metric is absent".to_owned())
+            })?;
+            let observations = self.evidence.long_horizon.as_ref().ok_or_else(|| {
+                AhrbError::Validation("long-horizon observations are absent".to_owned())
+            })?;
+            let identities: Vec<&RepetitionIdentity> =
+                observations.iter().map(|item| &item.identity).collect();
+            self.validate_repetition_component("long-horizon", &identities)?;
+            let mut assertions = Vec::new();
+            let mut slopes = Vec::new();
+            let mut residuals = Vec::new();
+            for observation in observations {
+                self.require_phase_coverage(
+                    &observation.baseline_phase,
+                    self.timing.idle_baseline_ms,
+                )?;
+                self.require_phase_coverage(
+                    &observation.final_post_close_phase,
+                    self.timing
+                        .barrier_discard_ms
+                        .saturating_add(self.timing.barrier_steady_ms),
+                )?;
+                let final_plateau = self.evidence.series.trailing_plateau(
+                    &observation.final_post_close_phase,
+                    metric,
+                    1,
+                    self.timing.barrier_steady_ms.saturating_mul(1_000_000),
+                )?;
+                let metrics = long_horizon_metrics(observation)?;
                 let residual = observation
                     .final_post_close_bytes
                     .saturating_sub(observation.baseline_bytes);
@@ -962,56 +1801,229 @@ impl<'a> Analysis<'a> {
                     (observation.baseline_bytes as f64
                         * self.envelope.long_horizon_baseline_fraction) as u64,
                 );
+                slopes.push(metrics.bytes_per_turn);
+                residuals.push(residual as f64);
+                let prefix = format!("rep{}", observation.identity.repetition);
+                let expected_checkpoint_count = self
+                    .timing
+                    .long_horizon_turns
+                    .checked_div(self.timing.long_horizon_sample_turns)
+                    .unwrap_or(0)
+                    .saturating_add(1) as usize;
+                let maximum_checkpoint_fds = observation
+                    .points
+                    .iter()
+                    .map(|point| point.open_fds)
+                    .max()
+                    .unwrap_or(0);
+                let maximum_checkpoint_threads = observation
+                    .points
+                    .iter()
+                    .map(|point| point.threads)
+                    .max()
+                    .unwrap_or(0);
+                let expected_turn_records: BTreeSet<u32> =
+                    (1..=self.timing.long_horizon_turns).collect();
+                let observed_turn_records: BTreeSet<u32> =
+                    observation.tool_results_by_turn.keys().copied().collect();
+                let mut fixture_errors = Vec::new();
+                let mut result_cursors = BTreeSet::new();
+                let mut result_event_ids = BTreeSet::new();
+                let mut result_count = 0_usize;
+                for turn in 1..=self.timing.long_horizon_turns {
+                    let results = observation
+                        .tool_results_by_turn
+                        .get(&turn)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    result_count = result_count.saturating_add(results.len());
+                    for result in results {
+                        result_cursors.insert(result.cursor);
+                        result_event_ids.insert(result.event_id.as_str());
+                    }
+                    if turn % 10 == 0 {
+                        let expected_call_id =
+                            format!("resource-long-r{}-t{turn}", observation.identity.repetition);
+                        if results.len() != 1
+                            || results.first().is_none_or(|result| {
+                                result.call_id != expected_call_id || result.name != "write_fixture"
+                            })
+                        {
+                            fixture_errors.push(format!(
+                                "turn {turn}: expected one write_fixture/{expected_call_id}, observed {results:?}"
+                            ));
+                        }
+                    } else if !results.is_empty() {
+                        fixture_errors.push(format!(
+                            "turn {turn}: expected no fixture result, observed {results:?}"
+                        ));
+                    }
+                }
+                let distinct_results =
+                    result_cursors.len() == result_count && result_event_ids.len() == result_count;
+                assertions.extend([
+                    check(
+                        &format!("{prefix}-long-horizon-turns"),
+                        observation.completed_turns == self.timing.long_horizon_turns
+                            && metrics.final_turn == self.timing.long_horizon_turns,
+                        format!(
+                            "completed={} final-checkpoint={} expected={}",
+                            observation.completed_turns,
+                            metrics.final_turn,
+                            self.timing.long_horizon_turns
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-checkpoint-count"),
+                        observation.points.len() == expected_checkpoint_count
+                            && observation.points.first().map(|point| point.turn) == Some(0),
+                        format!(
+                            "{} checkpoints, expected {expected_checkpoint_count}, first={:?}",
+                            observation.points.len(),
+                            observation.points.first().map(|point| point.turn)
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-checkpoint-cadence"),
+                        metrics.maximum_turn_gap <= self.timing.long_horizon_sample_turns,
+                        format!("maximum gap {} turns", metrics.maximum_turn_gap),
+                    ),
+                    check(
+                        &format!("{prefix}-tool-result-turn-coverage"),
+                        observed_turn_records == expected_turn_records && distinct_results,
+                        format!(
+                            "turn-records={} expected={} distinct-results={distinct_results}",
+                            observed_turn_records.len(),
+                            expected_turn_records.len()
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-fixture-tool-cadence"),
+                        fixture_errors.is_empty(),
+                        if fixture_errors.is_empty() {
+                            format!("{result_count} exact fixture results")
+                        } else {
+                            fixture_errors.join("; ")
+                        },
+                    ),
+                    check(
+                        &format!("{prefix}-official-session-close"),
+                        observation.closed_session_id.as_deref()
+                            == Some(observation.expected_session_id.as_str()),
+                        format!(
+                            "expected={:?} closed={:?}",
+                            observation.expected_session_id, observation.closed_session_id
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-memory-per-turn"),
+                        metrics.bytes_per_turn <= self.envelope.maximum_long_horizon_bytes_per_turn,
+                        format!("{:.3} bytes/turn", metrics.bytes_per_turn),
+                    ),
+                    check(
+                        &format!("{prefix}-final-residual"),
+                        residual <= residual_limit,
+                        format!("{residual} <= {residual_limit}"),
+                    ),
+                    check(
+                        &format!("{prefix}-final-plateau"),
+                        final_plateau.trustworthy
+                            && final_plateau.median_bytes == observation.final_post_close_bytes,
+                        format!(
+                            "trustworthy={} median={} recorded={}",
+                            final_plateau.trustworthy,
+                            final_plateau.median_bytes,
+                            observation.final_post_close_bytes
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-process-identity-reclaim"),
+                        !observation.baseline_processes.is_empty()
+                            && observation.final_post_close_processes
+                                == observation.baseline_processes,
+                        format!(
+                            "baseline={:?} final={:?}",
+                            observation.baseline_processes, observation.final_post_close_processes
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-final-fd-reclaim"),
+                        observation.final_post_close_open_fds <= maximum_checkpoint_fds,
+                        format!(
+                            "baseline={} final={} workload-max={maximum_checkpoint_fds}",
+                            observation.baseline_open_fds, observation.final_post_close_open_fds,
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-final-thread-reclaim"),
+                        observation.final_post_close_threads <= maximum_checkpoint_threads,
+                        format!(
+                            "baseline={} final={} workload-max={maximum_checkpoint_threads}",
+                            observation.baseline_threads, observation.final_post_close_threads,
+                        ),
+                    ),
+                    check(
+                        &format!("{prefix}-fd-leak"),
+                        !metrics.monotonic_fd_growth,
+                        format!("monotonic={}", metrics.monotonic_fd_growth),
+                    ),
+                    check(
+                        &format!("{prefix}-thread-leak"),
+                        !metrics.monotonic_thread_growth,
+                        format!("monotonic={}", metrics.monotonic_thread_growth),
+                    ),
+                ]);
+            }
+            Ok((assertions, slopes, residuals))
+        })();
+        match result {
+            Ok((assertions, slopes, residuals)) => {
+                record_distribution(&mut self.metrics, "long_horizon_bytes_per_turn", &slopes);
+                record_distribution(
+                    &mut self.metrics,
+                    "long_horizon_final_residual_bytes",
+                    &residuals,
+                );
                 self.metrics.insert(
                     "long_horizon_bytes_per_turn".to_owned(),
-                    metrics.bytes_per_turn,
+                    median_f64_values(&slopes).unwrap_or(f64::INFINITY),
                 );
-                self.metrics.insert(
-                    "long_horizon_final_residual_bytes".to_owned(),
-                    residual as f64,
-                );
-                self.insert_checks(
-                    29,
-                    vec![
-                        check(
-                            "long-horizon-turns",
-                            metrics.final_turn >= expected_turns,
-                            format!("{} >= {expected_turns}", metrics.final_turn),
-                        ),
-                        check(
-                            "checkpoint-cadence",
-                            metrics.maximum_turn_gap <= self.timing.long_horizon_sample_turns,
-                            format!(
-                                "maximum gap {} turns <= {}",
-                                metrics.maximum_turn_gap, self.timing.long_horizon_sample_turns
-                            ),
-                        ),
-                        check(
-                            "memory-per-turn",
-                            metrics.bytes_per_turn
-                                <= self.envelope.maximum_long_horizon_bytes_per_turn,
-                            format!("{:.3} bytes/turn", metrics.bytes_per_turn),
-                        ),
-                        check(
-                            "final-residual",
-                            residual <= residual_limit,
-                            format!("{residual} <= {residual_limit}"),
-                        ),
-                        check(
-                            "fd-leak",
-                            !metrics.monotonic_fd_growth,
-                            format!("monotonic={}", metrics.monotonic_fd_growth),
-                        ),
-                        check(
-                            "thread-leak",
-                            !metrics.monotonic_thread_growth,
-                            format!("monotonic={}", metrics.monotonic_thread_growth),
-                        ),
-                    ],
-                );
+                self.insert_checks(29, assertions);
             }
             Err(error) => self.insert_error(29, error.to_string()),
         }
+    }
+
+    fn require_phase_coverage(&self, phase: &str, required_ms: u64) -> Result<()> {
+        let cadence = self.evidence.phases.cadence.as_ref().ok_or_else(|| {
+            AhrbError::Validation("split sampler cadence evidence is absent".to_owned())
+        })?;
+        let coverage = self.evidence.series.phase_coverage(
+            phase,
+            cadence.counter_cadence_ns,
+            required_ms.saturating_mul(1_000_000),
+        )?;
+        if !coverage.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} coverage is untrustworthy: observed={} ns required={} ns maximum-gap={} ns cadence-gaps={}",
+                coverage.observed_duration_ns,
+                coverage.required_duration_ns,
+                coverage.maximum_gap_ns,
+                coverage.cadence_gaps
+            )));
+        }
+        let membership =
+            membership_phase_coverage(cadence, phase, required_ms.saturating_mul(1_000_000))?;
+        if !membership.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} membership coverage is untrustworthy: observed={} ns required={} ns maximum-gap={} ns cadence-gaps={}",
+                membership.observed_duration_ns,
+                membership.required_duration_ns,
+                membership.maximum_gap_ns,
+                membership.cadence_gaps
+            )));
+        }
+        Ok(())
     }
 
     fn plateau(
@@ -1035,6 +2047,159 @@ impl<'a> Analysis<'a> {
         };
         self.plateaus.insert(name.to_owned(), plateau.clone());
         Ok(plateau)
+    }
+
+    fn record_sweep_point_metrics(
+        &mut self,
+        point: SweepPoint,
+        derived: crate::sampler::PointMetrics,
+    ) {
+        let prefix = format!("parallel_n{}", point.agents);
+        for (suffix, value) in [
+            ("baseline_bytes", point.baseline_bytes as f64),
+            ("steady_bytes", point.steady_bytes as f64),
+            ("workload_peak_bytes", point.workload_peak_bytes as f64),
+            ("cold_peak_bytes", point.cold_peak_bytes as f64),
+            ("post_turn_bytes", point.post_turn_bytes as f64),
+            ("post_close_bytes", point.post_close_bytes as f64),
+            (
+                "average_added_bytes_per_agent",
+                derived.average_added_bytes_per_agent,
+            ),
+            (
+                "post_turn_retained_bytes",
+                derived.post_turn_retained_bytes as f64,
+            ),
+            (
+                "post_close_residual_bytes",
+                derived.post_close_residual_bytes as f64,
+            ),
+            ("residual_bytes_per_agent", derived.residual_bytes_per_agent),
+            ("reclaim_ratio", derived.reclaim_ratio),
+        ] {
+            self.metrics.insert(format!("{prefix}_{suffix}"), value);
+        }
+        if let Some(value) = derived.adjacent_marginal_bytes_per_agent {
+            self.metrics
+                .insert(format!("{prefix}_adjacent_marginal_bytes_per_agent"), value);
+        }
+        if let Some(value) = derived.peak_amplification {
+            self.metrics
+                .insert(format!("{prefix}_peak_amplification"), value);
+        }
+    }
+
+    fn record_sweep_repetition_distributions(&mut self) -> Result<()> {
+        let mut repetitions = Vec::new();
+        for repetition in 0..self.timing.repetitions {
+            let points: Vec<SweepPoint> = self
+                .timing
+                .sweep_widths
+                .iter()
+                .map(|agents| {
+                    self.sweep_repetition_points
+                        .get(&(*agents, repetition))
+                        .copied()
+                        .ok_or_else(|| {
+                            AhrbError::Validation(format!(
+                                "missing N={agents} repetition {repetition} distribution point"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            repetitions.push(SweepMetrics::calculate(&points)?);
+        }
+
+        let beta: Vec<f64> = repetitions
+            .iter()
+            .filter_map(|metrics| metrics.headline_beta_bytes_per_agent)
+            .collect();
+        let beta_mib: Vec<f64> = repetitions
+            .iter()
+            .filter_map(|metrics| metrics.headline_beta_mib_per_agent)
+            .collect();
+        let alpha: Vec<f64> = repetitions
+            .iter()
+            .filter_map(|metrics| metrics.scaling_exponent_alpha)
+            .collect();
+        if alpha.len() != repetitions.len() {
+            return Err(AhrbError::Validation(
+                "scaling alpha requires a strictly positive active delta at every width and repetition"
+                    .to_owned(),
+            ));
+        }
+        let cold_peaks: Vec<f64> = repetitions
+            .iter()
+            .map(|metrics| metrics.maximum_cold_peak_bytes as f64)
+            .collect();
+        let workload_peaks: Vec<f64> = repetitions
+            .iter()
+            .map(|metrics| metrics.maximum_workload_peak_bytes as f64)
+            .collect();
+        record_distribution(&mut self.metrics, "parallel_beta_bytes_per_agent", &beta);
+        record_distribution(&mut self.metrics, "parallel_beta_mib_per_agent", &beta_mib);
+        record_distribution(&mut self.metrics, "parallel_scaling_exponent", &alpha);
+        record_distribution(&mut self.metrics, "maximum_cold_peak_bytes", &cold_peaks);
+        record_distribution(
+            &mut self.metrics,
+            "maximum_workload_peak_bytes",
+            &workload_peaks,
+        );
+
+        for &agents in &self.timing.sweep_widths {
+            let mut values: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+            for metrics in &repetitions {
+                let (point, derived) = metrics
+                    .points
+                    .iter()
+                    .find(|(point, _)| point.agents == agents)
+                    .ok_or_else(|| {
+                        AhrbError::Validation(format!("N={agents} distribution is absent"))
+                    })?;
+                for (name, value) in [
+                    ("baseline_bytes", point.baseline_bytes as f64),
+                    ("steady_bytes", point.steady_bytes as f64),
+                    ("workload_peak_bytes", point.workload_peak_bytes as f64),
+                    ("cold_peak_bytes", point.cold_peak_bytes as f64),
+                    ("post_turn_bytes", point.post_turn_bytes as f64),
+                    ("post_close_bytes", point.post_close_bytes as f64),
+                    (
+                        "average_added_bytes_per_agent",
+                        derived.average_added_bytes_per_agent,
+                    ),
+                    (
+                        "peak_amplification",
+                        derived.peak_amplification.unwrap_or(0.0),
+                    ),
+                    (
+                        "post_turn_retained_bytes",
+                        derived.post_turn_retained_bytes as f64,
+                    ),
+                    (
+                        "post_close_residual_bytes",
+                        derived.post_close_residual_bytes as f64,
+                    ),
+                    ("residual_bytes_per_agent", derived.residual_bytes_per_agent),
+                    ("reclaim_ratio", derived.reclaim_ratio),
+                ] {
+                    values.entry(name).or_default().push(value);
+                }
+                if let Some(value) = derived.adjacent_marginal_bytes_per_agent {
+                    values
+                        .entry("adjacent_marginal_bytes_per_agent")
+                        .or_default()
+                        .push(value);
+                }
+            }
+            for (name, distribution) in values {
+                record_distribution(
+                    &mut self.metrics,
+                    &format!("parallel_n{agents}_{name}"),
+                    &distribution,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn insert_checks(&mut self, row: u8, assertions: Vec<Assertion>) {
@@ -1147,11 +2312,403 @@ fn phase_net_growth(series: &SampleSeries, phase: &str, metric: MemoryMetric) ->
     Ok(last.saturating_sub(first))
 }
 
+fn membership_phase_coverage(
+    cadence: &ResourceCadenceEvidence,
+    phase: &str,
+    required_duration_ns: u64,
+) -> Result<PhaseCoverage> {
+    if cadence.membership_cadence_ns == 0 {
+        return Err(AhrbError::Validation(
+            "membership cadence must be nonzero".to_owned(),
+        ));
+    }
+    let times = cadence
+        .membership_samples_by_phase
+        .get(phase)
+        .ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "phase {phase:?} has no membership-refresh evidence"
+            ))
+        })?;
+    if times.len() < 2 || times.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return Err(AhrbError::Validation(format!(
+            "phase {phase:?} needs strictly increasing membership boundary samples"
+        )));
+    }
+    let start_ns = times.first().copied().unwrap_or(0);
+    let end_ns = times.last().copied().unwrap_or(start_ns);
+    let observed_duration_ns = end_ns.saturating_sub(start_ns);
+    let (maximum_gap_ns, cadence_gaps, cadence_trustworthy) =
+        cadence_quality(times, cadence.membership_cadence_ns);
+    let duration_covered =
+        observed_duration_ns.saturating_add(cadence.membership_cadence_ns) >= required_duration_ns;
+    Ok(PhaseCoverage {
+        sample_count: times.len(),
+        start_ns,
+        end_ns,
+        observed_duration_ns,
+        required_duration_ns,
+        maximum_gap_ns,
+        cadence_gaps,
+        duration_covered,
+        trustworthy: duration_covered && cadence_trustworthy,
+    })
+}
+
+fn validate_membership_cadence(cadence: &ResourceCadenceEvidence) -> Result<()> {
+    if cadence.membership_samples_by_phase.is_empty() {
+        return Err(AhrbError::Validation(
+            "membership-refresh evidence is absent".to_owned(),
+        ));
+    }
+    if cadence.membership_refreshes_by_phase.is_empty() {
+        return Err(AhrbError::Validation(
+            "membership discovery-duration evidence is absent".to_owned(),
+        ));
+    }
+    for (phase, times) in &cadence.membership_samples_by_phase {
+        let refreshes = cadence
+            .membership_refreshes_by_phase
+            .get(phase)
+            .ok_or_else(|| {
+                AhrbError::Validation(format!(
+                    "phase {phase:?} has no membership discovery-duration evidence"
+                ))
+            })?;
+        let mut refresh_times = refreshes
+            .iter()
+            .map(|refresh| refresh.elapsed_ns)
+            .collect::<Vec<_>>();
+        refresh_times.sort_unstable();
+        refresh_times.dedup();
+        if refresh_times != *times {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} membership timestamps disagree with discovery evidence"
+            )));
+        }
+        if let Some(overrun) = refreshes
+            .iter()
+            .find(|refresh| refresh.discovery_wall_ns > cadence.membership_cadence_ns)
+        {
+            return Err(AhrbError::Validation(format!(
+                "sampler overload: membership phase {phase:?} lane {} discovery consumed {} wall ns at a {} ns cadence",
+                overrun.lane, overrun.discovery_wall_ns, cadence.membership_cadence_ns
+            )));
+        }
+        let required = times
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(times.first().copied().unwrap_or(0));
+        let coverage = membership_phase_coverage(cadence, phase, required.max(1))?;
+        if !coverage.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "sampler overload: membership phase {phase:?} has {} bounded-jitter gaps and maximum gap {} ns",
+                coverage.cadence_gaps, coverage.maximum_gap_ns
+            )));
+        }
+    }
+    if cadence.membership_refreshes_by_phase.len() != cadence.membership_samples_by_phase.len() {
+        return Err(AhrbError::Validation(
+            "membership discovery evidence contains unknown phases".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn complete_idle_repetitions(
+    repetitions: &[IdlePhaseRepetition],
+    required_count: u32,
+    profile: ResourceProfile,
+) -> Result<(Vec<IdlePhaseRepetition>, BTreeMap<u32, String>)> {
+    let expected: BTreeSet<u32> = (0..required_count).collect();
+    let mut by_repetition = BTreeMap::new();
+    for repetition in repetitions {
+        if by_repetition
+            .insert(repetition.identity.repetition, repetition.clone())
+            .is_some()
+        {
+            return Err(AhrbError::Validation(format!(
+                "duplicate idle evidence for repetition {}",
+                repetition.identity.repetition
+            )));
+        }
+    }
+    let observed: BTreeSet<u32> = by_repetition.keys().copied().collect();
+    if observed != expected {
+        return Err(AhrbError::Validation(format!(
+            "idle fresh-profile repetitions incomplete: required={expected:?} observed={observed:?}"
+        )));
+    }
+    let identities: Vec<&RepetitionIdentity> = by_repetition
+        .values()
+        .map(|repetition| &repetition.identity)
+        .collect();
+    let tokens = validate_component_identities("idle", &identities, profile, required_count, None)?;
+    Ok((by_repetition.into_values().collect(), tokens))
+}
+
+fn validate_component_identities(
+    component: &str,
+    identities: &[&RepetitionIdentity],
+    profile: ResourceProfile,
+    required_count: u32,
+    expected_tokens: Option<&BTreeMap<u32, String>>,
+) -> Result<BTreeMap<u32, String>> {
+    let expected_repetitions: BTreeSet<u32> = (0..required_count).collect();
+    let mut tokens = BTreeMap::new();
+    let mut unique_tokens = BTreeSet::new();
+    for identity in identities {
+        if identity.profile != profile {
+            return Err(AhrbError::Validation(format!(
+                "{component} repetition {} used profile {:?}, expected {profile:?}",
+                identity.repetition, identity.profile
+            )));
+        }
+        if identity.isolation_token.is_empty() {
+            return Err(AhrbError::Validation(format!(
+                "{component} repetition {} has an empty isolation token",
+                identity.repetition
+            )));
+        }
+        if tokens
+            .insert(identity.repetition, identity.isolation_token.clone())
+            .is_some()
+        {
+            return Err(AhrbError::Validation(format!(
+                "{component} has duplicate repetition {}",
+                identity.repetition
+            )));
+        }
+        if !unique_tokens.insert(identity.isolation_token.clone()) {
+            return Err(AhrbError::Validation(format!(
+                "{component} reused isolation token {:?}",
+                identity.isolation_token
+            )));
+        }
+    }
+    let observed: BTreeSet<u32> = tokens.keys().copied().collect();
+    if observed != expected_repetitions {
+        return Err(AhrbError::Validation(format!(
+            "{component} repetitions incomplete: required={expected_repetitions:?} observed={observed:?}"
+        )));
+    }
+    if let Some(expected) = expected_tokens {
+        if &tokens != expected {
+            return Err(AhrbError::Validation(format!(
+                "{component} isolation tokens do not match the fresh-profile idle repetitions"
+            )));
+        }
+    }
+    Ok(tokens)
+}
+
+fn validate_warmups(
+    observations: Option<&[WarmupObservation]>,
+    timing: &ResourceTimingPlan,
+    expected_tokens: &BTreeMap<u32, String>,
+) -> Result<()> {
+    let observations = observations
+        .ok_or_else(|| AhrbError::Validation("unmeasured warm-up evidence is absent".to_owned()))?;
+    let identities: Vec<&RepetitionIdentity> = observations
+        .iter()
+        .map(|observation| &observation.identity)
+        .collect();
+    validate_component_identities(
+        "warm-up",
+        &identities,
+        timing.profile,
+        timing.repetitions,
+        Some(expected_tokens),
+    )?;
+    for observation in observations {
+        if observation.completed_turns != timing.warmup_turns
+            || !observation.terminalized
+            || !observation.closed
+        {
+            return Err(AhrbError::Validation(format!(
+                "warm-up repetition {} is incomplete: turns={} required={} terminalized={} closed={}",
+                observation.identity.repetition,
+                observation.completed_turns,
+                timing.warmup_turns,
+                observation.terminalized,
+                observation.closed
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sweep_structure(
+    observations: &[SweepObservation],
+    timing: &ResourceTimingPlan,
+    expected_tokens: &BTreeMap<u32, String>,
+) -> Result<()> {
+    let mut identities = BTreeMap::<u32, RepetitionIdentity>::new();
+    let mut seeds = BTreeSet::new();
+    let mut orders = BTreeMap::<u32, BTreeMap<u32, u32>>::new();
+    for observation in observations {
+        let repetition = observation.identity.repetition;
+        if let Some(existing) = identities.get(&repetition) {
+            if existing != &observation.identity {
+                return Err(AhrbError::Validation(format!(
+                    "sweep repetition {repetition} has inconsistent profile isolation identity"
+                )));
+            }
+        } else {
+            identities.insert(repetition, observation.identity.clone());
+        }
+        seeds.insert(observation.width_rotation_seed);
+        if orders
+            .entry(repetition)
+            .or_default()
+            .insert(observation.width_order_index, observation.agents)
+            .is_some()
+        {
+            return Err(AhrbError::Validation(format!(
+                "sweep repetition {repetition} has duplicate width order index {}",
+                observation.width_order_index
+            )));
+        }
+    }
+    if seeds.len() != 1 {
+        return Err(AhrbError::Validation(format!(
+            "sweep width rotation seed is not stable: {seeds:?}"
+        )));
+    }
+    let identity_refs: Vec<&RepetitionIdentity> = identities.values().collect();
+    validate_component_identities(
+        "sweep",
+        &identity_refs,
+        timing.profile,
+        timing.repetitions,
+        Some(expected_tokens),
+    )?;
+    let seed = seeds.first().copied().unwrap_or(0);
+    for repetition in 0..timing.repetitions {
+        let mut expected = timing.sweep_widths.clone();
+        if !expected.is_empty() {
+            let offset = usize::try_from(seed)
+                .unwrap_or(usize::MAX)
+                .wrapping_add(repetition as usize)
+                % expected.len();
+            expected.rotate_left(offset);
+        }
+        let observed_order = orders.get(&repetition).ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "sweep repetition {repetition} has no width-order evidence"
+            ))
+        })?;
+        let expected_indexes: BTreeSet<u32> =
+            (0..u32::try_from(expected.len()).unwrap_or(u32::MAX)).collect();
+        let observed_indexes: BTreeSet<u32> = observed_order.keys().copied().collect();
+        let observed: Vec<u32> = observed_order.values().copied().collect();
+        if observed_indexes != expected_indexes || observed != expected {
+            return Err(AhrbError::Validation(format!(
+                "sweep repetition {repetition} width rotation mismatch: expected={expected:?} observed={observed:?} indexes={observed_indexes:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn median_u64_values(values: &[u64]) -> Option<u64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        length if length % 2 == 1 => sorted.get(middle).copied(),
+        _ => {
+            let lower = sorted.get(middle.saturating_sub(1)).copied()?;
+            let upper = sorted.get(middle).copied()?;
+            Some(lower.saturating_add(upper.saturating_sub(lower) / 2))
+        }
+    }
+}
+
+fn median_f64_values(values: &[f64]) -> Option<f64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        length if length % 2 == 1 => sorted.get(middle).copied(),
+        _ => {
+            let lower = sorted.get(middle.saturating_sub(1)).copied()?;
+            let upper = sorted.get(middle).copied()?;
+            Some(lower + (upper - lower) / 2.0)
+        }
+    }
+}
+
+fn record_distribution(metrics: &mut BTreeMap<String, f64>, prefix: &str, values: &[f64]) {
+    let Some(median) = median_f64_values(values) else {
+        return;
+    };
+    let deviations: Vec<f64> = values.iter().map(|value| (value - median).abs()).collect();
+    let mad = median_f64_values(&deviations).unwrap_or(0.0);
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = 95_usize
+        .saturating_mul(sorted.len())
+        .saturating_add(99)
+        .saturating_div(100)
+        .saturating_sub(1);
+    let p95 = sorted.get(rank).copied().unwrap_or(median);
+    metrics.insert(format!("{prefix}_median"), median);
+    metrics.insert(format!("{prefix}_mad"), mad);
+    metrics.insert(format!("{prefix}_p95"), p95);
+}
+
+fn aggregate_sweep_points(points: impl Iterator<Item = SweepPoint>) -> Result<SweepPoint> {
+    let points: Vec<SweepPoint> = points.collect();
+    let agents = points
+        .first()
+        .map(|point| point.agents)
+        .ok_or_else(|| AhrbError::Validation("cannot aggregate an empty sweep".to_owned()))?;
+    if points.iter().any(|point| point.agents != agents) {
+        return Err(AhrbError::Validation(
+            "cannot aggregate sweep points with different widths".to_owned(),
+        ));
+    }
+    let median = |select: fn(&SweepPoint) -> u64| {
+        median_u64_values(&points.iter().map(select).collect::<Vec<_>>())
+            .ok_or_else(|| AhrbError::Validation("sweep median is absent".to_owned()))
+    };
+    Ok(SweepPoint {
+        agents,
+        baseline_bytes: median(|point| point.baseline_bytes)?,
+        steady_bytes: median(|point| point.steady_bytes)?,
+        workload_peak_bytes: points
+            .iter()
+            .map(|point| point.workload_peak_bytes)
+            .max()
+            .unwrap_or(0),
+        cold_peak_bytes: points
+            .iter()
+            .map(|point| point.cold_peak_bytes)
+            .max()
+            .unwrap_or(0),
+        post_turn_bytes: median(|point| point.post_turn_bytes)?,
+        post_close_bytes: median(|point| point.post_close_bytes)?,
+    })
+}
+
+fn point_reclaim_ratio(point: SweepPoint) -> f64 {
+    let active = point.steady_bytes.saturating_sub(point.baseline_bytes);
+    if active == 0 {
+        return 0.0;
+    }
+    ((point.steady_bytes as f64 - point.post_close_bytes as f64) / active as f64).clamp(0.0, 1.0)
+}
+
 fn derive_sweep_point(
     series: &SampleSeries,
     observation: &SweepObservation,
     metric: MemoryMetric,
-    trailing_ns: u64,
+    timing: &ResourceTimingPlan,
+    cadence: &ResourceCadenceEvidence,
     maximum_spread: f64,
 ) -> Result<(SweepPoint, Vec<(String, Plateau)>)> {
     if observation.agents == 0 {
@@ -1159,11 +2716,88 @@ fn derive_sweep_point(
             "sweep observation has N=0".to_owned(),
         ));
     }
-    if observation.minimum_steady_processes < observation.agents as usize {
+    if observation.barrier_checkpoint.is_empty() {
         return Err(AhrbError::Validation(format!(
-            "N={} steady membership requirement {} is smaller than N",
-            observation.agents, observation.minimum_steady_processes
+            "N={} repetition {} has no named barrier checkpoint",
+            observation.agents, observation.identity.repetition
         )));
+    }
+    if observation.expected_barrier_actors.len() != observation.agents as usize {
+        return Err(AhrbError::Validation(format!(
+            "N={} repetition {} expected actor set has {} unique actors",
+            observation.agents,
+            observation.identity.repetition,
+            observation.expected_barrier_actors.len()
+        )));
+    }
+    if observation.observed_barrier_actors != observation.expected_barrier_actors {
+        return Err(AhrbError::Validation(format!(
+            "N={} repetition {} barrier {:?} actor evidence is incomplete: expected={:?} observed={:?}",
+            observation.agents,
+            observation.identity.repetition,
+            observation.barrier_checkpoint,
+            observation.expected_barrier_actors,
+            observation.observed_barrier_actors
+        )));
+    }
+    for (phase, duration_ms) in [
+        (&observation.baseline_phase, timing.idle_baseline_ms),
+        (&observation.steady_phase, timing.barrier_hold_ms),
+        (&observation.post_turn_phase, timing.barrier_steady_ms),
+        (&observation.post_close_phase, timing.barrier_steady_ms),
+    ] {
+        let coverage = series.phase_coverage(
+            phase,
+            cadence.counter_cadence_ns,
+            duration_ms.saturating_mul(1_000_000),
+        )?;
+        if !coverage.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "N={} repetition {} phase {phase:?} is truncated or gapped: observed={} ns required={} ns maximum-gap={} ns",
+                observation.agents,
+                observation.identity.repetition,
+                coverage.observed_duration_ns,
+                coverage.required_duration_ns,
+                coverage.maximum_gap_ns
+            )));
+        }
+        let membership =
+            membership_phase_coverage(cadence, phase, duration_ms.saturating_mul(1_000_000))?;
+        if !membership.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "N={} repetition {} membership phase {phase:?} is truncated or gapped",
+                observation.agents, observation.identity.repetition
+            )));
+        }
+    }
+    for phase in [&observation.workload_phase, &observation.cold_phase] {
+        let coverage = series.phase_coverage(
+            phase,
+            cadence.counter_cadence_ns,
+            cadence.counter_cadence_ns,
+        )?;
+        if !coverage.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "N={} repetition {} boundary phase {phase:?} is gapped",
+                observation.agents, observation.identity.repetition
+            )));
+        }
+        let membership = membership_phase_coverage(cadence, phase, cadence.membership_cadence_ns)?;
+        if !membership.trustworthy {
+            return Err(AhrbError::Validation(format!(
+                "N={} repetition {} boundary membership phase {phase:?} is gapped",
+                observation.agents, observation.identity.repetition
+            )));
+        }
+    }
+    if timing
+        .barrier_discard_ms
+        .saturating_add(timing.barrier_steady_ms)
+        > timing.barrier_hold_ms
+    {
+        return Err(AhrbError::Validation(
+            "barrier discard plus steady window exceeds the hold duration".to_owned(),
+        ));
     }
     let baseline = series.plateau(
         &observation.baseline_phase,
@@ -1174,17 +2808,19 @@ fn derive_sweep_point(
         &observation.steady_phase,
         metric,
         observation.minimum_steady_processes,
-        trailing_ns,
+        timing.barrier_steady_ms.saturating_mul(1_000_000),
     )?;
-    let post_turn = series.plateau(
+    let post_turn = series.trailing_plateau(
         &observation.post_turn_phase,
         metric,
         observation.minimum_post_turn_processes,
+        timing.barrier_steady_ms.saturating_mul(1_000_000),
     )?;
-    let post_close = series.plateau(
+    let post_close = series.trailing_plateau(
         &observation.post_close_phase,
         metric,
         observation.minimum_post_close_processes,
+        timing.barrier_steady_ms.saturating_mul(1_000_000),
     )?;
     for (name, plateau) in [
         ("baseline", &baseline),
@@ -1213,10 +2849,34 @@ fn derive_sweep_point(
     Ok((
         point,
         vec![
-            (format!("n{}-baseline", observation.agents), baseline),
-            (format!("n{}-steady", observation.agents), steady),
-            (format!("n{}-post-turn", observation.agents), post_turn),
-            (format!("n{}-post-close", observation.agents), post_close),
+            (
+                format!(
+                    "rep{}-n{}-baseline",
+                    observation.identity.repetition, observation.agents
+                ),
+                baseline,
+            ),
+            (
+                format!(
+                    "rep{}-n{}-steady",
+                    observation.identity.repetition, observation.agents
+                ),
+                steady,
+            ),
+            (
+                format!(
+                    "rep{}-n{}-post-turn",
+                    observation.identity.repetition, observation.agents
+                ),
+                post_turn,
+            ),
+            (
+                format!(
+                    "rep{}-n{}-post-close",
+                    observation.identity.repetition, observation.agents
+                ),
+                post_close,
+            ),
         ],
     ))
 }
@@ -1283,7 +2943,7 @@ fn adjacent_marginals_stable(metrics: &SweepMetrics) -> bool {
             let upper = preceding.len() / 2;
             preceding[upper - 1] + (preceding[upper] - preceding[upper - 1]) / 2.0
         };
-        if median > 0.0 && marginals[index] > median * 2.0 {
+        if marginals[index] > median * 2.0 {
             return false;
         }
     }
@@ -1416,11 +3076,16 @@ mod tests {
             cgroup_memory_bytes: None,
             cgroup_peak_bytes: None,
             cpu_ns,
+            open_fds: None,
+            thread_count: Some(2),
             collection_ns: 1_000,
+            collection_wall_ns: 1_000,
             processes,
+            process_samples: Vec::new(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_phase(
         series: &mut SampleSeries,
         clock: &mut u64,
@@ -1428,95 +3093,414 @@ mod tests {
         bytes: u64,
         cpu_fraction_percent: u64,
         process_count: usize,
+        duration_ms: u64,
+        cadence_ns: u64,
     ) -> Result<()> {
-        let initial_cpu = *clock / 100 * cpu_fraction_percent;
-        for offset in 0..=2_u64 {
-            let elapsed = clock.saturating_add(offset * 1_000_000_000);
-            let cpu = initial_cpu.saturating_add(offset * 10_000_000 * cpu_fraction_percent);
+        let duration_ns = duration_ms.saturating_mul(1_000_000);
+        let steps = duration_ns.saturating_add(cadence_ns.saturating_sub(1)) / cadence_ns;
+        let initial_cpu = *clock / 10;
+        for offset in 0..=steps {
+            let phase_elapsed = offset.saturating_mul(cadence_ns).min(duration_ns);
+            let elapsed = clock.saturating_add(phase_elapsed);
+            let cpu = initial_cpu
+                .saturating_add(phase_elapsed.saturating_mul(cpu_fraction_percent) / 100);
             series.push(sample(elapsed, phase, bytes, cpu, process_count))?;
         }
-        *clock = clock.saturating_add(3_000_000_000);
+        *clock = clock.saturating_add(duration_ns).saturating_add(cadence_ns);
         Ok(())
     }
 
+    fn repetition_identity(profile: ResourceProfile, repetition: u32) -> RepetitionIdentity {
+        RepetitionIdentity {
+            repetition,
+            profile,
+            isolation_token: format!("fresh-{profile:?}-{repetition}"),
+        }
+    }
+
+    fn membership_samples(series: &SampleSeries, cadence_ns: u64) -> BTreeMap<String, Vec<u64>> {
+        let mut bounds = BTreeMap::<String, (u64, u64)>::new();
+        for sample in &series.samples {
+            bounds
+                .entry(sample.phase.clone())
+                .and_modify(|(_, end)| *end = sample.elapsed_ns)
+                .or_insert((sample.elapsed_ns, sample.elapsed_ns));
+        }
+        bounds
+            .into_iter()
+            .map(|(phase, (start, end))| {
+                let mut times = Vec::new();
+                let mut current = start;
+                while current < end {
+                    times.push(current);
+                    current = current.saturating_add(cadence_ns).min(end);
+                }
+                times.push(end);
+                (phase, times)
+            })
+            .collect()
+    }
+
     fn passing_evidence(profile: ResourceProfile) -> Result<ResourceEvidence> {
+        let timing = ResourceTimingPlan::for_profile(profile);
+        let cadence_ns = 20_000_000;
         let mut series = SampleSeries::default();
         let mut clock = 0_u64;
-        add_phase(&mut series, &mut clock, "warm-idle", 100 * MIB, 0, 1)?;
-        add_phase(&mut series, &mut clock, "idle-cpu", 100 * MIB, 0, 1)?;
-        add_phase(&mut series, &mut clock, "idle-drift", 100 * MIB, 0, 1)?;
-        add_phase(&mut series, &mut clock, "ordinary-base", 100 * MIB, 0, 1)?;
-        add_phase(&mut series, &mut clock, "ordinary-active", 120 * MIB, 1, 2)?;
-        add_phase(&mut series, &mut clock, "ordinary-return", 100 * MIB, 0, 1)?;
-        add_phase(&mut series, &mut clock, "cold-start", 130 * MIB, 2, 1)?;
-        add_phase(&mut series, &mut clock, "ready-idle", 100 * MIB, 0, 1)?;
-        add_phase(&mut series, &mut clock, "single-turn", 120 * MIB, 1, 2)?;
-        add_phase(&mut series, &mut clock, "single-barrier", 120 * MIB, 1, 2)?;
-
-        let mut sweep = Vec::new();
-        for agents in [1_u32, 2, 4, 8] {
-            let baseline = format!("n{agents}-base");
-            let workload = format!("n{agents}-workload");
-            let cold = format!("n{agents}-cold");
-            let steady = format!("n{agents}-steady");
-            let post_turn = format!("n{agents}-post-turn");
-            let post_close = format!("n{agents}-post-close");
-            let active = (100 + u64::from(agents) * 8) * MIB;
-            add_phase(&mut series, &mut clock, &baseline, 100 * MIB, 0, 1)?;
+        let mut idle_repetitions = Vec::new();
+        for repetition in 0..timing.repetitions {
+            let warm_idle = format!("rep{repetition}-warm-idle");
+            let idle_cpu = format!("rep{repetition}-idle-cpu");
+            let idle_drift = format!("rep{repetition}-idle-drift");
             add_phase(
                 &mut series,
                 &mut clock,
-                &workload,
-                active + MIB,
-                2,
-                agents as usize + 1,
-            )?;
-            add_phase(
-                &mut series,
-                &mut clock,
-                &cold,
-                active + 2 * MIB,
-                2,
-                agents as usize + 1,
-            )?;
-            add_phase(
-                &mut series,
-                &mut clock,
-                &steady,
-                active,
+                &warm_idle,
+                100 * MIB,
+                0,
                 1,
-                agents as usize + 1,
+                timing.idle_baseline_ms,
+                cadence_ns,
             )?;
             add_phase(
                 &mut series,
                 &mut clock,
-                &post_turn,
-                active,
+                &idle_cpu,
+                100 * MIB,
+                0,
                 1,
-                agents as usize + 1,
+                timing.idle_cpu_ms,
+                cadence_ns,
             )?;
-            add_phase(&mut series, &mut clock, &post_close, 100 * MIB, 0, 1)?;
-            sweep.push(SweepObservation {
-                agents,
-                baseline_phase: baseline,
-                workload_phase: workload,
-                cold_phase: cold,
-                steady_phase: steady,
-                post_turn_phase: post_turn,
-                post_close_phase: post_close,
-                minimum_steady_processes: agents as usize + 1,
-                minimum_baseline_processes: 1,
-                minimum_post_turn_processes: agents as usize + 1,
-                minimum_post_close_processes: 1,
+            add_phase(
+                &mut series,
+                &mut clock,
+                &idle_drift,
+                100 * MIB,
+                0,
+                1,
+                timing.idle_drift_ms,
+                cadence_ns,
+            )?;
+            idle_repetitions.push(IdlePhaseRepetition {
+                identity: repetition_identity(profile, repetition),
+                warm_idle,
+                idle_cpu,
+                idle_drift,
             });
         }
-        let turns = ResourceTimingPlan::for_profile(profile).long_horizon_turns;
+        let mut ordinary_returns = Vec::new();
+        let mut cold_starts = Vec::new();
+        let mut single_agents = Vec::new();
+        let mut cleanups = Vec::new();
+        let mut long_horizons = Vec::new();
+        for repetition in 0..timing.repetitions {
+            let identity = repetition_identity(profile, repetition);
+            let ordinary_base = format!("rep{repetition}-ordinary-base");
+            let ordinary_active = format!("rep{repetition}-ordinary-active");
+            let ordinary_return = format!("rep{repetition}-ordinary-return");
+            let cold_start = format!("rep{repetition}-cold-start");
+            let ready_idle = format!("rep{repetition}-ready-idle");
+            let single_turn = format!("rep{repetition}-single-turn");
+            let single_barrier = format!("rep{repetition}-single-barrier");
+            for (phase, bytes, cpu, duration) in [
+                (&ordinary_base, 100 * MIB, 0, timing.idle_baseline_ms),
+                (&ordinary_active, 120 * MIB, 1, 20),
+                (&ordinary_return, 100 * MIB, 0, timing.barrier_steady_ms),
+                (&cold_start, 130 * MIB, 2, 60),
+                (&ready_idle, 100 * MIB, 0, timing.idle_baseline_ms),
+                (&single_turn, 120 * MIB, 1, 20),
+                (&single_barrier, 120 * MIB, 1, timing.barrier_hold_ms),
+            ] {
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    phase,
+                    bytes,
+                    cpu,
+                    1,
+                    duration,
+                    cadence_ns,
+                )?;
+            }
+            let turn_cpu_start = series
+                .samples
+                .iter()
+                .find(|sample| sample.phase == single_turn)
+                .map_or(0, |sample| sample.cpu_ns);
+            series.push(sample(
+                clock,
+                &single_turn,
+                120 * MIB,
+                turn_cpu_start.saturating_add(1_000_000),
+                1,
+            ))?;
+            clock = clock.saturating_add(cadence_ns);
+            ordinary_returns.push(ReturnToIdleObservation {
+                identity: identity.clone(),
+                baseline_phase: ordinary_base,
+                active_phase: ordinary_active,
+                returned_phase: ordinary_return,
+                settled_after_ms: 500,
+                remaining_workers: 0,
+                minimum_baseline_processes: 1,
+                minimum_returned_processes: 1,
+            });
+            cold_starts.push(ColdStartObservation {
+                identity: identity.clone(),
+                cold_phase: cold_start,
+                ready_idle_phase: ready_idle,
+                sampling_started_after_launch_ms: 5,
+                readiness_ms: 50,
+                startup_bound_ms: 10_000,
+                minimum_idle_processes: 1,
+            });
+            single_agents.push(SingleAgentObservation {
+                identity: identity.clone(),
+                turn_phase: single_turn,
+                scripted_turns: 1,
+                barrier_phase: single_barrier,
+            });
+            cleanups.push(CleanupObservation {
+                identity: identity.clone(),
+                reclaim_after_ms: 500,
+                remaining_workers: 0,
+                expected_actor_sessions: timing
+                    .sweep_widths
+                    .last()
+                    .copied()
+                    .into_iter()
+                    .flat_map(|agents| 0..agents)
+                    .map(|actor| (format!("actor-{actor}"), format!("session-{actor}")))
+                    .collect(),
+                closed_actor_sessions: timing
+                    .sweep_widths
+                    .last()
+                    .copied()
+                    .into_iter()
+                    .flat_map(|agents| 0..agents)
+                    .map(|actor| (format!("actor-{actor}"), format!("session-{actor}")))
+                    .collect(),
+                baseline_processes: BTreeSet::from([ProcIdentity {
+                    pid: 1,
+                    start_time: 1,
+                }]),
+                post_close_processes: BTreeSet::from([ProcIdentity {
+                    pid: 1,
+                    start_time: 1,
+                }]),
+                baseline_threads: Some(2),
+                post_close_threads: Some(2),
+            });
+            let long_baseline = format!("rep{repetition}-long-baseline");
+            let long_final = format!("rep{repetition}-long-final");
+            add_phase(
+                &mut series,
+                &mut clock,
+                &long_baseline,
+                100 * MIB,
+                0,
+                1,
+                timing.idle_baseline_ms,
+                cadence_ns,
+            )?;
+            add_phase(
+                &mut series,
+                &mut clock,
+                &long_final,
+                100 * MIB,
+                0,
+                1,
+                timing
+                    .barrier_discard_ms
+                    .saturating_add(timing.barrier_steady_ms),
+                cadence_ns,
+            )?;
+            let tool_results_by_turn: BTreeMap<u32, Vec<LongHorizonToolResult>> = (1..=timing
+                .long_horizon_turns)
+                .map(|turn| {
+                    let results = if turn % 10 == 0 {
+                        vec![LongHorizonToolResult {
+                            event_id: format!("fixture-r{repetition}-t{turn}"),
+                            cursor: u64::from(turn),
+                            call_id: format!("resource-long-r{repetition}-t{turn}"),
+                            name: "write_fixture".to_owned(),
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    (turn, results)
+                })
+                .collect();
+            long_horizons.push(LongHorizonObservation {
+                identity,
+                baseline_phase: long_baseline,
+                final_post_close_phase: long_final,
+                points: (0..=timing.long_horizon_turns)
+                    .step_by(timing.long_horizon_sample_turns as usize)
+                    .map(|turn| LongHorizonPoint {
+                        turn,
+                        memory_bytes: 100 * MIB,
+                        open_fds: 10,
+                        threads: 2,
+                    })
+                    .collect(),
+                completed_turns: timing.long_horizon_turns,
+                tool_results_by_turn,
+                expected_session_id: format!("long-session-{repetition}"),
+                closed_session_id: Some(format!("long-session-{repetition}")),
+                baseline_bytes: 100 * MIB,
+                final_post_close_bytes: 100 * MIB,
+                baseline_open_fds: 10,
+                final_post_close_open_fds: 10,
+                baseline_threads: 2,
+                final_post_close_threads: 2,
+                baseline_processes: BTreeSet::from([ProcIdentity {
+                    pid: 1,
+                    start_time: 1,
+                }]),
+                final_post_close_processes: BTreeSet::from([ProcIdentity {
+                    pid: 1,
+                    start_time: 1,
+                }]),
+            });
+        }
+
+        let mut sweep = Vec::new();
+        let width_rotation_seed = 17_u64;
+        for repetition in 0..timing.repetitions {
+            let mut rotated_widths = timing.sweep_widths.clone();
+            let rotation = (usize::try_from(width_rotation_seed).unwrap_or(usize::MAX)
+                + repetition as usize)
+                % rotated_widths.len();
+            rotated_widths.rotate_left(rotation);
+            for (width_order_index, agents) in rotated_widths.into_iter().enumerate() {
+                let baseline = format!("rep{repetition}-n{agents}-base");
+                let workload = format!("rep{repetition}-n{agents}-workload");
+                let cold = format!("rep{repetition}-n{agents}-cold");
+                let steady = format!("rep{repetition}-n{agents}-steady");
+                let post_turn = format!("rep{repetition}-n{agents}-post-turn");
+                let post_close = format!("rep{repetition}-n{agents}-post-close");
+                let active = (100 + u64::from(agents) * 8) * MIB;
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    &baseline,
+                    100 * MIB,
+                    0,
+                    1,
+                    timing.idle_baseline_ms,
+                    cadence_ns,
+                )?;
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    &workload,
+                    active + MIB,
+                    2,
+                    1,
+                    20,
+                    cadence_ns,
+                )?;
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    &cold,
+                    active + 2 * MIB,
+                    2,
+                    1,
+                    20,
+                    cadence_ns,
+                )?;
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    &steady,
+                    active,
+                    1,
+                    1,
+                    timing.barrier_hold_ms,
+                    cadence_ns,
+                )?;
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    &post_turn,
+                    active,
+                    1,
+                    1,
+                    timing.barrier_steady_ms,
+                    cadence_ns,
+                )?;
+                add_phase(
+                    &mut series,
+                    &mut clock,
+                    &post_close,
+                    100 * MIB,
+                    0,
+                    1,
+                    timing.barrier_steady_ms,
+                    cadence_ns,
+                )?;
+                let actors: BTreeSet<String> =
+                    (0..agents).map(|actor| format!("actor-{actor}")).collect();
+                sweep.push(SweepObservation {
+                    identity: repetition_identity(profile, repetition),
+                    agents,
+                    expected_barrier_actors: actors.clone(),
+                    observed_barrier_actors: actors,
+                    barrier_checkpoint: "tool-complete-hold".to_owned(),
+                    baseline_phase: baseline,
+                    workload_phase: workload,
+                    cold_phase: cold,
+                    steady_phase: steady,
+                    post_turn_phase: post_turn,
+                    post_close_phase: post_close,
+                    minimum_steady_processes: 1,
+                    minimum_baseline_processes: 1,
+                    minimum_post_turn_processes: 1,
+                    minimum_post_close_processes: 1,
+                    post_close_settled_after_ms: 500,
+                    width_rotation_seed,
+                    width_order_index: u32::try_from(width_order_index).unwrap_or(u32::MAX),
+                });
+            }
+        }
+        let membership_cadence_ns = 10_000_000;
+        let membership_samples_by_phase = membership_samples(&series, membership_cadence_ns);
+        let membership_refreshes_by_phase = membership_samples_by_phase
+            .iter()
+            .map(|(phase, times)| {
+                (
+                    phase.clone(),
+                    times
+                        .iter()
+                        .map(|elapsed_ns| MembershipRefreshEvidence {
+                            elapsed_ns: *elapsed_ns,
+                            discovery_wall_ns: 1_000,
+                            discovery_cpu_ns: 1_000,
+                            lane: 0,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let cadence = ResourceCadenceEvidence {
+            membership_cadence_ns,
+            counter_cadence_ns: cadence_ns,
+            counter_kind: ResourceCounterKind::MacOsRusage,
+            membership_samples_by_phase,
+            membership_refreshes_by_phase,
+        };
         Ok(ResourceEvidence {
-            completed_repetitions: ResourceTimingPlan::for_profile(profile).repetitions,
+            completed_repetitions: timing.repetitions,
             series,
-            phases: ResourcePhases::default(),
+            phases: ResourcePhases {
+                repetitions: idle_repetitions,
+                cadence: Some(cadence),
+                ..ResourcePhases::default()
+            },
             memory_metric: Some(MemoryMetric::Effective),
-            sampler_cadence_ns: Some(50_000_000),
+            sampler_cadence_ns: Some(cadence_ns),
             idle: Some(IdleObservation {
                 declared_model: IdleProcessModel::PersistentTree,
                 busy_polling_detected: Some(false),
@@ -1525,46 +3509,61 @@ mod tests {
                 initial_threads: Some(2),
                 final_threads: Some(2),
             }),
-            sweep,
-            ordinary_return: Some(ReturnToIdleObservation {
-                baseline_phase: "ordinary-base".to_owned(),
-                active_phase: "ordinary-active".to_owned(),
-                returned_phase: "ordinary-return".to_owned(),
-                settled_after_ms: 500,
-                remaining_workers: 0,
-                minimum_baseline_processes: 1,
-                minimum_returned_processes: 1,
-            }),
-            cold_start: Some(ColdStartObservation {
-                cold_phase: "cold-start".to_owned(),
-                ready_idle_phase: "ready-idle".to_owned(),
-                readiness_ms: 50,
-                startup_bound_ms: 10_000,
-                minimum_idle_processes: 1,
-            }),
-            single_agent: Some(SingleAgentObservation {
-                turn_phase: "single-turn".to_owned(),
-                scripted_turns: 1,
-                barrier_phase: "single-barrier".to_owned(),
-            }),
-            cleanup: Some(CleanupObservation {
-                reclaim_after_ms: 500,
-                remaining_workers: 0,
-            }),
-            long_horizon: Some(LongHorizonObservation {
-                points: (0..=turns)
-                    .step_by(100)
-                    .map(|turn| LongHorizonPoint {
-                        turn,
-                        memory_bytes: 100 * MIB,
-                        open_fds: 10,
-                        threads: 2,
+            warmup: Some(
+                (0..timing.repetitions)
+                    .map(|repetition| WarmupObservation {
+                        identity: repetition_identity(profile, repetition),
+                        completed_turns: timing.warmup_turns,
+                        terminalized: true,
+                        closed: true,
                     })
                     .collect(),
-                baseline_bytes: 100 * MIB,
-                final_post_close_bytes: 100 * MIB,
-            }),
+            ),
+            sweep,
+            ordinary_return: Some(ordinary_returns),
+            cold_start: Some(cold_starts),
+            single_agent: Some(single_agents),
+            cleanup: Some(cleanups),
+            long_horizon: Some(long_horizons),
         })
+    }
+
+    fn assert_row_28_fails(evidence: &ResourceEvidence, expected: &str) -> Result<()> {
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .ok_or_else(|| AhrbError::Validation("row 28 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains(expected)),
+            "unexpected row-28 outcome: {:?}",
+            row.outcome
+        );
+        Ok(())
+    }
+
+    fn assert_row_29_fails(evidence: &ResourceEvidence, expected: &str) -> Result<()> {
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 29)
+            .ok_or_else(|| AhrbError::Validation("row 29 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains(expected)),
+            "unexpected row-29 outcome: {:?}",
+            row.outcome
+        );
+        Ok(())
     }
 
     #[test]
@@ -1573,13 +3572,311 @@ mod tests {
         let cert = ResourceTimingPlan::for_profile(ResourceProfile::Cert);
         assert_eq!(quick.repetitions, 3);
         assert_eq!(cert.repetitions, 7);
-        assert_eq!(quick.sweep_widths, vec![1, 2, 4, 8]);
+        assert_eq!(quick.sweep_widths, vec![1, 2, 4]);
         assert_eq!(cert.barrier_hold_ms, 3_000);
         assert_eq!(cert.barrier_discard_ms, 1_000);
         assert_eq!(cert.barrier_steady_ms, 2_000);
-        assert_eq!(quick.idle_drift_ms, 30_000);
+        assert_eq!(quick.idle_cpu_ms, 1_000);
+        assert_eq!(quick.idle_drift_ms, 4_000);
+        assert_eq!(quick.barrier_hold_ms, 500);
         assert_eq!(cert.idle_drift_ms, 120_000);
         assert_eq!(cert.long_horizon_turns, 1_000);
+    }
+
+    #[test]
+    fn missing_official_session_close_cannot_pass_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let cleanup = evidence
+            .cleanup
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| AhrbError::Validation("cleanup observation is absent".to_owned()))?;
+        let actor = cleanup
+            .closed_actor_sessions
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| AhrbError::Validation("closed session set is empty".to_owned()))?;
+        cleanup.closed_actor_sessions.remove(&actor);
+        assert_row_28_fails(&evidence, "official-close-set")
+    }
+
+    #[test]
+    fn equal_count_process_replacement_cannot_pass_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let cleanup = evidence
+            .cleanup
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| AhrbError::Validation("cleanup observation is absent".to_owned()))?;
+        cleanup.post_close_processes = BTreeSet::from([ProcIdentity {
+            pid: 9_999,
+            start_time: 2,
+        }]);
+        assert_row_28_fails(&evidence, "process-identity-reclaim")
+    }
+
+    #[test]
+    fn leaked_thread_cannot_pass_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let cleanup = evidence
+            .cleanup
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| AhrbError::Validation("cleanup observation is absent".to_owned()))?;
+        cleanup.post_close_threads = cleanup.baseline_threads.map(|threads| threads + 1);
+        assert_row_28_fails(&evidence, "thread-reclaim")
+    }
+
+    #[test]
+    fn reclaim_below_eighty_percent_cannot_pass_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let target_agents = ResourceTimingPlan::for_profile(ResourceProfile::Quick)
+            .sweep_widths
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let phase = evidence
+            .sweep
+            .iter()
+            .find(|observation| {
+                observation.identity.repetition == 0 && observation.agents == target_agents
+            })
+            .map(|observation| observation.post_close_phase.clone())
+            .ok_or_else(|| AhrbError::Validation("Nmax post-close phase is absent".to_owned()))?;
+        for sample in evidence
+            .series
+            .samples
+            .iter_mut()
+            .filter(|sample| sample.phase == phase)
+        {
+            let retained = 120 * MIB;
+            sample.rss_bytes = retained;
+            sample.pss_bytes = Some(retained);
+            sample.private_bytes = Some(retained);
+        }
+        assert_row_28_fails(&evidence, "reclaim-ratio")
+    }
+
+    #[test]
+    fn excessive_post_close_residual_cannot_pass_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let target_agents = ResourceTimingPlan::for_profile(ResourceProfile::Quick)
+            .sweep_widths
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let target_phases: Vec<(String, String)> = evidence
+            .sweep
+            .iter()
+            .filter(|observation| observation.agents == target_agents)
+            .map(|observation| {
+                (
+                    observation.post_turn_phase.clone(),
+                    observation.post_close_phase.clone(),
+                )
+            })
+            .collect();
+        if target_phases.is_empty() {
+            return Err(AhrbError::Validation(
+                "Nmax post-close phases are absent".to_owned(),
+            ));
+        }
+        for (post_turn, post_close) in target_phases {
+            for sample in &mut evidence.series.samples {
+                let bytes = if sample.phase == post_turn {
+                    Some(500 * MIB)
+                } else if sample.phase == post_close {
+                    Some(165 * MIB)
+                } else {
+                    None
+                };
+                if let Some(bytes) = bytes {
+                    sample.rss_bytes = bytes;
+                    sample.pss_bytes = Some(bytes);
+                    sample.private_bytes = Some(bytes);
+                }
+            }
+        }
+        assert_row_28_fails(&evidence, "post-close-residual")
+    }
+
+    #[test]
+    fn missing_fixture_tool_turn_cannot_pass_row_29() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let observation = evidence
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation
+            .tool_results_by_turn
+            .get_mut(&10)
+            .ok_or_else(|| AhrbError::Validation("turn 10 tool record is absent".to_owned()))?
+            .clear();
+        assert_row_29_fails(&evidence, "fixture-tool-cadence")
+    }
+
+    #[test]
+    fn duplicate_or_wrong_fixture_result_cannot_pass_row_29() -> Result<()> {
+        let mut duplicate = passing_evidence(ResourceProfile::Quick)?;
+        let observation = duplicate
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        let results = observation
+            .tool_results_by_turn
+            .get_mut(&10)
+            .ok_or_else(|| AhrbError::Validation("turn 10 tool record is absent".to_owned()))?;
+        results.push(LongHorizonToolResult {
+            event_id: "duplicate-result".to_owned(),
+            cursor: 9_999,
+            call_id: "resource-long-r0-t10".to_owned(),
+            name: "write_fixture".to_owned(),
+        });
+        assert_row_29_fails(&duplicate, "fixture-tool-cadence")?;
+
+        let mut wrong = passing_evidence(ResourceProfile::Quick)?;
+        let observation = wrong
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        let result = observation
+            .tool_results_by_turn
+            .get_mut(&10)
+            .and_then(|results| results.first_mut())
+            .ok_or_else(|| AhrbError::Validation("turn 10 fixture result is absent".to_owned()))?;
+        result.call_id = "matching-but-wrong".to_owned();
+        result.name = "read_fixture".to_owned();
+        assert_row_29_fails(&wrong, "fixture-tool-cadence")
+    }
+
+    #[test]
+    fn missing_per_turn_tool_record_cannot_pass_row_29() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let observation = evidence
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation.tool_results_by_turn.remove(&11);
+        assert_row_29_fails(&evidence, "tool-result-turn-coverage")
+    }
+
+    #[test]
+    fn missing_session_close_or_initial_checkpoint_cannot_pass_row_29() -> Result<()> {
+        let mut missing_close = passing_evidence(ResourceProfile::Quick)?;
+        let observation = missing_close
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation.closed_session_id = None;
+        assert_row_29_fails(&missing_close, "official-session-close")?;
+
+        let mut missing_initial = passing_evidence(ResourceProfile::Quick)?;
+        let observation = missing_initial
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        if !observation.points.is_empty() {
+            observation.points.remove(0);
+        }
+        assert_row_29_fails(&missing_initial, "checkpoint-count")
+    }
+
+    #[test]
+    fn final_identity_fd_or_thread_leak_cannot_pass_row_29() -> Result<()> {
+        let mut replaced = passing_evidence(ResourceProfile::Quick)?;
+        let observation = replaced
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation.final_post_close_processes = BTreeSet::from([ProcIdentity {
+            pid: 9_999,
+            start_time: 2,
+        }]);
+        assert_row_29_fails(&replaced, "process-identity-reclaim")?;
+
+        let mut fd_leak = passing_evidence(ResourceProfile::Quick)?;
+        let observation = fd_leak
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation.final_post_close_open_fds = observation.baseline_open_fds.saturating_add(1);
+        assert_row_29_fails(&fd_leak, "final-fd-reclaim")?;
+
+        let mut thread_leak = passing_evidence(ResourceProfile::Quick)?;
+        let observation = thread_leak
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation.final_post_close_threads = observation.baseline_threads.saturating_add(1);
+        assert_row_29_fails(&thread_leak, "final-thread-reclaim")
+    }
+
+    #[test]
+    fn excessive_memory_slope_or_final_residual_cannot_pass_row_29() -> Result<()> {
+        let mut slope = passing_evidence(ResourceProfile::Quick)?;
+        let observation = slope
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        for point in &mut observation.points {
+            point.memory_bytes = point
+                .memory_bytes
+                .saturating_add(u64::from(point.turn).saturating_mul(65_537));
+        }
+        assert_row_29_fails(&slope, "memory-per-turn")?;
+
+        let mut residual = passing_evidence(ResourceProfile::Quick)?;
+        let observation = residual
+            .long_horizon
+            .as_mut()
+            .and_then(|observations| observations.first_mut())
+            .ok_or_else(|| {
+                AhrbError::Validation("long-horizon observation is absent".to_owned())
+            })?;
+        observation.final_post_close_bytes = observation.baseline_bytes.saturating_add(65 * MIB);
+        let final_phase = observation.final_post_close_phase.clone();
+        for sample in residual
+            .series
+            .samples
+            .iter_mut()
+            .filter(|sample| sample.phase == final_phase)
+        {
+            sample.rss_bytes = observation.final_post_close_bytes;
+            sample.pss_bytes = Some(observation.final_post_close_bytes);
+            sample.private_bytes = Some(observation.final_post_close_bytes);
+        }
+        assert_row_29_fails(&residual, "final-residual")
     }
 
     #[test]
@@ -1606,6 +3903,605 @@ mod tests {
                 .and_then(|metrics| metrics.headline_beta_mib_per_agent),
             Some(8.0)
         );
+        assert_eq!(
+            certification.metrics["parallel_n4_baseline_bytes"],
+            (100 * MIB) as f64
+        );
+        assert_eq!(
+            certification.metrics["parallel_n4_steady_bytes"],
+            (132 * MIB) as f64
+        );
+        assert_eq!(
+            certification.metrics["parallel_n4_adjacent_marginal_bytes_per_agent"],
+            (8 * MIB) as f64
+        );
+        assert_eq!(certification.metrics["parallel_n8_reclaim_ratio"], 1.0);
+        assert_eq!(certification.metrics["parallel_beta_mib_per_agent"], 8.0);
+        assert_eq!(
+            certification.metrics["maximum_workload_peak_bytes"],
+            (165 * MIB) as f64
+        );
+        assert_eq!(
+            certification.metrics["single_agent_barrier_idle_cpu_one_core"],
+            0.01
+        );
+        for key in [
+            "idle_baseline_bytes_median",
+            "idle_baseline_bytes_mad",
+            "idle_baseline_bytes_p95",
+            "idle_cpu_one_core_p95",
+            "idle_drift_bytes_per_minute_mad",
+            "idle_net_growth_bytes_p95",
+            "parallel_beta_bytes_per_agent_median",
+            "parallel_beta_bytes_per_agent_mad",
+            "parallel_beta_bytes_per_agent_p95",
+            "parallel_scaling_exponent_p95",
+            "maximum_workload_peak_bytes_p95",
+            "parallel_n4_baseline_bytes_mad",
+            "parallel_n4_steady_bytes_p95",
+            "parallel_n4_adjacent_marginal_bytes_per_agent_p95",
+            "parallel_n8_reclaim_ratio_median",
+            "parallel_n8_post_close_residual_bytes_p95",
+            "ordinary_residual_bytes_median",
+            "ordinary_residual_bytes_mad",
+            "ordinary_residual_bytes_p95",
+            "cold_readiness_ms_median",
+            "single_agent_cpu_ns_per_turn_p95",
+            "cleanup_reclaim_after_ms_median",
+            "long_horizon_bytes_per_turn_mad",
+        ] {
+            assert!(certification.metrics.contains_key(key), "missing {key}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_daemon_proves_n8_with_logical_barrier_actors() -> Result<()> {
+        let evidence = passing_evidence(ResourceProfile::Cert)?;
+        assert!(evidence.sweep.iter().all(|point| {
+            point.minimum_steady_processes == 1
+                && point.expected_barrier_actors == point.observed_barrier_actors
+        }));
+        let certification = evaluate_resources(
+            ResourceProfile::Cert,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row26 = certification.rows.iter().find(|row| row.row == 26);
+        assert!(row26.is_some_and(|row| matches!(row.outcome, TestOutcome::Pass)));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_barrier_actor_or_repetition_evidence_cannot_certify() -> Result<()> {
+        let mut missing_actor = passing_evidence(ResourceProfile::Cert)?;
+        if let Some(observation) = missing_actor
+            .sweep
+            .iter_mut()
+            .find(|point| point.agents == 8 && point.identity.repetition == 0)
+        {
+            observation.observed_barrier_actors.pop_first();
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Cert,
+            &missing_actor,
+            &ResourceEnvelope::default(),
+        );
+        let row26 = certification.rows.iter().find(|row| row.row == 26);
+        assert!(row26.is_some_and(|row| !matches!(row.outcome, TestOutcome::Pass)));
+
+        let mut missing_repetition = passing_evidence(ResourceProfile::Cert)?;
+        missing_repetition
+            .sweep
+            .retain(|point| !(point.agents == 8 && point.identity.repetition == 6));
+        let certification = evaluate_resources(
+            ResourceProfile::Cert,
+            &missing_repetition,
+            &ResourceEnvelope::default(),
+        );
+        let row26 = certification.rows.iter().find(|row| row.row == 26);
+        assert!(row26.is_some_and(|row| !matches!(row.outcome, TestOutcome::Pass)));
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_or_unclosed_warmup_cannot_certify_row_26() -> Result<()> {
+        let mut omitted = passing_evidence(ResourceProfile::Quick)?;
+        omitted.warmup = None;
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &omitted,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 26)
+            .ok_or_else(|| AhrbError::Validation("row 26 is absent".to_owned()))?;
+        assert!(matches!(&row.outcome, TestOutcome::Error(message) if message.contains("warm-up")));
+
+        let mut unclosed = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(observation) = unclosed
+            .warmup
+            .as_mut()
+            .and_then(|observations| observations.get_mut(1))
+        {
+            observation.closed = false;
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &unclosed,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 26)
+            .ok_or_else(|| AhrbError::Validation("row 26 is absent".to_owned()))?;
+        assert!(matches!(&row.outcome, TestOutcome::Error(message) if message.contains("warm-up")));
+        Ok(())
+    }
+
+    #[test]
+    fn per_component_identity_and_seeded_rotation_are_mandatory() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(observations) = evidence.ordinary_return.as_mut() {
+            observations.pop();
+        }
+        if let Some(observations) = evidence.cold_start.as_mut() {
+            observations[0].identity.profile = ResourceProfile::Cert;
+        }
+        if let Some(observations) = evidence.single_agent.as_mut() {
+            let reused = observations[0].identity.isolation_token.clone();
+            observations[1].identity.isolation_token = reused;
+        }
+        if let Some(observations) = evidence.cleanup.as_mut() {
+            observations[1].identity.repetition = 0;
+        }
+        if let Some(observations) = evidence.long_horizon.as_mut() {
+            observations.pop();
+        }
+        if let Some(observation) = evidence.sweep.first_mut() {
+            observation.width_order_index = u32::MAX;
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        for row in [23_u8, 24, 25, 26, 28, 29] {
+            assert!(
+                certification
+                    .rows
+                    .iter()
+                    .find(|result| result.row == row)
+                    .is_some_and(|result| !matches!(result.outcome, TestOutcome::Pass))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn membership_and_counter_cadence_are_independent_gates() -> Result<()> {
+        let mut membership_gap = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(cadence) = membership_gap.phases.cadence.as_mut() {
+            let retained = if let Some(times) = cadence
+                .membership_samples_by_phase
+                .get_mut("rep0-warm-idle")
+            {
+                if times.len() > 4 {
+                    times.remove(1);
+                    times.remove(1);
+                }
+                Some(times.iter().copied().collect::<BTreeSet<_>>())
+            } else {
+                None
+            };
+            if let (Some(retained), Some(refreshes)) = (
+                retained,
+                cadence
+                    .membership_refreshes_by_phase
+                    .get_mut("rep0-warm-idle"),
+            ) {
+                refreshes.retain(|refresh| retained.contains(&refresh.elapsed_ns));
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &membership_gap,
+            &ResourceEnvelope::default(),
+        );
+        assert!(certification.rows.iter().all(|row| {
+            matches!(&row.outcome, TestOutcome::Error(message) if message.contains("membership"))
+        }));
+
+        let mut wrong_counter = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(cadence) = wrong_counter.phases.cadence.as_mut() {
+            cadence.counter_cadence_ns = 10_000_000;
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &wrong_counter,
+            &ResourceEnvelope::default(),
+        );
+        assert!(certification.rows.iter().all(|row| {
+            matches!(&row.outcome, TestOutcome::Error(message) if message.contains("cadence mismatch"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_membership_scheduler_jitter_is_accepted() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(cadence) = evidence.phases.cadence.as_mut() {
+            let phase = "rep0-warm-idle";
+            let times = cadence
+                .membership_samples_by_phase
+                .get_mut(phase)
+                .ok_or_else(|| AhrbError::Validation("fixture phase absent".to_owned()))?;
+            if times.len() < 6 {
+                return Err(AhrbError::Validation(
+                    "fixture phase has insufficient samples".to_owned(),
+                ));
+            }
+            times[5] = times[5].saturating_add(5_000_000);
+            let refreshes = cadence
+                .membership_refreshes_by_phase
+                .get_mut(phase)
+                .ok_or_else(|| AhrbError::Validation("fixture refreshes absent".to_owned()))?;
+            refreshes[5].elapsed_ns = times[5];
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        assert!(
+            certification
+                .rows
+                .iter()
+                .all(|row| matches!(row.outcome, TestOutcome::Pass))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn membership_discovery_wall_overrun_errors_every_resource_row() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        if let Some(cadence) = evidence.phases.cadence.as_mut() {
+            let refresh = cadence
+                .membership_refreshes_by_phase
+                .get_mut("rep0-warm-idle")
+                .and_then(|refreshes| refreshes.first_mut())
+                .ok_or_else(|| AhrbError::Validation("fixture refresh absent".to_owned()))?;
+            refresh.discovery_wall_ns = cadence.membership_cadence_ns.saturating_add(1);
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        assert!(certification.rows.iter().all(|row| {
+            matches!(&row.outcome, TestOutcome::Error(message) if message.contains("discovery consumed"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn periodic_idle_store_poll_signature_forces_row_21_failure() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let repetition = evidence
+            .phases
+            .repetitions
+            .first()
+            .ok_or_else(|| AhrbError::Validation("idle repetition is absent".to_owned()))?;
+        let phase = repetition.idle_drift.clone();
+        let first = evidence
+            .series
+            .samples
+            .iter()
+            .find(|sample| sample.phase == phase)
+            .map(|sample| (sample.elapsed_ns, sample.cpu_ns))
+            .ok_or_else(|| AhrbError::Validation("idle drift phase is absent".to_owned()))?;
+        // Model a cheap session-file stat every 500 ms. Its average CPU remains
+        // far below the 1% ceiling, so row 21 must fail because of periodicity.
+        for sample in evidence
+            .series
+            .samples
+            .iter_mut()
+            .filter(|sample| sample.phase == phase)
+        {
+            let polls = sample.elapsed_ns.saturating_sub(first.0) / 500_000_000;
+            sample.cpu_ns = first.1.saturating_add(polls.saturating_mul(100_000));
+        }
+        let detected =
+            detect_busy_polling(&evidence.series, &evidence.phases.repetitions, 20_000_000)?;
+        assert!(detected);
+        if let Some(idle) = evidence.idle.as_mut() {
+            idle.busy_polling_detected = Some(detected);
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|result| result.row == 21)
+            .ok_or_else(|| AhrbError::Validation("row 21 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("busy-polling"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intermediate_idle_repetition_worker_growth_forces_row_22_failure() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let phase = evidence
+            .phases
+            .repetitions
+            .get(1)
+            .map(|repetition| repetition.idle_drift.clone())
+            .ok_or_else(|| AhrbError::Validation("second idle repetition is absent".to_owned()))?;
+        let final_elapsed = evidence
+            .series
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .map(|sample| sample.elapsed_ns)
+            .max()
+            .ok_or_else(|| AhrbError::Validation("idle drift samples are absent".to_owned()))?;
+        let final_sample = evidence
+            .series
+            .samples
+            .iter_mut()
+            .find(|sample| sample.phase == phase && sample.elapsed_ns == final_elapsed)
+            .ok_or_else(|| AhrbError::Validation("final idle sample is absent".to_owned()))?;
+        final_sample.processes.push(ProcessInfo {
+            identity: ProcIdentity {
+                pid: 9_999,
+                start_time: 1,
+            },
+            ppid: 1,
+            command: "leaked-worker".to_owned(),
+            ownership: ProcOwnership::Descendant,
+        });
+        final_sample.thread_count = Some(3);
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|result| result.row == 22)
+            .ok_or_else(|| AhrbError::Validation("row 22 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("rep1-worker-growth"))
+        );
+        assert!(
+            row.evidence
+                .iter()
+                .any(|item| item.starts_with("rep1-thread-growth: 2 -> 3"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_readiness_cold_peak_forces_row_24_failure() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let phase = evidence
+            .cold_start
+            .as_ref()
+            .and_then(|observations| observations.first())
+            .map(|observation| observation.cold_phase.clone())
+            .ok_or_else(|| AhrbError::Validation("cold-start observation is absent".to_owned()))?;
+        let first_elapsed = evidence
+            .series
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .map(|sample| sample.elapsed_ns)
+            .min()
+            .ok_or_else(|| AhrbError::Validation("cold-start sample is absent".to_owned()))?;
+        let sample = evidence
+            .series
+            .samples
+            .iter_mut()
+            .find(|sample| sample.phase == phase && sample.elapsed_ns == first_elapsed)
+            .ok_or_else(|| AhrbError::Validation("first cold-start sample is absent".to_owned()))?;
+        let excessive_peak = 5 * GIB;
+        sample.rss_bytes = excessive_peak;
+        sample.pss_bytes = Some(excessive_peak);
+        sample.private_bytes = Some(excessive_peak);
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|result| result.row == 24)
+            .ok_or_else(|| AhrbError::Validation("row 24 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("cold-peak"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn single_agent_cold_peak_over_envelope_forces_row_25_failure() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let phase = evidence
+            .sweep
+            .iter()
+            .find(|observation| observation.agents == 1)
+            .map(|observation| observation.cold_phase.clone())
+            .ok_or_else(|| AhrbError::Validation("N=1 cold phase is absent".to_owned()))?;
+        let sample = evidence
+            .series
+            .samples
+            .iter_mut()
+            .find(|sample| sample.phase == phase)
+            .ok_or_else(|| AhrbError::Validation("N=1 cold sample is absent".to_owned()))?;
+        let excessive_peak = 5 * GIB;
+        sample.rss_bytes = excessive_peak;
+        sample.pss_bytes = Some(excessive_peak);
+        sample.private_bytes = Some(excessive_peak);
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|result| result.row == 25)
+            .ok_or_else(|| AhrbError::Validation("row 25 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("single-agent-cold-peak"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_barrier_terminal_cpu_is_included_in_row_25() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let phase = evidence
+            .single_agent
+            .as_ref()
+            .and_then(|observations| observations.first())
+            .map(|observation| observation.turn_phase.clone())
+            .ok_or_else(|| AhrbError::Validation("single-agent turn phase is absent".to_owned()))?;
+        let first_cpu = evidence
+            .series
+            .samples
+            .iter()
+            .find(|sample| sample.phase == phase)
+            .map(|sample| sample.cpu_ns)
+            .ok_or_else(|| AhrbError::Validation("turn-start sample is absent".to_owned()))?;
+        let final_elapsed = evidence
+            .series
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .map(|sample| sample.elapsed_ns)
+            .max()
+            .ok_or_else(|| AhrbError::Validation("turn-end sample is absent".to_owned()))?;
+        let final_sample = evidence
+            .series
+            .samples
+            .iter_mut()
+            .find(|sample| sample.phase == phase && sample.elapsed_ns == final_elapsed)
+            .ok_or_else(|| AhrbError::Validation("turn-end sample is absent".to_owned()))?;
+        final_sample.cpu_ns = first_cpu.saturating_add(300_000_000);
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|result| result.row == 25)
+            .ok_or_else(|| AhrbError::Validation("row 25 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("cpu-per-turn"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_count_process_replacement_invalidates_row_25_cpu_delta() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let phase = evidence
+            .single_agent
+            .as_ref()
+            .and_then(|observations| observations.first())
+            .map(|observation| observation.turn_phase.clone())
+            .ok_or_else(|| AhrbError::Validation("single-agent turn phase is absent".to_owned()))?;
+        let final_elapsed = evidence
+            .series
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .map(|sample| sample.elapsed_ns)
+            .max()
+            .ok_or_else(|| AhrbError::Validation("turn-end sample is absent".to_owned()))?;
+        let final_sample = evidence
+            .series
+            .samples
+            .iter_mut()
+            .find(|sample| sample.phase == phase && sample.elapsed_ns == final_elapsed)
+            .ok_or_else(|| AhrbError::Validation("turn-end sample is absent".to_owned()))?;
+        let process = final_sample.processes.first_mut().ok_or_else(|| {
+            AhrbError::Validation("turn-end process membership is absent".to_owned())
+        })?;
+        process.identity = ProcIdentity {
+            pid: 9_999,
+            start_time: 2,
+        };
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|result| result.row == 25)
+            .ok_or_else(|| AhrbError::Validation("row 25 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("complete-turn-boundaries"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_profile_window_and_late_n8_reclaim_do_not_pass() -> Result<()> {
+        let mut truncated = passing_evidence(ResourceProfile::Cert)?;
+        let phase = "rep0-warm-idle";
+        let start = truncated
+            .series
+            .samples
+            .iter()
+            .find(|sample| sample.phase == phase)
+            .map_or(0, |sample| sample.elapsed_ns);
+        truncated.series.samples.retain(|sample| {
+            sample.phase != phase || sample.elapsed_ns <= start.saturating_add(1_000_000_000)
+        });
+        let certification = evaluate_resources(
+            ResourceProfile::Cert,
+            &truncated,
+            &ResourceEnvelope::default(),
+        );
+        let row20 = certification.rows.iter().find(|row| row.row == 20);
+        assert!(row20.is_some_and(|row| !matches!(row.outcome, TestOutcome::Pass)));
+
+        let mut late_reclaim = passing_evidence(ResourceProfile::Cert)?;
+        for observation in &mut late_reclaim.sweep {
+            if observation.agents == 8 && observation.identity.repetition == 6 {
+                observation.post_close_settled_after_ms = 10_001;
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Cert,
+            &late_reclaim,
+            &ResourceEnvelope::default(),
+        );
+        let row23 = certification.rows.iter().find(|row| row.row == 23);
+        let row28 = certification.rows.iter().find(|row| row.row == 28);
+        assert!(row23.is_some_and(|row| !matches!(row.outcome, TestOutcome::Pass)));
+        assert!(row28.is_some_and(|row| !matches!(row.outcome, TestOutcome::Pass)));
         Ok(())
     }
 
@@ -1629,11 +4525,12 @@ mod tests {
     fn unstable_plateau_and_missing_n4_cannot_certify() -> Result<()> {
         let mut evidence = passing_evidence(ResourceProfile::Cert)?;
         evidence.sweep.retain(|point| point.agents != 4);
-        if let Some(sample) = evidence
+        for sample in evidence
             .series
             .samples
             .iter_mut()
-            .find(|sample| sample.phase == "warm-idle")
+            .filter(|sample| sample.phase == "rep0-warm-idle")
+            .take(10)
         {
             sample.pss_bytes = Some(200 * MIB);
         }
@@ -1652,7 +4549,9 @@ mod tests {
     #[test]
     fn sampler_overload_turns_every_resource_row_into_error() -> Result<()> {
         let mut evidence = passing_evidence(ResourceProfile::Quick)?;
-        evidence.sampler_cadence_ns = Some(1);
+        for sample in &mut evidence.series.samples {
+            sample.collection_ns = 40_000_000;
+        }
         let certification = evaluate_resources(
             ResourceProfile::Quick,
             &evidence,
@@ -1665,13 +4564,97 @@ mod tests {
     }
 
     #[test]
+    fn zero_n1_active_delta_cannot_disappear_from_row_27_fit() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let steady_and_baseline: Vec<_> = evidence
+            .sweep
+            .iter()
+            .filter(|observation| observation.agents == 1)
+            .map(|observation| {
+                let baseline = evidence
+                    .series
+                    .samples
+                    .iter()
+                    .find(|sample| sample.phase == observation.baseline_phase)
+                    .and_then(|sample| sample.pss_bytes)
+                    .unwrap_or(0);
+                (observation.steady_phase.clone(), baseline)
+            })
+            .collect();
+        for (phase, baseline) in steady_and_baseline {
+            for sample in evidence
+                .series
+                .samples
+                .iter_mut()
+                .filter(|sample| sample.phase == phase)
+            {
+                sample.rss_bytes = baseline;
+                sample.pss_bytes = Some(baseline);
+                sample.private_bytes = Some(baseline);
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 27)
+            .ok_or_else(|| AhrbError::Validation("row 27 is absent".to_owned()))?;
+        assert!(
+            matches!(&row.outcome, TestOutcome::Error(message) if message.contains("positive active delta"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonpositive_preceding_marginal_does_not_hide_a_scaling_jump() -> Result<()> {
+        let points = [
+            SweepPoint {
+                agents: 1,
+                baseline_bytes: 0,
+                steady_bytes: 100,
+                workload_peak_bytes: 100,
+                cold_peak_bytes: 100,
+                post_turn_bytes: 100,
+                post_close_bytes: 0,
+            },
+            SweepPoint {
+                agents: 2,
+                baseline_bytes: 0,
+                steady_bytes: 90,
+                workload_peak_bytes: 90,
+                cold_peak_bytes: 90,
+                post_turn_bytes: 90,
+                post_close_bytes: 0,
+            },
+            SweepPoint {
+                agents: 4,
+                baseline_bytes: 0,
+                steady_bytes: 110,
+                workload_peak_bytes: 110,
+                cold_peak_bytes: 110,
+                post_turn_bytes: 110,
+                post_close_bytes: 0,
+            },
+        ];
+        let metrics = SweepMetrics::calculate(&points)?;
+        assert!(!adjacent_marginals_stable(&metrics));
+        Ok(())
+    }
+
+    #[test]
     fn monotonic_fd_or_thread_growth_fails_long_horizon() -> Result<()> {
         let mut evidence = passing_evidence(ResourceProfile::Cert)?;
-        if let Some(long) = evidence.long_horizon.as_mut() {
-            for (index, point) in long.points.iter_mut().enumerate() {
-                let growth = u64::try_from(index).unwrap_or(u64::MAX);
-                point.open_fds = 10_u64.saturating_add(growth);
-                point.threads = 2_u64.saturating_add(growth);
+        if let Some(observations) = evidence.long_horizon.as_mut() {
+            for long in observations {
+                for (index, point) in long.points.iter_mut().enumerate() {
+                    let growth = u64::try_from(index).unwrap_or(u64::MAX);
+                    point.open_fds = 10_u64.saturating_add(growth);
+                    point.threads = 2_u64.saturating_add(growth);
+                }
             }
         }
         let certification = evaluate_resources(

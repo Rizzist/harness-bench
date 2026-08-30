@@ -77,6 +77,10 @@ pub trait Transport: Send {
     fn request(&mut self, request: TransportRequest) -> DriverFuture<'_, TransportResponse>;
     /// Stop persistent transport resources.
     fn stop(&mut self) -> DriverFuture<'_, ()>;
+    /// Launcher/controller PIDs directly owned by this transport.
+    fn owned_pids(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 impl<T: Transport + ?Sized> Transport for Box<T> {
@@ -90,6 +94,10 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 
     fn stop(&mut self) -> DriverFuture<'_, ()> {
         (**self).stop()
+    }
+
+    fn owned_pids(&self) -> Vec<u32> {
+        (**self).owned_pids()
     }
 }
 
@@ -115,6 +123,12 @@ pub trait Driver: Send {
     fn subturn(&mut self, session: &SessionId, prompt: &str) -> DriverFuture<'_, ()>;
     /// Queue a distinct next turn.
     fn queue(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()>;
+    /// Release a state barrier previously reported by the session.
+    fn release_checkpoint(
+        &mut self,
+        session: &SessionId,
+        release_token: &str,
+    ) -> DriverFuture<'_, ()>;
     /// Create a native child actor and return its stable session ID.
     fn spawn_agent(
         &mut self,
@@ -158,6 +172,8 @@ pub struct DriverOperations {
     pub subturn: String,
     /// Queue a distinct next turn.
     pub queue: String,
+    /// Release a durable state checkpoint.
+    pub release_checkpoint: String,
     /// Spawn a native child.
     pub spawn_agent: String,
     /// Cancel active work.
@@ -178,6 +194,7 @@ impl Default for DriverOperations {
             steer: "session.steer".to_owned(),
             subturn: "session.subturn".to_owned(),
             queue: "session.queue".to_owned(),
+            release_checkpoint: "checkpoint.release".to_owned(),
             spawn_agent: "agent.spawn".to_owned(),
             cancel: "session.cancel".to_owned(),
             close: "session.close".to_owned(),
@@ -295,6 +312,19 @@ impl<T: Transport> Driver for GenericDriver<T> {
             self,
             operation,
             json!({ "session_id": session.0, "prompt": prompt, "key": key }),
+        )
+    }
+
+    fn release_checkpoint(
+        &mut self,
+        session: &SessionId,
+        release_token: &str,
+    ) -> DriverFuture<'_, ()> {
+        let operation = self.operations.release_checkpoint.clone();
+        unit_call(
+            self,
+            operation,
+            json!({ "session_id": session.0, "release_token": release_token }),
         )
     }
 
@@ -589,6 +619,10 @@ impl Transport for StdinRpcTransport {
             }
             Ok(())
         })
+    }
+
+    fn owned_pids(&self) -> Vec<u32> {
+        self.pid().into_iter().collect()
     }
 }
 

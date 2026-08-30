@@ -3,8 +3,21 @@
 use crate::process::Sample;
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const MIB: f64 = 1_048_576.0;
+
+pub(crate) fn cadence_quality(times: &[u64], cadence_ns: u64) -> (u64, usize, bool) {
+    let gaps = times
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .collect::<Vec<_>>();
+    let maximum_gap_ns = gaps.iter().copied().max().unwrap_or(0);
+    let jitter_gaps = gaps.iter().filter(|gap| **gap > cadence_ns).count();
+    let allowed_jitter = gaps.len().div_ceil(100).max(1);
+    let bounded = maximum_gap_ns <= cadence_ns.saturating_mul(2) && jitter_gaps <= allowed_jitter;
+    (maximum_gap_ns, jitter_gaps, bounded)
+}
 
 /// Selects the memory counter used for an analysis.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,13 +97,24 @@ impl SampleSeries {
                 "plateau trailing window must be nonzero".to_owned(),
             ));
         }
-        let end = self
+        let mut phase_times = self
             .samples
             .iter()
             .filter(|sample| sample.phase == phase)
-            .map(|sample| sample.elapsed_ns)
-            .max()
+            .map(|sample| sample.elapsed_ns);
+        let first = phase_times
+            .next()
             .ok_or_else(|| AhrbError::Validation(format!("phase {phase:?} has no samples")))?;
+        let mut end = first;
+        for elapsed_ns in phase_times {
+            end = end.max(elapsed_ns);
+        }
+        if end.saturating_sub(first) < trailing_ns {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} spans {} ns, shorter than the requested {trailing_ns} ns trailing window",
+                end.saturating_sub(first)
+            )));
+        }
         self.plateau_in_window(
             phase,
             metric,
@@ -126,16 +150,25 @@ impl SampleSeries {
             .next()
             .ok_or_else(|| AhrbError::Validation(format!("phase {phase:?} has no samples")))?;
         let mut last = first;
+        let mut sample_count = 1_usize;
         for sample in samples {
             last = sample;
+            sample_count = sample_count.saturating_add(1);
         }
-        let elapsed_ns = last.elapsed_ns.saturating_sub(first.elapsed_ns);
-        let cpu_ns = last.cpu_ns.saturating_sub(first.cpu_ns);
-        let one_core_fraction = if elapsed_ns == 0 {
-            0.0
-        } else {
-            cpu_ns as f64 / elapsed_ns as f64
-        };
+        if sample_count < 2 || last.elapsed_ns <= first.elapsed_ns {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} needs at least two distinct sample times for CPU"
+            )));
+        }
+        if last.cpu_ns < first.cpu_ns {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} cumulative CPU moved backwards: {} < {}",
+                last.cpu_ns, first.cpu_ns
+            )));
+        }
+        let elapsed_ns = last.elapsed_ns - first.elapsed_ns;
+        let cpu_ns = last.cpu_ns - first.cpu_ns;
+        let one_core_fraction = cpu_ns as f64 / elapsed_ns as f64;
         Ok(PhaseCpu {
             elapsed_ns,
             cpu_ns,
@@ -143,8 +176,65 @@ impl SampleSeries {
         })
     }
 
-    /// Detect collection overhead and cadence overruns. AHRB classifies any
-    /// overhead above ten percent of one core as sampler overload.
+    /// Verify that one phase was sampled continuously for its required duration.
+    ///
+    /// The first and last samples are the phase-boundary observations. Because a
+    /// periodic sampler can finish up to one cadence before the controller changes
+    /// phase, one cadence is allowed at the trailing boundary. Any within-phase gap
+    /// larger than the requested cadence is a missed collection.
+    pub fn phase_coverage(
+        &self,
+        phase: &str,
+        cadence_ns: u64,
+        required_duration_ns: u64,
+    ) -> Result<PhaseCoverage> {
+        if cadence_ns == 0 {
+            return Err(AhrbError::Validation(
+                "sampling cadence must be nonzero".to_owned(),
+            ));
+        }
+        if required_duration_ns == 0 {
+            return Err(AhrbError::Validation(
+                "required phase duration must be nonzero".to_owned(),
+            ));
+        }
+        let times: Vec<u64> = self
+            .samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .map(|sample| sample.elapsed_ns)
+            .collect();
+        if times.len() < 2 {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} needs at least two boundary samples"
+            )));
+        }
+        if times.windows(2).any(|pair| pair[1] <= pair[0]) {
+            return Err(AhrbError::Validation(format!(
+                "phase {phase:?} sample times are not strictly increasing"
+            )));
+        }
+        let start_ns = times.first().copied().unwrap_or(0);
+        let end_ns = times.last().copied().unwrap_or(start_ns);
+        let observed_duration_ns = end_ns.saturating_sub(start_ns);
+        let (maximum_gap_ns, cadence_gaps, cadence_trustworthy) =
+            cadence_quality(&times, cadence_ns);
+        let duration_covered =
+            observed_duration_ns.saturating_add(cadence_ns) >= required_duration_ns;
+        Ok(PhaseCoverage {
+            sample_count: times.len(),
+            start_ns,
+            end_ns,
+            observed_duration_ns,
+            required_duration_ns,
+            maximum_gap_ns,
+            cadence_gaps,
+            duration_covered,
+            trustworthy: duration_covered && cadence_trustworthy,
+        })
+    }
+
+    /// Detect sampler-thread CPU cost and cadence overruns.
     pub fn sampling_health(&self, cadence_ns: u64) -> Result<SamplingHealth> {
         if cadence_ns == 0 {
             return Err(AhrbError::Validation(
@@ -154,19 +244,43 @@ impl SampleSeries {
         let collection_ns = self.samples.iter().fold(0_u64, |total, sample| {
             total.saturating_add(sample.collection_ns)
         });
-        let observation_ns = match (self.samples.first(), self.samples.last()) {
-            (Some(first), Some(last)) => last
-                .elapsed_ns
-                .saturating_sub(first.elapsed_ns)
-                .saturating_add(cadence_ns),
-            _ => 0,
-        };
+        let mut observation_ns = 0_u64;
+        let mut segment_times = Vec::new();
+        let mut cadence_gaps = 0_usize;
+        let mut cadence_untrustworthy = false;
+        let mut previous: Option<&Sample> = None;
+        for sample in &self.samples {
+            match previous {
+                Some(prior) if prior.phase == sample.phase => {
+                    let gap = sample.elapsed_ns.saturating_sub(prior.elapsed_ns);
+                    observation_ns = observation_ns.saturating_add(gap);
+                    segment_times.push(sample.elapsed_ns);
+                }
+                _ => {
+                    if !segment_times.is_empty() {
+                        let (_, gaps, trustworthy) = cadence_quality(&segment_times, cadence_ns);
+                        cadence_gaps = cadence_gaps.saturating_add(gaps);
+                        cadence_untrustworthy |= !trustworthy;
+                    }
+                    segment_times.clear();
+                    segment_times.push(sample.elapsed_ns);
+                    observation_ns = observation_ns.saturating_add(cadence_ns);
+                }
+            }
+            previous = Some(sample);
+        }
+        if !segment_times.is_empty() {
+            let (_, gaps, trustworthy) = cadence_quality(&segment_times, cadence_ns);
+            cadence_gaps = cadence_gaps.saturating_add(gaps);
+            cadence_untrustworthy |= !trustworthy;
+        }
         let cadence_overruns = self
             .samples
             .iter()
-            .filter(|sample| sample.collection_ns > cadence_ns)
+            .filter(|sample| sample.collection_wall_ns > cadence_ns)
             .count();
-        let overhead_one_core = if observation_ns == 0 {
+        // Periodic collectors store direct thread CPU time in `collection_ns`.
+        let collection_cpu_fraction = if observation_ns == 0 {
             0.0
         } else {
             collection_ns as f64 / observation_ns as f64
@@ -174,9 +288,12 @@ impl SampleSeries {
         Ok(SamplingHealth {
             collection_ns,
             observation_ns,
-            overhead_one_core,
+            collection_cpu_fraction,
             cadence_overruns,
-            overloaded: overhead_one_core > 0.10 || cadence_overruns > 0,
+            cadence_gaps,
+            overloaded: collection_cpu_fraction > 0.10
+                || cadence_overruns > 0
+                || cadence_untrustworthy,
         })
     }
 
@@ -224,20 +341,37 @@ impl SampleSeries {
         };
         let minimum_observed_processes = selected
             .iter()
-            .map(|sample| sample.processes.len())
+            .map(|sample| {
+                sample
+                    .processes
+                    .iter()
+                    .map(|process| process.identity)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+            })
             .min()
             .map_or(0, |value| value);
         let all_expected_present = minimum_observed_processes >= minimum_processes;
+        let distinct_sample_times = selected
+            .iter()
+            .map(|sample| sample.elapsed_ns)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let has_multiple_sample_times = distinct_sample_times >= 2;
         Ok(Plateau {
             metric,
             sample_count: values.len(),
+            distinct_sample_times,
             minimum_observed_processes,
             median_bytes,
             p05_bytes,
             p95_bytes,
             relative_spread,
             all_expected_present,
-            trustworthy: relative_spread <= 0.05 && all_expected_present,
+            has_multiple_sample_times,
+            trustworthy: relative_spread <= 0.05
+                && all_expected_present
+                && has_multiple_sample_times,
         })
     }
 }
@@ -249,6 +383,8 @@ pub struct Plateau {
     pub metric: MemoryMetric,
     /// Samples in the candidate window.
     pub sample_count: usize,
+    /// Number of distinct monotonic timestamps represented by the window.
+    pub distinct_sample_times: usize,
     /// Smallest whole-tree membership observed in the window.
     pub minimum_observed_processes: usize,
     /// Median bytes.
@@ -261,7 +397,10 @@ pub struct Plateau {
     pub relative_spread: f64,
     /// Whether every sample met the caller's membership requirement.
     pub all_expected_present: bool,
-    /// Whether spread is at most five percent and all expected processes were present.
+    /// Whether the window contains at least two distinct sample times.
+    pub has_multiple_sample_times: bool,
+    /// Whether the window has temporal coverage, spread is at most five percent,
+    /// and all expected processes were present.
     pub trustworthy: bool,
 }
 
@@ -276,6 +415,29 @@ pub struct PhaseCpu {
     pub one_core_fraction: f64,
 }
 
+/// Boundary, duration, and cadence evidence for one phase window.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PhaseCoverage {
+    /// Samples carrying this phase, including the boundary observations.
+    pub sample_count: usize,
+    /// First phase sample in monotonic nanoseconds.
+    pub start_ns: u64,
+    /// Last phase sample in monotonic nanoseconds.
+    pub end_ns: u64,
+    /// Difference between the first and last boundary samples.
+    pub observed_duration_ns: u64,
+    /// Minimum duration required by the selected profile.
+    pub required_duration_ns: u64,
+    /// Largest interval between consecutive phase samples.
+    pub maximum_gap_ns: u64,
+    /// Intervals larger than the requested cadence.
+    pub cadence_gaps: usize,
+    /// Whether boundary coverage reaches the required duration within one cadence.
+    pub duration_covered: bool,
+    /// Whether duration and cadence coverage are both trustworthy.
+    pub trustworthy: bool,
+}
+
 /// Evidence that the sampler itself did not distort the benchmark.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct SamplingHealth {
@@ -283,10 +445,12 @@ pub struct SamplingHealth {
     pub collection_ns: u64,
     /// Time span represented by the series.
     pub observation_ns: u64,
-    /// Collection CPU-time approximation as a fraction of one core.
-    pub overhead_one_core: f64,
-    /// Samples whose collection duration exceeded the requested cadence.
+    /// Aggregate sampler thread-CPU fraction of one core.
+    pub collection_cpu_fraction: f64,
+    /// Samples whose wall collection duration exceeded the requested cadence.
     pub cadence_overruns: usize,
+    /// Within-phase intervals larger than the requested cadence.
+    pub cadence_gaps: usize,
     /// Whether the run must become `ERROR: sampler overload`.
     pub overloaded: bool,
 }
@@ -342,6 +506,8 @@ pub struct SweepMetrics {
     pub scaling_exponent_alpha: Option<f64>,
     /// Largest cold whole-tree peak in the sweep.
     pub maximum_cold_peak_bytes: u64,
+    /// Largest workload whole-tree peak in the sweep.
+    pub maximum_workload_peak_bytes: u64,
 }
 
 impl SweepMetrics {
@@ -357,6 +523,7 @@ impl SweepMetrics {
         let mut previous: Option<SweepPoint> = None;
         let mut derived = Vec::with_capacity(sorted.len());
         let mut maximum_cold_peak_bytes = 0_u64;
+        let mut maximum_workload_peak_bytes = 0_u64;
         for point in &sorted {
             if point.agents == 0 {
                 return Err(AhrbError::Validation(
@@ -367,6 +534,18 @@ impl SweepMetrics {
                 return Err(AhrbError::Validation(format!(
                     "resource sweep contains duplicate N={}",
                     point.agents
+                )));
+            }
+            if point.steady_bytes < point.baseline_bytes {
+                return Err(AhrbError::Validation(format!(
+                    "resource sweep N={} steady memory {} is below baseline {}",
+                    point.agents, point.steady_bytes, point.baseline_bytes
+                )));
+            }
+            if point.workload_peak_bytes < point.steady_bytes {
+                return Err(AhrbError::Validation(format!(
+                    "resource sweep N={} workload peak {} is below steady memory {}",
+                    point.agents, point.workload_peak_bytes, point.steady_bytes
                 )));
             }
             let active_delta = point.steady_bytes.saturating_sub(point.baseline_bytes);
@@ -397,6 +576,8 @@ impl SweepMetrics {
                 },
             ));
             maximum_cold_peak_bytes = maximum_cold_peak_bytes.max(point.cold_peak_bytes);
+            maximum_workload_peak_bytes =
+                maximum_workload_peak_bytes.max(point.workload_peak_bytes);
             previous = Some(*point);
         }
 
@@ -409,6 +590,7 @@ impl SweepMetrics {
             headline_beta_mib_per_agent,
             scaling_exponent_alpha,
             maximum_cold_peak_bytes,
+            maximum_workload_peak_bytes,
         })
     }
 }
@@ -495,12 +677,16 @@ fn median_f64(sorted: &[f64]) -> Option<f64> {
 }
 
 fn scaling_exponent(points: &[SweepPoint]) -> Option<f64> {
+    if points.iter().any(|point| {
+        point.agents == 0 || point.steady_bytes.saturating_sub(point.baseline_bytes) == 0
+    }) {
+        return None;
+    }
     let log_points: Vec<(f64, f64)> = points
         .iter()
-        .filter_map(|point| {
+        .map(|point| {
             let delta = point.steady_bytes.saturating_sub(point.baseline_bytes);
-            (point.agents > 0 && delta > 0)
-                .then_some(((point.agents as f64).ln(), (delta as f64).ln()))
+            ((point.agents as f64).ln(), (delta as f64).ln())
         })
         .collect();
     linear_slope(&log_points)
@@ -545,8 +731,12 @@ mod tests {
             cgroup_memory_bytes: None,
             cgroup_peak_bytes: None,
             cpu_ns: elapsed_ns / 100,
+            open_fds: None,
+            thread_count: None,
             collection_ns: 1,
+            collection_wall_ns: 1,
             processes,
+            process_samples: Vec::new(),
         }
     }
 
@@ -562,6 +752,58 @@ mod tests {
 
         let missing = series.plateau("steady", MemoryMetric::Rss, 9)?;
         assert!(!missing.trustworthy);
+        Ok(())
+    }
+
+    #[test]
+    fn plateau_requires_temporal_coverage_and_unique_membership() -> Result<()> {
+        let mut series = SampleSeries::default();
+        let mut only = sample(0, 100, 2);
+        only.processes[1].identity = only.processes[0].identity;
+        series.push(only)?;
+
+        let plateau = series.plateau("steady", MemoryMetric::Rss, 2)?;
+        assert_eq!(plateau.sample_count, 1);
+        assert_eq!(plateau.distinct_sample_times, 1);
+        assert_eq!(plateau.minimum_observed_processes, 1);
+        assert!(!plateau.has_multiple_sample_times);
+        assert!(!plateau.all_expected_present);
+        assert!(!plateau.trustworthy);
+        Ok(())
+    }
+
+    #[test]
+    fn phase_cpu_rejects_missing_interval_and_counter_regression() -> Result<()> {
+        let mut singleton = SampleSeries::default();
+        singleton.push(sample(0, 100, 1))?;
+        assert!(singleton.phase_cpu("steady").is_err());
+
+        let mut regressed = SampleSeries::default();
+        let mut first = sample(0, 100, 1);
+        first.cpu_ns = 20;
+        let mut second = sample(100, 100, 1);
+        second.cpu_ns = 10;
+        regressed.push(first)?;
+        regressed.push(second)?;
+        assert!(regressed.phase_cpu("steady").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_plateau_requires_the_requested_phase_duration() -> Result<()> {
+        let mut series = SampleSeries::default();
+        series.push(sample(0, 100, 1))?;
+        series.push(sample(10, 100, 1))?;
+        assert!(
+            series
+                .trailing_plateau("steady", MemoryMetric::Rss, 1, 11)
+                .is_err()
+        );
+        assert!(
+            series
+                .trailing_plateau("steady", MemoryMetric::Rss, 1, 10)?
+                .trustworthy
+        );
         Ok(())
     }
 
@@ -594,7 +836,33 @@ mod tests {
                 .iter()
                 .all(|(_, point)| point.reclaim_ratio == 1.0)
         );
+        assert_eq!(metrics.maximum_workload_peak_bytes, 171 * 1_048_576_u64);
         Ok(())
+    }
+
+    #[test]
+    fn sweep_rejects_impossible_steady_and_peak_relationships() {
+        let below_baseline = SweepPoint {
+            agents: 1,
+            baseline_bytes: 100,
+            steady_bytes: 99,
+            workload_peak_bytes: 100,
+            cold_peak_bytes: 100,
+            post_turn_bytes: 100,
+            post_close_bytes: 100,
+        };
+        assert!(SweepMetrics::calculate(&[below_baseline]).is_err());
+
+        let peak_below_steady = SweepPoint {
+            agents: 1,
+            baseline_bytes: 100,
+            steady_bytes: 110,
+            workload_peak_bytes: 109,
+            cold_peak_bytes: 100,
+            post_turn_bytes: 110,
+            post_close_bytes: 100,
+        };
+        assert!(SweepMetrics::calculate(&[peak_below_steady]).is_err());
     }
 
     #[test]
@@ -608,6 +876,68 @@ mod tests {
         series.push(second)?;
         let health = series.sampling_health(100)?;
         assert!(health.overloaded);
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_health_detects_a_missed_cadence_gap() -> Result<()> {
+        let mut series = SampleSeries::default();
+        series.push(sample(0, 100, 1))?;
+        series.push(sample(201, 100, 1))?;
+        let health = series.sampling_health(100)?;
+        assert_eq!(health.cadence_gaps, 1);
+        assert!(health.overloaded);
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_health_allows_one_bounded_scheduler_jitter_gap() -> Result<()> {
+        let mut series = SampleSeries::default();
+        let mut elapsed = 0_u64;
+        for index in 0..101 {
+            series.push(sample(elapsed, 100, 1))?;
+            elapsed = elapsed.saturating_add(if index == 50 { 150 } else { 100 });
+        }
+        let health = series.sampling_health(100)?;
+        assert_eq!(health.cadence_gaps, 1);
+        assert!(!health.overloaded);
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_health_rejects_more_than_one_percent_jitter_gaps() -> Result<()> {
+        let mut series = SampleSeries::default();
+        let mut elapsed = 0_u64;
+        for index in 0..201 {
+            series.push(sample(elapsed, 100, 1))?;
+            elapsed = elapsed.saturating_add(if matches!(index, 25 | 75 | 125) {
+                150
+            } else {
+                100
+            });
+        }
+        let health = series.sampling_health(100)?;
+        assert_eq!(health.cadence_gaps, 3);
+        assert!(health.overloaded);
+        Ok(())
+    }
+
+    #[test]
+    fn phase_coverage_rejects_truncation_and_gaps() -> Result<()> {
+        let mut truncated = SampleSeries::default();
+        truncated.push(sample(0, 100, 1))?;
+        truncated.push(sample(100, 100, 1))?;
+        let coverage = truncated.phase_coverage("steady", 100, 300)?;
+        assert!(!coverage.duration_covered);
+        assert!(!coverage.trustworthy);
+
+        let mut gapped = SampleSeries::default();
+        gapped.push(sample(0, 100, 1))?;
+        gapped.push(sample(201, 100, 1))?;
+        gapped.push(sample(300, 100, 1))?;
+        let coverage = gapped.phase_coverage("steady", 100, 300)?;
+        assert_eq!(coverage.cadence_gaps, 1);
+        assert!(!coverage.trustworthy);
         Ok(())
     }
 }

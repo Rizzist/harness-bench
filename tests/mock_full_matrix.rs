@@ -41,11 +41,11 @@ fn json_text(values: &[Value]) -> String {
 }
 
 #[test]
-fn incomplete_full_matrix_refuses_certification_with_complete_artifacts() {
+fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     let output = run_directory();
     let (status, report) = run_full_matrix(&output);
 
-    assert_eq!(status.code(), Some(1));
+    assert_eq!(status.code(), Some(0));
 
     assert_eq!(report.results.len(), 41);
     assert_eq!(
@@ -57,27 +57,21 @@ fn incomplete_full_matrix_refuses_certification_with_complete_artifacts() {
         (1_u8..=41).collect::<Vec<_>>()
     );
     for result in &report.results {
-        if (20..=29).contains(&result.row) {
-            assert!(matches!(result.outcome, TestOutcome::Error(_)));
-        } else {
-            assert!(matches!(result.outcome, TestOutcome::Pass));
-        }
-        if matches!(result.outcome, TestOutcome::Pass) {
-            assert!(
-                !result.evidence.is_empty(),
-                "passing row {} has no evaluated evidence",
-                result.row
-            );
-            assert!(
-                result
-                    .evidence
-                    .iter()
-                    .all(|item| !item.contains("runner-wired")
-                        && !item.contains("not produced evidence")),
-                "row {} retained placeholder evidence",
-                result.row
-            );
-        }
+        assert!(matches!(result.outcome, TestOutcome::Pass));
+        assert!(
+            !result.evidence.is_empty(),
+            "passing row {} has no evaluated evidence",
+            result.row
+        );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .all(|item| !item.contains("runner-wired")
+                    && !item.contains("not produced evidence")),
+            "row {} retained placeholder evidence",
+            result.row
+        );
     }
 
     // Raw events must remain observations, not circular restatements of the already
@@ -120,21 +114,25 @@ fn incomplete_full_matrix_refuses_certification_with_complete_artifacts() {
         report
             .samples
             .iter()
-            .any(|sample| sample.phase.contains("n8") || sample.phase.contains("barrier"))
+            .any(|sample| sample.phase.contains("n4") || sample.phase.contains("barrier"))
     );
     for key in ["crash_recovery_ms", "journal_recovered_events"] {
         assert!(report.metrics.contains_key(key), "missing metric {key}");
     }
-    assert!(!report.metrics.contains_key("parallel_beta_mib_per_agent"));
+    assert!(report.metrics.contains_key("parallel_beta_mib_per_agent"));
     assert!(report.metrics["crash_recovery_ms"] < 10_000.0);
     assert!(report.metrics["journal_recovered_events"] >= 1.0);
-    assert!(report.badge.is_none());
+    let badge = report.badge.as_ref().expect("full matrix badge");
+    assert_eq!(badge.os, std::env::consts::OS);
+    assert_eq!(badge.topology, "shared-daemon-sessions");
+    assert_eq!(badge.parallel_width, 4);
 
     for artifact in [
         "report.md",
         "report.json",
         "samples.jsonl",
         "processes.jsonl",
+        "membership.jsonl",
         "events.jsonl",
         "model-requests.jsonl",
         "junit.xml",

@@ -2,12 +2,27 @@
 
 use crate::Result;
 use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
-use crate::process::{ProcessInfo, Sample};
+use crate::process::{ProcessSample, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
+
+/// One auditable recursive process-membership refresh boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MembershipSample {
+    /// Monotonic nanoseconds since resource collection began.
+    pub elapsed_ns: u64,
+    /// Resource phase active at this refresh.
+    pub phase: String,
+    /// Wall time consumed by recursive discovery.
+    pub discovery_wall_ns: u64,
+    /// Calling-thread CPU consumed by recursive discovery.
+    pub discovery_cpu_ns: u64,
+    /// Deterministic staggered sampler lane.
+    pub lane: u32,
+}
 
 /// Reproducibility fingerprint fields.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -52,7 +67,10 @@ pub struct Report {
     /// Raw resource samples.
     pub samples: Vec<Sample>,
     /// Raw process observations.
-    pub processes: Vec<ProcessInfo>,
+    pub processes: Vec<ProcessSample>,
+    /// Raw recursive process-membership refresh timestamps.
+    #[serde(default)]
+    pub membership: Vec<MembershipSample>,
     /// Normalized event JSON records.
     pub events: Vec<Value>,
     /// Redacted fake-model request JSON records.
@@ -72,6 +90,7 @@ pub fn write_bundle(report: &Report, directory: &Path, junit: bool) -> Result<()
     )?;
     write_jsonl(&directory.join("samples.jsonl"), &report.samples)?;
     write_jsonl(&directory.join("processes.jsonl"), &report.processes)?;
+    write_jsonl(&directory.join("membership.jsonl"), &report.membership)?;
     write_jsonl(&directory.join("events.jsonl"), &report.events)?;
     write_jsonl(
         &directory.join("model-requests.jsonl"),

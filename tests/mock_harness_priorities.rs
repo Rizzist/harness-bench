@@ -229,16 +229,24 @@ impl RpcProcess {
     }
 
     async fn spawn_with_state(state_dir: PathBuf) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ahrb-mock-harness"))
+        Self::spawn_with_state_and_environment(state_dir, BTreeMap::new()).await
+    }
+
+    async fn spawn_with_state_and_environment(
+        state_dir: PathBuf,
+        environment: BTreeMap<String, String>,
+    ) -> Self {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ahrb-mock-harness"));
+        command
             .arg("serve")
             .arg("--state-dir")
             .arg(&state_dir)
+            .envs(environment)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn mock harness");
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn mock harness");
         let stdin = child.stdin.take().expect("mock stdin");
         let stdout = child.stdout.take().expect("mock stdout");
         Self {
@@ -791,6 +799,265 @@ async fn functional_and_control_surfaces_emit_ordered_normalized_evidence() {
     assert_eq!(
         events_of(&cancelled, EventVocab::TerminalCancelled).len(),
         1
+    );
+
+    let state_dir = process.shutdown().await;
+    cleanup(&state_dir);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn persistent_daemon_holds_n_sessions_eventfully_and_reclaims() {
+    use ahrb::workflow::Barrier;
+
+    const AGENTS: usize = 8;
+    const MIB: u64 = 1024 * 1024;
+    const RESERVATION_BYTES: u64 = 4 * MIB;
+
+    let state_dir = temporary_directory("one-daemon-resource-surface");
+    std::fs::create_dir_all(&state_dir).expect("create resource state");
+    let scenario = "one-daemon-resource-surface";
+    let marker = |actor: &str, checkpoint: &str| {
+        format!("[[AHRB:scenario={scenario};actor={actor};checkpoint={checkpoint}]]")
+    };
+    let mut actors = BTreeMap::new();
+    let mut responses = Vec::new();
+    for index in 1..=AGENTS {
+        let actor = format!("agent-{index}");
+        actors.insert(
+            actor.clone(),
+            Actor {
+                id: actor.clone(),
+                parent: None,
+                prompt: marker(&actor, "start"),
+                workspace: actor.clone(),
+            },
+        );
+        responses.push(ScriptedResponse {
+            scenario: scenario.to_owned(),
+            actor: actor.clone(),
+            checkpoint: "start".to_owned(),
+            request_hash: String::new(),
+            response: json!({
+                "tool_calls": [{
+                    "id": format!("resource-call-{index}"),
+                    "name": "write_fixture",
+                    "arguments": {
+                        "path": "resource.txt",
+                        "content": format!("agent-{index} {}", marker(&actor, "terminal")),
+                        "ahrb_checkpoint": {
+                            "name": "resource-steady",
+                            "phase": "after-commit"
+                        }
+                    }
+                }]
+            }),
+            fault: None,
+            barrier: None,
+        });
+        responses.push(ScriptedResponse {
+            scenario: scenario.to_owned(),
+            actor,
+            checkpoint: "terminal".to_owned(),
+            request_hash: String::new(),
+            response: json!({"text": "AHRB_SUCCESS one daemon"}),
+            fault: None,
+            barrier: None,
+        });
+    }
+    let workflow = Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.to_owned(),
+        actors,
+        barriers: BTreeMap::<String, Barrier>::new(),
+        responses,
+    };
+    let workflow_path = state_dir.join("embedded-workflow.json");
+    std::fs::write(
+        &workflow_path,
+        serde_json::to_vec(&workflow).expect("serialize resource workflow"),
+    )
+    .expect("write resource workflow");
+    let environment = BTreeMap::from([(
+        "AHRB_MOCK_EMBEDDED_WORKFLOW".to_owned(),
+        workflow_path.to_string_lossy().into_owned(),
+    )]);
+    let mut process =
+        RpcProcess::spawn_with_state_and_environment(state_dir.clone(), environment).await;
+    let daemon_pid = process.pid();
+    let readiness_session = process
+        .rpc("session.create", json!({"marker": "resource-readiness"}))
+        .await["session_id"]
+        .as_str()
+        .expect("readiness session")
+        .to_owned();
+    process
+        .rpc("session.close", json!({"session_id": readiness_session}))
+        .await;
+    let located_pid: u32 = std::fs::read_to_string(state_dir.join("daemon.pid"))
+        .expect("stable daemon PID locator")
+        .parse()
+        .expect("numeric daemon PID");
+    assert_eq!(located_pid, daemon_pid);
+
+    let mut sampler = platform_sampler();
+    let baseline_tree = sampler
+        .discover(&[daemon_pid])
+        .expect("discover idle daemon");
+    assert_eq!(baseline_tree.members.len(), 1, "one shared daemon process");
+    let baseline = sampler
+        .sample(&baseline_tree, "warm-idle")
+        .expect("sample idle daemon");
+    let effective =
+        |sample: &ahrb::process::Sample| sample.footprint_bytes.unwrap_or(sample.rss_bytes);
+
+    let mut sessions = Vec::new();
+    for index in 1..=AGENTS {
+        let actor = format!("agent-{index}");
+        let session_id = process
+            .rpc("session.create", json!({"marker": actor}))
+            .await["session_id"]
+            .as_str()
+            .expect("resource session ID")
+            .to_owned();
+        process
+            .rpc(
+                "session.submit",
+                json!({
+                    "session_id": session_id,
+                    "prompt": marker(&actor, "start"),
+                    "key": "resource-turn"
+                }),
+            )
+            .await;
+        sessions.push(session_id);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let reached = loop {
+        let mut reached = Vec::new();
+        for session in &sessions {
+            let events = attach_events(&mut process, session, None).await;
+            if let Some(barrier) = events
+                .iter()
+                .find(|event| event.event == EventVocab::BarrierReached)
+            {
+                let result = events
+                    .iter()
+                    .find(|event| event.event == EventVocab::ToolResult)
+                    .expect("tool result precedes held checkpoint");
+                assert!(result.cursor < barrier.cursor);
+                assert!(
+                    events.iter().all(|event| !is_terminal_vocab(&event.event)),
+                    "held session must remain nonterminal"
+                );
+                reached.push((session.clone(), barrier.clone()));
+            }
+        }
+        if reached.len() == AGENTS {
+            break reached;
+        }
+        assert!(Instant::now() < deadline, "all N sessions reached the hold");
+        tokio::task::yield_now().await;
+    };
+
+    assert_eq!(
+        process.pid(),
+        daemon_pid,
+        "daemon persists across N sessions"
+    );
+    let active_tree = sampler
+        .discover(&[daemon_pid])
+        .expect("rediscover active daemon");
+    assert_eq!(active_tree.members.len(), 1, "agents are daemon tasks");
+    let active = sampler
+        .sample(&active_tree, "n8-barrier-steady")
+        .expect("sample active sessions");
+    assert!(
+        effective(&active).saturating_sub(effective(&baseline))
+            >= (AGENTS as u64 * RESERVATION_BYTES * 3 / 4),
+        "page-touched session reservations must be visible"
+    );
+
+    for (session, barrier) in &reached {
+        let release_token = barrier.payload["release_token"]
+            .as_str()
+            .expect("barrier release token");
+        let released = process
+            .rpc(
+                "checkpoint.release",
+                json!({"session_id": session, "release_token": release_token}),
+            )
+            .await;
+        assert_eq!(released["released"], true);
+        assert_eq!(released["idempotent"], false);
+    }
+    let first_token = reached[0].1.payload["release_token"]
+        .as_str()
+        .expect("first release token");
+    let repeated = process
+        .rpc(
+            "checkpoint.release",
+            json!({"session_id": reached[0].0, "release_token": first_token}),
+        )
+        .await;
+    assert_eq!(repeated["idempotent"], true);
+
+    for session in &sessions {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let events = attach_events(&mut process, session, None).await;
+            if events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalSuccess)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "released session terminalizes");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let mut released_bytes = 0_u64;
+    for session in &sessions {
+        let closed = process
+            .rpc("session.close", json!({"session_id": session}))
+            .await;
+        released_bytes = released_bytes.saturating_add(
+            closed["released_bytes"]
+                .as_u64()
+                .expect("released reservation bytes"),
+        );
+    }
+    assert_eq!(released_bytes, AGENTS as u64 * RESERVATION_BYTES);
+
+    let reclaim_deadline = Instant::now() + Duration::from_secs(1);
+    let post_close = loop {
+        let tree = sampler
+            .discover(&[daemon_pid])
+            .expect("rediscover reclaimed daemon");
+        let sample = sampler
+            .sample(&tree, "post-close")
+            .expect("sample reclaimed daemon");
+        if effective(&active).saturating_sub(effective(&sample))
+            >= AGENTS as u64 * RESERVATION_BYTES * 4 / 5
+        {
+            break sample;
+        }
+        assert!(
+            Instant::now() < reclaim_deadline,
+            "munmap reclaim reaches 80%"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(post_close.processes.len(), 1);
+    assert_eq!(process.pid(), daemon_pid, "daemon returns to idle in place");
+    assert_eq!(
+        std::fs::read_to_string(state_dir.join("daemon.pid"))
+            .expect("PID locator remains present")
+            .parse::<u32>()
+            .expect("numeric post-close PID"),
+        daemon_pid
     );
 
     let state_dir = process.shutdown().await;
