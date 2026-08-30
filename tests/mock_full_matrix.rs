@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::evaluate::TestOutcome;
 use ahrb::report::Report;
 use serde_json::Value;
@@ -16,6 +18,7 @@ fn run_directory() -> PathBuf {
 }
 
 fn run_full_matrix(output: &Path) -> (std::process::ExitStatus, Report) {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
         .current_dir(repository)
@@ -29,10 +32,13 @@ fn run_full_matrix(output: &Path) -> (std::process::ExitStatus, Report) {
         .arg("--junit")
         .output()
         .expect("execute AHRB against its built-in mock harness");
-    let report = serde_json::from_slice(
-        &std::fs::read(output.join("report.json")).expect("read full report"),
-    )
-    .expect("parse full report");
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &result,
+        &report_path,
+        "AHRB full-matrix subprocess did not produce a report",
+    );
+    let report = serde_json::from_slice(&report_bytes).expect("parse full report");
     (result.status, report)
 }
 

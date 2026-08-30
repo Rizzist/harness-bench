@@ -42,6 +42,7 @@ command = [
   "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check",
   "--ignore-user-config", "--ignore-rules",
   "-c", 'model_provider="ahrb"',
+  "-c", "model_context_window=128000",
   "-c", 'model_providers.ahrb.name="AHRB Fake Model"',
   "-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"',
   "-c", 'model_providers.ahrb.env_key="OPENAI_API_KEY"',
@@ -58,6 +59,7 @@ resume = [
   "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check",
   "--ignore-user-config", "--ignore-rules",
   "-c", 'model_provider="ahrb"',
+  "-c", "model_context_window=128000",
   "-c", 'model_providers.ahrb.name="AHRB Fake Model"',
   "-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"',
   "-c", 'model_providers.ahrb.env_key="OPENAI_API_KEY"',
@@ -77,8 +79,8 @@ topology = "client-process-fanout"
 max_agents = 8
 fanout_mode = "client"
 
-# TODO(orchestrator): confirm the current Codex model-visible shell alias remains
-# `shell` and that its `command` field is argv-shaped against the real binary.
+# TODO(orchestrator): revalidate these known Codex tool item variants when the
+# probed CLI changes its exec JSONL schema.
 [tools.aliases]
 write = "shell"
 read = "shell"
@@ -112,8 +114,56 @@ event = "tool-call"
 payload_pointer = "/item"
 
 [[events.rules]]
+matches = "item.started"
+match_fields = { "/item/type" = "function_call" }
+event = "tool-call"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.started"
+match_fields = { "/item/type" = "local_shell_call" }
+event = "tool-call"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.started"
+match_fields = { "/item/type" = "file_change" }
+event = "tool-call"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.started"
+match_fields = { "/item/type" = "patch_apply" }
+event = "tool-call"
+payload_pointer = "/item"
+
+[[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "command_execution" }
+event = "tool-result"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "function_call" }
+event = "tool-result"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "local_shell_call" }
+event = "tool-result"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "file_change" }
+event = "tool-result"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "patch_apply" }
 event = "tool-result"
 payload_pointer = "/item"
 
@@ -131,10 +181,17 @@ event = "terminal-success"
 matches = "turn.failed"
 event = "terminal-failure"
 
+[[events.rules]]
+matches = "error"
+event = "terminal-failure"
+
 [exit]
 success = 0
 success_stdout = ['"type":"turn.completed"']
-failure_stdout = ['"type":"turn.failed"', '"type":"error"']
+# Codex may emit a non-fatal item.completed whose nested item.type is "error"
+# when an unknown model ID uses fallback metadata. Structured turn failure,
+# process exit, and the required success marker remain authoritative.
+failure_stdout = ['"type":"turn.failed"']
 failures = { provider = 1 }
 
 [process]
@@ -159,4 +216,3 @@ sessions = "Codex persists a thread under isolated CODEX_HOME"
 resume = "codex exec resume reopens the prior thread in a fresh process"
 
 [capabilities.optional]
-

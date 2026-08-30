@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::Result;
 use ahrb::cli::{Profile, RunOptions};
 use ahrb::evaluate::TestOutcome;
@@ -10,6 +12,7 @@ fn output_directory() -> PathBuf {
 
 #[tokio::test]
 async fn mock_harness_exercises_the_non_resource_report_pipeline() -> Result<()> {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let output = output_directory();
     match std::fs::remove_dir_all(&output) {
         Ok(()) => {}

@@ -13,12 +13,14 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -28,11 +30,51 @@ use tokio::task::JoinHandle;
 /// Maximum accepted fake-model request body. This keeps malformed peers bounded.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
+const BIND_MAX_ATTEMPTS: usize = 8;
+const BIND_BACKOFF_MS: u64 = 10;
+
 // The managed source-build sandbox permits local listeners but may reject concurrent
 // binds. Serialize listener-owning unit tests; production servers are unaffected.
 #[cfg(test)]
 pub(crate) static LOCAL_SERVER_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct ProcessServerTestLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_process_server_test_lock() -> Result<ProcessServerTestLock> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let path = std::env::temp_dir().join("ahrb-test-server-subprocess.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        loop {
+            // SAFETY: `file` owns this valid descriptor for the full lifetime of the lock.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                return Ok(ProcessServerTestLock { _file: file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ProcessServerTestLock {})
+    }
+}
 
 /// A protocol-independent canonical model request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -320,7 +362,7 @@ pub struct FakeModelServer {
 impl FakeModelServer {
     /// Bind a loopback/local address and start serving all built-in protocol frontends.
     pub async fn bind(addr: SocketAddr, engine: Arc<FakeModelEngine>) -> Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = retry_transient_bind(|| TcpListener::bind(addr)).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let task_engine = Arc::clone(&engine);
@@ -416,7 +458,8 @@ impl FakeModelUnixServer {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener =
+            retry_transient_bind(|| std::future::ready(UnixListener::bind(&socket_path))).await?;
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let task_engine = Arc::clone(&engine);
         let task = tokio::spawn(async move {
@@ -474,6 +517,45 @@ impl FakeModelUnixServer {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+async fn retry_transient_bind<T, F, Fut>(mut bind: F) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    for attempt in 1..=BIND_MAX_ATTEMPTS {
+        match bind().await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if attempt < BIND_MAX_ATTEMPTS && is_transient_bind_error(&error) => {
+                let delay_ms = BIND_BACKOFF_MS.saturating_mul(attempt as u64);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other(
+        "fake-model bind retry loop exhausted without a result",
+    ))
+}
+
+pub(crate) fn is_transient_bind_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    ) {
+        return true;
+    }
+    error.raw_os_error().is_some_and(|code| {
+        matches!(
+            code,
+            libc::ENOBUFS | libc::ENOMEM | libc::EMFILE | libc::ENFILE
+        )
+    })
 }
 
 async fn serve_request(
@@ -779,6 +861,7 @@ fn render_chat_value(response: &ModelResponse) -> Result<Value> {
     } else {
         "tool_calls"
     };
+    let completion_tokens = nonzero_token_estimate(&Value::Object(message.clone()));
     Ok(json!({
         "id": stable_id("chatcmpl", response),
         "object": "chat.completion",
@@ -789,7 +872,11 @@ fn render_chat_value(response: &ModelResponse) -> Result<Value> {
             "message": Value::Object(message),
             "finish_reason": finish_reason
         }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        "usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": completion_tokens,
+            "total_tokens": completion_tokens.saturating_add(1)
+        }
     }))
 }
 
@@ -855,6 +942,7 @@ fn render_responses_value(response: &ModelResponse) -> Result<Value> {
             "status": "completed"
         }));
     }
+    let output_tokens = nonzero_token_estimate(&Value::Array(output.clone()));
     Ok(json!({
         "id": stable_id("resp", response),
         "object": "response",
@@ -862,7 +950,11 @@ fn render_responses_value(response: &ModelResponse) -> Result<Value> {
         "status": "completed",
         "model": response.model,
         "output": output,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": output_tokens,
+            "total_tokens": output_tokens.saturating_add(1)
+        }
     }))
 }
 
@@ -895,6 +987,7 @@ fn render_anthropic_value(response: &ModelResponse) -> Result<Value> {
         };
         content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
     }
+    let output_tokens = nonzero_token_estimate(&Value::Array(content.clone()));
     Ok(json!({
         "id": stable_id("msg", response),
         "type": "message",
@@ -903,7 +996,7 @@ fn render_anthropic_value(response: &ModelResponse) -> Result<Value> {
         "content": content,
         "stop_reason": if tool_calls.is_empty() { "end_turn" } else { "tool_use" },
         "stop_sequence": null,
-        "usage": {"input_tokens": 0, "output_tokens": 0}
+        "usage": {"input_tokens": 1, "output_tokens": output_tokens}
     }))
 }
 
@@ -942,22 +1035,22 @@ fn stable_id(prefix: &str, response: &ModelResponse) -> String {
     format!("{prefix}_{}", &digest[..24])
 }
 
+fn nonzero_token_estimate(value: &Value) -> u64 {
+    let bytes = value.to_string().len();
+    u64::try_from(bytes.saturating_add(3) / 4)
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
 fn render_json_or_sse(value: Value, stream: bool, dialect: &str) -> Result<RenderedResponse> {
     let mut headers = BTreeMap::new();
     let body = if stream {
         headers.insert("cache-control".to_owned(), "no-cache".to_owned());
         headers.insert("content-type".to_owned(), "text/event-stream".to_owned());
-        let serialized = serde_json::to_string(&value)?;
         match dialect {
-            "chat" => format!("data: {serialized}\n\ndata: [DONE]\n\n").into_bytes(),
-            "responses" => format!(
-                "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{serialized}}}\n\n"
-            )
-            .into_bytes(),
-            "anthropic" => format!(
-                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{serialized}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
-            )
-            .into_bytes(),
+            "chat" => render_chat_sse(&value)?,
+            "responses" => render_responses_sse(&value)?,
+            "anthropic" => render_anthropic_sse(&value)?,
             _ => {
                 return Err(AhrbError::Protocol(format!(
                     "unknown streaming dialect {dialect:?}"
@@ -973,6 +1066,495 @@ fn render_json_or_sse(value: Value, stream: bool, dialect: &str) -> Result<Rende
         headers,
         body,
     })
+}
+
+fn push_sse_event(body: &mut Vec<u8>, event: Option<&str>, data: &Value) -> Result<()> {
+    if let Some(event) = event {
+        body.extend_from_slice(b"event: ");
+        body.extend_from_slice(event.as_bytes());
+        body.push(b'\n');
+    }
+    body.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut *body, data)?;
+    body.extend_from_slice(b"\n\n");
+    Ok(())
+}
+
+fn positive_usage_token(usage: Option<&Map<String, Value>>, key: &str, fallback: u64) -> u64 {
+    usage
+        .and_then(|usage| usage.get(key))
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(fallback.max(1))
+}
+
+fn render_responses_sse(value: &Value) -> Result<Vec<u8>> {
+    let response = value.as_object().ok_or_else(|| {
+        AhrbError::Protocol("OpenAI Responses value must be an object".to_owned())
+    })?;
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AhrbError::Protocol("OpenAI Responses value lacks output[]".to_owned()))?;
+    let output_tokens = positive_usage_token(
+        response.get("usage").and_then(Value::as_object),
+        "output_tokens",
+        nonzero_token_estimate(&Value::Array(output.clone())),
+    );
+    let input_tokens = positive_usage_token(
+        response.get("usage").and_then(Value::as_object),
+        "input_tokens",
+        1,
+    );
+
+    let mut completed_response = value.clone();
+    let completed = completed_response.as_object_mut().ok_or_else(|| {
+        AhrbError::Protocol("OpenAI Responses value must be an object".to_owned())
+    })?;
+    completed.insert("status".to_owned(), Value::String("completed".to_owned()));
+    completed.insert(
+        "usage".to_owned(),
+        json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens.saturating_add(output_tokens)
+        }),
+    );
+
+    let mut created_response = completed_response.clone();
+    let created = created_response.as_object_mut().ok_or_else(|| {
+        AhrbError::Protocol("OpenAI Responses value must be an object".to_owned())
+    })?;
+    created.insert("status".to_owned(), Value::String("in_progress".to_owned()));
+    created.insert("output".to_owned(), Value::Array(Vec::new()));
+    created.insert("usage".to_owned(), Value::Null);
+
+    let mut body = Vec::new();
+    let mut sequence_number = 0_u64;
+    push_responses_event(
+        &mut body,
+        &mut sequence_number,
+        "response.created",
+        json!({"response": created_response}),
+    )?;
+
+    for (output_index, item) in output.iter().enumerate() {
+        let item_object = item.as_object().ok_or_else(|| {
+            AhrbError::Protocol("OpenAI Responses output items must be objects".to_owned())
+        })?;
+        let item_type = item_object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AhrbError::Protocol("OpenAI Responses output item lacks type".to_owned())
+            })?;
+        let item_id = item_object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AhrbError::Protocol("OpenAI Responses output item lacks id".to_owned())
+            })?;
+
+        let mut started_item = item.clone();
+        let started = started_item.as_object_mut().ok_or_else(|| {
+            AhrbError::Protocol("OpenAI Responses output items must be objects".to_owned())
+        })?;
+        started.insert("status".to_owned(), Value::String("in_progress".to_owned()));
+        match item_type {
+            "message" => {
+                started.insert("content".to_owned(), Value::Array(Vec::new()));
+            }
+            "function_call" => {
+                started.insert("arguments".to_owned(), Value::String(String::new()));
+            }
+            _ => {}
+        }
+        push_responses_event(
+            &mut body,
+            &mut sequence_number,
+            "response.output_item.added",
+            json!({"output_index": output_index, "item": started_item}),
+        )?;
+
+        match item_type {
+            "message" => {
+                let content = item_object
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "OpenAI Responses message item lacks content[]".to_owned(),
+                        )
+                    })?;
+                for (content_index, part) in content.iter().enumerate() {
+                    let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                    let mut started_part = part.clone();
+                    if part_type == "output_text" {
+                        if let Some(started_part) = started_part.as_object_mut() {
+                            started_part.insert("text".to_owned(), Value::String(String::new()));
+                        }
+                    }
+                    push_responses_event(
+                        &mut body,
+                        &mut sequence_number,
+                        "response.content_part.added",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "part": started_part
+                        }),
+                    )?;
+                    if part_type == "output_text" {
+                        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                        push_responses_event(
+                            &mut body,
+                            &mut sequence_number,
+                            "response.output_text.delta",
+                            json!({
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "delta": text,
+                                "logprobs": []
+                            }),
+                        )?;
+                        push_responses_event(
+                            &mut body,
+                            &mut sequence_number,
+                            "response.output_text.done",
+                            json!({
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "text": text,
+                                "logprobs": []
+                            }),
+                        )?;
+                    }
+                    push_responses_event(
+                        &mut body,
+                        &mut sequence_number,
+                        "response.content_part.done",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "part": part
+                        }),
+                    )?;
+                }
+            }
+            "function_call" => {
+                let arguments = item_object
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                push_responses_event(
+                    &mut body,
+                    &mut sequence_number,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": arguments
+                    }),
+                )?;
+                push_responses_event(
+                    &mut body,
+                    &mut sequence_number,
+                    "response.function_call_arguments.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments
+                    }),
+                )?;
+            }
+            _ => {}
+        }
+        push_responses_event(
+            &mut body,
+            &mut sequence_number,
+            "response.output_item.done",
+            json!({"output_index": output_index, "item": item}),
+        )?;
+    }
+
+    push_responses_event(
+        &mut body,
+        &mut sequence_number,
+        "response.completed",
+        json!({"response": completed_response}),
+    )?;
+    Ok(body)
+}
+
+fn push_responses_event(
+    body: &mut Vec<u8>,
+    sequence_number: &mut u64,
+    event: &str,
+    fields: Value,
+) -> Result<()> {
+    let mut data = fields.as_object().cloned().ok_or_else(|| {
+        AhrbError::Protocol("OpenAI Responses event fields must be an object".to_owned())
+    })?;
+    data.insert("type".to_owned(), Value::String(event.to_owned()));
+    data.insert(
+        "sequence_number".to_owned(),
+        Value::Number((*sequence_number).into()),
+    );
+    *sequence_number = sequence_number.saturating_add(1);
+    push_sse_event(body, Some(event), &Value::Object(data))
+}
+
+fn render_chat_sse(value: &Value) -> Result<Vec<u8>> {
+    let completion = value.as_object().ok_or_else(|| {
+        AhrbError::Protocol("OpenAI Chat Completions value must be an object".to_owned())
+    })?;
+    let id = required_string(completion, "id")?;
+    let model = required_string(completion, "model")?;
+    let created = completion
+        .get("created")
+        .cloned()
+        .unwrap_or_else(|| json!(1_700_000_000_u64));
+    let choices = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AhrbError::Protocol("OpenAI Chat Completions value lacks choices[]".to_owned())
+        })?;
+    let fallback_tokens = nonzero_token_estimate(&Value::Array(choices.clone()));
+    let usage = completion.get("usage").and_then(Value::as_object);
+    let prompt_tokens = positive_usage_token(usage, "prompt_tokens", 1);
+    let completion_tokens = positive_usage_token(usage, "completion_tokens", fallback_tokens);
+
+    let mut body = Vec::new();
+    for (choice_offset, choice) in choices.iter().enumerate() {
+        let choice = choice.as_object().ok_or_else(|| {
+            AhrbError::Protocol("OpenAI Chat Completions choices must be objects".to_owned())
+        })?;
+        let index = choice
+            .get("index")
+            .cloned()
+            .unwrap_or_else(|| json!(choice_offset));
+        let message = choice
+            .get("message")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                AhrbError::Protocol("OpenAI Chat Completions choice lacks message".to_owned())
+            })?;
+        let role = message
+            .get("role")
+            .cloned()
+            .unwrap_or_else(|| Value::String("assistant".to_owned()));
+        push_chat_chunk(
+            &mut body,
+            id,
+            model,
+            &created,
+            json!([{"index": index, "delta": {"role": role}, "finish_reason": null}]),
+            None,
+        )?;
+
+        if let Some(content) = message.get("content").and_then(Value::as_str) {
+            push_chat_chunk(
+                &mut body,
+                id,
+                model,
+                &created,
+                json!([{"index": index, "delta": {"content": content}, "finish_reason": null}]),
+                None,
+            )?;
+        }
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for (tool_index, tool_call) in tool_calls.iter().enumerate() {
+                let mut tool_call = tool_call.as_object().cloned().ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "OpenAI Chat Completions tool calls must be objects".to_owned(),
+                    )
+                })?;
+                tool_call.insert("index".to_owned(), json!(tool_index));
+                push_chat_chunk(
+                    &mut body,
+                    id,
+                    model,
+                    &created,
+                    json!([{
+                        "index": index,
+                        "delta": {"tool_calls": [Value::Object(tool_call)]},
+                        "finish_reason": null
+                    }]),
+                    None,
+                )?;
+            }
+        }
+        let finish_reason = choice
+            .get("finish_reason")
+            .cloned()
+            .unwrap_or_else(|| Value::String("stop".to_owned()));
+        push_chat_chunk(
+            &mut body,
+            id,
+            model,
+            &created,
+            json!([{"index": index, "delta": {}, "finish_reason": finish_reason}]),
+            Some(json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens.saturating_add(completion_tokens)
+            })),
+        )?;
+    }
+    body.extend_from_slice(b"data: [DONE]\n\n");
+    Ok(body)
+}
+
+fn push_chat_chunk(
+    body: &mut Vec<u8>,
+    id: &str,
+    model: &str,
+    created: &Value,
+    choices: Value,
+    usage: Option<Value>,
+) -> Result<()> {
+    let mut chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": choices
+    });
+    if let Some(usage) = usage {
+        let object = chunk.as_object_mut().ok_or_else(|| {
+            AhrbError::Protocol("OpenAI Chat Completions chunk must be an object".to_owned())
+        })?;
+        object.insert("usage".to_owned(), usage);
+    }
+    push_sse_event(body, None, &chunk)
+}
+
+fn render_anthropic_sse(value: &Value) -> Result<Vec<u8>> {
+    let message = value.as_object().ok_or_else(|| {
+        AhrbError::Protocol("Anthropic Messages value must be an object".to_owned())
+    })?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AhrbError::Protocol("Anthropic Messages value lacks content[]".to_owned())
+        })?;
+    let usage = message.get("usage").and_then(Value::as_object);
+    let input_tokens = positive_usage_token(usage, "input_tokens", 1);
+    let output_tokens = positive_usage_token(
+        usage,
+        "output_tokens",
+        nonzero_token_estimate(&Value::Array(content.clone())),
+    );
+
+    let mut started_message = value.clone();
+    let started = started_message.as_object_mut().ok_or_else(|| {
+        AhrbError::Protocol("Anthropic Messages value must be an object".to_owned())
+    })?;
+    started.insert("content".to_owned(), Value::Array(Vec::new()));
+    started.insert("stop_reason".to_owned(), Value::Null);
+    started.insert("stop_sequence".to_owned(), Value::Null);
+    started.insert(
+        "usage".to_owned(),
+        json!({"input_tokens": input_tokens, "output_tokens": 0}),
+    );
+
+    let mut body = Vec::new();
+    push_sse_event(
+        &mut body,
+        Some("message_start"),
+        &json!({"type": "message_start", "message": started_message}),
+    )?;
+    for (index, block) in content.iter().enumerate() {
+        let block_object = block.as_object().ok_or_else(|| {
+            AhrbError::Protocol("Anthropic Messages content blocks must be objects".to_owned())
+        })?;
+        let block_type = block_object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AhrbError::Protocol("Anthropic Messages content block lacks type".to_owned())
+            })?;
+        let (started_block, delta) = match block_type {
+            "text" => (
+                json!({"type": "text", "text": ""}),
+                json!({
+                    "type": "text_delta",
+                    "text": block_object.get("text").and_then(Value::as_str).unwrap_or("")
+                }),
+            ),
+            "tool_use" => {
+                let id = block_object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol("Anthropic tool_use block lacks id".to_owned())
+                    })?;
+                let name = block_object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol("Anthropic tool_use block lacks name".to_owned())
+                    })?;
+                let input = block_object
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                (
+                    json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                    json!({
+                        "type": "input_json_delta",
+                        "partial_json": serde_json::to_string(&input)?
+                    }),
+                )
+            }
+            _ => (block.clone(), json!({"type": "text_delta", "text": ""})),
+        };
+        push_sse_event(
+            &mut body,
+            Some("content_block_start"),
+            &json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": started_block
+            }),
+        )?;
+        push_sse_event(
+            &mut body,
+            Some("content_block_delta"),
+            &json!({"type": "content_block_delta", "index": index, "delta": delta}),
+        )?;
+        push_sse_event(
+            &mut body,
+            Some("content_block_stop"),
+            &json!({"type": "content_block_stop", "index": index}),
+        )?;
+    }
+    let stop_reason = message
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or_else(|| Value::String("end_turn".to_owned()));
+    let stop_sequence = message.get("stop_sequence").cloned().unwrap_or(Value::Null);
+    push_sse_event(
+        &mut body,
+        Some("message_delta"),
+        &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+            "usage": {"output_tokens": output_tokens}
+        }),
+    )?;
+    push_sse_event(
+        &mut body,
+        Some("message_stop"),
+        &json!({"type": "message_stop"}),
+    )?;
+    Ok(body)
 }
 
 fn response_from_parts(
@@ -1150,7 +1732,38 @@ impl Body for DeterministicBody {
 mod tests {
     use super::*;
     use crate::workflow::{Actor, Barrier};
+    use std::cell::Cell;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn transient_bind_errors_are_retried_but_permanent_errors_are_not() -> Result<()> {
+        let transient_attempts = Cell::new(0_usize);
+        let listener = retry_transient_bind(|| {
+            let attempt = transient_attempts.get().saturating_add(1);
+            transient_attempts.set(attempt);
+            std::future::ready(if attempt < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                Ok("bound")
+            })
+        })
+        .await?;
+        assert_eq!(listener, "bound");
+        assert_eq!(transient_attempts.get(), 3);
+
+        let permanent_attempts = Cell::new(0_usize);
+        let error = retry_transient_bind(|| {
+            permanent_attempts.set(permanent_attempts.get().saturating_add(1));
+            std::future::ready(Err::<(), _>(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+        })
+        .await
+        .expect_err("permanent bind error must be returned");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(permanent_attempts.get(), 1);
+        Ok(())
+    }
 
     fn simple_workflow() -> Workflow {
         Workflow {
@@ -1182,6 +1795,51 @@ mod tests {
         br#"{"model":"ahrb-fake","messages":[{"role":"user","content":"go [[AHRB:scenario=routing;actor=root;checkpoint=start]]"}]}"#.to_vec()
     }
 
+    fn streamed_tool_response() -> ModelResponse {
+        ModelResponse {
+            model: "ahrb-fake-v1".to_owned(),
+            scenario: "routing".to_owned(),
+            actor: "root".to_owned(),
+            checkpoint: "start".to_owned(),
+            request_hash: "request-hash".to_owned(),
+            value: json!({
+                "tool_calls": [{
+                    "id": "call_fixture",
+                    "name": "shell",
+                    "arguments": {"command": ["ahrb-fixture", "write"]}
+                }]
+            }),
+            fault: None,
+            retry: false,
+            stream: true,
+        }
+    }
+
+    fn sse_json_frames(body: &[u8]) -> Result<Vec<(Option<String>, Value)>> {
+        let body = std::str::from_utf8(body).map_err(|error| {
+            AhrbError::Protocol(format!("test SSE response was not UTF-8: {error}"))
+        })?;
+        let mut frames = Vec::new();
+        for frame in body.split("\n\n").filter(|frame| !frame.is_empty()) {
+            let mut event = None;
+            let mut data = None;
+            for line in frame.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    event = Some(value.to_owned());
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data = Some(value);
+                }
+            }
+            let data = data.ok_or_else(|| {
+                AhrbError::Protocol(format!("test SSE frame lacks data: {frame:?}"))
+            })?;
+            if data != "[DONE]" {
+                frames.push((event, serde_json::from_str(data)?));
+            }
+        }
+        Ok(frames)
+    }
+
     #[tokio::test]
     async fn routes_by_marker_and_retries_idempotently() -> Result<()> {
         let engine = FakeModelEngine::new(&simple_workflow())?;
@@ -1207,9 +1865,135 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn responses_sse_streams_function_call_lifecycle_and_nonzero_usage() -> Result<()> {
+        let rendered = OpenAiResponsesFrontend.render(&streamed_tool_response())?;
+        let frames = sse_json_frames(&rendered.body)?;
+        let event_names: Vec<_> = frames
+            .iter()
+            .map(|(event, _)| event.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            event_names,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        assert_eq!(
+            frames[1].1.pointer("/item/type").and_then(Value::as_str),
+            Some("function_call")
+        );
+        assert_eq!(
+            frames[1].1.pointer("/item/status").and_then(Value::as_str),
+            Some("in_progress")
+        );
+        assert!(
+            frames[5]
+                .1
+                .pointer("/response/usage/output_tokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|tokens| tokens > 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_sse_streams_role_tool_delta_finish_and_done() -> Result<()> {
+        let rendered = OpenAiChatFrontend.render(&streamed_tool_response())?;
+        let frames = sse_json_frames(&rendered.body)?;
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|(event, value)| {
+            event.is_none()
+                && value.get("object").and_then(Value::as_str) == Some("chat.completion.chunk")
+        }));
+        assert_eq!(
+            frames[0]
+                .1
+                .pointer("/choices/0/delta/role")
+                .and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            frames[1]
+                .1
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("shell")
+        );
+        assert_eq!(
+            frames[2]
+                .1
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert!(
+            frames[2]
+                .1
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|tokens| tokens > 0)
+        );
+        assert!(rendered.body.ends_with(b"data: [DONE]\n\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_sse_streams_tool_block_then_terminal_message_events() -> Result<()> {
+        let rendered = AnthropicMessagesFrontend.render(&streamed_tool_response())?;
+        let frames = sse_json_frames(&rendered.body)?;
+        let event_names: Vec<_> = frames
+            .iter()
+            .map(|(event, _)| event.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            event_names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            frames[1]
+                .1
+                .pointer("/content_block/type")
+                .and_then(Value::as_str),
+            Some("tool_use")
+        );
+        assert_eq!(
+            frames[2].1.pointer("/delta/type").and_then(Value::as_str),
+            Some("input_json_delta")
+        );
+        assert_eq!(
+            frames[4]
+                .1
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str),
+            Some("tool_use")
+        );
+        assert!(
+            frames[4]
+                .1
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|tokens| tokens > 0)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn http_server_serves_chat_completions_and_records_evidence() -> Result<()> {
         let _listener_guard = LOCAL_SERVER_TEST_LOCK.lock().await;
+        let _process_guard = acquire_process_server_test_lock()?;
         let engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);
         let bound = FakeModelServer::bind(
             "127.0.0.1:0".parse().map_err(|error| {
@@ -1259,6 +2043,7 @@ mod tests {
     #[tokio::test]
     async fn unix_http_server_uses_the_same_frontend_and_removes_socket() -> Result<()> {
         let _listener_guard = LOCAL_SERVER_TEST_LOCK.lock().await;
+        let _process_guard = acquire_process_server_test_lock()?;
         // macOS limits sockaddr_un paths to 104 bytes; use the short system temp root.
         #[cfg(target_os = "macos")]
         let temporary_root = Path::new("/private/tmp");

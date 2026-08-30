@@ -8,7 +8,9 @@ use crate::driver::{
 };
 use crate::evaluate::{Assertion, TestResult, certify, classify, suite_exit_code};
 use crate::events::{EventVocab, NormalizedEvent};
-use crate::fake_model::{FakeModelEngine, FakeModelServer, FakeModelUnixServer};
+use crate::fake_model::{
+    FakeModelEngine, FakeModelServer, FakeModelUnixServer, is_transient_bind_error,
+};
 use crate::manifest::{Manifest, TransportKind};
 use crate::process::{ProcessSample, ProcessTree, Sample, Sampler};
 use crate::report::{Fingerprint, MembershipSample, Report, TopologyMetric};
@@ -1063,8 +1065,16 @@ async fn start_model(
             let environment = BTreeMap::from([(base_url_env.to_owned(), server.base_url())]);
             Ok((ModelServer::Tcp(server), environment))
         }
-        Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            start_unix_model(engine).await
+        Err(AhrbError::Io(error))
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || is_transient_bind_error(&error) =>
+        {
+            let tcp_error = error.to_string();
+            start_unix_model(engine).await.map_err(|unix_error| {
+                AhrbError::Protocol(format!(
+                    "TCP fake-model bind failed after bounded retries ({tcp_error}); Unix-socket fallback failed: {unix_error}"
+                ))
+            })
         }
         Err(error) => Err(error),
     }
@@ -1077,13 +1087,28 @@ async fn start_unix_model(
     let root = PathBuf::from("/private/tmp");
     #[cfg(not(target_os = "macos"))]
     let root = PathBuf::from("/tmp");
-    let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let directory = root.join(format!("ahrb-fm-{}-{sequence}", std::process::id()));
-    std::fs::create_dir(&directory).map_err(|error| {
-        AhrbError::Protocol(format!(
-            "create Unix fake-model directory {}: {error}",
-            directory.display()
-        ))
+    let mut directory = None;
+    for _ in 0..8 {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = root.join(format!("ahrb-fm-{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                directory = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(AhrbError::Protocol(format!(
+                    "create Unix fake-model directory {}: {error}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    let directory = directory.ok_or_else(|| {
+        AhrbError::Protocol(
+            "allocate a fresh Unix fake-model directory after 8 attempts".to_owned(),
+        )
     })?;
     let path = directory.join("model.sock");
     let server = FakeModelUnixServer::bind(&path, engine)
@@ -2217,23 +2242,36 @@ async fn await_owned_pid(
     };
     let path = PathBuf::from(crate::manifest::render_template(template, variables)?);
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
+    let timeout = Duration::from_secs(2);
+    let maximum_backoff = Duration::from_millis(25);
+    let mut backoff = Duration::from_millis(2);
+    let mut last_invalid = None;
+    while started.elapsed() < timeout {
         match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let pid = text.trim().parse::<u32>().map_err(|_| {
-                    AhrbError::Protocol(format!("PID locator {} is invalid", path.display()))
-                })?;
-                return Ok(Some(pid));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            Ok(text) => match text.trim().parse::<u32>() {
+                Ok(pid) => return Ok(Some(pid)),
+                Err(_) => last_invalid = Some(text),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        if started.elapsed() < timeout {
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(maximum_backoff);
+        }
+    }
+    if let Some(text) = last_invalid {
+        return Err(AhrbError::Protocol(format!(
+            "PID locator {} remained invalid for {} ms (last value {:?})",
+            path.display(),
+            timeout.as_millis(),
+            text.trim()
+        )));
     }
     Err(AhrbError::Timeout(format!(
-        "PID locator {} did not appear",
-        path.display()
+        "PID locator {} did not appear within {} ms",
+        path.display(),
+        timeout.as_millis()
     )))
 }
 
@@ -4329,6 +4367,106 @@ mod resource_sampler_tests {
             event: EventVocab::ToolResult,
             payload: json!({"cursor": cursor}),
         }
+    }
+
+    #[tokio::test]
+    async fn owned_pid_locator_retries_transient_invalid_contents() {
+        let manifest = crate::manifest::load(Path::new("adapters/mock/manifest.toml"))
+            .expect("load mock manifest");
+        let root =
+            std::env::temp_dir().join(format!("ahrb-pid-locator-retry-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).expect("remove stale PID-locator test directory");
+        }
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).expect("create PID-locator test state");
+        let locator = state.join("daemon.pid");
+        std::fs::write(&locator, []).expect("publish transient empty PID locator");
+        let expected_pid = std::process::id();
+        let writer_locator = locator.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            std::fs::write(writer_locator, expected_pid.to_string())
+                .expect("publish complete PID locator");
+        });
+        let variables =
+            BTreeMap::from([("profile".to_owned(), root.to_string_lossy().into_owned())]);
+        let observed = await_owned_pid(&manifest, &variables)
+            .await
+            .expect("retry transient PID locator")
+            .expect("mock manifest declares a PID locator");
+        writer.await.expect("PID-locator writer task");
+        assert_eq!(observed, expected_pid);
+        std::fs::remove_dir_all(root).expect("remove PID-locator test directory");
+    }
+
+    #[test]
+    fn codex_fixture_tools_map_to_executable_shell_argv() {
+        let manifest = crate::manifest::load(Path::new("adapters/codex/manifest.toml"))
+            .expect("load Codex manifest");
+        let write = mapped_tool_call(
+            &manifest,
+            "write",
+            "call-write".to_owned(),
+            json!({"path": "fixture.txt", "content": "fixture payload"}),
+        )
+        .expect("map Codex fixture write");
+        assert_eq!(write.get("name").and_then(Value::as_str), Some("shell"));
+        let command = write
+            .pointer("/arguments/command")
+            .and_then(Value::as_array)
+            .expect("Codex shell command is argv-shaped");
+        let command: Vec<_> = command.iter().filter_map(Value::as_str).collect();
+        assert!(command.first().is_some_and(|program| {
+            program.ends_with("ahrb-fixture") || *program == "ahrb-fixture"
+        }));
+        assert_eq!(
+            &command[1..],
+            [
+                "write",
+                "--path",
+                "fixture.txt",
+                "--content",
+                "fixture payload"
+            ]
+        );
+
+        let read = mapped_tool_call(
+            &manifest,
+            "read",
+            "call-read".to_owned(),
+            json!({"path": "fixture.txt"}),
+        )
+        .expect("map Codex fixture read");
+        assert_eq!(read.get("name").and_then(Value::as_str), Some("shell"));
+        let read_command: Vec<_> = read
+            .pointer("/arguments/command")
+            .and_then(Value::as_array)
+            .expect("Codex read command is argv-shaped")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(&read_command[1..], ["read", "--path", "fixture.txt"]);
+
+        let fail = mapped_tool_call(
+            &manifest,
+            "fail",
+            "call-fail".to_owned(),
+            json!({"message": "expected failure"}),
+        )
+        .expect("map Codex fixture failure");
+        assert_eq!(fail.get("name").and_then(Value::as_str), Some("shell"));
+        let fail_command: Vec<_> = fail
+            .pointer("/arguments/command")
+            .and_then(Value::as_array)
+            .expect("Codex fail command is argv-shaped")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            &fail_command[1..],
+            ["fail", "--message", "expected failure"]
+        );
     }
 
     #[test]

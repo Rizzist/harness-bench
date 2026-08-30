@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::evaluate::TestOutcome;
 use ahrb::report::Report;
 use serde_json::Value;
@@ -18,6 +20,7 @@ fn run_directory(label: &str) -> PathBuf {
 }
 
 fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, String) {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
         .current_dir(repository)
@@ -31,10 +34,13 @@ fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, Str
         .arg("--junit")
         .output()
         .expect("execute AHRB against the per-invocation reference harness");
-    let report: Report = serde_json::from_slice(
-        &std::fs::read(output.join("report.json")).expect("read mock-exec report"),
-    )
-    .expect("parse mock-exec report");
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &result,
+        &report_path,
+        "AHRB mock-exec subprocess did not produce a report",
+    );
+    let report: Report = serde_json::from_slice(&report_bytes).expect("parse mock-exec report");
     let junit = std::fs::read_to_string(output.join("junit.xml")).expect("read mock-exec JUnit");
     (result.status, report, junit)
 }

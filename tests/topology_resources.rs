@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::driver::{Driver, PerInvocationConfig, PerInvocationDriver};
 use ahrb::evaluate::TestOutcome;
 use ahrb::evaluate::{Assertion, certify, classify};
@@ -32,6 +34,7 @@ fn platform_sampler() -> Box<dyn Sampler> {
 
 #[test]
 fn per_invocation_resource_rows_measure_process_fanout_without_idle_penalty() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = run_directory();
     let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
@@ -47,16 +50,13 @@ fn per_invocation_resource_rows_measure_process_fanout_without_idle_penalty() {
         .arg("20,21,22,23,24,25,26,27,28,29")
         .output()
         .expect("run per-invocation resource certification");
-    assert_eq!(
-        result.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&result.stderr)
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &result,
+        &report_path,
+        "resource-certification subprocess did not produce a report",
     );
-    let report: Report = serde_json::from_slice(
-        &std::fs::read(output.join("report.json")).expect("read resource report"),
-    )
-    .expect("parse resource report");
+    let report: Report = serde_json::from_slice(&report_bytes).expect("parse resource report");
     assert_eq!(report.results.len(), 10);
     assert!(
         report

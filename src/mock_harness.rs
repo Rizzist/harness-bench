@@ -39,6 +39,8 @@ pub const DEFAULT_SESSION_MEMORY_MIB: u64 = 4;
 
 const MIB: u64 = 1024 * 1024;
 static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static NEW_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static REPLACE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Durable append-only event storage for one session.
 #[derive(Clone, Debug)]
@@ -340,7 +342,13 @@ impl MockHarness {
             if !meta_path.is_file() {
                 continue;
             }
-            let meta: SessionMeta = serde_json::from_slice(&fs::read(meta_path)?)?;
+            let meta_bytes = fs::read(&meta_path)?;
+            let meta: SessionMeta = serde_json::from_slice(&meta_bytes).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "decode session metadata {}: {error}",
+                    meta_path.display()
+                ))
+            })?;
             let journal = DurableJournal::open(entry.path().join("journal.jsonl"))?;
             let events = journal.all()?;
             reconcile_durable_tool_effects(&config.state_dir, &meta.id, &events)?;
@@ -2285,21 +2293,54 @@ fn safe_relative(path: &str) -> Result<PathBuf> {
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let sequence = NEW_FILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".ahrb-new-{}-{sequence}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let publish_result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temporary, path)?;
+        Ok(())
+    })();
+    let cleanup_result = fs::remove_file(&temporary);
+    publish_result?;
+    cleanup_result?;
     sync_parent(path)
 }
 
 fn write_replace_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let sequence = REPLACE_FILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(
+        ".ahrb-replace-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let temporary = PathBuf::from(temporary);
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    sync_parent(path)
+        .open(&temporary)?;
+    let publish_result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(not(unix))]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temporary, path)?;
+        sync_parent(path)
+    })();
+    if publish_result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    publish_result
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -2341,6 +2382,26 @@ mod tests {
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
         }
+    }
+
+    #[test]
+    fn synced_replacement_leaves_only_the_complete_published_file() {
+        let directory = temporary_dir("atomic-replace");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("create atomic-replace test directory");
+        let path = directory.join("daemon.pid");
+        write_replace_synced(&path, b"12345").expect("publish initial PID locator");
+        write_replace_synced(&path, b"67890").expect("replace PID locator");
+        assert_eq!(
+            fs::read(&path).expect("read replaced PID locator"),
+            b"67890"
+        );
+        let entries = fs::read_dir(&directory)
+            .expect("read atomic-replace test directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect atomic-replace test entries");
+        assert_eq!(entries.len(), 1, "replacement temporary file leaked");
+        std::fs::remove_dir_all(directory).expect("remove atomic-replace test directory");
     }
 
     #[test]
@@ -3246,6 +3307,7 @@ mod tests {
         use crate::workflow::{Actor, ScriptedResponse, WORKFLOW_SCHEMA_VERSION, Workflow};
 
         let _listener_guard = crate::fake_model::LOCAL_SERVER_TEST_LOCK.lock().await;
+        let _process_guard = crate::fake_model::acquire_process_server_test_lock()?;
         #[cfg(target_os = "macos")]
         let temporary_root = Path::new("/private/tmp");
         #[cfg(not(target_os = "macos"))]

@@ -1202,59 +1202,7 @@ impl PerInvocationDriver {
         status: std::process::ExitStatus,
         stdout: &[u8],
     ) -> (EventVocab, Value) {
-        let text = String::from_utf8_lossy(stdout);
-        let code = status.code();
-        let failure_marker = self
-            .config
-            .exit
-            .failure_stdout
-            .iter()
-            .find(|marker| text.contains(marker.as_str()))
-            .cloned();
-        let success_marker_ok = self.config.exit.success_stdout.is_empty()
-            || self
-                .config
-                .exit
-                .success_stdout
-                .iter()
-                .any(|marker| text.contains(marker));
-        let success =
-            code == Some(self.config.exit.success) && failure_marker.is_none() && success_marker_ok;
-        if success {
-            (
-                EventVocab::TerminalSuccess,
-                json!({"status":"success", "exit_code":code}),
-            )
-        } else {
-            let category = code
-                .and_then(|value| {
-                    self.config
-                        .exit
-                        .failures
-                        .iter()
-                        .find_map(|(category, expected)| {
-                            (*expected == value).then(|| category.clone())
-                        })
-                })
-                .unwrap_or_else(|| {
-                    if failure_marker.is_some() {
-                        "stdout-failure".to_owned()
-                    } else if code == Some(self.config.exit.success) {
-                        "stdout-contract".to_owned()
-                    } else {
-                        "unmapped-exit".to_owned()
-                    }
-                });
-            (
-                EventVocab::TerminalFailure,
-                json!({
-                    "status":"failure",
-                    "category":category,
-                    "exit_code":code,
-                    "failure_marker":failure_marker
-                }),
-            )
-        }
+        classify_exit_contract(&self.config.exit, status.code(), stdout)
     }
 
     fn refresh_source(
@@ -1888,6 +1836,67 @@ impl Driver for PerInvocationDriver {
             .into_iter()
             .collect()
     }
+}
+
+fn classify_exit_contract(
+    exit: &ExitContract,
+    code: Option<i32>,
+    stdout: &[u8],
+) -> (EventVocab, Value) {
+    let text = String::from_utf8_lossy(stdout);
+    let failure_marker = exit
+        .failure_stdout
+        .iter()
+        .find(|marker| text.contains(marker.as_str()))
+        .cloned()
+        .or_else(|| stdout_has_top_level_error(stdout).then(|| "top-level JSONL error".to_owned()));
+    let success_marker_ok = exit.success_stdout.is_empty()
+        || exit
+            .success_stdout
+            .iter()
+            .any(|marker| text.contains(marker));
+    let success = code == Some(exit.success) && failure_marker.is_none() && success_marker_ok;
+    if success {
+        (
+            EventVocab::TerminalSuccess,
+            json!({"status":"success", "exit_code":code}),
+        )
+    } else {
+        let category = code
+            .and_then(|value| {
+                exit.failures
+                    .iter()
+                    .find_map(|(category, expected)| (*expected == value).then(|| category.clone()))
+            })
+            .unwrap_or_else(|| {
+                if failure_marker.is_some() {
+                    "stdout-failure".to_owned()
+                } else if code == Some(exit.success) {
+                    "stdout-contract".to_owned()
+                } else {
+                    "unmapped-exit".to_owned()
+                }
+            });
+        (
+            EventVocab::TerminalFailure,
+            json!({
+                "status":"failure",
+                "category":category,
+                "exit_code":code,
+                "failure_marker":failure_marker
+            }),
+        )
+    }
+}
+
+fn stdout_has_top_level_error(stdout: &[u8]) -> bool {
+    stdout.split(|byte| *byte == b'\n').any(|line| {
+        let line = trim_ascii(line);
+        serde_json::from_slice::<Value>(line)
+            .ok()
+            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+            .is_some_and(|event_type| event_type == "error")
+    })
 }
 
 fn parse_event_records(bytes: &[u8], framing: &str) -> Result<Vec<Value>> {
@@ -2555,6 +2564,145 @@ mod tests {
         assert_ne!(events[0].id, events[1].id);
         assert_eq!(events[0].cursor, 1);
         assert_eq!(events[1].cursor, 2);
+    }
+
+    #[test]
+    fn codex_exec_jsonl_rules_normalize_known_tool_and_terminal_items() {
+        let manifest = crate::manifest::load(Path::new("adapters/codex/manifest.toml"))
+            .expect("load Codex manifest");
+        let mut records = vec![
+            json!({"type": "thread.started", "thread_id": "thread-1"}),
+            json!({"type": "turn.started"}),
+        ];
+        for (index, item_type) in [
+            "command_execution",
+            "function_call",
+            "local_shell_call",
+            "file_change",
+            "patch_apply",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = format!("tool-{index}");
+            records.push(json!({
+                "type": "item.started",
+                "item": {"id": id, "type": item_type}
+            }));
+            records.push(json!({
+                "type": "item.completed",
+                "item": {"id": id, "type": item_type}
+            }));
+        }
+        records.extend([
+            json!({
+                "type": "item.completed",
+                "item": {"id": "message-1", "type": "agent_message", "text": "done"}
+            }),
+            json!({"type": "turn.completed", "usage": {"output_tokens": 1}}),
+            json!({"type": "turn.failed", "error": {"message": "failed"}}),
+            json!({"type": "error", "message": "fatal provider error"}),
+        ]);
+        let mut session = PersistedExecSession {
+            local_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            marker: "root".to_owned(),
+            harness_id: String::new(),
+            turns: 1,
+            invocations: 1,
+            next_cursor: 1,
+            closed: false,
+        };
+        let events = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &mut session,
+            &records,
+            &BTreeMap::new(),
+            "turn-1",
+            true,
+        )
+        .expect("normalize Codex JSONL records");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == EventVocab::ToolCall)
+                .count(),
+            5
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == EventVocab::ToolResult)
+                .count(),
+            5
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == EventVocab::ModelResponse)
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalSuccess)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalFailure)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == EventVocab::TerminalFailure)
+                .count(),
+            2
+        );
+        assert_eq!(events.len(), 16);
+    }
+
+    #[test]
+    fn codex_exit_contract_ignores_nested_metadata_warning_but_keeps_failures() {
+        let manifest = crate::manifest::load(Path::new("adapters/codex/manifest.toml"))
+            .expect("load Codex manifest");
+        let metadata_warning_then_success = br#"{"type":"item.completed","item":{"type":"error","message":"Model metadata not found"}}
+{"type":"turn.completed","usage":{"output_tokens":1}}
+"#;
+        let (event, _) =
+            classify_exit_contract(&manifest.exit, Some(0), metadata_warning_then_success);
+        assert_eq!(event, EventVocab::TerminalSuccess);
+
+        for (code, stdout) in [
+            (
+                Some(0),
+                br#"{"type":"error","message":"fatal"}
+{"type":"turn.completed","usage":{"output_tokens":1}}
+"#
+                .as_slice(),
+            ),
+            (
+                Some(0),
+                br#"{"type":"turn.failed"}
+"#
+                .as_slice(),
+            ),
+            (
+                Some(1),
+                br#"{"type":"turn.completed","usage":{"output_tokens":1}}
+"#
+                .as_slice(),
+            ),
+            (
+                Some(0),
+                br#"{"type":"item.completed"}
+"#
+                .as_slice(),
+            ),
+        ] {
+            let (event, _) = classify_exit_contract(&manifest.exit, code, stdout);
+            assert_eq!(event, EventVocab::TerminalFailure);
+        }
     }
 
     #[tokio::test]

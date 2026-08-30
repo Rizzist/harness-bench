@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::driver::{Driver, GenericDriver, StdinRpcTransport};
 use ahrb::events::{EventVocab, NormalizedEvent};
 #[cfg(unix)]
@@ -139,6 +141,7 @@ fn workflow(scenario: &str, checkpoints: Vec<(&str, Value, Option<Fault>)>) -> W
 }
 
 async fn run(workflow: Workflow, idle_timeout_ms: u64) -> RunEvidence {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let state_dir = temporary_directory(&workflow.scenario);
     std::fs::create_dir_all(&state_dir).expect("create isolated mock state");
     let engine = Arc::new(FakeModelEngine::new(&workflow).expect("valid test workflow"));

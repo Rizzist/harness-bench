@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::driver::{Driver, PerInvocationConfig, PerInvocationDriver};
 use ahrb::evaluate::TestOutcome;
 use ahrb::events::EventVocab;
@@ -9,6 +11,7 @@ use std::time::Duration;
 
 #[test]
 fn per_invocation_cli_runs_against_fake_model_and_extracts_own_stdout() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = std::env::temp_dir().join(format!("ahrb-exec-transport-{}", std::process::id()));
     if output.exists() {
@@ -27,16 +30,13 @@ fn per_invocation_cli_runs_against_fake_model_and_extracts_own_stdout() {
         .arg("1,2,9,10,16")
         .output()
         .expect("run per-invocation reference CLI");
-    assert_eq!(
-        result.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&result.stderr)
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &result,
+        &report_path,
+        "exec-transport subprocess did not produce a report",
     );
-    let report: Report = serde_json::from_slice(
-        &std::fs::read(output.join("report.json")).expect("read exec report"),
-    )
-    .expect("parse exec report");
+    let report: Report = serde_json::from_slice(&report_bytes).expect("parse exec report");
     assert_eq!(report.results.len(), 5);
     assert!(
         report

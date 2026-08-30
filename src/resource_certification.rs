@@ -3136,11 +3136,15 @@ fn derive_sweep_point(
             )));
         }
     }
+    let workload_peak = phase_peak(series, &observation.workload_phase, metric)?;
     let point = SweepPoint {
         agents: observation.agents,
         baseline_bytes: baseline.median_bytes,
         steady_bytes: steady.median_bytes,
-        workload_peak_bytes: phase_peak(series, &observation.workload_phase, metric)?,
+        // The steady barrier is part of the active workload lifecycle. Sampling jitter
+        // can observe a small allocation after the last workload-boundary sample, so
+        // the lifecycle peak must never exclude the later steady plateau.
+        workload_peak_bytes: workload_peak.max(steady.median_bytes),
         cold_peak_bytes: phase_peak(series, &observation.cold_phase, metric)?,
         post_turn_bytes: post_turn.median_bytes,
         post_close_bytes: post_close.median_bytes,
@@ -4865,6 +4869,52 @@ mod tests {
         assert!(certification.rows.iter().all(|row| {
             matches!(&row.outcome, TestOutcome::Error(message) if message.contains("sampler overload"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn workload_peak_includes_allocations_observed_at_the_steady_barrier() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        for observation in &evidence.sweep {
+            let steady_bytes = evidence
+                .series
+                .samples
+                .iter()
+                .find(|sample| sample.phase == observation.steady_phase)
+                .and_then(|sample| sample.pss_bytes)
+                .ok_or_else(|| {
+                    AhrbError::Validation(format!(
+                        "steady sample {:?} is absent",
+                        observation.steady_phase
+                    ))
+                })?;
+            for sample in evidence
+                .series
+                .samples
+                .iter_mut()
+                .filter(|sample| sample.phase == observation.workload_phase)
+            {
+                let boundary_bytes = steady_bytes.saturating_sub(1);
+                sample.rss_bytes = boundary_bytes;
+                sample.pss_bytes = Some(boundary_bytes);
+                sample.private_bytes = Some(boundary_bytes);
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        for row in [26_u8, 27, 28] {
+            assert!(
+                certification
+                    .rows
+                    .iter()
+                    .find(|result| result.row == row)
+                    .is_some_and(|result| matches!(result.outcome, TestOutcome::Pass)),
+                "resource row {row} must accept a later steady-barrier peak"
+            );
+        }
         Ok(())
     }
 

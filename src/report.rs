@@ -1,13 +1,13 @@
 //! Human-readable, machine-readable, and raw-evidence reports.
 
-use crate::Result;
 use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
 use crate::process::{ProcessSample, Sample};
+use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One auditable recursive process-membership refresh boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,6 +119,22 @@ pub fn write_bundle(report: &Report, directory: &Path, junit: bool) -> Result<()
         )?;
     }
     Ok(())
+}
+
+/// Persist a best-effort diagnostic when a run aborts before its bundle is complete.
+pub fn write_failure_diagnostic(
+    directory: &Path,
+    manifest: &Path,
+    error: &AhrbError,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join("run-error.txt");
+    let content = format!(
+        "AHRB run aborted\nmanifest={}\nreport=report.json\nerror={error}\n",
+        manifest.display()
+    );
+    write_atomic(&path, content.as_bytes())?;
+    Ok(path)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

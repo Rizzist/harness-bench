@@ -1,3 +1,5 @@
+mod common;
+
 use ahrb::evaluate::TestOutcome;
 use ahrb::report::Report;
 use std::path::Path;
@@ -5,6 +7,7 @@ use std::process::Command;
 
 #[test]
 fn undeclared_exec_operations_emit_unsupported_and_junit_skips() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = std::env::temp_dir().join(format!("ahrb-capability-gating-{}", std::process::id()));
     if root.exists() {
@@ -47,16 +50,13 @@ fn undeclared_exec_operations_emit_unsupported_and_junit_skips() {
         .arg("--junit")
         .output()
         .expect("run capability-gated exec rows");
-    assert_eq!(
-        command.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&command.stderr)
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &command,
+        &report_path,
+        "under-declared exec subprocess did not produce a report",
     );
-    let report: Report = serde_json::from_slice(
-        &std::fs::read(output.join("report.json")).expect("read capability report"),
-    )
-    .expect("parse capability report");
+    let report: Report = serde_json::from_slice(&report_bytes).expect("parse capability report");
     assert_eq!(report.results.len(), 10);
     assert!(report.results.iter().all(|result| {
         matches!(result.outcome, TestOutcome::Unsupported(_))
@@ -74,6 +74,7 @@ fn undeclared_exec_operations_emit_unsupported_and_junit_skips() {
 
 #[test]
 fn missing_daemon_session_surface_reports_unsupported_instead_of_aborting() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = std::env::temp_dir().join(format!(
         "ahrb-daemon-capability-gating-{}",
@@ -103,19 +104,56 @@ fn missing_daemon_session_surface_reports_unsupported_instead_of_aborting() {
         .arg("30")
         .output()
         .expect("run daemon with missing session attach");
-    assert_eq!(
-        command.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&command.stderr)
+    let report_path = output.join("report.json");
+    let report_bytes = common::read_ahrb_run_report(
+        &command,
+        &report_path,
+        "under-declared daemon subprocess did not produce a report",
     );
-    let report: Report = serde_json::from_slice(
-        &std::fs::read(output.join("report.json")).expect("read daemon capability report"),
-    )
-    .expect("parse daemon capability report");
+    let report: Report =
+        serde_json::from_slice(&report_bytes).expect("parse daemon capability report");
     assert!(matches!(
         report.results.first().map(|result| &result.outcome),
         Some(TestOutcome::Unsupported(_))
     ));
     std::fs::remove_dir_all(root).expect("remove daemon capability root");
+}
+
+#[test]
+fn aborted_run_exits_nonzero_and_persists_a_diagnostic() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-aborted-run-diagnostic-{}",
+        std::process::id()
+    ));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove stale aborted-run output");
+    }
+    let output = root.join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(repository)
+        .arg("run")
+        .arg("--manifest")
+        .arg(root.join("missing-manifest.toml"))
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run AHRB with a missing manifest");
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("ahrb: run aborted for manifest"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ahrb: report.json was not written"),
+        "stderr: {stderr}"
+    );
+    assert!(!output.join("report.json").exists());
+    let diagnostic = std::fs::read_to_string(output.join("run-error.txt"))
+        .expect("read persisted run diagnostic");
+    assert!(diagnostic.contains("AHRB run aborted"));
+    assert!(diagnostic.contains("missing-manifest.toml"));
+    std::fs::remove_dir_all(root).expect("remove aborted-run output");
 }
