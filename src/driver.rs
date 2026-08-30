@@ -760,6 +760,10 @@ pub struct PerInvocationConfig {
     pub replay_command: Vec<String>,
     /// Isolated environment inherited by every invocation.
     pub environment: BTreeMap<String, String>,
+    /// Fully populated manifest-level template variables. Per-session and
+    /// per-turn values are layered over this foundation for every argv and
+    /// event-path render.
+    pub base_variables: BTreeMap<String, String>,
     /// Fresh run profile containing AHRB bookkeeping and harness state roots.
     pub profile_root: PathBuf,
     /// Harness-owned event source and normalization table.
@@ -923,7 +927,8 @@ impl PerInvocationDriver {
         let directory = self.session_directory(&session.local_id);
         let workspace = directory.join("workspace");
         let journal = directory.join("harness-journal.jsonl");
-        BTreeMap::from([
+        let mut variables = self.config.base_variables.clone();
+        variables.extend([
             (
                 "profile".to_owned(),
                 self.config.profile_root.to_string_lossy().into_owned(),
@@ -938,13 +943,15 @@ impl PerInvocationDriver {
                 },
             ),
             ("marker".to_owned(), session.marker.clone()),
+            ("actor".to_owned(), session.marker.clone()),
             ("turn_key".to_owned(), key.to_owned()),
             (
                 "workspace".to_owned(),
                 workspace.to_string_lossy().into_owned(),
             ),
             ("journal".to_owned(), journal.to_string_lossy().into_owned()),
-        ])
+        ]);
+        variables
     }
 
     fn render_invocation(

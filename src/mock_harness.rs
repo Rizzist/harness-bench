@@ -141,6 +141,14 @@ struct PendingTurn {
     key: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ExecTemplateEvidence {
+    base_url: String,
+    base_url_matches_environment: bool,
+    credential_fingerprint: String,
+    credential_matches_environment: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointPhase {
     BeforeEffect,
@@ -554,7 +562,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 "ahrb-mock-harness serve|rpc --state-dir PATH [--idle-timeout-ms N] \
                  [--session-memory-mib N]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
-                 --session-id ID --prompt PROMPT --key KEY\n\
+                 --session-id ID --prompt PROMPT --key KEY \
+                 [--base-url URL --credential TOKEN]\n\
                  ahrb-mock-harness release-checkpoint --state-dir PATH \
                  --session-id ID --release-token TOKEN\n\
                  ahrb-mock-harness cancel-session --state-dir PATH --session-id ID\n\
@@ -574,6 +583,8 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     let mut requested_session_id = None;
     let mut prompt = None;
     let mut key = None;
+    let mut rendered_base_url = None;
+    let mut rendered_credential = None;
     let mut event_journal = None;
     let mut post_output_delay_ms = 0_u64;
     let mut config_args = Vec::new();
@@ -588,6 +599,8 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             "--session-id" => requested_session_id = Some(value.clone()),
             "--prompt" => prompt = Some(value.clone()),
             "--key" => key = Some(value.clone()),
+            "--base-url" => rendered_base_url = Some(value.clone()),
+            "--credential" => rendered_credential = Some(value.clone()),
             "--event-journal" => event_journal = Some(PathBuf::from(value)),
             "--post-output-delay-ms" => {
                 post_output_delay_ms = value
@@ -611,6 +624,24 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         .ok_or_else(|| AhrbError::Usage("--session-id is required".to_owned()))?;
     let prompt = prompt.ok_or_else(|| AhrbError::Usage("--prompt is required".to_owned()))?;
     let key = key.ok_or_else(|| AhrbError::Usage("--key is required".to_owned()))?;
+    let exec_template_evidence = match (rendered_base_url, rendered_credential) {
+        (Some(base_url), Some(credential)) => {
+            let environment_base_url = std::env::var("AHRB_MOCK_BASE_URL").unwrap_or_default();
+            let environment_credential = std::env::var("AHRB_MOCK_API_KEY").unwrap_or_default();
+            Some(ExecTemplateEvidence {
+                base_url_matches_environment: base_url == environment_base_url,
+                credential_fingerprint: format!("{:x}", Sha256::digest(credential.as_bytes())),
+                credential_matches_environment: credential == environment_credential,
+                base_url,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(AhrbError::Usage(
+                "--base-url and --credential must be provided together".to_owned(),
+            ));
+        }
+    };
     let config = parse_config(&config_args)?;
     let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
     let turn = PendingTurn { prompt, key };
@@ -621,7 +652,14 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         let after = journal.all()?.last().map(|event| event.cursor);
         (id, journal, after)
     };
-    let spawn = accept_turn(&harness, &session_id, turn.clone(), false).await?;
+    let spawn = accept_turn(
+        &harness,
+        &session_id,
+        turn.clone(),
+        false,
+        exec_template_evidence.as_ref(),
+    )
+    .await?;
     let resume_pending = if spawn {
         false
     } else {
@@ -892,7 +930,8 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
             let id = required_str(&request.params, "session_id")?.to_owned();
             let prompt = required_str(&request.params, "prompt")?.to_owned();
             let key = required_str(&request.params, "key")?.to_owned();
-            let spawn = accept_turn(&harness, &id, PendingTurn { prompt, key }, false).await?;
+            let spawn =
+                accept_turn(&harness, &id, PendingTurn { prompt, key }, false, None).await?;
             if spawn {
                 spawn_worker(Arc::clone(&harness), id);
             }
@@ -979,7 +1018,7 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
             if let Some(prompt) = prompt {
                 let key = format!("native-spawn:{parent}:{child}");
                 let spawn =
-                    accept_turn(&harness, &child, PendingTurn { prompt, key }, false).await?;
+                    accept_turn(&harness, &child, PendingTurn { prompt, key }, false, None).await?;
                 if spawn {
                     spawn_worker(Arc::clone(&harness), child.clone());
                 }
@@ -1061,6 +1100,7 @@ async fn accept_turn(
     id: &str,
     turn: PendingTurn,
     from_queue: bool,
+    exec_template_evidence: Option<&ExecTemplateEvidence>,
 ) -> Result<bool> {
     let hook = {
         let mut guard = harness.lock().await;
@@ -1085,11 +1125,11 @@ async fn accept_turn(
         session.pending = Some(turn.clone());
         session.active = true;
         session.cancelled = false;
-        guard.append(
-            id,
-            EventVocab::TurnAccepted,
-            json!({ "prompt": turn.prompt, "key": turn.key }),
-        )?;
+        let mut payload = json!({ "prompt": turn.prompt, "key": turn.key });
+        if let Some(evidence) = exec_template_evidence {
+            payload["exec_template"] = serde_json::to_value(evidence)?;
+        }
+        guard.append(id, EventVocab::TurnAccepted, payload)?;
         guard.config.acceptance_hook.clone()
     };
     run_hook_and_record(harness, id, "acceptance", &turn.key, &hook).await?;
@@ -1149,7 +1189,7 @@ async fn worker_loop(harness: Arc<Mutex<MockHarness>>, id: &str) -> Result<()> {
         let Some(next) = next else {
             return Ok(());
         };
-        if !accept_turn(&harness, id, next, true).await? {
+        if !accept_turn(&harness, id, next, true, None).await? {
             continue;
         }
     }
@@ -2565,6 +2605,7 @@ mod tests {
                     key: "turn-1".to_owned(),
                 },
                 false,
+                None,
             )
             .await?
         );
@@ -3068,6 +3109,7 @@ mod tests {
                         key: "resource-turn".to_owned(),
                     },
                     false,
+                    None,
                 )
                 .await?
             );
@@ -3277,6 +3319,7 @@ mod tests {
                 key: "turn-1".to_owned(),
             },
             false,
+            None,
         )
         .await?;
         assert!(accepted);

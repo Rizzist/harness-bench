@@ -121,6 +121,7 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
         cancel_command: Vec::new(),
         replay_command: Vec::new(),
         environment: BTreeMap::from([("AHRB_MOCK_MODEL".to_owned(), "ahrb-fake-v1".to_owned())]),
+        base_variables: BTreeMap::new(),
         profile_root: profile.to_path_buf(),
         events,
         exit: manifest.exit,

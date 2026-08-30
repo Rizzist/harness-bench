@@ -37,14 +37,14 @@ persistent = false
 
 [transport]
 kind = "exec"
-command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--credential", "{{credential}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
 timeout_ms = 10000
 
 [sessions]
 create = []
 submit = []
 attach = []
-resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--credential", "{{credential}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
 close_delete = []
 list = []
 id_pointer = "/session_id"
@@ -134,6 +134,7 @@ paths = ["{{profile}}"]
 
 [capture]
 redact_env = ["AHRB_MOCK_API_KEY"]
+allow_credential_argv = true
 max_bytes = 1048576
 
 [capabilities.required]

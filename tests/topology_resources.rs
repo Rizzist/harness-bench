@@ -177,6 +177,7 @@ async fn launch_gate_and_process_group_retain_an_orphan_after_launcher_exit() {
         cancel_command: Vec::new(),
         replay_command: Vec::new(),
         environment: BTreeMap::new(),
+        base_variables: BTreeMap::new(),
         profile_root: profile.clone(),
         events: manifest.events,
         exit: manifest.exit,

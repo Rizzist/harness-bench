@@ -28,6 +28,16 @@ fn topology_and_persistence_must_describe_the_same_architecture() {
 }
 
 #[test]
+fn credential_argv_requires_an_explicit_capture_policy_opt_in() {
+    let mut manifest = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+        .expect("load opted-in exec manifest");
+    manifest.capture.allow_credential_argv = false;
+    let error = ahrb::manifest::validate(&manifest)
+        .expect_err("credential argv must remain rejected by default");
+    assert!(error.to_string().contains("credential value in argv"));
+}
+
+#[test]
 fn cold_isolation_requires_profile_scoped_home_and_xdg_roots() {
     let mut manifest =
         ahrb::manifest::load(Path::new("adapters/mock/manifest.toml")).expect("load mock manifest");

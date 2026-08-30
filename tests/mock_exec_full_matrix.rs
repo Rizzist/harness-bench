@@ -1,5 +1,8 @@
 use ahrb::evaluate::TestOutcome;
 use ahrb::report::Report;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +37,161 @@ fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, Str
     .expect("parse mock-exec report");
     let junit = std::fs::read_to_string(output.join("junit.xml")).expect("read mock-exec JUnit");
     (result.status, report, junit)
+}
+
+fn run_profile(output: &Path) -> PathBuf {
+    let mut profiles = std::fs::read_dir(output)
+        .expect("read certification output")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("profile-"))
+        })
+        .collect::<Vec<_>>();
+    profiles.sort();
+    assert_eq!(profiles.len(), 1, "certification must use one run profile");
+    profiles.remove(0)
+}
+
+fn provider_value(provider: &str, key: &str) -> String {
+    let prefix = format!("{key} = '");
+    provider
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix('\''))
+        .unwrap_or_else(|| panic!("provider config omitted {key}"))
+        .to_owned()
+}
+
+fn exec_template_evidence(event: &Value) -> Option<&Value> {
+    (event.get("event").and_then(Value::as_str) == Some("turn-accepted"))
+        .then(|| event.pointer("/payload/exec_template"))
+        .flatten()
+}
+
+fn assert_rendered_bindings(evidence: &Value, base_url: &str, credential_fingerprint: &str) {
+    assert_eq!(
+        evidence.get("base_url").and_then(Value::as_str),
+        Some(base_url)
+    );
+    assert_eq!(
+        evidence
+            .get("credential_fingerprint")
+            .and_then(Value::as_str),
+        Some(credential_fingerprint)
+    );
+    assert_eq!(
+        evidence
+            .get("base_url_matches_environment")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        evidence
+            .get("credential_matches_environment")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+fn assert_exec_template_propagation(output: &Path, report: &Report) {
+    let profile = run_profile(output);
+    let provider = std::fs::read_to_string(profile.join("config/provider.toml"))
+        .expect("read generated provider config");
+    let base_url = provider_value(&provider, "base_url");
+    let credential = provider_value(&provider, "credential");
+    let credential_fingerprint = format!("{:x}", Sha256::digest(credential.as_bytes()));
+
+    let rendered = report
+        .events
+        .iter()
+        .filter_map(exec_template_evidence)
+        .collect::<Vec<_>>();
+    let accepted_turns = report
+        .events
+        .iter()
+        .filter(|event| event.get("event").and_then(Value::as_str) == Some("turn-accepted"))
+        .count();
+    assert!(
+        !rendered.is_empty(),
+        "main exec turns recorded no rendered bindings"
+    );
+    assert_eq!(
+        rendered.len(),
+        accepted_turns,
+        "every accepted main exec turn must record rendered bindings"
+    );
+    for evidence in &rendered {
+        assert_rendered_bindings(evidence, &base_url, &credential_fingerprint);
+    }
+
+    let mut turns_by_session = BTreeMap::<&str, usize>::new();
+    for event in report
+        .events
+        .iter()
+        .filter(|event| exec_template_evidence(event).is_some())
+    {
+        let session_id = event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("exec binding event has session ID");
+        *turns_by_session.entry(session_id).or_default() += 1;
+    }
+    assert!(
+        turns_by_session.values().any(|turns| *turns >= 2),
+        "no session proved both initial-command and resume-command rendering"
+    );
+
+    let mut resource_bindings = Vec::new();
+    let mut resource_accepted_turns = 0_usize;
+    for repetition in std::fs::read_dir(&profile)
+        .expect("read run profile")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("per-invocation-resource-repetition-"))
+        })
+    {
+        let sessions = repetition.join("state/sessions");
+        for session in std::fs::read_dir(sessions)
+            .expect("read per-invocation resource sessions")
+            .filter_map(std::result::Result::ok)
+        {
+            let journal = std::fs::read_to_string(session.path().join("journal.jsonl"))
+                .expect("read per-invocation resource journal");
+            for line in journal.lines() {
+                let event: Value =
+                    serde_json::from_str(line).expect("parse resource journal event");
+                if event.get("event").and_then(Value::as_str) == Some("turn-accepted") {
+                    resource_accepted_turns = resource_accepted_turns.saturating_add(1);
+                }
+                if let Some(evidence) = exec_template_evidence(&event) {
+                    resource_bindings.push(evidence.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        !resource_bindings.is_empty(),
+        "resource collector recorded no rendered bindings"
+    );
+    assert_eq!(
+        resource_bindings.len(),
+        resource_accepted_turns,
+        "every accepted resource-collector turn must record rendered bindings"
+    );
+    for evidence in &resource_bindings {
+        assert_rendered_bindings(evidence, &base_url, &credential_fingerprint);
+    }
+
+    let serialized_report = serde_json::to_string(report).expect("serialize report for redaction");
+    assert!(
+        !serialized_report.contains(&credential),
+        "raw rendered credential leaked into report evidence"
+    );
 }
 
 #[test]
@@ -75,6 +233,7 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
     assert_eq!(badge.comparison_scope, "within-topology-only");
     assert!(junit.contains("failures=\"0\""));
     assert!(junit.contains("skipped=\"6\""));
+    assert_exec_template_propagation(&output, &report);
     std::fs::remove_dir_all(&output).expect("remove reference mock-exec output");
 
     let variant_root = run_directory("without-durable-journal");

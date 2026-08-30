@@ -1120,6 +1120,7 @@ fn make_driver(
             cancel_command: resolve_local_program(&manifest.agents.cancel)?,
             replay_command: resolve_local_program(&manifest.events.replay_command)?,
             environment: environment.clone(),
+            base_variables: variables.clone(),
             profile_root: profile_root.to_path_buf(),
             events: manifest.events.clone(),
             exit: manifest.exit.clone(),

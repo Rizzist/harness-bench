@@ -455,6 +455,10 @@ pub struct CapturePolicy {
     /// Environment names whose values are redacted.
     #[serde(default)]
     pub redact_env: Vec<String>,
+    /// Explicitly permit `{{credential}}` in direct argv templates. This is
+    /// disabled by default because process arguments can be externally visible.
+    #[serde(default)]
+    pub allow_credential_argv: bool,
     /// Maximum bytes captured per stream.
     #[serde(default)]
     pub max_bytes: usize,
@@ -640,7 +644,9 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         ));
     }
     for (label, argv) in command_vectors(manifest) {
-        if argv.iter().any(|arg| arg.contains("{{credential}}")) {
+        if !manifest.capture.allow_credential_argv
+            && argv.iter().any(|arg| arg.contains("{{credential}}"))
+        {
             return Err(AhrbError::Validation(format!(
                 "{label} embeds the credential value in argv"
             )));
