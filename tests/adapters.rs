@@ -265,6 +265,15 @@ fn fixture_templates_execute_write_read_and_fail_effects_for_native_adapters() -
 fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Result<()> {
     let claude = ahrb::manifest::load(Path::new("adapters/claude-code/manifest.toml"))?;
     assert_eq!(claude.fake_model.allowed_paths, ["/v1/messages"]);
+    for command in [&claude.transport.command, &claude.sessions.resume] {
+        assert_eq!(command.first().map(String::as_str), Some("/usr/bin/env"));
+        assert!(
+            command
+                .iter()
+                .any(|argument| argument == "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
+        );
+        assert!(command.iter().any(|argument| argument == "claude"));
+    }
     assert_eq!(claude.tools.aliases["write"].primary(), Some("Bash"));
     assert_eq!(
         claude
@@ -278,6 +287,11 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
         rule.event == "tool-result"
             && rule.payload_bindings.get("call_id").map(String::as_str)
                 == Some("/_ahrb_expanded/tool_use_id")
+    }));
+    assert!(claude.events.rules.iter().any(|rule| {
+        rule.matches == "result"
+            && rule.match_fields.get("/is_error").map(String::as_str) == Some("true")
+            && rule.event == "terminal-failure"
     }));
     for subtype in [
         "error_max_turns",

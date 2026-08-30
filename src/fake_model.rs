@@ -108,7 +108,19 @@ impl ModelRequest {
 
     /// Compute the stable hash used for transition validation and retry identity.
     pub fn canonical_hash(&self) -> Result<String> {
-        canonical_request_hash(&self.canonical)
+        canonical_request_hash(&retry_identity_canonical(&self.dialect, &self.canonical))
+    }
+
+    fn same_retry_identity(&self, other: &Self) -> bool {
+        self.dialect == other.dialect
+            && self.endpoint == other.endpoint
+            && self.model == other.model
+            && self.scenario == other.scenario
+            && self.actor == other.actor
+            && self.checkpoint == other.checkpoint
+            && self.credential_fingerprint == other.credential_fingerprint
+            && retry_identity_canonical(&self.dialect, &self.canonical)
+                == retry_identity_canonical(&other.dialect, &other.canonical)
     }
 }
 
@@ -123,7 +135,7 @@ pub struct ModelResponse {
     pub actor: String,
     /// Accepted checkpoint.
     pub checkpoint: String,
-    /// Canonical request hash.
+    /// Canonical retry-identity hash.
     pub request_hash: String,
     /// Deterministic semantic response.
     pub value: Value,
@@ -168,9 +180,9 @@ pub trait ProtocolFrontend: Send + Sync {
 pub struct ModelRequestRecord {
     /// Parsed canonical request.
     pub request: ModelRequest,
-    /// SHA-256 of canonical semantic JSON.
+    /// SHA-256 of canonical retry-identity JSON.
     pub canonical_hash: String,
-    /// Number of byte-equivalent attempts observed for this semantic request.
+    /// Number of retry-equivalent attempts observed for this semantic request.
     pub attempts: u64,
     /// Whether the workflow state machine accepted the request.
     pub accepted: bool,
@@ -217,7 +229,7 @@ impl FakeModelEngine {
                     attempts: 0,
                     accepted: false,
                 });
-            if record.request != request {
+            if !record.request.same_retry_identity(&request) {
                 return Err(AhrbError::Protocol(
                     "request evidence key collision with different request".to_owned(),
                 ));
@@ -1140,6 +1152,22 @@ pub fn canonicalize_json(value: &Value) -> Value {
         }
         _ => value.clone(),
     }
+}
+
+fn retry_identity_canonical(dialect: &str, value: &Value) -> Value {
+    let mut canonical = canonicalize_json(value);
+    if dialect == "openai-chat-completions" {
+        if let Some(object) = canonical.as_object_mut() {
+            // Rick v0.1.18 probes an OpenAI-compatible model with the complete
+            // conversation before sending the real streamed request. These
+            // response-delivery controls vary between the probe and request,
+            // but the model, conversation, and tool declaration do not.
+            object.remove("max_completion_tokens");
+            object.remove("stream");
+            object.remove("stream_options");
+        }
+    }
+    canonical
 }
 
 /// SHA-256 a canonical JSON request into lowercase hexadecimal.
@@ -2194,6 +2222,58 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn openai_chat_retry_identity_ignores_rick_probe_delivery_controls() -> Result<()> {
+        let frontend = OpenAiChatFrontend;
+        let common = json!({
+            "model": "ahrb-fake",
+            "messages": [{
+                "role": "user",
+                "content": "go [[AHRB:scenario=routing;actor=root;checkpoint=start]]"
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    }
+                }
+            }]
+        });
+        let mut probe_body = common.clone();
+        probe_body["max_completion_tokens"] = json!(1);
+        probe_body["stream"] = json!(false);
+        let probe_bytes = serde_json::to_vec(&probe_body)?;
+        let probe = frontend.parse(frontend.path(), &BTreeMap::new(), &probe_bytes)?;
+
+        let mut streamed_body = common.clone();
+        streamed_body["max_completion_tokens"] = json!(16_384);
+        streamed_body["stream"] = json!(true);
+        streamed_body["stream_options"] = json!({"include_usage": true});
+        let streamed_bytes = serde_json::to_vec(&streamed_body)?;
+        let streamed = frontend.parse(frontend.path(), &BTreeMap::new(), &streamed_bytes)?;
+
+        assert_eq!(probe.canonical_hash()?, streamed.canonical_hash()?);
+        let engine = FakeModelEngine::new(&simple_workflow())?;
+        assert!(!engine.handle(probe).await?.retry);
+        assert!(engine.handle(streamed.clone()).await?.retry);
+        let records = engine.request_records().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].attempts, 2);
+
+        let mut changed_body = streamed_body;
+        changed_body["messages"][0]["content"] =
+            json!("different [[AHRB:scenario=routing;actor=root;checkpoint=start]]");
+        let changed_bytes = serde_json::to_vec(&changed_body)?;
+        let changed = frontend.parse(frontend.path(), &BTreeMap::new(), &changed_bytes)?;
+        assert_ne!(streamed.canonical_hash()?, changed.canonical_hash()?);
+        assert!(engine.handle(changed).await.is_err());
+        Ok(())
+    }
+
     #[test]
     fn scripted_write_fixture_uses_the_shell_tool_declared_by_the_request() -> Result<()> {
         let scripted = json!({
@@ -2434,6 +2514,39 @@ mod tests {
                 command.contains(crate::events::NATIVE_FIXTURE_METADATA_PREFIX),
                 "{adapter}"
             );
+            if adapter == "claude-code" {
+                let rendered = AnthropicMessagesFrontend.render(&ModelResponse {
+                    model: manifest.fake_model.model.clone(),
+                    scenario: "native".to_owned(),
+                    actor: "claude".to_owned(),
+                    checkpoint: "start".to_owned(),
+                    request_hash: "claude-request-hash".to_owned(),
+                    value: adapted.clone(),
+                    fault: None,
+                    retry: false,
+                    stream: true,
+                })?;
+                let frames = sse_json_frames(&rendered.body)?;
+                assert_eq!(
+                    frames[1]
+                        .1
+                        .pointer("/content_block/name")
+                        .and_then(Value::as_str),
+                    Some("Bash")
+                );
+                let partial_input = frames[2]
+                    .1
+                    .pointer("/delta/partial_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "Claude Anthropic tool input delta is absent".to_owned(),
+                        )
+                    })?;
+                let input: Value = serde_json::from_str(partial_input)?;
+                assert!(input.is_object());
+                assert_eq!(input.get("command").and_then(Value::as_str), Some(command));
+            }
             let status = std::process::Command::new("/bin/sh")
                 .args(["-c", command])
                 .current_dir(&directory)

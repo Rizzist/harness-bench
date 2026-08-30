@@ -2,7 +2,7 @@
 schema = 1
 id = "claude-code"
 name = "Claude Code"
-revision = "print-stream-json-native-tools-v2"
+revision = "print-stream-json-native-tools-v3"
 
 [availability]
 exec_paths = ["claude"]
@@ -39,6 +39,7 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
+  "/usr/bin/env", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
   "claude", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
   "--model", "{{model}}", "--add-dir", "{{workspace}}",
   "--dangerously-skip-permissions", "--allowedTools", "Bash",
@@ -48,6 +49,7 @@ timeout_ms = 30000
 
 [sessions]
 resume = [
+  "/usr/bin/env", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
   "claude", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
   "--model", "{{model}}", "--add-dir", "{{workspace}}",
   "--dangerously-skip-permissions", "--allowedTools", "Bash",
@@ -77,6 +79,9 @@ write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{cont
 read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
 fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 
+# Claude Code 2.1.251 otherwise issues an auxiliary session-title model request
+# containing the user's route marker but no tool declarations. Nonessential
+# traffic is disabled so that request cannot consume the real turn checkpoint.
 # TODO(orchestrator): capture one installed-version transcript to reconfirm that
 # successful Bash tool_result blocks always carry is_error=false and that init
 # remains the best available proxy for model-request. The lower-case bash alias
@@ -123,6 +128,11 @@ payload_pointer = "/_ahrb_expanded"
 matches = "result"
 match_fields = { "/subtype" = "success", "/is_error" = "false" }
 event = "terminal-success"
+
+[[events.rules]]
+matches = "result"
+match_fields = { "/is_error" = "true" }
+event = "terminal-failure"
 
 [[events.rules]]
 matches = "result"

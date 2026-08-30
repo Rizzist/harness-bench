@@ -3191,6 +3191,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_success_subtype_is_failure_when_result_is_error() {
+        let manifest = crate::manifest::load(Path::new("adapters/claude-code/manifest.toml"))
+            .expect("load Claude Code manifest");
+        let mut session = PersistedExecSession {
+            local_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            marker: "root".to_owned(),
+            harness_id: String::new(),
+            turns: 1,
+            invocations: 1,
+            next_cursor: 1,
+            closed: false,
+        };
+        let records = [json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "session_id": "claude-session"
+        })];
+        let events = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &mut session,
+            &records,
+            &BTreeMap::new(),
+            "turn-1",
+            true,
+        )
+        .expect("normalize Claude API error result");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalFailure)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalSuccess)
+        );
+    }
+
     #[tokio::test]
     async fn managed_daemon_is_cold_owned_and_reaped() {
         let logs = std::env::temp_dir().join(format!(
