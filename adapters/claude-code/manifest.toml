@@ -2,7 +2,7 @@
 schema = 1
 id = "claude-code"
 name = "Claude Code"
-revision = "print-stream-json-v1"
+revision = "print-stream-json-native-tools-v2"
 
 [availability]
 exec_paths = ["claude"]
@@ -39,19 +39,19 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
-  "claude", "-p", "--bare", "--verbose", "--output-format", "stream-json",
-  "--include-partial-messages", "--model", "{{model}}",
+  "claude", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
+  "--model", "{{model}}", "--add-dir", "{{workspace}}",
   "--dangerously-skip-permissions", "--allowedTools", "Bash",
-  "--session-id", "{{session_id}}", "--", "{{prompt}}"
+  "--session-id", "{{session_id}}"
 ]
 timeout_ms = 30000
 
 [sessions]
 resume = [
-  "claude", "-p", "--bare", "--verbose", "--output-format", "stream-json",
-  "--include-partial-messages", "--model", "{{model}}",
+  "claude", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
+  "--model", "{{model}}", "--add-dir", "{{workspace}}",
   "--dangerously-skip-permissions", "--allowedTools", "Bash",
-  "--resume", "{{session_id}}", "--", "{{prompt}}"
+  "--resume", "{{session_id}}"
 ]
 id_pointer = "/session_id"
 
@@ -64,20 +64,24 @@ max_agents = 8
 fanout_mode = "client"
 
 [tools.aliases]
-write = "Bash"
-read = "Bash"
-fail = "Bash"
+write = ["Bash", "bash"]
+read = ["Bash", "bash"]
+fail = ["Bash", "bash"]
 
 [tools.bindings]
-command = "command"
+"Bash.command" = "command"
+"bash.command" = "command"
 
 [tools.fixtures]
 write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
 read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
 fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 
-# TODO(orchestrator): revalidate these stream-json predicates when testing a
-# Claude Code release other than the probed 2.1.x output contract.
+# TODO(orchestrator): capture one installed-version transcript to reconfirm that
+# successful Bash tool_result blocks always carry is_error=false and that init
+# remains the best available proxy for model-request. The lower-case bash alias
+# is a compatibility fallback; the official 2.1.x model-visible name is Bash.
+# Also pin process exit codes for every error_* subtype and permission failure.
 [events]
 source = "stdout"
 framing = "jsonl"
@@ -98,6 +102,7 @@ expand_pointer = "/message/content"
 match_fields = { "/_ahrb_expanded/type" = "tool_use" }
 event = "tool-call"
 payload_pointer = "/_ahrb_expanded"
+payload_bindings = { call_id = "/_ahrb_expanded/id", arguments = "/_ahrb_expanded/input" }
 
 [[events.rules]]
 matches = "user"
@@ -105,6 +110,7 @@ expand_pointer = "/message/content"
 match_fields = { "/_ahrb_expanded/type" = "tool_result" }
 event = "tool-result"
 payload_pointer = "/_ahrb_expanded"
+payload_bindings = { call_id = "/_ahrb_expanded/tool_use_id", result = "/_ahrb_expanded" }
 
 [[events.rules]]
 matches = "assistant"
@@ -115,18 +121,33 @@ payload_pointer = "/_ahrb_expanded"
 
 [[events.rules]]
 matches = "result"
-match_fields = { "/subtype" = "success" }
+match_fields = { "/subtype" = "success", "/is_error" = "false" }
 event = "terminal-success"
 
 [[events.rules]]
 matches = "result"
-match_fields = { "/is_error" = "true" }
+match_fields = { "/subtype" = "error_max_turns" }
+event = "terminal-failure"
+
+[[events.rules]]
+matches = "result"
+match_fields = { "/subtype" = "error_during_execution" }
+event = "terminal-failure"
+
+[[events.rules]]
+matches = "result"
+match_fields = { "/subtype" = "error_max_budget_usd" }
+event = "terminal-failure"
+
+[[events.rules]]
+matches = "result"
+match_fields = { "/subtype" = "error_max_structured_output_retries" }
 event = "terminal-failure"
 
 [exit]
 success = 0
-success_stdout = ['"type":"result"']
-failure_stdout = ['"is_error":true', '"subtype":"error']
+success_stdout = ['"subtype":"success"']
+failure_stdout = ['"subtype":"error_']
 failures = { provider = 1 }
 
 [process]

@@ -2353,6 +2353,104 @@ mod tests {
     }
 
     #[test]
+    fn remaining_adapter_writes_render_through_their_declared_native_shell() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("ahrb-native-adapter-writes-{}", std::process::id()));
+        if directory.exists() {
+            std::fs::remove_dir_all(&directory)?;
+        }
+        std::fs::create_dir_all(&directory)?;
+
+        for adapter in ["claude-code", "pi", "rick"] {
+            let manifest =
+                crate::manifest::load(Path::new(&format!("adapters/{adapter}/manifest.toml")))?;
+            let aliases = manifest.tools.aliases["write"].candidates();
+            let native_name = aliases.first().ok_or_else(|| {
+                AhrbError::Validation(format!("{adapter} has no native write alias"))
+            })?;
+            let effect = format!("{adapter}.txt");
+            let scripted = json!({
+                "tool_calls": [{
+                    "id": format!("call-{adapter}"),
+                    "name": "write_fixture",
+                    "arguments": {"path": effect, "content": adapter},
+                    "_ahrb_native": {
+                        "semantic": "write",
+                        "aliases": aliases,
+                        "bindings": manifest.tools.bindings,
+                        "argv": [
+                            "/bin/sh",
+                            "-c",
+                            format!("printf '%s' '{adapter}' > '{effect}'")
+                        ]
+                    }
+                }]
+            });
+            let schema = json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": false
+            });
+            let request = match manifest.fake_model.dialect {
+                crate::manifest::ProtocolDialect::AnthropicMessages => json!({
+                    "tools": [{
+                        "name": native_name,
+                        "input_schema": schema
+                    }]
+                }),
+                crate::manifest::ProtocolDialect::OpenAiChatCompletions => json!({
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": native_name,
+                            "parameters": schema
+                        }
+                    }]
+                }),
+                crate::manifest::ProtocolDialect::OpenAiResponses => json!({
+                    "tools": [{
+                        "type": "function",
+                        "name": native_name,
+                        "parameters": schema
+                    }]
+                }),
+            };
+            let adapted = adapt_scripted_tool_calls(&scripted, &request)?;
+            assert_eq!(
+                adapted
+                    .pointer("/tool_calls/0/name")
+                    .and_then(Value::as_str),
+                Some(native_name.as_str()),
+                "{adapter}"
+            );
+            let command = adapted
+                .pointer("/tool_calls/0/arguments/command")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AhrbError::Protocol(format!("{adapter} native command is absent"))
+                })?;
+            assert!(
+                command.contains(crate::events::NATIVE_FIXTURE_METADATA_PREFIX),
+                "{adapter}"
+            );
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .current_dir(&directory)
+                .status()?;
+            assert!(status.success(), "{adapter}");
+            assert_eq!(
+                std::fs::read_to_string(directory.join(&effect))?,
+                adapter,
+                "{adapter}"
+            );
+        }
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn responses_sse_streams_function_call_lifecycle_and_nonzero_usage() -> Result<()> {
         let rendered = OpenAiResponsesFrontend.render(&streamed_tool_response())?;
         let frames = sse_json_frames(&rendered.body)?;

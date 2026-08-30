@@ -2,17 +2,13 @@
 schema = 1
 id = "rick"
 name = "Rick"
-revision = "exec-stream-json-v1-unvalidated-provider"
+revision = "exec-stream-json-native-tools-v2"
 
 [availability]
 exec_paths = ["rick"]
 version_probe = ["rick", "version"]
 version_pattern = "rick v"
 
-# TODO(orchestrator): Rick v0.1.18 did not honor OPENAI_BASE_URL for its built-in
-# OpenAI provider during the sandboxed probe. Replace this env-only injection with
-# Rick's documented noninteractive isolated rick.json/auth.json custom-provider
-# schema when that contract is published or confirmed by the real-harness run.
 [fake_model]
 dialect = "open-ai-chat-completions"
 base_url_env = "OPENAI_BASE_URL"
@@ -31,11 +27,25 @@ XDG_DATA_HOME = "{{profile}}/data"
 XDG_STATE_HOME = "{{profile}}/state"
 XDG_RUNTIME_DIR = "{{profile}}/runtime"
 TMPDIR = "{{profile}}/tmp"
-RICK_HOME = "{{profile}}/rick-home"
-RICK_DATA = "{{profile}}/rick-data"
+RICK_HOME = "{{profile}}/home/.config/rick"
+RICK_DATA = "{{profile}}/home/.local/share/rick"
+
+[[isolation.generated_files]]
+path = "{{profile}}/home/.config/rick/rick.json"
+mode = "0600"
+content = '''{
+  "model": "ahrb/{{model}}",
+  "provider": {
+    "ahrb": {
+      "type": "openai-compatible",
+      "baseUrl": "{{base_url}}/v1",
+      "apiKey": "{{credential}}"
+    }
+  }
+}
+'''
 
 [isolation]
-generated_files = []
 forbidden_roots = ["~/.config/rick", "~/.local/share/rick"]
 
 [daemon]
@@ -44,19 +54,12 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
-  "rick", "--new", "exec", "--output-format", "stream-json",
-  "--model", "openai/{{model}}", "--permission-profile", "ci",
-  "--sandbox", "workspace-write", "--yolo", "{{prompt}}"
+  "rick", "exec", "--output-format", "stream-json", "--yolo",
+  "--model", "ahrb/{{model}}", "{{prompt}}"
 ]
 timeout_ms = 30000
 
 [sessions]
-resume = [
-  "rick", "--resume", "{{session_id}}", "exec", "--output-format", "stream-json",
-  "--model", "openai/{{model}}", "--permission-profile", "ci",
-  "--sandbox", "workspace-write", "--yolo", "{{prompt}}"
-]
-id_pointer = "/session_id"
 
 [next_input]
 [agents]
@@ -66,15 +69,18 @@ topology = "client-process-fanout"
 max_agents = 8
 fanout_mode = "client"
 
-# TODO(orchestrator): confirm Rick's model-visible shell alias/input key and its
-# stream-json success/session event names against the orchestrator's real binary.
+# Rick v0.1.18 names this built-in BashTool `bash`.
+# TODO(orchestrator): confirm whether older supported builds used the `shell`
+# compatibility alias; it is selected only when the harness declares it with a
+# string-valued command field.
 [tools.aliases]
-write = "bash"
-read = "bash"
-fail = "bash"
+write = ["bash", "shell"]
+read = ["bash", "shell"]
+fail = ["bash", "shell"]
 
 [tools.bindings]
-command = "command"
+"bash.command" = "command"
+"shell.command" = "command"
 
 [tools.fixtures]
 write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
@@ -84,37 +90,57 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 [events]
 source = "stdout"
 framing = "jsonl"
+id_pointer = "/session_id"
 
 [[events.rules]]
-matches = "session_start"
+matches = "done"
 event = "turn-accepted"
 
 [[events.rules]]
-matches = "turn_start"
+matches = "tool_start"
+event = "model-request"
+
+[[events.rules]]
+matches = "text"
 event = "model-request"
 
 [[events.rules]]
 matches = "tool_start"
 event = "tool-call"
+payload_pointer = "/tool"
+payload_bindings = { arguments = "/tool/input" }
 
 [[events.rules]]
-matches = "tool_result"
+matches = "tool_end"
 event = "tool-result"
+payload_pointer = "/tool"
+payload_bindings = { arguments = "/tool/input", result = "/tool" }
 
 [[events.rules]]
-matches = "assistant"
+matches = "text"
 event = "model-response"
 
 [[events.rules]]
-matches = "result"
+matches = "done"
 event = "terminal-success"
 
 [[events.rules]]
 matches = "error"
 event = "terminal-failure"
 
+# TODO(orchestrator): Rick v0.1.x stream-json ToolRecord has name/input/output/
+# is_error but no native call ID. AHRB therefore recovers the abstract call ID
+# independently from the fixture metadata repeated in each tool_start/tool_end
+# input. Capture a real transcript to confirm both records repeat input. This is
+# sound for AHRB's serial per-invocation fixture calls, but Rick must expose an ID
+# before arbitrary concurrent same-name calls can be correlated. Rick also emits
+# no explicit accepted/model-request record, so `done`, `tool_start`, and `text`
+# are retrospective proxies; replace them if a future release adds start events.
+# Pin provider/authentication error exit codes against the orchestrator binary.
+
 [exit]
 success = 0
+success_stdout = ['"type":"done"']
 failure_stdout = ['"type":"error"']
 failures = { provider = 1 }
 
@@ -136,8 +162,5 @@ max_bytes = 1048576
 
 [capabilities.required]
 headless = "rick exec --output-format stream-json is noninteractive"
-sessions = "Rick persists sessions beneath isolated RICK_DATA"
-resume = "rick --resume reopens a saved session in a fresh process"
 
 [capabilities.optional]
-

@@ -907,13 +907,21 @@ fn canonical_native_result(native: Value) -> Value {
     };
     if !result.contains_key("ok") {
         let value = Value::Object(result.clone());
+        let is_error = nested_value(&value, "is_error")
+            .or_else(|| nested_value(&value, "isError"))
+            .and_then(Value::as_bool);
         let exit_code = nested_value(&value, "exit_code").and_then(Value::as_i64);
         let status = nested_value(&value, "status").and_then(Value::as_str);
-        let ok = exit_code.map(|code| code == 0).or_else(|| {
-            status.and_then(|status| match status {
-                "completed" | "success" | "succeeded" => Some(true),
-                "failed" | "failure" | "error" | "cancelled" => Some(false),
-                _ => None,
+        let has_output = nested_value(&value, "output").is_some();
+        let ok = is_error.map(|is_error| !is_error).or_else(|| {
+            exit_code.map(|code| code == 0).or_else(|| {
+                status
+                    .and_then(|status| match status {
+                        "completed" | "success" | "succeeded" => Some(true),
+                        "failed" | "failure" | "error" | "cancelled" => Some(false),
+                        _ => None,
+                    })
+                    .or(has_output.then_some(true))
             })
         });
         if let Some(ok) = ok {
@@ -2087,8 +2095,12 @@ fn stdout_has_top_level_error(stdout: &[u8]) -> bool {
         let line = trim_ascii(line);
         serde_json::from_slice::<Value>(line)
             .ok()
-            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-            .is_some_and(|event_type| event_type == "error")
+            .is_some_and(|value| {
+                let event_type = value.get("type").and_then(Value::as_str);
+                event_type == Some("error")
+                    || (event_type == Some("result")
+                        && value.get("is_error").and_then(Value::as_bool) == Some(true))
+            })
     })
 }
 
@@ -2924,6 +2936,168 @@ mod tests {
     }
 
     #[test]
+    fn remaining_exec_adapter_rules_correlate_native_fixture_events() {
+        let metadata = serde_json::to_vec(&json!({
+            "call_id": "call-write",
+            "name": "write_fixture",
+            "arguments": {"path": "fixture.txt", "content": "fixture payload"}
+        }))
+        .expect("serialize fixture metadata")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+        let command = format!(
+            "/usr/bin/true; : '{}{}'",
+            NATIVE_FIXTURE_METADATA_PREFIX, metadata
+        );
+        let cases = [
+            (
+                "claude-code",
+                vec![
+                    json!({"type":"system","subtype":"init","session_id":"claude-session"}),
+                    json!({
+                        "type":"assistant",
+                        "session_id":"claude-session",
+                        "message":{"content":[{
+                            "type":"tool_use","id":"toolu-1","name":"Bash",
+                            "input":{"command":command}
+                        }]}
+                    }),
+                    json!({
+                        "type":"user",
+                        "session_id":"claude-session",
+                        "message":{"content":[{
+                            "type":"tool_result","tool_use_id":"toolu-1",
+                            "content":"ok","is_error":false
+                        }]}
+                    }),
+                    json!({
+                        "type":"assistant","session_id":"claude-session",
+                        "message":{"content":[{"type":"text","text":"done"}]}
+                    }),
+                    json!({
+                        "type":"result","subtype":"success","is_error":false,
+                        "session_id":"claude-session"
+                    }),
+                ],
+            ),
+            (
+                "pi",
+                vec![
+                    json!({"type":"session","version":3,"id":"pi-session","cwd":"/tmp"}),
+                    json!({"type":"agent_start"}),
+                    json!({"type":"turn_start"}),
+                    json!({
+                        "type":"tool_execution_start","toolCallId":"pi-tool-1",
+                        "toolName":"bash","args":{"command":command}
+                    }),
+                    json!({
+                        "type":"tool_execution_end","toolCallId":"pi-tool-1",
+                        "toolName":"bash","result":{"content":"ok"},"isError":false
+                    }),
+                    json!({
+                        "type":"message_end",
+                        "message":{"role":"assistant","content":[],"stopReason":"stop"}
+                    }),
+                    json!({"type":"agent_settled"}),
+                ],
+            ),
+            (
+                "rick",
+                vec![
+                    json!({
+                        "type":"tool_start",
+                        "tool":{"name":"bash","input":{"command":command}}
+                    }),
+                    json!({
+                        "type":"tool_end",
+                        "tool":{
+                            "name":"bash","input":{"command":command},
+                            "output":"ok","is_error":false
+                        }
+                    }),
+                    json!({"type":"text","text":"done"}),
+                    json!({"type":"done","session_id":"rick-session"}),
+                ],
+            ),
+        ];
+
+        for (index, (adapter, records)) in cases.into_iter().enumerate() {
+            let manifest =
+                crate::manifest::load(Path::new(&format!("adapters/{adapter}/manifest.toml")))
+                    .expect("load exec adapter manifest");
+            let mut session = PersistedExecSession {
+                local_id: format!("00000000-0000-4000-8000-00000000000{index}"),
+                marker: "root".to_owned(),
+                harness_id: String::new(),
+                turns: 1,
+                invocations: 1,
+                next_cursor: 1,
+                closed: false,
+            };
+            let events = PerInvocationDriver::normalize_records(
+                &manifest.events,
+                &mut session,
+                &records,
+                &BTreeMap::new(),
+                "turn-1",
+                true,
+            )
+            .expect("normalize native exec events");
+            let call = events
+                .iter()
+                .find(|event| event.event == EventVocab::ToolCall)
+                .expect("normalized tool call");
+            let result = events
+                .iter()
+                .find(|event| event.event == EventVocab::ToolResult)
+                .expect("normalized tool result");
+            assert_eq!(
+                call.payload.get("call_id").and_then(Value::as_str),
+                Some("call-write"),
+                "{adapter}"
+            );
+            assert_eq!(
+                result.payload.get("call_id").and_then(Value::as_str),
+                Some("call-write"),
+                "{adapter}"
+            );
+            assert_eq!(
+                result
+                    .payload
+                    .pointer("/result/ok")
+                    .and_then(Value::as_bool),
+                Some(true),
+                "{adapter}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event == EventVocab::TerminalSuccess),
+                "{adapter}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_result_status_supports_boolean_error_and_output_schemas() {
+        for (native, expected) in [
+            (json!({"is_error": false}), true),
+            (json!({"is_error": true}), false),
+            (json!({"isError": false}), true),
+            (json!({"isError": true}), false),
+            (json!({"output": "completed"}), true),
+        ] {
+            assert_eq!(
+                canonical_native_result(native)
+                    .get("ok")
+                    .and_then(Value::as_bool),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn codex_exit_contract_ignores_nested_metadata_warning_but_keeps_failures() {
         let manifest = crate::manifest::load(Path::new("adapters/codex/manifest.toml"))
             .expect("load Codex manifest");
@@ -2964,6 +3138,57 @@ mod tests {
             let (event, _) = classify_exit_contract(&manifest.exit, code, stdout);
             assert_eq!(event, EventVocab::TerminalFailure);
         }
+    }
+
+    #[test]
+    fn claude_exit_contract_distinguishes_tool_and_terminal_errors() {
+        let manifest = crate::manifest::load(Path::new("adapters/claude-code/manifest.toml"))
+            .expect("load Claude Code manifest");
+        let failed_tool_then_success = br#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu-1","is_error":true}]}}
+{"type":"result","subtype":"success","is_error":false}
+"#;
+        let (event, _) = classify_exit_contract(&manifest.exit, Some(0), failed_tool_then_success);
+        assert_eq!(event, EventVocab::TerminalSuccess);
+
+        let failed_terminal = br#"{"type":"result","subtype":"success","is_error":true}
+"#;
+        let (event, _) = classify_exit_contract(&manifest.exit, Some(0), failed_terminal);
+        assert_eq!(event, EventVocab::TerminalFailure);
+    }
+
+    #[test]
+    fn claude_error_subtype_is_terminal_even_when_is_error_is_false() {
+        let manifest = crate::manifest::load(Path::new("adapters/claude-code/manifest.toml"))
+            .expect("load Claude Code manifest");
+        let mut session = PersistedExecSession {
+            local_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            marker: "root".to_owned(),
+            harness_id: String::new(),
+            turns: 1,
+            invocations: 1,
+            next_cursor: 1,
+            closed: false,
+        };
+        let records = [json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": false,
+            "session_id": "claude-session"
+        })];
+        let events = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &mut session,
+            &records,
+            &BTreeMap::new(),
+            "turn-1",
+            true,
+        )
+        .expect("normalize Claude error subtype");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalFailure)
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 schema = 1
 id = "pi"
 name = "Pi Coding Agent"
-revision = "print-json-v1"
+revision = "print-json-native-tools-v2"
 
 [availability]
 exec_paths = ["pi"]
@@ -16,19 +16,34 @@ credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
 allowed_paths = ["/v1/chat/completions"]
 
-[[fake_model.provider_templates]]
-path = "{{profile}}/pi/models.json"
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+
+[[isolation.generated_files]]
+path = "{{profile}}/home/.pi/agent/models.json"
 mode = "0600"
 content = '''{
   "providers": {
     "ahrb": {
-      "name": "AHRB Fake Model",
       "baseUrl": "{{base_url}}/v1",
-      "apiKey": "{{credential}}",
       "api": "openai-completions",
+      "apiKey": "{{credential}}",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
       "models": [
         {
-          "id": "ahrb-fake-v1",
+          "id": "{{model}}",
           "name": "AHRB Fake Model",
           "reasoning": false,
           "input": ["text"],
@@ -41,22 +56,18 @@ content = '''{
 }
 '''
 
-[model_roles.primary]
-model = "ahrb-fake-v1"
-required = true
-
-[isolation.roots]
-HOME = "{{profile}}/home"
-XDG_CONFIG_HOME = "{{profile}}/config"
-XDG_DATA_HOME = "{{profile}}/data"
-XDG_STATE_HOME = "{{profile}}/state"
-XDG_RUNTIME_DIR = "{{profile}}/runtime"
-TMPDIR = "{{profile}}/tmp"
-PI_CODING_AGENT_DIR = "{{profile}}/pi"
-PI_CODING_AGENT_SESSION_DIR = "{{profile}}/pi/sessions"
+[[isolation.generated_files]]
+path = "{{profile}}/home/.pi/agent/auth.json"
+mode = "0600"
+content = '''{
+  "ahrb": {
+    "type": "api_key",
+    "key": "{{credential}}"
+  }
+}
+'''
 
 [isolation]
-generated_files = []
 forbidden_roots = ["~/.pi"]
 
 [daemon]
@@ -65,21 +76,14 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
-  "pi", "--print", "--mode", "json", "--provider", "ahrb", "--model", "{{model}}",
-  "--session-dir", "{{profile}}/pi/sessions", "--session-id", "{{session_id}}",
+  "pi", "-p", "{{prompt}}", "--provider", "ahrb", "--model", "{{model}}",
+  "--mode", "json", "--no-session",
   "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
-  "--no-themes", "--approve", "--offline", "--tools", "bash", "--", "{{prompt}}"
+  "--no-themes", "--no-approve", "--offline", "--tools", "bash"
 ]
 timeout_ms = 30000
 
 [sessions]
-resume = [
-  "pi", "--print", "--mode", "json", "--provider", "ahrb", "--model", "{{model}}",
-  "--session-dir", "{{profile}}/pi/sessions", "--session-id", "{{session_id}}",
-  "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
-  "--no-themes", "--approve", "--offline", "--tools", "bash", "--", "{{prompt}}"
-]
-id_pointer = "/id"
 
 [next_input]
 [agents]
@@ -95,7 +99,7 @@ read = "bash"
 fail = "bash"
 
 [tools.bindings]
-command = "command"
+"bash.command" = "command"
 
 [tools.fixtures]
 write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
@@ -105,23 +109,30 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 [events]
 source = "stdout"
 framing = "jsonl"
-id_pointer = "/id"
+id_pointer = "/toolCallId"
 
-[[events.rules]]
-matches = "session"
-event = "turn-accepted"
+# TODO(orchestrator): capture one real 0.84.x JSON transcript to reconfirm final
+# assistant/agent_settled ordering, decide policy for the rare deferred stop
+# reason, and determine whether retries need disabling for fault rows. JSON mode
+# exits zero even for error/aborted, so the terminal rules remain authoritative.
 
 [[events.rules]]
 matches = "agent_start"
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "turn_start"
 event = "model-request"
 
 [[events.rules]]
 matches = "tool_execution_start"
 event = "tool-call"
+payload_bindings = { call_id = "/toolCallId", name = "/toolName", arguments = "/args" }
 
 [[events.rules]]
 matches = "tool_execution_end"
 event = "tool-result"
+payload_bindings = { call_id = "/toolCallId", name = "/toolName", result = "" }
 
 [[events.rules]]
 matches = "message_end"
@@ -130,12 +141,28 @@ event = "model-response"
 payload_pointer = "/message"
 
 [[events.rules]]
-matches = "agent_settled"
+matches = "message_end"
+match_fields = { "/message/role" = "assistant", "/message/stopReason" = "stop" }
 event = "terminal-success"
+
+[[events.rules]]
+matches = "message_end"
+match_fields = { "/message/role" = "assistant", "/message/stopReason" = "length" }
+event = "terminal-failure"
+
+[[events.rules]]
+matches = "message_end"
+match_fields = { "/message/role" = "assistant", "/message/stopReason" = "error" }
+event = "terminal-failure"
+
+[[events.rules]]
+matches = "message_end"
+match_fields = { "/message/role" = "assistant", "/message/stopReason" = "aborted" }
+event = "terminal-failure"
 
 [exit]
 success = 0
-success_stdout = ['"type":"agent_settled"']
+success_stdout = ['"stopReason":"stop"']
 failure_stdout = ['"stopReason":"error"', '"stopReason":"aborted"']
 failures = { provider = 1 }
 
@@ -157,8 +184,5 @@ max_bytes = 1048576
 
 [capabilities.required]
 headless = "pi --print --mode json terminates without the TUI"
-sessions = "Pi stores the exact caller-supplied UUID under the isolated session directory"
-resume = "reusing pi --session-id reopens the persisted project session"
 
 [capabilities.optional]
-
