@@ -640,6 +640,305 @@ pub fn evaluate_resources(
     analysis.finish()
 }
 
+/// One completed fresh-process resource trial. Memory is the sampled whole-tree
+/// peak while all `agents` CLI processes are live; process exit is the reclaim
+/// boundary and is intentionally not compared with a daemon idle baseline.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PerInvocationObservation {
+    /// Fresh-profile repetition number.
+    pub repetition: u32,
+    /// Concurrent harness process count.
+    pub agents: u32,
+    /// Maximum effective whole-tree bytes during the turn.
+    pub peak_bytes: u64,
+    /// Launch-to-first-observation cold peak.
+    pub cold_peak_bytes: u64,
+    /// Whole-tree cumulative CPU for the scripted turn group.
+    pub cpu_ns: u64,
+    /// Processes that reached terminal exit.
+    pub completed_processes: u32,
+    /// Owned process-group members still alive after launcher terminal exit.
+    #[serde(default)]
+    pub residual_processes: u32,
+}
+
+/// Evaluate transient, one-process-per-turn resource evidence without folding a
+/// nonexistent idle baseline into per-turn cost.
+pub fn evaluate_per_invocation_resources(
+    profile: ResourceProfile,
+    observations: &[PerInvocationObservation],
+    envelope: &ResourceEnvelope,
+) -> ResourceCertification {
+    let timing = ResourceTimingPlan::for_profile(profile);
+    let mut rows = Vec::new();
+    let mut metrics = BTreeMap::new();
+    let expected_trials = timing
+        .repetitions
+        .saturating_mul(u32::try_from(timing.sweep_widths.len()).unwrap_or(u32::MAX));
+    let trial_identities: BTreeSet<(u32, u32)> = observations
+        .iter()
+        .map(|observation| (observation.repetition, observation.agents))
+        .collect();
+    let lifecycle_error = if observations.len()
+        != usize::try_from(expected_trials).unwrap_or(usize::MAX)
+        || trial_identities.len() != observations.len()
+    {
+        Some(format!(
+            "per-invocation lifecycle has {} unique trials and {} observations, expected {expected_trials}",
+            trial_identities.len(),
+            observations.len()
+        ))
+    } else {
+        None
+    };
+    let maximum_residual_processes = observations
+        .iter()
+        .map(|observation| observation.residual_processes)
+        .max()
+        .unwrap_or(0);
+    let every_tree_exited = observations.iter().all(|observation| {
+        observation.completed_processes == observation.agents && observation.residual_processes == 0
+    });
+    metrics.insert(
+        "maximum_residual_processes".to_owned(),
+        f64::from(maximum_residual_processes),
+    );
+    let lifecycle_row = |row: u8, name: &str, detail: String| {
+        classify(
+            row,
+            resource_row_id(row),
+            Pillar::Resource,
+            Some(true),
+            &[Assertion {
+                name: name.to_owned(),
+                passed: every_tree_exited,
+                detail,
+            }],
+            lifecycle_error.clone(),
+        )
+    };
+    metrics.insert("idle_median_bytes".to_owned(), 0.0);
+    metrics.insert("idle_cpu_one_core".to_owned(), 0.0);
+    rows.push(lifecycle_row(
+        20,
+        "zero-process-between-turns",
+        format!(
+            "client process fan-out retained at most {maximum_residual_processes} owned processes between turns; certified idle footprint is 0 bytes only when every tree exits"
+        ),
+    ));
+    rows.push(lifecycle_row(
+        21,
+        "zero-process-idle-cpu",
+        format!(
+            "{maximum_residual_processes} owned processes remained capable of busy-polling after launcher exit"
+        ),
+    ));
+    rows.push(lifecycle_row(
+        22,
+        "zero-process-idle-drift",
+        format!(
+            "memory-at-rest drift is structurally zero only when all process groups exit; maximum residual={maximum_residual_processes}"
+        ),
+    ));
+    rows.push(lifecycle_row(
+        23,
+        "process-exit-return",
+        format!(
+            "every completed invocation must return to zero owned processes; maximum residual={maximum_residual_processes}"
+        ),
+    ));
+
+    let mut points = Vec::new();
+    let mut incomplete = None;
+    for agents in &timing.sweep_widths {
+        let trials: Vec<_> = observations
+            .iter()
+            .filter(|observation| observation.agents == *agents)
+            .collect();
+        if trials.len() != timing.repetitions as usize {
+            incomplete = Some(format!(
+                "N={agents} has {} repetitions, expected {}",
+                trials.len(),
+                timing.repetitions
+            ));
+            break;
+        }
+        let repetitions: BTreeSet<u32> = trials.iter().map(|trial| trial.repetition).collect();
+        let expected: BTreeSet<u32> = (0..timing.repetitions).collect();
+        if repetitions != expected {
+            incomplete = Some(format!(
+                "N={agents} repetition identities were {repetitions:?}, expected {expected:?}"
+            ));
+            break;
+        }
+        if trials
+            .iter()
+            .any(|trial| trial.completed_processes != *agents)
+        {
+            incomplete = Some(format!("N={agents} did not terminalize every CLI process"));
+            break;
+        }
+        let peak = median_u64_values(
+            &trials
+                .iter()
+                .map(|trial| trial.peak_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or(0);
+        let cold = median_u64_values(
+            &trials
+                .iter()
+                .map(|trial| trial.cold_peak_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or(0);
+        points.push(SweepPoint {
+            agents: *agents,
+            baseline_bytes: 0,
+            steady_bytes: peak,
+            workload_peak_bytes: peak,
+            cold_peak_bytes: cold,
+            post_turn_bytes: 0,
+            post_close_bytes: 0,
+        });
+        metrics.insert(
+            format!("parallel_n{agents}_process_peak_bytes"),
+            peak as f64,
+        );
+    }
+    let (sweep_metrics, sweep_error) = if incomplete.is_none() {
+        match SweepMetrics::calculate(&points) {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(format!("per-process sweep is invalid: {error}"))),
+        }
+    } else {
+        (None, None)
+    };
+    let maximum_cold = points
+        .iter()
+        .map(|point| point.cold_peak_bytes)
+        .max()
+        .unwrap_or(0);
+    metrics.insert("maximum_cold_peak_bytes".to_owned(), maximum_cold as f64);
+    rows.push(classify(
+        24,
+        resource_row_id(24),
+        Pillar::Resource,
+        Some(true),
+        &[check(
+            "transient-cold-peak",
+            incomplete.is_none() && maximum_cold <= envelope.maximum_peak_bytes,
+            format!("maximum transient cold peak {maximum_cold} bytes"),
+        )],
+        incomplete.clone(),
+    ));
+
+    let n1 = observations
+        .iter()
+        .filter(|observation| observation.agents == 1)
+        .collect::<Vec<_>>();
+    let n1_peak =
+        median_u64_values(&n1.iter().map(|item| item.peak_bytes).collect::<Vec<_>>()).unwrap_or(0);
+    let n1_cpu = median_u64_values(&n1.iter().map(|item| item.cpu_ns).collect::<Vec<_>>())
+        .unwrap_or(u64::MAX);
+    metrics.insert("single_process_peak_bytes".to_owned(), n1_peak as f64);
+    metrics.insert("single_process_cpu_ns".to_owned(), n1_cpu as f64);
+    rows.push(classify(
+        25,
+        resource_row_id(25),
+        Pillar::Resource,
+        Some(true),
+        &[
+            check(
+                "single-process-measured",
+                n1_peak > 0,
+                format!("peak={n1_peak} bytes"),
+            ),
+            check(
+                "single-process-cpu",
+                n1_cpu <= envelope.maximum_cpu_ns_per_turn,
+                format!("{n1_cpu} ns/scripted turn"),
+            ),
+        ],
+        incomplete.clone(),
+    ));
+
+    if let Some(metrics_value) = &sweep_metrics {
+        if let Some(beta) = metrics_value.headline_beta_bytes_per_agent {
+            metrics.insert("parallel_beta_bytes_per_agent".to_owned(), beta);
+            metrics.insert("parallel_beta_mib_per_agent".to_owned(), beta / MIB as f64);
+        }
+        if let Some(alpha) = metrics_value.scaling_exponent_alpha {
+            metrics.insert("parallel_scaling_exponent".to_owned(), alpha);
+        }
+    }
+    let beta = sweep_metrics
+        .as_ref()
+        .and_then(|value| value.headline_beta_bytes_per_agent)
+        .unwrap_or(f64::INFINITY);
+    let alpha = sweep_metrics
+        .as_ref()
+        .and_then(|value| value.scaling_exponent_alpha)
+        .unwrap_or(f64::INFINITY);
+    let maximum_width = timing.sweep_widths.last().copied().unwrap_or(0);
+    rows.push(classify(
+        26,
+        resource_row_id(26),
+        Pillar::Resource,
+        Some(true),
+        &[
+            check(
+                "parallel-process-width",
+                points
+                    .last()
+                    .is_some_and(|point| point.agents == maximum_width),
+                format!("measured through N={maximum_width}"),
+            ),
+            check(
+                "per-process-beta",
+                beta <= envelope.maximum_beta_bytes_per_agent,
+                format!("beta={beta:.3} bytes/process"),
+            ),
+        ],
+        incomplete.clone().or_else(|| sweep_error.clone()),
+    ));
+    rows.push(classify(
+        27,
+        resource_row_id(27),
+        Pillar::Resource,
+        Some(true),
+        &[check(
+            "process-scaling-alpha",
+            alpha <= envelope.maximum_scaling_exponent,
+            format!("alpha={alpha:.6}"),
+        )],
+        incomplete.or(sweep_error),
+    ));
+    rows.push(lifecycle_row(
+        28,
+        "process-exit-reclaim",
+        format!(
+            "automatic PASS only after whole-tree exit is observed; maximum residual={maximum_residual_processes}"
+        ),
+    ));
+    rows.push(lifecycle_row(
+        29,
+        "process-exit-long-horizon",
+        format!(
+            "automatic PASS only after every fresh process group exits; maximum residual={maximum_residual_processes}"
+        ),
+    ));
+    rows.sort_by_key(|row| row.row);
+    ResourceCertification {
+        timing,
+        rows,
+        plateaus: BTreeMap::new(),
+        sampling_health: None,
+        sweep_metrics,
+        metrics,
+    }
+}
+
 struct Analysis<'a> {
     timing: ResourceTimingPlan,
     evidence: &'a ResourceEvidence,
@@ -4701,5 +5000,118 @@ mod tests {
         assert!(monotonic_growth(&[6, 7, 8, 9, 10, 11]));
         assert!(monotonic_growth(&[6, 7, 7, 8, 8, 9]));
         assert!(!monotonic_growth(&[6, 7, 8, 7, 9, 10]));
+    }
+
+    #[test]
+    fn per_invocation_resources_use_zero_idle_and_process_marginals() {
+        let timing = ResourceTimingPlan::for_profile(ResourceProfile::Quick);
+        let observations = timing
+            .sweep_widths
+            .iter()
+            .flat_map(|agents| {
+                (0..timing.repetitions).map(move |repetition| PerInvocationObservation {
+                    repetition,
+                    agents: *agents,
+                    peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cold_peak_bytes: u64::from(*agents) * 21 * MIB,
+                    cpu_ns: u64::from(*agents) * 10_000_000,
+                    completed_processes: *agents,
+                    residual_processes: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let certification = evaluate_per_invocation_resources(
+            ResourceProfile::Quick,
+            &observations,
+            &ResourceEnvelope::default(),
+        );
+
+        assert_eq!(certification.rows.len(), 10);
+        assert!(
+            certification
+                .rows
+                .iter()
+                .all(|row| matches!(row.outcome, TestOutcome::Pass))
+        );
+        assert_eq!(certification.metrics.get("idle_median_bytes"), Some(&0.0));
+        assert_eq!(
+            certification.metrics.get("parallel_beta_mib_per_agent"),
+            Some(&20.0)
+        );
+        for row in [20_u8, 21, 22, 23, 28, 29] {
+            let evidence = certification
+                .rows
+                .iter()
+                .find(|result| result.row == row)
+                .map(|result| result.evidence.join(" "))
+                .unwrap_or_default();
+            assert!(evidence.contains("process") || evidence.contains("resident"));
+        }
+    }
+
+    #[test]
+    fn per_invocation_resources_reject_duplicate_repetition_evidence() {
+        let timing = ResourceTimingPlan::for_profile(ResourceProfile::Quick);
+        let observations = timing
+            .sweep_widths
+            .iter()
+            .flat_map(|agents| {
+                (0..timing.repetitions).map(move |_| PerInvocationObservation {
+                    repetition: 0,
+                    agents: *agents,
+                    peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cold_peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cpu_ns: 10_000_000,
+                    completed_processes: *agents,
+                    residual_processes: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let certification = evaluate_per_invocation_resources(
+            ResourceProfile::Quick,
+            &observations,
+            &ResourceEnvelope::default(),
+        );
+
+        for row in [24_u8, 25, 26, 27] {
+            assert!(certification.rows.iter().any(|result| {
+                result.row == row
+                    && matches!(&result.outcome, TestOutcome::Error(detail) if detail.contains("repetition identities"))
+            }));
+        }
+    }
+
+    #[test]
+    fn per_invocation_residual_child_fails_zero_idle_and_automatic_trials() {
+        let timing = ResourceTimingPlan::for_profile(ResourceProfile::Quick);
+        let mut observations = timing
+            .sweep_widths
+            .iter()
+            .flat_map(|agents| {
+                (0..timing.repetitions).map(move |repetition| PerInvocationObservation {
+                    repetition,
+                    agents: *agents,
+                    peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cold_peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cpu_ns: 10_000_000,
+                    completed_processes: *agents,
+                    residual_processes: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(first) = observations.first_mut() {
+            first.residual_processes = 1;
+        }
+        let certification = evaluate_per_invocation_resources(
+            ResourceProfile::Quick,
+            &observations,
+            &ResourceEnvelope::default(),
+        );
+
+        for row in [20_u8, 21, 22, 23, 28, 29] {
+            assert!(certification.rows.iter().any(|result| {
+                result.row == row && matches!(result.outcome, TestOutcome::Fail(_))
+            }));
+        }
     }
 }

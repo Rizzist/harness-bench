@@ -116,12 +116,29 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
             .iter()
             .any(|sample| sample.phase.contains("n4") || sample.phase.contains("barrier"))
     );
-    for key in ["crash_recovery_ms", "journal_recovered_events"] {
+    for key in [
+        "crash_recovery_ms",
+        "crash_recovery_tree_cleared",
+        "crash_recovery_valid",
+        "journal_recovered_events",
+        "journal_recovery_valid",
+        "journal_torn_tail_injected",
+    ] {
         assert!(report.metrics.contains_key(key), "missing metric {key}");
     }
-    assert!(report.metrics.contains_key("parallel_beta_mib_per_agent"));
+    assert!(
+        report
+            .resource_metrics
+            .contains_key("parallel_beta_mib_per_agent")
+    );
+    assert!(report.resource_metrics.values().all(|metric| {
+        metric.topology == "shared-daemon-sessions"
+            && metric.comparison_scope == "within-topology-only"
+    }));
     assert!(report.metrics["crash_recovery_ms"] < 10_000.0);
+    assert_eq!(report.metrics["crash_recovery_valid"], 1.0);
     assert!(report.metrics["journal_recovered_events"] >= 1.0);
+    assert_eq!(report.metrics["journal_torn_tail_injected"], 1.0);
     let badge = report.badge.as_ref().expect("full matrix badge");
     assert_eq!(badge.os, std::env::consts::OS);
     assert_eq!(badge.topology, "shared-daemon-sessions");

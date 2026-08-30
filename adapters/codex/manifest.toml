@@ -1,0 +1,162 @@
+[identity]
+schema = 1
+id = "codex"
+name = "OpenAI Codex CLI"
+revision = "exec-jsonl-v1"
+
+[availability]
+exec_paths = ["codex"]
+version_probe = ["codex", "--version"]
+version_pattern = "codex-cli"
+
+[fake_model]
+dialect = "open-ai-responses"
+base_url_env = "OPENAI_BASE_URL"
+credential_env = "OPENAI_API_KEY"
+model = "ahrb-fake-v1"
+allowed_paths = ["/v1/responses"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+CODEX_HOME = "{{profile}}/codex"
+
+[isolation]
+generated_files = []
+forbidden_roots = ["~/.codex"]
+
+[daemon]
+persistent = false
+
+[transport]
+kind = "exec"
+command = [
+  "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check",
+  "--ignore-user-config", "--ignore-rules",
+  "-c", 'model_provider="ahrb"',
+  "-c", 'model_providers.ahrb.name="AHRB Fake Model"',
+  "-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"',
+  "-c", 'model_providers.ahrb.env_key="OPENAI_API_KEY"',
+  "-c", 'model_providers.ahrb.wire_api="responses"',
+  "-c", "model_providers.ahrb.request_max_retries=0",
+  "-c", "model_providers.ahrb.stream_max_retries=0",
+  "--model", "{{model}}", "--sandbox", "workspace-write", "-C", "{{workspace}}",
+  "{{prompt}}"
+]
+timeout_ms = 30000
+
+[sessions]
+resume = [
+  "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check",
+  "--ignore-user-config", "--ignore-rules",
+  "-c", 'model_provider="ahrb"',
+  "-c", 'model_providers.ahrb.name="AHRB Fake Model"',
+  "-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"',
+  "-c", 'model_providers.ahrb.env_key="OPENAI_API_KEY"',
+  "-c", 'model_providers.ahrb.wire_api="responses"',
+  "-c", "model_providers.ahrb.request_max_retries=0",
+  "-c", "model_providers.ahrb.stream_max_retries=0",
+  "--model", "{{model}}", "--sandbox", "workspace-write", "-C", "{{workspace}}",
+  "resume", "{{session_id}}", "{{prompt}}"
+]
+id_pointer = "/thread_id"
+
+[next_input]
+[agents]
+
+[concurrency]
+topology = "client-process-fanout"
+max_agents = 8
+fanout_mode = "client"
+
+# TODO(orchestrator): confirm the current Codex model-visible shell alias remains
+# `shell` and that its `command` field is argv-shaped against the real binary.
+[tools.aliases]
+write = "shell"
+read = "shell"
+fail = "shell"
+
+[tools.bindings]
+command_argv = "command"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+
+[events]
+source = "stdout"
+framing = "jsonl"
+id_pointer = "/item/id"
+
+[[events.rules]]
+matches = "thread.started"
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "turn.started"
+event = "model-request"
+
+[[events.rules]]
+matches = "item.started"
+match_fields = { "/item/type" = "command_execution" }
+event = "tool-call"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "command_execution" }
+event = "tool-result"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "agent_message" }
+event = "model-response"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "turn.completed"
+event = "terminal-success"
+
+[[events.rules]]
+matches = "turn.failed"
+event = "terminal-failure"
+
+[exit]
+success = 0
+success_stdout = ['"type":"turn.completed"']
+failure_stdout = ['"type":"turn.failed"', '"type":"error"']
+failures = { provider = 1 }
+
+[process]
+executable_names = ["codex", "node"]
+
+[resources]
+turn_timeout_ms = 30000
+idle_timeout_ms = 2000
+max_output_bytes = 1048576
+
+[hooks]
+[cleanup]
+paths = ["{{profile}}"]
+
+[capture]
+redact_env = ["OPENAI_API_KEY"]
+max_bytes = 1048576
+
+[capabilities.required]
+headless = "codex exec --json terminates without an interactive UI"
+sessions = "Codex persists a thread under isolated CODEX_HOME"
+resume = "codex exec resume reopens the prior thread in a fresh process"
+
+[capabilities.optional]
+

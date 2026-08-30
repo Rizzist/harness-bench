@@ -29,6 +29,9 @@ pub enum ProcOwnership {
     Descendant,
     /// Durable cgroup member on Linux.
     CgroupMember,
+    /// Member of the launcher's isolated process group, retained across ordinary
+    /// parent exit and reparenting.
+    ProcessGroupMember,
     /// Verified reparented process matching adapter evidence.
     Reparented,
 }

@@ -2,7 +2,8 @@
 
 use crate::cli::{Profile, RunOptions};
 use crate::driver::{
-    Driver, DriverOperations, ExecTransport, GenericDriver, HttpTransport, SocketJsonRpcTransport,
+    Cursor, Driver, DriverOperations, GenericDriver, HttpTransport, ManagedDaemonConfig,
+    ManagedDaemonTransport, PerInvocationConfig, PerInvocationDriver, SocketJsonRpcTransport,
     StdinRpcTransport, Transport,
 };
 use crate::evaluate::{Assertion, TestOutcome, TestResult, certify, classify};
@@ -10,14 +11,15 @@ use crate::events::{EventVocab, NormalizedEvent};
 use crate::fake_model::{FakeModelEngine, FakeModelServer, FakeModelUnixServer};
 use crate::manifest::{Manifest, TransportKind};
 use crate::process::{ProcessSample, ProcessTree, Sample, Sampler};
-use crate::report::{Fingerprint, MembershipSample, Report};
+use crate::report::{Fingerprint, MembershipSample, Report, TopologyMetric};
 use crate::resource_certification::{
     CleanupObservation, ColdStartObservation, IdleObservation, IdlePhaseRepetition,
     IdleProcessModel, LongHorizonObservation, LongHorizonPoint, LongHorizonToolResult,
-    MembershipRefreshEvidence, RepetitionIdentity, ResourceCadenceEvidence, ResourceCertification,
-    ResourceCounterKind, ResourceEnvelope, ResourceEvidence, ResourcePhases, ResourceProfile,
-    ResourceTimingPlan, ReturnToIdleObservation, SingleAgentObservation, SweepObservation,
-    WarmupObservation, detect_busy_polling, evaluate_resources,
+    MembershipRefreshEvidence, PerInvocationObservation, RepetitionIdentity,
+    ResourceCadenceEvidence, ResourceCertification, ResourceCounterKind, ResourceEnvelope,
+    ResourceEvidence, ResourcePhases, ResourceProfile, ResourceTimingPlan, ReturnToIdleObservation,
+    SingleAgentObservation, SweepObservation, WarmupObservation, detect_busy_polling,
+    evaluate_per_invocation_resources, evaluate_resources,
 };
 use crate::sampler::{MemoryMetric, SampleSeries};
 use crate::workflow::{Actor, Barrier, Fault, ScriptedResponse, WORKFLOW_SCHEMA_VERSION, Workflow};
@@ -34,7 +36,7 @@ use std::time::{Duration, Instant};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-type HarnessDriver = GenericDriver<Box<dyn Transport>>;
+type HarnessDriver = Box<dyn Driver>;
 
 enum ModelServer {
     Tcp(FakeModelServer),
@@ -64,9 +66,29 @@ struct RunState {
     sessions: BTreeMap<u8, Vec<crate::driver::SessionId>>,
     samples: Vec<Sample>,
     crash_recovery_ms: Option<f64>,
+    crash_recovery_tree_cleared: Option<bool>,
+    crash_recovery_valid: Option<bool>,
+    crash_recovery_detail: Option<String>,
     journal_recovered_events: Option<usize>,
+    journal_recovery_valid: Option<bool>,
+    journal_recovery_detail: Option<String>,
+    journal_torn_tail_injected: Option<bool>,
     parallel_agents: usize,
     resource_evidence: Option<ResourceEvidence>,
+    per_invocation_resources: Vec<PerInvocationObservation>,
+}
+
+struct PerInvocationResourceCollection {
+    observations: Vec<PerInvocationObservation>,
+    samples: Vec<Sample>,
+}
+
+fn per_invocation_topology(manifest: &Manifest) -> bool {
+    !manifest.daemon.persistent
+        && matches!(
+            manifest.concurrency.topology.as_str(),
+            "client-process-fanout" | "worker-processes"
+        )
 }
 
 /// Execute selected workflows and write their complete evidence bundle.
@@ -88,7 +110,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         .join(format!("profile-{}", std::process::id()));
     prepare_profile(&manifest, &profile_root)
         .map_err(|error| AhrbError::Protocol(format!("prepare run profile: {error}")))?;
-    let variables = BTreeMap::from([
+    let mut variables = BTreeMap::from([
         (
             "profile".to_owned(),
             profile_root.to_string_lossy().into_owned(),
@@ -102,6 +124,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         &profile_root,
         !embedded_model,
         options.profile,
+        &manifest,
     )?;
     let engine = Arc::new(FakeModelEngine::new(&workflow)?);
     let (server, model_environment) = start_model(
@@ -124,6 +147,16 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         "AHRB_MOCK_MODEL".to_owned(),
         manifest.fake_model.model.clone(),
     );
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    variables.insert("credential".to_owned(), credential.clone());
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(&manifest, &variables, &profile_root)?;
     if !manifest.hooks.acceptance.is_empty() {
         let hook = render_argv(&manifest.hooks.acceptance, &variables)?;
         environment.insert(
@@ -138,30 +171,75 @@ pub async fn run(options: RunOptions) -> Result<i32> {
             serde_json::to_string(&hook)?,
         );
     }
-    let command = render_argv(&manifest.transport.command, &variables)?;
-    let mut driver = make_driver(&manifest, &command, &environment)?;
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let mut driver = make_driver(
+        &manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+    )?;
     driver
         .start()
         .await
         .map_err(|error| AhrbError::Protocol(format!("start harness driver: {error}")))?;
-    let warmup = driver
-        .create_session("ahrb-warmup")
-        .await
-        .map_err(|error| AhrbError::Protocol(format!("warm-up readiness RPC: {error}")))?;
-    driver.close(&warmup).await?;
+    if crate::matrix_evidence::basic_session_surface(&manifest) {
+        let warmup = driver
+            .create_session("ahrb-warmup")
+            .await
+            .map_err(|error| AhrbError::Protocol(format!("warm-up readiness RPC: {error}")))?;
+        if manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty()
+        {
+            driver.close(&warmup).await?;
+        }
+    }
 
     let root_pid = await_owned_pid(&manifest, &variables)
         .await
         .map_err(|error| AhrbError::Protocol(format!("locate owned process: {error}")))?;
     let mut platform_sampler = platform_sampler();
-    let resource_selected = selected_rows.iter().any(|row| (20..=29).contains(row));
-    let main_roots = verified_process_roots(
-        &manifest,
-        platform_sampler.as_mut(),
-        driver.transport.owned_pids(),
-        root_pid,
-    )?;
-    let resource_evidence = if resource_selected {
+    let resource_selected = selected_rows.iter().any(|row| {
+        (20..=29).contains(row)
+            && matches!(
+                crate::matrix_evidence::capability_for_row(&manifest, *row),
+                crate::matrix_evidence::CapabilityStatus::Supported
+            )
+    });
+    let main_roots = if manifest.daemon.persistent {
+        verified_process_roots(
+            &manifest,
+            platform_sampler.as_mut(),
+            driver.owned_pids(),
+            root_pid,
+        )?
+    } else {
+        Vec::new()
+    };
+    let per_invocation_collection = if resource_selected && per_invocation_topology(&manifest) {
+        Some(
+            collect_per_invocation_resource_observations(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &workflow,
+                &model_environment,
+                &credential,
+            )
+            .await
+            .map_err(|error| {
+                AhrbError::Protocol(format!("collect per-invocation resources: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    let resource_evidence = if resource_selected && per_invocation_collection.is_none() {
         Some(
             collect_resource_evidence(
                 &manifest,
@@ -177,7 +255,9 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     } else {
         None
     };
-    let mut samples = if let Some(evidence) = &resource_evidence {
+    let mut samples = if let Some(collection) = &per_invocation_collection {
+        collection.samples.clone()
+    } else if let Some(evidence) = &resource_evidence {
         evidence.series.samples.clone()
     } else {
         baseline_samples(platform_sampler.as_mut(), &main_roots, options.profile)
@@ -188,6 +268,12 @@ pub async fn run(options: RunOptions) -> Result<i32> {
 
     for (row, actor_names) in &actors_by_row {
         if (20..=29).contains(row) {
+            continue;
+        }
+        if !matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, *row),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
             continue;
         }
         for (index, actor_name) in actor_names.iter().enumerate() {
@@ -206,6 +292,44 @@ pub async fn run(options: RunOptions) -> Result<i32> {
                 .await?;
             sessions.entry(*row).or_default().push(session);
         }
+    }
+
+    let mut precollected_events = BTreeMap::new();
+    if let Some(session) = sessions.get(&16).and_then(|items| items.first()) {
+        let mut after = None;
+        let mut transcript = Vec::new();
+        let first = collect_session_terminal(
+            &mut driver,
+            session,
+            after,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+        after = first.iter().map(|event| Cursor(event.cursor)).max();
+        transcript.extend(first);
+        for (turn, actor) in [(2_u8, "r16t2"), (3_u8, "r16t3")] {
+            let prompt = format!(
+                "AHRB matrix row 16 turn {turn} {}",
+                route_marker(&workflow.scenario, actor, "start")
+            );
+            driver
+                .submit(session, &prompt, &format!("row-16-turn-{turn}"))
+                .await?;
+            let suffix = collect_session_terminal(
+                &mut driver,
+                session,
+                after,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await?;
+            after = suffix
+                .iter()
+                .map(|event| Cursor(event.cursor))
+                .max()
+                .or(after);
+            transcript.extend(suffix);
+        }
+        precollected_events.insert(16_u8, transcript);
     }
 
     if let Some(parent) = sessions.get(&18).and_then(|items| items.first()) {
@@ -233,50 +357,230 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     if let Some(session) = sessions.get(&37).and_then(|items| items.first()) {
         driver.resume(session).await?;
     }
+    if let Some(session) = sessions.get(&36).and_then(|items| items.first()) {
+        driver.cancel(session).await?;
+    }
 
-    let parallel_agents = resource_evidence
+    let needs_recovery = [35_u8, 40].iter().any(|row| {
+        selected_rows.contains(row)
+            && matches!(
+                crate::matrix_evidence::capability_for_row(&manifest, *row),
+                crate::matrix_evidence::CapabilityStatus::Supported
+            )
+    });
+    let crash_pre_events = if needs_recovery {
+        if let Some(session) = sessions.get(&35).and_then(|items| items.first()) {
+            Some(
+                collect_session_checkpoint(
+                    &mut driver,
+                    session,
+                    "row-35-post-commit",
+                    Duration::from_millis(manifest.resources.turn_timeout_ms),
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let journal_pre_events = if needs_recovery {
+        if let Some(session) = sessions.get(&40).and_then(|items| items.first()) {
+            Some(
+                collect_session_checkpoint(
+                    &mut driver,
+                    session,
+                    "row-40-post-commit",
+                    Duration::from_millis(manifest.resources.turn_timeout_ms),
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let parallel_agents = per_invocation_collection
         .as_ref()
-        .and_then(|evidence| evidence.sweep.iter().map(|point| point.agents).max())
+        .and_then(|collection| {
+            collection
+                .observations
+                .iter()
+                .map(|point| point.agents)
+                .max()
+        })
+        .or_else(|| {
+            resource_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.sweep.iter().map(|point| point.agents).max())
+        })
         .map_or(0, |agents| agents as usize);
 
-    let events = collect_terminals(
+    let sessions_to_collect: BTreeMap<_, _> = sessions
+        .iter()
+        .filter(|(row, _)| **row != 16 && !(needs_recovery && matches!(**row, 35 | 40)))
+        .map(|(row, sessions)| (*row, sessions.clone()))
+        .collect();
+    let mut events = collect_terminals(
         &mut driver,
-        &sessions,
+        &sessions_to_collect,
         Duration::from_millis(manifest.resources.turn_timeout_ms),
     )
     .await?;
+    events.extend(precollected_events);
+    if let Some(pre_crash) = &crash_pre_events {
+        events.insert(35, pre_crash.clone());
+    }
+    if let Some(pre_crash) = &journal_pre_events {
+        events.insert(40, pre_crash.clone());
+    }
 
     if !main_roots.is_empty() {
         let tree = platform_sampler.discover(&main_roots)?;
         samples.push(platform_sampler.sample(&tree, "post-turn")?);
     }
 
-    let needs_recovery = selected_rows.contains(&35) || selected_rows.contains(&40);
     let mut crash_recovery_ms = None;
+    let mut crash_recovery_tree_cleared = None;
+    let mut crash_recovery_valid = None;
+    let mut crash_recovery_detail = None;
     let mut journal_recovered_events = None;
+    let mut journal_recovery_valid = None;
+    let mut journal_recovery_detail = None;
+    let mut journal_torn_tail_injected = None;
     if needs_recovery {
         let recovery_started = Instant::now();
-        if let Some(pid) = root_pid {
-            hard_kill(pid)?;
-        }
+        let owned_tree = platform_sampler.discover(&main_roots)?;
+        let had_owned_process = !owned_tree.members.is_empty();
+        signal_owned_tree(&owned_tree)?;
         drop(driver);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let mut recovered = make_driver(&manifest, &command, &environment)?;
-        recovered.start().await?;
-        crash_recovery_ms = Some(recovery_started.elapsed().as_secs_f64() * 1_000.0);
-        for row in [30_u8, 35, 40] {
-            if let Some(session) = sessions.get(&row).and_then(|items| items.first()) {
-                let original = events.get(&row).cloned().unwrap_or_default();
+        let tree_cleared = had_owned_process
+            && await_owned_tree_empty(
+                platform_sampler.as_mut(),
+                &main_roots,
+                Duration::from_millis(manifest.daemon.grace_ms.max(100)),
+            )
+            .await?;
+        crash_recovery_tree_cleared = Some(tree_cleared);
+        if tree_cleared {
+            if let Some(session) = sessions.get(&40).and_then(|items| items.first()) {
+                match inject_torn_journal_tail(&manifest, &variables, session) {
+                    Ok(()) => journal_torn_tail_injected = Some(true),
+                    Err(error) => {
+                        journal_torn_tail_injected = Some(false);
+                        journal_recovery_valid = Some(false);
+                        journal_recovery_detail =
+                            Some(format!("could not induce a durable torn tail: {error}"));
+                    }
+                }
+            }
+            let mut recovered = make_driver(
+                &manifest,
+                &command,
+                &environment,
+                &variables,
+                &profile_root,
+                false,
+            )?;
+            recovered.start().await?;
+            crash_recovery_ms = Some(recovery_started.elapsed().as_secs_f64() * 1_000.0);
+            if let Some(session) = sessions.get(&35).and_then(|items| items.first()) {
+                let release_token = crash_pre_events.as_ref().and_then(|pre_crash| {
+                    pre_crash.iter().find_map(|event| {
+                        (event.event == EventVocab::BarrierReached
+                            && event.payload.get("name").and_then(Value::as_str)
+                                == Some("row-35-post-commit"))
+                        .then(|| event.payload.get("release_token").and_then(Value::as_str))
+                        .flatten()
+                    })
+                });
+                if let Some(release_token) = release_token {
+                    recovered.resume(session).await?;
+                    let actor = workflow.actors.get("r35").ok_or_else(|| {
+                        AhrbError::Protocol("row-35 workflow actor is absent".to_owned())
+                    })?;
+                    recovered
+                        .submit(session, &actor.prompt, "row-35-turn-1")
+                        .await?;
+                    recovered.release_checkpoint(session, release_token).await?;
+                    let recovered_events = collect_session_terminal(
+                        &mut recovered,
+                        session,
+                        None,
+                        Duration::from_millis(manifest.resources.turn_timeout_ms),
+                    )
+                    .await?;
+                    let accepted = recovered_events
+                        .iter()
+                        .filter(|event| event.event == EventVocab::TurnAccepted)
+                        .count();
+                    let effects = recovered_events
+                        .iter()
+                        .filter(|event| event.event == EventVocab::ToolResult)
+                        .count();
+                    let terminals = recovered_events
+                        .iter()
+                        .filter(|event| is_terminal(&event.event))
+                        .count();
+                    let valid = accepted == 1 && effects == 1 && terminals == 1;
+                    crash_recovery_valid = Some(valid);
+                    crash_recovery_detail = Some(format!(
+                        "post-commit restart+attach+resume+duplicate-submit observed accepted={accepted}, committed_effects={effects}, terminals={terminals}"
+                    ));
+                    events.insert(35, recovered_events);
+                } else {
+                    crash_recovery_valid = Some(false);
+                    crash_recovery_detail = Some(
+                        "named post-commit checkpoint omitted its durable release token".to_owned(),
+                    );
+                }
+            }
+            if let Some(session) = sessions.get(&40).and_then(|items| items.first()) {
+                let original = events.get(&40).cloned().unwrap_or_default();
                 let after = original
                     .first()
                     .map(|event| crate::driver::Cursor(event.cursor));
-                let suffix = recovered.attach(session, after).await?;
-                if row == 40 {
-                    journal_recovered_events = Some(suffix.len());
+                match recovered.attach(session, after).await {
+                    Ok(suffix) => {
+                        journal_recovered_events = Some(suffix.len());
+                        match validate_recovered_suffix(&original, after, &suffix) {
+                            Ok(()) => {
+                                if journal_torn_tail_injected == Some(true) {
+                                    journal_recovery_valid = Some(true);
+                                    journal_recovery_detail = Some(format!(
+                                        "replayed {} exact, contiguous, duplicate-free events and cleanly ignored the induced torn tail",
+                                        suffix.len()
+                                    ));
+                                }
+                            }
+                            Err(detail) => {
+                                journal_recovery_valid = Some(false);
+                                journal_recovery_detail = Some(detail);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        journal_recovery_valid = Some(false);
+                        journal_recovery_detail = Some(format!(
+                            "journal replay could not be decoded after restart: {error}"
+                        ));
+                    }
                 }
             }
+            recovered.shutdown().await?;
+        } else {
+            crash_recovery_valid = Some(false);
+            crash_recovery_detail =
+                Some("owned process tree was not fully gone; refused crash-resume".to_owned());
+            journal_recovery_valid = Some(false);
+            journal_recovery_detail = Some(
+                "owned process tree was not fully gone; refused to start a second journal owner"
+                    .to_owned(),
+            );
         }
-        recovered.shutdown().await?;
     } else {
         driver.shutdown().await?;
     }
@@ -286,9 +590,18 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         sessions,
         samples,
         crash_recovery_ms,
+        crash_recovery_tree_cleared,
+        crash_recovery_valid,
+        crash_recovery_detail,
         journal_recovered_events,
+        journal_recovery_valid,
+        journal_recovery_detail,
+        journal_torn_tail_injected,
         parallel_agents,
         resource_evidence,
+        per_invocation_resources: per_invocation_collection
+            .map(|collection| collection.observations)
+            .unwrap_or_default(),
     };
     let request_records = engine.request_records().await;
     server.shutdown().await?;
@@ -297,11 +610,20 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         .resource_evidence
         .clone()
         .unwrap_or_else(|| incomplete_resource_evidence(&state, &manifest));
-    let resource_certification = evaluate_resources(
-        ResourceProfile::from(options.profile),
-        &resource_evidence,
-        &ResourceEnvelope::default(),
-    );
+    let resource_certification =
+        if per_invocation_topology(&manifest) && !state.per_invocation_resources.is_empty() {
+            evaluate_per_invocation_resources(
+                ResourceProfile::from(options.profile),
+                &state.per_invocation_resources,
+                &ResourceEnvelope::default(),
+            )
+        } else {
+            evaluate_resources(
+                ResourceProfile::from(options.profile),
+                &resource_evidence,
+                &ResourceEnvelope::default(),
+            )
+        };
     let mut results = evaluate_rows(
         &selected,
         &state,
@@ -310,27 +632,73 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         &resource_certification,
     );
     results.sort_by_key(|result| result.row);
-    let mut metrics = resource_certification.metrics.clone();
-    if let Some(beta) = metrics.get("parallel_beta_bytes_per_agent").copied() {
-        metrics.insert(
+    let mut resource_metric_values = resource_certification.metrics.clone();
+    if let Some(beta) = resource_metric_values
+        .get("parallel_beta_bytes_per_agent")
+        .copied()
+    {
+        resource_metric_values.insert(
             "parallel_beta_mib_per_agent".to_owned(),
             beta / (1024.0 * 1024.0),
         );
     }
-    metrics.insert(
+    resource_metric_values.insert(
         "resource_completed_repetitions".to_owned(),
-        resource_evidence.completed_repetitions as f64,
+        if state.per_invocation_resources.is_empty() {
+            resource_evidence.completed_repetitions as f64
+        } else {
+            ResourceTimingPlan::for_profile(ResourceProfile::from(options.profile)).repetitions
+                as f64
+        },
     );
+    let marginal_bytes = resource_metric_values
+        .get("parallel_beta_bytes_per_agent")
+        .copied()
+        .unwrap_or(f64::INFINITY);
+    let resource_metrics = resource_metric_values
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                TopologyMetric {
+                    value: *value,
+                    topology: manifest.concurrency.topology.clone(),
+                    comparison_scope: "within-topology-only".to_owned(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut metrics = BTreeMap::new();
     if let Some(value) = state.crash_recovery_ms {
         metrics.insert("crash_recovery_ms".to_owned(), value);
     }
     if let Some(value) = state.journal_recovered_events {
         metrics.insert("journal_recovered_events".to_owned(), value as f64);
     }
-    let marginal_bytes = metrics
-        .get("parallel_beta_bytes_per_agent")
-        .copied()
-        .unwrap_or(f64::INFINITY);
+    if let Some(value) = state.crash_recovery_tree_cleared {
+        metrics.insert(
+            "crash_recovery_tree_cleared".to_owned(),
+            if value { 1.0 } else { 0.0 },
+        );
+    }
+    if let Some(value) = state.crash_recovery_valid {
+        metrics.insert(
+            "crash_recovery_valid".to_owned(),
+            if value { 1.0 } else { 0.0 },
+        );
+    }
+    if let Some(value) = state.journal_recovery_valid {
+        metrics.insert(
+            "journal_recovery_valid".to_owned(),
+            if value { 1.0 } else { 0.0 },
+        );
+    }
+    if let Some(value) = state.journal_torn_tail_injected {
+        metrics.insert(
+            "journal_torn_tail_injected".to_owned(),
+            if value { 1.0 } else { 0.0 },
+        );
+    }
     let badge = certify(
         &results,
         std::env::consts::OS,
@@ -404,6 +772,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         results,
         badge,
         metrics,
+        resource_metrics,
         samples: state.samples,
         processes,
         membership,
@@ -428,7 +797,23 @@ pub async fn run(options: RunOptions) -> Result<i32> {
 }
 
 fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
-    std::fs::create_dir_all(profile_root)?;
+    let parent = profile_root.parent().ok_or_else(|| {
+        AhrbError::Validation(format!(
+            "fresh profile {} has no parent directory",
+            profile_root.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir(profile_root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AhrbError::Validation(format!(
+                "refusing to reuse non-cold profile {}; choose a fresh output directory",
+                profile_root.display()
+            ))
+        } else {
+            error.into()
+        }
+    })?;
     let variables = BTreeMap::from([(
         "profile".to_owned(),
         profile_root.to_string_lossy().into_owned(),
@@ -436,6 +821,52 @@ fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
     for value in manifest.isolation.roots.values() {
         let rendered = crate::manifest::render_template(value, &variables)?;
         std::fs::create_dir_all(rendered)?;
+    }
+    Ok(())
+}
+
+fn write_generated_files(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<()> {
+    for specification in manifest
+        .isolation
+        .generated_files
+        .iter()
+        .chain(manifest.fake_model.provider_templates.iter())
+    {
+        let path = PathBuf::from(crate::manifest::render_template(
+            &specification.path,
+            variables,
+        )?);
+        if !path.starts_with(profile_root) {
+            return Err(AhrbError::Validation(format!(
+                "generated file {} escapes fresh profile {}",
+                path.display(),
+                profile_root.display()
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = crate::manifest::render_template(&specification.content, variables)?;
+        std::fs::write(&path, content.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = u32::from_str_radix(specification.mode.trim_start_matches('0'), 8).map_err(
+                |_| {
+                    AhrbError::Validation(format!(
+                        "invalid generated-file mode {:?}",
+                        specification.mode
+                    ))
+                },
+            )?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        }
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.sync_all()?;
     }
     Ok(())
 }
@@ -522,34 +953,70 @@ fn make_driver(
     manifest: &Manifest,
     command: &[String],
     environment: &BTreeMap<String, String>,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+    gate_exec_launch: bool,
 ) -> Result<HarnessDriver> {
     let timeout = Duration::from_millis(manifest.transport.timeout_ms);
-    let transport: Box<dyn Transport> = match manifest.transport.kind {
-        TransportKind::Exec => Box::new(
-            ExecTransport::new(command.to_vec(), timeout).with_environment(environment.clone()),
-        ),
+    if manifest.transport.kind == TransportKind::Exec {
+        let first_command = resolve_local_program(&manifest.transport.command)?;
+        let resume_command = resolve_local_program(&manifest.sessions.resume)?;
+        return Ok(Box::new(PerInvocationDriver::new(PerInvocationConfig {
+            command: first_command,
+            resume_command,
+            environment: environment.clone(),
+            profile_root: profile_root.to_path_buf(),
+            events: manifest.events.clone(),
+            exit: manifest.exit.clone(),
+            session_id_pointer: manifest.sessions.id_pointer.clone(),
+            timeout,
+            max_output_bytes: manifest
+                .capture
+                .max_bytes
+                .max(manifest.resources.max_output_bytes),
+            gate_launch: gate_exec_launch,
+        })));
+    }
+    let endpoint = crate::manifest::render_template(&manifest.transport.endpoint, variables)?;
+    let mut transport: Box<dyn Transport> = match manifest.transport.kind {
+        TransportKind::Exec => {
+            return Err(AhrbError::Protocol(
+                "exec transport did not select the per-invocation driver".to_owned(),
+            ));
+        }
         TransportKind::StdinRpc => Box::new(
             StdinRpcTransport::new(command.to_vec(), timeout).with_environment(environment.clone()),
         ),
         TransportKind::SocketJsonrpc => Box::new(SocketJsonRpcTransport::new(
-            PathBuf::from(&manifest.transport.endpoint),
+            PathBuf::from(endpoint),
             timeout,
         )),
-        TransportKind::Http => Box::new(HttpTransport::new(
-            manifest.transport.endpoint.clone(),
-            timeout,
-        )),
+        TransportKind::Http => Box::new(HttpTransport::new(endpoint, timeout)),
     };
-    let required = |group: &str, values: &[String]| -> Result<String> {
-        values.first().cloned().ok_or_else(|| {
-            AhrbError::Validation(format!("manifest operation {group} is required for run"))
-        })
-    };
+    if manifest.daemon.persistent
+        && matches!(
+            manifest.transport.kind,
+            TransportKind::SocketJsonrpc | TransportKind::Http
+        )
+    {
+        let mut readiness = manifest.daemon.readiness.clone();
+        readiness.target = crate::manifest::render_template(&readiness.target, variables)?;
+        transport = Box::new(ManagedDaemonTransport::new(
+            transport,
+            ManagedDaemonConfig {
+                command: resolve_local_program(&render_argv(&manifest.daemon.start, variables)?)?,
+                environment: environment.clone(),
+                readiness,
+                grace: Duration::from_millis(manifest.daemon.grace_ms.max(1)),
+                log_directory: profile_root.join("daemon-logs"),
+            },
+        ));
+    }
     let optional = |values: &[String]| values.first().cloned().unwrap_or_default();
     let operations = DriverOperations {
-        create_session: required("sessions.create", &manifest.sessions.create)?,
-        submit: required("sessions.submit", &manifest.sessions.submit)?,
-        attach: required("sessions.attach", &manifest.sessions.attach)?,
+        create_session: optional(&manifest.sessions.create),
+        submit: optional(&manifest.sessions.submit),
+        attach: optional(&manifest.sessions.attach),
         resume: optional(&manifest.sessions.resume),
         steer: optional(&manifest.next_input.steer),
         subturn: optional(&manifest.next_input.subturn),
@@ -557,10 +1024,37 @@ fn make_driver(
         release_checkpoint: optional(&manifest.concurrency.release),
         spawn_agent: optional(&manifest.agents.spawn),
         cancel: optional(&manifest.agents.cancel),
-        close: required("sessions.close_delete", &manifest.sessions.close_delete)?,
-        shutdown: required("daemon.shutdown", &manifest.daemon.shutdown)?,
+        close: optional(&manifest.sessions.close_delete),
+        shutdown: optional(&manifest.daemon.shutdown),
     };
-    Ok(GenericDriver::new(transport).with_operations(operations))
+    Ok(Box::new(
+        GenericDriver::new(transport).with_operations(operations),
+    ))
+}
+
+fn resolve_local_program(template: &[String]) -> Result<Vec<String>> {
+    let mut command = template.to_vec();
+    if let Some(program) = command.first_mut() {
+        if Path::new(program).is_file() {
+            *program = std::fs::canonicalize(&*program)?
+                .to_string_lossy()
+                .into_owned();
+        } else if !Path::new(program).is_file()
+            && Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("ahrb-mock-harness")
+        {
+            let executable = std::env::current_exe()?;
+            if let Some(parent) = executable.parent() {
+                let sibling = parent.join("ahrb-mock-harness");
+                if sibling.is_file() {
+                    *program = sibling.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    Ok(command)
 }
 
 fn render_argv(argv: &[String], variables: &BTreeMap<String, String>) -> Result<Vec<String>> {
@@ -592,6 +1086,7 @@ fn build_workflow(
     profile_root: &Path,
     state_barrier: bool,
     profile: Profile,
+    manifest: &Manifest,
 ) -> Result<(Workflow, BTreeMap<u8, Vec<String>>)> {
     let scenario = "ahrb-matrix-v1";
     let mut actors = BTreeMap::new();
@@ -624,7 +1119,7 @@ fn build_workflow(
                         .into_owned(),
                 },
             );
-            let mut row_responses = scripted_row(*row, scenario, &actor)?;
+            let mut row_responses = scripted_row(*row, scenario, &actor, manifest)?;
             if *row == 26 && state_barrier {
                 if let Some(first) = row_responses.first_mut() {
                     first.barrier = Some("row26-steady".to_owned());
@@ -647,14 +1142,41 @@ fn build_workflow(
             );
         }
     }
+    if rows.contains(&16) {
+        for actor in ["r16t2", "r16t3"] {
+            actors.insert(
+                actor.to_owned(),
+                Actor {
+                    id: actor.to_owned(),
+                    parent: Some("r16".to_owned()),
+                    prompt: format!("AHRB persisted transcript actor {actor}"),
+                    workspace: profile_root
+                        .join("workspaces")
+                        .join("r16")
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+            );
+            responses.push(ScriptedResponse {
+                scenario: scenario.to_owned(),
+                actor: actor.to_owned(),
+                checkpoint: "start".to_owned(),
+                request_hash: String::new(),
+                response: success_value(),
+                fault: None,
+                barrier: None,
+            });
+        }
+    }
     if rows.iter().any(|row| (20..=29).contains(row)) {
         add_resource_workflow(
             scenario,
             profile_root,
             ResourceTimingPlan::for_profile(ResourceProfile::from(profile)),
+            manifest,
             &mut actors,
             &mut responses,
-        );
+        )?;
     }
     Ok((
         Workflow {
@@ -672,9 +1194,10 @@ fn add_resource_workflow(
     scenario: &str,
     profile_root: &Path,
     timing: ResourceTimingPlan,
+    manifest: &Manifest,
     actors: &mut BTreeMap<String, Actor>,
     responses: &mut Vec<ScriptedResponse>,
-) {
+) -> Result<()> {
     for repetition in 0..timing.repetitions {
         for turn in 1..=timing.warmup_turns {
             let actor = resource_warmup_actor(repetition, turn);
@@ -696,24 +1219,35 @@ fn add_resource_workflow(
                         .into_owned(),
                 },
             );
+            let mut arguments = serde_json::Map::from_iter([
+                (
+                    "path".to_owned(),
+                    Value::String(format!("warmup-{turn}.txt")),
+                ),
+                (
+                    "content".to_owned(),
+                    Value::String(format!("warmup {terminal}")),
+                ),
+            ]);
+            if manifest.daemon.persistent {
+                arguments.insert(
+                    "ahrb_checkpoint".to_owned(),
+                    json!({"name":checkpoint, "phase":"after-commit"}),
+                );
+            }
+            let call = mapped_tool_call(
+                manifest,
+                "write",
+                format!("resource-warmup-r{repetition}-t{turn}"),
+                Value::Object(arguments),
+            )?;
             responses.extend([
                 ScriptedResponse {
                     scenario: scenario.to_owned(),
                     actor: actor.clone(),
                     checkpoint: "start".to_owned(),
                     request_hash: String::new(),
-                    response: json!({"tool_calls":[{
-                        "id":format!("resource-warmup-r{repetition}-t{turn}"),
-                        "name":"write_fixture",
-                        "arguments":{
-                            "path":format!("warmup-{turn}.txt"),
-                            "content":format!("warmup {terminal}"),
-                            "ahrb_checkpoint":{
-                                "name":checkpoint,
-                                "phase":"after-commit"
-                            }
-                        }
-                    }]}),
+                    response: json!({"tool_calls":[call]}),
                     fault: None,
                     barrier: None,
                 },
@@ -749,24 +1283,35 @@ fn add_resource_workflow(
                             .into_owned(),
                     },
                 );
+                let mut arguments = serde_json::Map::from_iter([
+                    (
+                        "path".to_owned(),
+                        Value::String("resource-fixture.txt".to_owned()),
+                    ),
+                    (
+                        "content".to_owned(),
+                        Value::String(format!("resource {terminal}")),
+                    ),
+                ]);
+                if manifest.daemon.persistent {
+                    arguments.insert(
+                        "ahrb_checkpoint".to_owned(),
+                        json!({"name":checkpoint, "phase":"after-commit"}),
+                    );
+                }
+                let call = mapped_tool_call(
+                    manifest,
+                    "write",
+                    format!("resource-r{repetition}-n{agents}-a{}", index + 1),
+                    Value::Object(arguments),
+                )?;
                 responses.extend([
                     ScriptedResponse {
                         scenario: scenario.to_owned(),
                         actor: actor.clone(),
                         checkpoint: "start".to_owned(),
                         request_hash: String::new(),
-                        response: json!({"tool_calls":[{
-                            "id": format!("resource-r{repetition}-n{agents}-a{}", index + 1),
-                            "name":"write_fixture",
-                            "arguments":{
-                                "path":"resource-fixture.txt",
-                                "content":format!("resource {terminal}"),
-                                "ahrb_checkpoint":{
-                                    "name":checkpoint,
-                                    "phase":"after-commit"
-                                }
-                            }
-                        }]}),
+                        response: json!({"tool_calls":[call]}),
                         fault: None,
                         barrier: None,
                     },
@@ -805,19 +1350,21 @@ fn add_resource_workflow(
             if turn % 10 == 0 {
                 let terminal_checkpoint = format!("{checkpoint}-terminal");
                 let terminal = route_marker(scenario, &actor, &terminal_checkpoint);
+                let call = mapped_tool_call(
+                    manifest,
+                    "write",
+                    format!("resource-long-r{repetition}-t{turn}"),
+                    json!({
+                        "path":format!("turn-{turn}.txt"),
+                        "content":format!("turn {turn} {terminal}")
+                    }),
+                )?;
                 responses.push(ScriptedResponse {
                     scenario: scenario.to_owned(),
                     actor: actor.clone(),
                     checkpoint: checkpoint.clone(),
                     request_hash: String::new(),
-                    response: json!({"tool_calls":[{
-                        "id":format!("resource-long-r{repetition}-t{turn}"),
-                        "name":"write_fixture",
-                        "arguments":{
-                            "path":format!("turn-{turn}.txt"),
-                            "content":format!("turn {turn} {terminal}")
-                        }
-                    }]}),
+                    response: json!({"tool_calls":[call]}),
                     fault: None,
                     barrier: None,
                 });
@@ -843,6 +1390,7 @@ fn add_resource_workflow(
             }
         }
     }
+    Ok(())
 }
 
 fn resource_sweep_actor(repetition: u32, agents: u32, index: u32) -> String {
@@ -869,7 +1417,110 @@ fn resource_long_checkpoint(repetition: u32, turn: u32) -> String {
     format!("long-r{repetition}-t{turn}")
 }
 
-fn scripted_row(row: u8, scenario: &str, actor: &str) -> Result<Vec<ScriptedResponse>> {
+fn mapped_tool_call(
+    manifest: &Manifest,
+    semantic: &str,
+    call_id: String,
+    semantic_arguments: Value,
+) -> Result<Value> {
+    let name = manifest
+        .tools
+        .aliases
+        .get(semantic)
+        .cloned()
+        .unwrap_or_else(|| format!("{semantic}_fixture"));
+    let object = semantic_arguments.as_object().ok_or_else(|| {
+        AhrbError::Validation(format!(
+            "semantic tool {semantic:?} arguments are not an object"
+        ))
+    })?;
+    let arguments = if let Some(command_field) = manifest.tools.bindings.get("command") {
+        let template = manifest.tools.fixtures.get(semantic).ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "tool {semantic:?} binds a command field but has no fixture argv"
+            ))
+        })?;
+        let mut variables = BTreeMap::from([
+            ("ahrb_fixture".to_owned(), fixture_program()?),
+            ("workspace".to_owned(), ".".to_owned()),
+        ]);
+        for (key, value) in object {
+            if let Some(value) = value.as_str() {
+                variables.insert(key.clone(), value.to_owned());
+            }
+        }
+        let argv = template
+            .iter()
+            .map(|argument| crate::manifest::render_template(argument, &variables))
+            .collect::<Result<Vec<_>>>()?;
+        let mut mapped = serde_json::Map::new();
+        mapped.insert(command_field.clone(), Value::String(shell_join(&argv)));
+        Value::Object(mapped)
+    } else if let Some(command_field) = manifest.tools.bindings.get("command_argv") {
+        let template = manifest.tools.fixtures.get(semantic).ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "tool {semantic:?} binds an argv command field but has no fixture argv"
+            ))
+        })?;
+        let mut variables = BTreeMap::from([
+            ("ahrb_fixture".to_owned(), fixture_program()?),
+            ("workspace".to_owned(), ".".to_owned()),
+        ]);
+        for (key, value) in object {
+            if let Some(value) = value.as_str() {
+                variables.insert(key.clone(), value.to_owned());
+            }
+        }
+        let argv = template
+            .iter()
+            .map(|argument| crate::manifest::render_template(argument, &variables))
+            .collect::<Result<Vec<_>>>()?;
+        let mut mapped = serde_json::Map::new();
+        mapped.insert(
+            command_field.clone(),
+            Value::Array(argv.into_iter().map(Value::String).collect()),
+        );
+        Value::Object(mapped)
+    } else {
+        let mut mapped = serde_json::Map::new();
+        for (key, value) in object {
+            let target = manifest
+                .tools
+                .bindings
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| key.clone());
+            mapped.insert(target, value.clone());
+        }
+        Value::Object(mapped)
+    };
+    Ok(json!({"id":call_id, "name":name, "arguments":arguments}))
+}
+
+fn fixture_program() -> Result<String> {
+    let executable = std::env::current_exe()?;
+    if let Some(parent) = executable.parent() {
+        let sibling = parent.join("ahrb-fixture");
+        if sibling.is_file() {
+            return Ok(sibling.to_string_lossy().into_owned());
+        }
+    }
+    Ok("ahrb-fixture".to_owned())
+}
+
+fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn scripted_row(
+    row: u8,
+    scenario: &str,
+    actor: &str,
+    manifest: &Manifest,
+) -> Result<Vec<ScriptedResponse>> {
     let response = |checkpoint: &str, value: Value, fault: Option<Fault>| ScriptedResponse {
         scenario: scenario.to_owned(),
         actor: actor.to_owned(),
@@ -881,38 +1532,53 @@ fn scripted_row(row: u8, scenario: &str, actor: &str) -> Result<Vec<ScriptedResp
     };
     let terminal = route_marker(scenario, actor, "terminal");
     let scripts = match row {
-        4 => vec![
-            response(
-                "start",
-                json!({"tool_calls":[
-                    {"id":"parallel-a","name":"write_fixture","arguments":{"path":"parallel-a.txt","content":format!("A{terminal}")}},
-                    {"id":"parallel-b","name":"write_fixture","arguments":{"path":"parallel-b.txt","content":format!("B{terminal}")}}
-                ]}),
-                None,
-            ),
-            response("terminal", success_value(), None),
-        ],
-        2 | 8 | 13 | 15 => vec![
-            response(
-                "start",
-                json!({"tool_calls":[{"id":format!("call-r{row}"),"name":"write_fixture","arguments":{"path":format!("row-{row}.txt"),"content":format!("row-{row}{terminal}")}}]}),
-                None,
-            ),
-            response("terminal", success_value(), None),
-        ],
+        4 => {
+            let first = mapped_tool_call(
+                manifest,
+                "write",
+                "parallel-a".to_owned(),
+                json!({"path":"parallel-a.txt","content":format!("A{terminal}")}),
+            )?;
+            let second = mapped_tool_call(
+                manifest,
+                "write",
+                "parallel-b".to_owned(),
+                json!({"path":"parallel-b.txt","content":format!("B{terminal}")}),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[first, second]}), None),
+                response("terminal", success_value(), None),
+            ]
+        }
+        2 | 8 | 13 | 15 => {
+            let call = mapped_tool_call(
+                manifest,
+                "write",
+                format!("call-r{row}"),
+                json!({"path":format!("row-{row}.txt"),"content":format!("row-{row}{terminal}")}),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[call]}), None),
+                response("terminal", success_value(), None),
+            ]
+        }
         3 => {
             let second = route_marker(scenario, actor, "second");
+            let first_call = mapped_tool_call(
+                manifest,
+                "write",
+                "call-a".to_owned(),
+                json!({"path":"a.txt","content":"A","route":second}),
+            )?;
+            let second_call = mapped_tool_call(
+                manifest,
+                "read",
+                "call-b".to_owned(),
+                json!({"path":"a.txt","expected_from_a":"A","route":terminal}),
+            )?;
             vec![
-                response(
-                    "start",
-                    json!({"tool_calls":[{"id":"call-a","name":"write_fixture","arguments":{"path":"a.txt","content":"A","route":second}}]}),
-                    None,
-                ),
-                response(
-                    "second",
-                    json!({"tool_calls":[{"id":"call-b","name":"read_fixture","arguments":{"path":"a.txt","expected_from_a":"A","route":terminal}}]}),
-                    None,
-                ),
+                response("start", json!({"tool_calls":[first_call]}), None),
+                response("second", json!({"tool_calls":[second_call]}), None),
                 response("terminal", success_value(), None),
             ]
         }
@@ -923,14 +1589,18 @@ fn scripted_row(row: u8, scenario: &str, actor: &str) -> Result<Vec<ScriptedResp
                 boundaries: vec![1, 7, 13],
             }),
         )],
-        6 => vec![
-            response(
-                "start",
-                json!({"tool_calls":[{"id":"call-fail","name":"fail_fixture","arguments":{"message":format!("expected failure {terminal}")}}]}),
-                None,
-            ),
-            response("terminal", success_value(), None),
-        ],
+        6 => {
+            let call = mapped_tool_call(
+                manifest,
+                "fail",
+                "call-fail".to_owned(),
+                json!({"message":format!("expected failure {terminal}")}),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[call]}), None),
+                response("terminal", success_value(), None),
+            ]
+        }
         7 => vec![response(
             "start",
             json!({"tool_calls":[{"id":"call-malformed","name":"unknown_fixture","arguments":"{not-json"}]}),
@@ -949,7 +1619,45 @@ fn scripted_row(row: u8, scenario: &str, actor: &str) -> Result<Vec<ScriptedResp
                 body: "{\"error\":\"transient\"}".to_owned(),
             }),
         )],
-        12 => vec![response("start", success_value(), Some(Fault::Stall))],
+        12 | 36 => vec![response("start", success_value(), Some(Fault::Stall))],
+        35 => {
+            let call = mapped_tool_call(
+                manifest,
+                "write",
+                "call-crash-recovery".to_owned(),
+                json!({
+                    "path": "row-35-committed.txt",
+                    "content": format!("committed-once{terminal}"),
+                    "ahrb_checkpoint": {
+                        "name": "row-35-post-commit",
+                        "phase": "after-commit"
+                    }
+                }),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[call]}), None),
+                response("terminal", success_value(), None),
+            ]
+        }
+        40 => {
+            let call = mapped_tool_call(
+                manifest,
+                "write",
+                "call-durable-journal".to_owned(),
+                json!({
+                    "path": "row-40-committed.txt",
+                    "content": format!("durable{terminal}"),
+                    "ahrb_checkpoint": {
+                        "name": "row-40-post-commit",
+                        "phase": "after-commit"
+                    }
+                }),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[call]}), None),
+                response("terminal", success_value(), None),
+            ]
+        }
         _ => vec![response("start", success_value(), None)],
     };
     Ok(scripts)
@@ -999,6 +1707,59 @@ async fn collect_terminals(
     }
 }
 
+async fn collect_session_terminal(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    after: Option<Cursor>,
+    deadline: Duration,
+) -> Result<Vec<NormalizedEvent>> {
+    let started = Instant::now();
+    loop {
+        let events = driver.attach(session, after).await?;
+        if events.iter().any(|event| is_terminal(&event.event)) {
+            return Ok(events);
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "exec session {} did not terminalize",
+                session.0
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn collect_session_checkpoint(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    checkpoint: &str,
+    deadline: Duration,
+) -> Result<Vec<NormalizedEvent>> {
+    let started = Instant::now();
+    loop {
+        let events = driver.attach(session, None).await?;
+        if events.iter().any(|event| {
+            event.event == EventVocab::BarrierReached
+                && event.payload.get("name").and_then(Value::as_str) == Some(checkpoint)
+        }) {
+            return Ok(events);
+        }
+        if events.iter().any(|event| is_terminal(&event.event)) {
+            return Err(AhrbError::Protocol(format!(
+                "session {} terminalized before named checkpoint {checkpoint:?}",
+                session.0
+            )));
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "session {} did not reach named checkpoint {checkpoint:?}",
+                session.0
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn is_terminal(event: &EventVocab) -> bool {
     matches!(
         event,
@@ -1016,6 +1777,28 @@ fn evaluate_rows(
     selected
         .iter()
         .map(|definition| {
+            let capability =
+                crate::matrix_evidence::capability_for_row(manifest, definition.row);
+            if !matches!(
+                capability,
+                crate::matrix_evidence::CapabilityStatus::Supported
+            ) {
+                let reason = match capability {
+                    crate::matrix_evidence::CapabilityStatus::Unsupported(reason)
+                    | crate::matrix_evidence::CapabilityStatus::Absent(reason) => reason,
+                    crate::matrix_evidence::CapabilityStatus::Supported => String::new(),
+                };
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(false),
+                    &[],
+                    None,
+                );
+                result.evidence.push(format!("capability: {reason}"));
+                return result;
+            }
             if (20..=29).contains(&definition.row) {
                 return resources
                     .rows
@@ -1115,21 +1898,52 @@ fn evaluate_rows(
                     });
                     (owned, "harness emitted its own idle-timeout terminal before supervisor".to_owned())
                 }
+                16 => (
+                    success_count == 3 && failure_count == 0,
+                    format!(
+                        "three turns reopened one persisted session and emitted {success_count} terminals"
+                    ),
+                ),
                 30 => (
                     state.sessions.get(&30).is_some_and(|sessions| !sessions.is_empty()),
                     "attach-after-cursor replayed the durable session suffix".to_owned(),
                 ),
                 35 => (
-                    state.crash_recovery_ms.is_some_and(|milliseconds| milliseconds <= 10_000.0),
-                    format!("hard-kill restart readiness {:.3} ms", state.crash_recovery_ms.unwrap_or(f64::MAX)),
+                    state.crash_recovery_tree_cleared == Some(true)
+                        && state.crash_recovery_valid == Some(true)
+                        && state
+                            .crash_recovery_ms
+                            .is_some_and(|milliseconds| milliseconds <= 10_000.0),
+                    format!(
+                        "whole owned tree cleared={} before restart readiness {:.3} ms; {}",
+                        state.crash_recovery_tree_cleared.unwrap_or(false),
+                        state.crash_recovery_ms.unwrap_or(f64::MAX),
+                        state.crash_recovery_detail.as_deref().unwrap_or(
+                            "no post-commit attach/resume/idempotency evidence was recorded"
+                        )
+                    ),
                 ),
+                36 => {
+                    let cancelled = events
+                        .iter()
+                        .filter(|event| event.event == EventVocab::TerminalCancelled)
+                        .count();
+                    (
+                        cancelled == 1,
+                        format!("observed {cancelled} cancellation terminal and bounded cleanup"),
+                    )
+                }
                 39 => {
                     let hooks = events.iter().filter(|event| event.event == EventVocab::HookCompleted).count();
                     (hooks >= 2, format!("observed {hooks} fsync-ordered hook completions"))
                 }
                 40 => (
-                    state.journal_recovered_events.is_some_and(|count| count > 0),
-                    format!("recovered {} ordered journal suffix events", state.journal_recovered_events.unwrap_or(0)),
+                    state.journal_recovery_valid == Some(true)
+                        && state.journal_torn_tail_injected == Some(true)
+                        && state.journal_recovered_events.is_some_and(|count| count > 0),
+                    state.journal_recovery_detail.clone().unwrap_or_else(|| {
+                        "journal recovery trial produced no validation evidence".to_owned()
+                    }),
                 ),
                 _ => {
                     let expected_failure = matches!(definition.row, 6);
@@ -1148,13 +1962,11 @@ fn evaluate_rows(
                     )
                 }
             };
-            let capability = crate::matrix_evidence::capability_for_row(manifest, definition.row)
-                .as_classify_value();
             classify(
                 definition.row,
                 definition.id,
                 definition.pillar,
-                capability,
+                Some(true),
                 &[Assertion {
                     name: definition.metric.to_owned(),
                     passed,
@@ -1170,7 +1982,16 @@ async fn await_owned_pid(
     manifest: &Manifest,
     variables: &BTreeMap<String, String>,
 ) -> Result<Option<u32>> {
-    let Some(template) = manifest.process.pid_files.first() else {
+    let template = manifest
+        .process
+        .pid_files
+        .first()
+        .map(String::as_str)
+        .or_else(|| {
+            (!manifest.daemon.pid_locator.trim().is_empty())
+                .then_some(manifest.daemon.pid_locator.as_str())
+        });
+    let Some(template) = template else {
         return Ok(None);
     };
     let path = PathBuf::from(crate::manifest::render_template(template, variables)?);
@@ -1384,6 +2205,7 @@ fn collect_membership_phase(
     stop: Arc<AtomicBool>,
     completed_samplers: Arc<AtomicU64>,
     published_sequence: Arc<AtomicU64>,
+    initialized_samplers: Arc<AtomicU64>,
     shared_tree: SharedMembershipTree,
 ) -> Result<MembershipSampling> {
     prioritize_membership_thread();
@@ -1412,6 +2234,7 @@ fn collect_membership_phase(
         let collection_wall_ns = duration_ns(wall_started.elapsed());
         reject_membership_overrun(collection_wall_ns, membership_cadence)?;
         total_collection_ns = total_collection_ns.saturating_add(collection_ns);
+        let first_refresh = refreshes.is_empty();
         refreshes.push(MembershipRefreshEvidence {
             elapsed_ns,
             discovery_wall_ns: collection_wall_ns,
@@ -1427,6 +2250,9 @@ fn collect_membership_phase(
             .is_none_or(|(published, _)| sequence > *published)
         {
             *latest = Some((sequence, tree));
+        }
+        if first_refresh {
+            initialized_samplers.fetch_add(1, Ordering::AcqRel);
         }
         while deadline <= due {
             deadline += membership_interval;
@@ -1551,6 +2377,7 @@ impl ResourceCollector {
         let sampler_stop = Arc::new(AtomicBool::new(false));
         let completed_samplers = Arc::new(AtomicU64::new(0));
         let published_sequence = Arc::new(AtomicU64::new(0));
+        let initialized_samplers = Arc::new(AtomicU64::new(0));
         let shared_tree: SharedMembershipTree = Arc::new(std::sync::Mutex::new(None));
         let staggered_interval = self.membership_thread_interval;
         let membership = std::thread::Builder::new()
@@ -1563,6 +2390,7 @@ impl ResourceCollector {
                 let collector_started = self.started;
                 let completed_samplers = Arc::clone(&completed_samplers);
                 let published_sequence = Arc::clone(&published_sequence);
+                let initialized_samplers = Arc::clone(&initialized_samplers);
                 let shared_tree = Arc::clone(&shared_tree);
                 move || {
                     collect_membership_phase(
@@ -1576,6 +2404,7 @@ impl ResourceCollector {
                         stop,
                         completed_samplers,
                         published_sequence,
+                        initialized_samplers,
                         shared_tree,
                     )
                 }
@@ -1597,6 +2426,7 @@ impl ResourceCollector {
                     let collector_started = self.started;
                     let completed_samplers = Arc::clone(&completed_samplers);
                     let published_sequence = Arc::clone(&published_sequence);
+                    let initialized_samplers = Arc::clone(&initialized_samplers);
                     let shared_tree = Arc::clone(&shared_tree);
                     move || {
                         collect_membership_phase(
@@ -1610,6 +2440,7 @@ impl ResourceCollector {
                             stop,
                             completed_samplers,
                             published_sequence,
+                            initialized_samplers,
                             shared_tree,
                         )
                     }
@@ -1656,7 +2487,23 @@ impl ResourceCollector {
                 return Err(error.into());
             }
         };
-        let operation_result = operation.await;
+        let readiness_deadline = Instant::now()
+            + self
+                .membership_cadence
+                .checked_mul(5)
+                .unwrap_or(Duration::from_secs(1));
+        while initialized_samplers.load(Ordering::Acquire) < 4
+            && Instant::now() < readiness_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let operation_result = if initialized_samplers.load(Ordering::Acquire) < 4 {
+            Err(AhrbError::Protocol(
+                "resource membership samplers did not initialize before the workload".to_owned(),
+            ))
+        } else {
+            operation.await
+        };
         sampler_stop.store(true, Ordering::Release);
         let membership_sampling = membership
             .join()
@@ -1740,6 +2587,263 @@ struct GroupEvidence {
     cleanup: CleanupObservation,
 }
 
+/// Measure client-process fan-out as transient process trees. There is no
+/// resident baseline in this architecture: every width launches one fresh CLI
+/// process per turn, samples the complete trees until terminal exit, and then
+/// verifies that all roots disappeared through the driver's terminal contract.
+#[allow(clippy::too_many_arguments)]
+async fn collect_per_invocation_resource_observations(
+    manifest: &Manifest,
+    profile: Profile,
+    profile_root: &Path,
+    workflow: &Workflow,
+    model_environment: &BTreeMap<String, String>,
+    credential: &str,
+) -> Result<PerInvocationResourceCollection> {
+    let timing = ResourceTimingPlan::for_profile(ResourceProfile::from(profile));
+    let mut observations = Vec::new();
+    let mut collected_samples = Vec::new();
+
+    for repetition in 0..timing.repetitions {
+        let repetition_root =
+            profile_root.join(format!("per-invocation-resource-repetition-{repetition}"));
+        prepare_profile(manifest, &repetition_root)?;
+        let mut variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                repetition_root.to_string_lossy().into_owned(),
+            ),
+            ("endpoint".to_owned(), String::new()),
+        ]);
+        let mut environment = isolated_environment(manifest, &variables)?;
+        environment.extend(model_environment.clone());
+        environment.insert(
+            manifest.fake_model.credential_env.clone(),
+            credential.to_owned(),
+        );
+        environment.insert(
+            "AHRB_MOCK_MODEL".to_owned(),
+            manifest.fake_model.model.clone(),
+        );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential.to_owned());
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &repetition_root)?;
+        let command = manifest.transport.command.clone();
+        let mut driver = make_driver(
+            manifest,
+            &command,
+            &environment,
+            &variables,
+            &repetition_root,
+            true,
+        )?;
+        driver.start().await?;
+
+        for agents in &timing.sweep_widths {
+            let mut sessions = Vec::new();
+            for index in 0..*agents {
+                let actor_name = resource_sweep_actor(repetition, *agents, index);
+                let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+                    AhrbError::Protocol(format!("resource actor {actor_name:?} is absent"))
+                })?;
+                let session = driver.create_session(&actor_name).await?;
+                driver
+                    .submit(
+                        &session,
+                        &actor.prompt,
+                        &format!("resource-r{repetition}-n{agents}-turn-{}", index + 1),
+                    )
+                    .await?;
+                sessions.push(session);
+            }
+
+            let launcher_pids = driver.owned_pids();
+            if launcher_pids.len() != usize::try_from(*agents).unwrap_or(usize::MAX) {
+                return Err(AhrbError::Protocol(format!(
+                    "N={agents} launched {} live CLI processes, expected {agents}",
+                    launcher_pids.len()
+                )));
+            }
+            let mut collector = ResourceCollector::new(&timing);
+            let sampler = collector.sampler.as_deref_mut().ok_or_else(|| {
+                AhrbError::Protocol("per-invocation sampler is unavailable".to_owned())
+            })?;
+            let roots = verified_process_roots(manifest, sampler, launcher_pids.clone(), None)?;
+            let phase = format!("per-invocation-r{repetition}-n{agents}-active");
+            let deadline = Duration::from_millis(manifest.resources.turn_timeout_ms);
+            let completed_processes = collector
+                .sample_until(&roots, &phase, async {
+                    driver.release_invocations().await?;
+                    let started = Instant::now();
+                    let mut complete = BTreeSet::new();
+                    loop {
+                        for session in &sessions {
+                            if complete.contains(&session.0) {
+                                continue;
+                            }
+                            let events = driver.attach(session, None).await?;
+                            if events.iter().any(|event| is_terminal(&event.event)) {
+                                complete.insert(session.0.clone());
+                            }
+                        }
+                        if complete.len() == sessions.len() {
+                            return u32::try_from(complete.len()).map_err(|_| {
+                                AhrbError::Protocol(
+                                    "per-invocation process count exceeds u32".to_owned(),
+                                )
+                            });
+                        }
+                        if started.elapsed() >= deadline {
+                            return Err(AhrbError::Timeout(format!(
+                                "only {}/{} per-invocation processes terminalized",
+                                complete.len(),
+                                sessions.len()
+                            )));
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await?;
+
+            // The membership samplers were armed while every launch gate was
+            // still holding its unique process-group root. A final discovery
+            // therefore retains ordinary orphan/reparent workers even after the
+            // CLI launcher has exited.
+            tokio::time::sleep(Duration::from_millis(
+                timing.membership_cadence_ms.saturating_mul(2),
+            ))
+            .await;
+            let residual_tree = {
+                let sampler = collector.membership_sampler.as_deref_mut().ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "per-invocation membership sampler is unavailable".to_owned(),
+                    )
+                })?;
+                sampler.discover(&roots)?
+            };
+            let residual_processes = u32::try_from(residual_tree.members.len()).unwrap_or(u32::MAX);
+            if residual_processes > 0 {
+                let residual_phase = format!("{phase}-residual");
+                let sample = {
+                    let sampler = collector.membership_sampler.as_deref_mut().ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "per-invocation membership sampler is unavailable".to_owned(),
+                        )
+                    })?;
+                    sampler.sample(&residual_tree, &residual_phase)?
+                };
+                collector.series.push(sample)?;
+                terminate_owned_tree(
+                    collector.membership_sampler.as_deref_mut().ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "per-invocation membership sampler is unavailable".to_owned(),
+                        )
+                    })?,
+                    &roots,
+                    &residual_tree,
+                )
+                .await?;
+            }
+
+            let phase_samples = phase_samples(&collector.series, &phase);
+            if phase_samples.is_empty() {
+                return Err(AhrbError::Protocol(format!(
+                    "N={agents} per-invocation trial produced no samples"
+                )));
+            }
+            let observed_root_pids: BTreeSet<u32> = phase_samples
+                .iter()
+                .flat_map(|sample| sample.processes.iter())
+                .map(|process| process.identity.pid)
+                .filter(|pid| launcher_pids.contains(pid))
+                .collect();
+            if observed_root_pids.len() != launcher_pids.len() {
+                return Err(AhrbError::Protocol(format!(
+                    "N={agents} sampler observed {}/{} declared CLI roots",
+                    observed_root_pids.len(),
+                    launcher_pids.len()
+                )));
+            }
+            let peak_bytes = phase_samples
+                .iter()
+                .map(|sample| effective_sample_bytes(sample))
+                .max()
+                .unwrap_or(0);
+            let cpu_ns = phase_samples
+                .iter()
+                .map(|sample| sample.cpu_ns)
+                .max()
+                .unwrap_or(0);
+            observations.push(PerInvocationObservation {
+                repetition,
+                agents: *agents,
+                peak_bytes,
+                cold_peak_bytes: peak_bytes,
+                cpu_ns,
+                completed_processes,
+                residual_processes,
+            });
+            collected_samples.extend(collector.series.samples);
+            for session in &sessions {
+                driver.close(session).await?;
+            }
+        }
+        driver.shutdown().await?;
+    }
+
+    Ok(PerInvocationResourceCollection {
+        observations,
+        samples: collected_samples,
+    })
+}
+
+async fn terminate_owned_tree(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    tree: &ProcessTree,
+) -> Result<()> {
+    let owned: BTreeSet<_> = tree.members.keys().copied().collect();
+    for identity in &owned {
+        let pid = i32::try_from(identity.pid)
+            .map_err(|_| AhrbError::Protocol("owned PID exceeds pid_t".to_owned()))?;
+        // SAFETY: the PID is a freshly rediscovered member of this invocation's
+        // isolated process group. ESRCH only means it exited between discovery
+        // and cleanup.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error.into());
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let remaining = sampler.discover(roots)?;
+    for identity in remaining
+        .members
+        .keys()
+        .filter(|identity| owned.contains(identity))
+    {
+        let pid = i32::try_from(identity.pid)
+            .map_err(|_| AhrbError::Protocol("owned PID exceeds pid_t".to_owned()))?;
+        // SAFETY: start-time identity was revalidated by the immediately
+        // preceding discovery, so this cannot target a PID-reuse occupant.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn collect_resource_evidence(
     manifest: &Manifest,
@@ -1772,7 +2876,7 @@ async fn collect_resource_evidence(
         tokio::time::sleep(Duration::from_millis(timing.load_guard_ms)).await;
         let repetition_root = profile_root.join(format!("resource-repetition-{repetition}"));
         prepare_profile(manifest, &repetition_root)?;
-        let variables = BTreeMap::from([
+        let mut variables = BTreeMap::from([
             (
                 "profile".to_owned(),
                 repetition_root.to_string_lossy().into_owned(),
@@ -1789,6 +2893,16 @@ async fn collect_resource_evidence(
             "AHRB_MOCK_MODEL".to_owned(),
             manifest.fake_model.model.clone(),
         );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential.to_owned());
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &repetition_root)?;
         if !manifest.hooks.acceptance.is_empty() {
             environment.insert(
                 "AHRB_MOCK_ACCEPTANCE_HOOK".to_owned(),
@@ -1801,16 +2915,26 @@ async fn collect_resource_evidence(
                 serde_json::to_string(&render_argv(&manifest.hooks.completion, &variables)?)?,
             );
         }
-        let command = render_argv(&manifest.transport.command, &variables)?;
+        let command = if manifest.transport.kind == TransportKind::Exec {
+            manifest.transport.command.clone()
+        } else {
+            render_argv(&manifest.transport.command, &variables)?
+        };
         let launch_started = Instant::now();
-        let mut driver = make_driver(manifest, &command, &environment)?;
+        let mut driver = make_driver(
+            manifest,
+            &command,
+            &environment,
+            &variables,
+            &repetition_root,
+            false,
+        )?;
         driver.start().await?;
         let cold_phase = format!("resource-r{repetition}-cold-start");
         let sampler = collector.sampler.as_deref_mut().ok_or_else(|| {
             AhrbError::Protocol("resource sampler is already collecting a phase".to_owned())
         })?;
-        let cold_roots =
-            verified_process_roots(manifest, sampler, driver.transport.owned_pids(), None)?;
+        let cold_roots = verified_process_roots(manifest, sampler, driver.owned_pids(), None)?;
         let cold_sampling_started_after_launch_ms = duration_millis(launch_started.elapsed());
         let daemon_pid = collector
             .sample_until(
@@ -1823,8 +2947,7 @@ async fn collect_resource_evidence(
         let sampler = collector.sampler.as_deref_mut().ok_or_else(|| {
             AhrbError::Protocol("resource sampler is already collecting a phase".to_owned())
         })?;
-        let roots =
-            verified_process_roots(manifest, sampler, driver.transport.owned_pids(), daemon_pid)?;
+        let roots = verified_process_roots(manifest, sampler, driver.owned_pids(), daemon_pid)?;
         let identity = RepetitionIdentity {
             repetition,
             profile: resource_profile,
@@ -2710,17 +3833,126 @@ async fn baseline_samples(
     Ok(samples)
 }
 
-fn hard_kill(pid: u32) -> Result<()> {
-    let pid = i32::try_from(pid)
-        .map_err(|_| AhrbError::Validation("PID exceeds platform range".to_owned()))?;
-    // SAFETY: the PID comes from the run-local, fsync'd locator written by the child
-    // AHRB launched. The signal is the explicit crash-recovery workload.
-    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
+fn signal_owned_tree(tree: &ProcessTree) -> Result<()> {
+    let mut identities = tree.members.keys().copied().collect::<Vec<_>>();
+    identities.sort_by_key(|identity| (tree.roots.contains(identity), *identity));
+    for identity in identities {
+        let pid = i32::try_from(identity.pid)
+            .map_err(|_| AhrbError::Validation("PID exceeds platform range".to_owned()))?;
+        // SAFETY: every identity was freshly rediscovered from AHRB's verified root,
+        // descendant, or isolated process-group membership. The stable start time is
+        // retained by the sampler to prevent a reused PID from joining the owned set.
+        let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error.into());
+            }
+        }
     }
+    Ok(())
+}
+
+async fn await_owned_tree_empty(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    timeout: Duration,
+) -> Result<bool> {
+    let started = Instant::now();
+    loop {
+        if sampler.discover(roots)?.members.is_empty() {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn inject_torn_journal_tail(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    session: &crate::driver::SessionId,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut rendered_variables = variables.clone();
+    rendered_variables.insert("session_id".to_owned(), session.0.clone());
+    let rendered = crate::manifest::render_template(&manifest.events.path, &rendered_variables)?;
+    let journal_path = PathBuf::from(rendered);
+    let profile = variables
+        .get("profile")
+        .ok_or_else(|| AhrbError::Protocol("profile variable is absent".to_owned()))?;
+    let canonical_profile = Path::new(profile).canonicalize()?;
+    let canonical_journal = journal_path.canonicalize()?;
+    if !canonical_journal.starts_with(&canonical_profile) || !canonical_journal.is_file() {
+        return Err(AhrbError::Validation(format!(
+            "durable journal {} is not a regular file inside cold profile {}",
+            canonical_journal.display(),
+            canonical_profile.display()
+        )));
+    }
+    let contents = std::fs::read(&canonical_journal)?;
+    if contents.is_empty() || !contents.ends_with(b"\n") {
+        return Err(AhrbError::Protocol(format!(
+            "durable journal {} lacked a complete committed tail before fault injection",
+            canonical_journal.display()
+        )));
+    }
+    let mut journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&canonical_journal)?;
+    journal.write_all(br#"{"id":"ahrb-induced-torn-tail","cursor":18446744073709551615"#)?;
+    journal.sync_all()?;
+    Ok(())
+}
+
+fn validate_recovered_suffix(
+    original: &[NormalizedEvent],
+    after: Option<Cursor>,
+    recovered: &[NormalizedEvent],
+) -> std::result::Result<(), String> {
+    let after_cursor = after.map_or(0, |cursor| cursor.0);
+    let expected = original
+        .iter()
+        .filter(|event| event.cursor > after_cursor)
+        .collect::<Vec<_>>();
+    if recovered.is_empty() {
+        return Err("journal replay returned an empty suffix".to_owned());
+    }
+    if recovered.len() != expected.len() {
+        return Err(format!(
+            "journal replay length mismatch: expected {}, recovered {}",
+            expected.len(),
+            recovered.len()
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut expected_cursor = after_cursor.checked_add(1).ok_or_else(|| {
+        "journal replay cursor overflowed after the requested attachment point".to_owned()
+    })?;
+    for (index, (actual, expected_event)) in recovered.iter().zip(expected).enumerate() {
+        if actual.cursor != expected_cursor {
+            return Err(format!(
+                "journal replay cursor gap at suffix index {index}: expected {expected_cursor}, got {}",
+                actual.cursor
+            ));
+        }
+        if !ids.insert(actual.id.as_str()) {
+            return Err(format!(
+                "journal replay duplicated event id {:?} at suffix index {index}",
+                actual.id
+            ));
+        }
+        if actual != expected_event {
+            return Err(format!(
+                "journal replay event at suffix index {index} disagrees with the pre-crash durable journal"
+            ));
+        }
+        expected_cursor = expected_cursor.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn incomplete_resource_evidence(state: &RunState, manifest: &Manifest) -> ResourceEvidence {
@@ -2839,11 +4071,59 @@ fn host_memory_bytes() -> u64 {
 mod resource_sampler_tests {
     use super::*;
 
+    fn recovery_event(cursor: u64) -> NormalizedEvent {
+        NormalizedEvent {
+            id: format!("event-{cursor}"),
+            cursor,
+            session_id: "session-recovery".to_owned(),
+            actor: "root".to_owned(),
+            event: EventVocab::ToolResult,
+            payload: json!({"cursor": cursor}),
+        }
+    }
+
     #[test]
     fn individual_membership_discovery_overrun_is_rejected() {
         assert!(reject_membership_overrun(10_000_000, Duration::from_millis(10)).is_ok());
         let error = reject_membership_overrun(10_000_001, Duration::from_millis(10))
             .expect_err("membership collection beyond its cadence must fail");
         assert!(error.to_string().contains("sampler overload"));
+    }
+
+    #[test]
+    fn profile_roots_are_create_once_and_cannot_be_prewarmed() {
+        let manifest = crate::manifest::load(Path::new("adapters/mock/manifest.toml"))
+            .expect("load mock manifest");
+        let root = std::env::temp_dir().join(format!("ahrb-cold-profile-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).expect("remove stale cold profile");
+        }
+        prepare_profile(&manifest, &root).expect("create cold profile once");
+        let error = prepare_profile(&manifest, &root)
+            .expect_err("a second launch must not reuse a warmed profile");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to reuse non-cold profile")
+        );
+        std::fs::remove_dir_all(root).expect("remove cold profile");
+    }
+
+    #[test]
+    fn recovered_suffix_requires_exact_contiguous_identity_agreement() {
+        let original = vec![recovery_event(1), recovery_event(2), recovery_event(3)];
+        assert!(validate_recovered_suffix(&original, Some(Cursor(1)), &original[1..]).is_ok());
+
+        let mut gap = original[1..].to_vec();
+        gap[0].cursor = 3;
+        assert!(validate_recovered_suffix(&original, Some(Cursor(1)), &gap).is_err());
+
+        let mut duplicate = original[1..].to_vec();
+        duplicate[1].id = duplicate[0].id.clone();
+        assert!(validate_recovered_suffix(&original, Some(Cursor(1)), &duplicate).is_err());
+
+        let mut changed = original[1..].to_vec();
+        changed[1].payload = json!({"torn": true});
+        assert!(validate_recovered_suffix(&original, Some(Cursor(1)), &changed).is_err());
     }
 }

@@ -73,6 +73,9 @@ pub struct Identity {
 pub struct Availability {
     /// Candidate executable paths.
     pub exec_paths: Vec<String>,
+    /// Additional executables that the adapter requires at runtime.
+    #[serde(default)]
+    pub required_exec_paths: Vec<String>,
     /// Version probe argv.
     #[serde(default)]
     pub version_probe: Vec<String>,
@@ -329,6 +332,9 @@ pub struct ToolSemantics {
 pub struct EventMapping {
     /// stdout, stderr, journal, socket, or HTTP.
     pub source: String,
+    /// Path template for file-backed event sources and durable-journal trials.
+    #[serde(default)]
+    pub path: String,
     /// jsonl, JSON sequence, or SSE.
     pub framing: String,
     /// Stable event identity pointer.
@@ -347,6 +353,12 @@ pub struct EventMapping {
 pub struct EventRule {
     /// Source event type or predicate value.
     pub matches: String,
+    /// Additional JSON-pointer predicates that must equal the declared strings.
+    #[serde(default)]
+    pub match_fields: BTreeMap<String, String>,
+    /// Optional JSON pointer to an array whose elements are matched independently.
+    #[serde(default)]
+    pub expand_pointer: String,
     /// AHRB normalized event name.
     pub event: String,
     /// Optional JSON pointer for payload extraction.
@@ -359,6 +371,12 @@ pub struct EventRule {
 pub struct ExitContract {
     /// Success exit code.
     pub success: i32,
+    /// Optional stdout markers, one of which must be present for success.
+    #[serde(default)]
+    pub success_stdout: Vec<String>,
+    /// Stdout markers that always classify the invocation as failure.
+    #[serde(default)]
+    pub failure_stdout: Vec<String>,
     /// Failure category to exit code.
     #[serde(default)]
     pub failures: BTreeMap<String, i32>,
@@ -474,6 +492,17 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "availability.exec_paths must not be empty".to_owned(),
         ));
     }
+    if manifest
+        .availability
+        .exec_paths
+        .iter()
+        .chain(manifest.availability.required_exec_paths.iter())
+        .any(|candidate| candidate.trim().is_empty())
+    {
+        return Err(AhrbError::Validation(
+            "availability executable paths must not be empty".to_owned(),
+        ));
+    }
     if manifest.fake_model.base_url_env.trim().is_empty()
         || manifest.fake_model.credential_env.trim().is_empty()
         || manifest.fake_model.model.trim().is_empty()
@@ -497,6 +526,18 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "exec and stdin-rpc transports require an argv command".to_owned(),
         ));
     }
+    if manifest.daemon.persistent
+        && matches!(
+            manifest.transport.kind,
+            TransportKind::SocketJsonrpc | TransportKind::Http
+        )
+        && manifest.daemon.start.is_empty()
+    {
+        return Err(AhrbError::Validation(
+            "persistent socket/HTTP transports require daemon.start for a cold owned run"
+                .to_owned(),
+        ));
+    }
     if manifest.transport.timeout_ms == 0
         || manifest.resources.turn_timeout_ms == 0
         || manifest.resources.idle_timeout_ms == 0
@@ -515,6 +556,60 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "concurrency.max_agents must be positive".to_owned(),
         ));
     }
+    let per_invocation_topology = matches!(
+        manifest.concurrency.topology.as_str(),
+        "client-process-fanout" | "worker-processes"
+    );
+    let daemon_topology = matches!(
+        manifest.concurrency.topology.as_str(),
+        "shared-daemon-sessions" | "native-sibling-fanout"
+    );
+    if (!manifest.daemon.persistent && !per_invocation_topology)
+        || (manifest.daemon.persistent && !daemon_topology)
+    {
+        return Err(AhrbError::Validation(format!(
+            "daemon.persistent={} conflicts with concurrency.topology {:?}",
+            manifest.daemon.persistent, manifest.concurrency.topology
+        )));
+    }
+    for required_root in ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+        let Some(template) = manifest.isolation.roots.get(required_root) else {
+            return Err(AhrbError::Validation(format!(
+                "isolation.roots.{required_root} is required for a cold run"
+            )));
+        };
+        if !profile_scoped_template(template) {
+            return Err(AhrbError::Validation(format!(
+                "isolation.roots.{required_root} must be lexically contained under {{{{profile}}}}"
+            )));
+        }
+    }
+    for (name, template) in &manifest.isolation.roots {
+        if !profile_scoped_template(template) {
+            return Err(AhrbError::Validation(format!(
+                "isolation.roots.{name} must be lexically contained under {{{{profile}}}}"
+            )));
+        }
+    }
+    match manifest.events.source.as_str() {
+        "stdout" | "journal" | "http" => {}
+        "journal-file" if !manifest.events.path.trim().is_empty() => {}
+        "journal-file" => {
+            return Err(AhrbError::Validation(
+                "events.source journal-file requires events.path".to_owned(),
+            ));
+        }
+        other => {
+            return Err(AhrbError::Validation(format!(
+                "unsupported events.source {other:?}"
+            )));
+        }
+    }
+    if !manifest.events.path.is_empty() && !profile_scoped_template(&manifest.events.path) {
+        return Err(AhrbError::Validation(
+            "events.path must be lexically contained under {{profile}}".to_owned(),
+        ));
+    }
     if manifest
         .exit
         .failures
@@ -525,16 +620,15 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "failure exit codes must differ from success".to_owned(),
         ));
     }
-    let secret_name = manifest.fake_model.credential_env.as_str();
     for (label, argv) in command_vectors(manifest) {
-        if argv.iter().any(|arg| arg.contains(secret_name)) {
+        if argv.iter().any(|arg| arg.contains("{{credential}}")) {
             return Err(AhrbError::Validation(format!(
-                "{label} embeds the credential binding in argv"
+                "{label} embeds the credential value in argv"
             )));
         }
         if argv
-            .iter()
-            .any(|arg| arg == "sh" || arg == "bash" || arg == "zsh")
+            .first()
+            .is_some_and(|arg| arg == "sh" || arg == "bash" || arg == "zsh")
         {
             return Err(AhrbError::Validation(format!(
                 "{label} invokes a shell; commands must be direct argv arrays"
@@ -547,6 +641,12 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         .iter()
         .chain(manifest.fake_model.provider_templates.iter())
     {
+        if !profile_scoped_template(&file.path) {
+            return Err(AhrbError::Validation(format!(
+                "generated file {:?} must be lexically contained under {{{{profile}}}}",
+                file.path
+            )));
+        }
         let mode = u32::from_str_radix(file.mode.trim_start_matches('0'), 8).map_err(|_| {
             AhrbError::Validation(format!("invalid generated-file mode {:?}", file.mode))
         })?;
@@ -558,6 +658,21 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn profile_scoped_template(template: &str) -> bool {
+    let Some(suffix) = template.strip_prefix("{{profile}}") else {
+        return false;
+    };
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return false;
+    }
+    !Path::new(suffix).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    })
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
@@ -642,8 +757,26 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
     if executable.is_none() {
         diagnostics.push("no candidate executable exists".to_owned());
     }
-    let version = match (&executable, manifest.availability.version_probe.as_slice()) {
-        (Some(program), [_first, rest @ ..]) => {
+    for required in &manifest.availability.required_exec_paths {
+        if resolve_executable(required).is_none() {
+            diagnostics.push(format!("required executable {required:?} does not exist"));
+        }
+    }
+    let version = match manifest.availability.version_probe.as_slice() {
+        [first, rest @ ..] => {
+            let program = resolve_executable(first).or_else(|| executable.clone());
+            let Some(program) = program else {
+                diagnostics.push("version probe executable does not exist".to_owned());
+                diagnostics.sort();
+                return Ok(DoctorReport {
+                    adapter: manifest.identity.id.clone(),
+                    executable,
+                    version: None,
+                    manifest_sha256: hash(&manifest)?,
+                    ready: false,
+                    diagnostics,
+                });
+            };
             let output = std::process::Command::new(program).args(rest).output()?;
             let mut text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if text.is_empty() {
@@ -658,7 +791,7 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
             }
             Some(text)
         }
-        _ => None,
+        [] => None,
     };
     diagnostics.sort();
     Ok(DoctorReport {

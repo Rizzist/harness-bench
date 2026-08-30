@@ -38,7 +38,7 @@ pub enum EventVocab {
 }
 
 /// One normalized, cursor-addressable event.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NormalizedEvent {
     /// Stable identity used for deduplication.
     pub id: String,
@@ -75,7 +75,7 @@ impl EventNormalizer {
         let rule = mapping
             .rules
             .iter()
-            .find(|rule| rule.matches == event_type)
+            .find(|rule| rule.matches == event_type && rule_matches(raw, rule))
             .ok_or_else(|| {
                 AhrbError::Protocol(format!("no normalization rule for {event_type:?}"))
             })?;
@@ -111,6 +111,18 @@ impl EventNormalizer {
             payload,
         }))
     }
+}
+
+/// Return whether a source record satisfies a rule's JSON-pointer predicates.
+pub(crate) fn rule_matches(raw: &Value, rule: &crate::manifest::EventRule) -> bool {
+    rule.match_fields.iter().all(|(pointer, expected)| {
+        raw.pointer(pointer).is_some_and(|actual| match actual {
+            Value::String(value) => value == expected,
+            Value::Bool(value) => value.to_string() == *expected,
+            Value::Number(value) => value.to_string() == *expected,
+            _ => false,
+        })
+    })
 }
 
 fn pointer_string(raw: &Value, pointer: &str, label: &str) -> Result<String> {

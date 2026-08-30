@@ -57,6 +57,14 @@ async fn mock_harness_exercises_the_non_resource_report_pipeline() -> Result<()>
     assert!(!report.processes.is_empty());
     assert!(report.events.len() >= 9);
     assert!(!report.model_requests.is_empty());
+    for metric in [
+        "crash_recovery_tree_cleared",
+        "crash_recovery_valid",
+        "journal_recovery_valid",
+        "journal_torn_tail_injected",
+    ] {
+        assert_eq!(report.metrics.get(metric), Some(&1.0), "metric {metric}");
+    }
     for file in [
         "report.md",
         "report.json",

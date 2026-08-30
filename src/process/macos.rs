@@ -11,6 +11,7 @@ use std::mem::{size_of, zeroed};
 use std::time::{Instant, SystemTime};
 
 const PROC_PPID_ONLY: u32 = 6;
+const PROC_PGRP_ONLY: u32 = 2;
 const PROC_PIDTBSDINFO: c_int = 3;
 const PROC_PIDTASKINFO: c_int = 4;
 const RUSAGE_INFO_V4: c_int = 4;
@@ -172,6 +173,7 @@ pub struct MacOsSampler {
     started: Instant,
     known: BTreeSet<ProcIdentity>,
     verified_roots: BTreeMap<u32, ProcIdentity>,
+    verified_groups: BTreeMap<ProcIdentity, u32>,
     excluded_roots: BTreeSet<ProcIdentity>,
     discovery_ns: u64,
     cpu: TreeCpuTracker,
@@ -188,6 +190,7 @@ impl Default for MacOsSampler {
             started: Instant::now(),
             known: BTreeSet::new(),
             verified_roots: BTreeMap::new(),
+            verified_groups: BTreeMap::new(),
             excluded_roots: BTreeSet::new(),
             discovery_ns: 0,
             cpu: TreeCpuTracker::default(),
@@ -278,6 +281,8 @@ impl MacOsSampler {
     ) -> Result<ProcessTree> {
         let root_pids: BTreeSet<u32> = roots.iter().copied().collect();
         self.verified_roots.retain(|pid, _| root_pids.contains(pid));
+        self.verified_groups
+            .retain(|identity, _| root_pids.contains(&identity.pid));
         let mut tree = ProcessTree::default();
         let mut owned_by_pid = BTreeMap::new();
 
@@ -296,10 +301,26 @@ impl MacOsSampler {
             } else {
                 self.verified_roots.insert(*pid, identity);
             }
+            if info.pbi_pgid != 0 {
+                self.verified_groups.insert(identity, info.pbi_pgid);
+            }
             tree.roots.insert(identity);
             owned_by_pid.insert(*pid, identity);
             tree.members
                 .insert(identity, process_info(info, ProcOwnership::DeclaredRoot));
+        }
+
+        let process_groups: BTreeSet<u32> = self.verified_groups.values().copied().collect();
+        for (pid, info) in by_pid {
+            if owned_by_pid.contains_key(pid) || !process_groups.contains(&info.pbi_pgid) {
+                continue;
+            }
+            let identity = identity_of(info);
+            owned_by_pid.insert(*pid, identity);
+            tree.members.insert(
+                identity,
+                process_info(info, ProcOwnership::ProcessGroupMember),
+            );
         }
 
         // Retain an already-attributed process across reparenting, but only while
@@ -344,6 +365,18 @@ impl Sampler for MacOsSampler {
         let discovery_started = Instant::now();
         let mut by_pid = BTreeMap::new();
         let mut pending: BTreeSet<u32> = roots.iter().copied().collect();
+        let mut process_groups: BTreeSet<u32> = self.verified_groups.values().copied().collect();
+        for pid in roots {
+            if let Some(info) = bsd_info(*pid)? {
+                if info.pbi_pgid != 0 {
+                    process_groups.insert(info.pbi_pgid);
+                }
+                by_pid.insert(*pid, info);
+            }
+        }
+        for process_group in process_groups {
+            pending.extend(list_pids_for(PROC_PGRP_ONLY, process_group)?);
+        }
         pending.extend(self.known.iter().map(|identity| identity.pid));
         pending.extend(self.excluded_roots.iter().map(|identity| identity.pid));
         while let Some(pid) = pending.pop_first() {

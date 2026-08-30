@@ -61,6 +61,9 @@ pub struct Badge {
     pub resource_class: String,
     /// Certified readiness facets.
     pub facets: Vec<String>,
+    /// Explicit guard against cross-topology resource ranking.
+    #[serde(default)]
+    pub comparison_scope: String,
 }
 
 /// A deterministic assertion emitted by a scenario runner.
@@ -110,7 +113,9 @@ pub fn classify(
     }
 }
 
-/// Return whether the complete mandatory matrix can earn a badge.
+/// Return whether the complete mandatory matrix can earn a badge. Unsupported
+/// optional operations are omitted from facets; unsupported mandatory rows
+/// remain honest non-passes and block the core badge.
 pub fn mandatory_passes(results: &[TestResult]) -> bool {
     crate::scenarios::all()
         .iter()
@@ -135,6 +140,8 @@ pub fn certify(
     if parallel_width < 4 || !mandatory_passes(results) {
         return None;
     }
+    // This class is meaningful only inside the topology printed on the badge.
+    // AHRB deliberately has no topology-erasing leaderboard/ranking key.
     let mib = marginal_bytes / (1024.0 * 1024.0);
     let resource_class = if mib <= 32.0 {
         "R32"
@@ -145,15 +152,20 @@ pub fn certify(
     } else {
         "R256+"
     };
-    let optional_rows: BTreeMap<u8, &str> =
-        BTreeMap::from([(18, "native-delegation"), (32, "subturn"), (39, "hooks")]);
-    let mut facets = vec![
-        "replay".to_owned(),
-        "crash".to_owned(),
-        "steer".to_owned(),
-        "queue".to_owned(),
-    ];
-    for (row, facet) in optional_rows {
+    let facet_rows: BTreeMap<u8, &str> = BTreeMap::from([
+        (18, "native-delegation"),
+        (30, "replay"),
+        (31, "steer"),
+        (32, "subturn"),
+        (33, "queue"),
+        (35, "crash"),
+        (36, "cancel"),
+        (37, "resume"),
+        (39, "hooks"),
+        (40, "journal"),
+    ]);
+    let mut facets = Vec::new();
+    for (row, facet) in facet_rows {
         if results
             .iter()
             .any(|result| result.row == row && matches!(result.outcome, TestOutcome::Pass))
@@ -167,6 +179,7 @@ pub fn certify(
         parallel_width,
         resource_class: resource_class.to_owned(),
         facets,
+        comparison_scope: "within-topology-only".to_owned(),
     })
 }
 

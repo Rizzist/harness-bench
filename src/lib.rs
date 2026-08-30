@@ -8,6 +8,7 @@ pub mod evaluate;
 pub mod events;
 pub mod evidence_collectors;
 pub mod fake_model;
+pub mod hbench;
 pub mod manifest;
 pub mod matrix_evidence;
 pub mod mock_harness;

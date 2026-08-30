@@ -246,6 +246,8 @@ impl RpcProcess {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().expect("spawn mock harness");
         let stdin = child.stdin.take().expect("mock stdin");
         let stdout = child.stdout.take().expect("mock stdout");

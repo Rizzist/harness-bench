@@ -2,52 +2,104 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "v1"
+revision = "0.0.966-resident-native-unvalidated"
+
 [availability]
-exec_paths = ["haider-agent"]
-version_probe = ["haider-agent", "--version"]
+exec_paths = ["haider"]
+required_exec_paths = ["haiderd"]
+version_probe = ["haider", "--version"]
 version_pattern = "haider"
+
+# TODO(orchestrator): wire the confirmed `haider account add ahrb --base-url ...
+# --api-key-env OPENAI_API_KEY --api-family openai --json` operation into a
+# noninteractive pre-daemon bootstrap; env injection alone is a placeholder.
 [fake_model]
 dialect = "open-ai-chat-completions"
 base_url_env = "OPENAI_BASE_URL"
 credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
 allowed_paths = ["/v1/chat/completions"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+HAIDER_PROFILE_DIR = "{{profile}}/haider/profile"
+HAIDER_RUNTIME_DIR = "{{profile}}/haider/runtime"
+
 [isolation]
-roots = { HOME = "{{profile}}/home", XDG_CONFIG_HOME = "{{profile}}/config", XDG_DATA_HOME = "{{profile}}/data", XDG_STATE_HOME = "{{profile}}/state", XDG_RUNTIME_DIR = "{{profile}}/runtime", TMPDIR = "{{profile}}/tmp" }
-forbidden_roots = ["~/.haider"]
+generated_files = []
+forbidden_roots = ["~/.config/haider", "~/.local/share/haider"]
+
+# The installed daemon requires profile/store/runtime together and uses h.sock.
+# TODO(orchestrator): add Haider's authenticated Hello/native-frame transport,
+# exact session operations, and segmented-journal extractor. Until then those
+# operations stay undeclared/UNSUPPORTED instead of inventing method names.
 [daemon]
-persistent = false
+persistent = true
+start = [
+  "haiderd", "--profile", "{{profile}}/haider/profile",
+  "--store-dir", "{{profile}}/haider/store",
+  "--runtime-dir", "{{profile}}/haider/runtime"
+]
+grace_ms = 2000
+
+[daemon.readiness]
+kind = "socket"
+target = "{{profile}}/haider/runtime/h.sock"
+timeout_ms = 10000
+
 [transport]
-kind = "exec"
-command = ["haider-agent"]
+kind = "socket-jsonrpc"
+endpoint = "{{profile}}/haider/runtime/h.sock"
 timeout_ms = 30000
+
 [sessions]
 [next_input]
 [agents]
+
 [concurrency]
-topology = "client-process-fanout"
-max_agents = 8
-fanout_mode = "client"
+topology = "shared-daemon-sessions"
+max_agents = 32
+fanout_mode = "native-sibling-fanout"
+
 [tools]
+
 [events]
-source = "stdout"
+source = "journal"
 framing = "jsonl"
+
 [exit]
 success = 0
-failures = { provider = 20, timeout = 21, cancelled = 22, invalid = 23 }
+failures = { provider = 1 }
+
 [process]
-executable_names = ["haider-agent"]
+executable_names = ["haiderd", "haider"]
+
 [resources]
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
+
 [hooks]
 [cleanup]
+paths = ["{{profile}}"]
+
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
-[capabilities]
-required = { routing = "core", headless = "core", sessions = "core" }
-optional = { native_delegation = "facet", hooks = "facet", subturn = "facet" }
 
+[capabilities.required]
+headless = "haiderd is the resident automation owner"
+
+[capabilities.optional]
+sessions = "facet pending verified native daemon operations"
+resume = "facet pending verified journal replay contract"
+native_delegation = "facet pending verified agent operations"

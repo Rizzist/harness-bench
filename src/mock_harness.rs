@@ -21,6 +21,7 @@ use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, Notify};
@@ -37,6 +38,7 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_SESSION_MEMORY_MIB: u64 = 4;
 
 const MIB: u64 = 1024 * 1024;
+static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Durable append-only event storage for one session.
 #[derive(Clone, Debug)]
@@ -308,6 +310,14 @@ struct MockHarness {
 
 impl MockHarness {
     fn open(config: MockConfig) -> Result<Self> {
+        Self::open_with_readiness(config, true)
+    }
+
+    fn open_per_invocation(config: MockConfig) -> Result<Self> {
+        Self::open_with_readiness(config, false)
+    }
+
+    fn open_with_readiness(config: MockConfig, publish_daemon_pid: bool) -> Result<Self> {
         fs::create_dir_all(config.state_dir.join("sessions"))?;
         fs::create_dir_all(config.state_dir.join("workspaces"))?;
         let mut sessions = BTreeMap::new();
@@ -354,14 +364,16 @@ impl MockHarness {
                 },
             );
         }
-        // Publish readiness only after durable session recovery and fixture-effect
-        // reconciliation have completed. The same file is the sampler's verified PID
-        // locator, so a visible PID always denotes a daemon ready to accept RPCs.
-        write_replace_synced(
-            &config.state_dir.join("daemon.pid"),
-            std::process::id().to_string().as_bytes(),
-        )?;
-        sync_directory(&config.state_dir)?;
+        if publish_daemon_pid {
+            // Publish readiness only after durable session recovery and fixture-effect
+            // reconciliation have completed. The same file is the sampler's verified PID
+            // locator, so a visible PID always denotes a daemon ready to accept RPCs.
+            write_replace_synced(
+                &config.state_dir.join("daemon.pid"),
+                std::process::id().to_string().as_bytes(),
+            )?;
+            sync_directory(&config.state_dir)?;
+        }
         Ok(Self {
             config,
             sessions,
@@ -528,12 +540,15 @@ pub async fn run(args: &[String]) -> Result<i32> {
     match command {
         "serve" => serve(parse_config(&args[1..])?, false).await,
         "rpc" => serve(parse_config(&args[1..])?, true).await,
+        "exec-turn" => exec_turn(&args[1..]).await,
         "inspect-journal" => inspect_journal(&args[1..]),
         "hook" => hook_command(&args[1..]),
         "--help" | "help" => {
             println!(
                 "ahrb-mock-harness serve|rpc --state-dir PATH [--idle-timeout-ms N] \
                  [--session-memory-mib N]\n\
+                 ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
+                 --prompt PROMPT --key KEY\n\
                  model endpoint comes from AHRB_MOCK_BASE_URL or AHRB_MOCK_UNIX_SOCKET; \
                  key/model come from AHRB_MOCK_API_KEY and AHRB_MOCK_MODEL"
             );
@@ -543,6 +558,95 @@ pub async fn run(args: &[String]) -> Result<i32> {
             "unknown mock harness command {other:?}"
         ))),
     }
+}
+
+async fn exec_turn(args: &[String]) -> Result<i32> {
+    let mut marker = None;
+    let mut prompt = None;
+    let mut key = None;
+    let mut event_journal = None;
+    let mut post_output_delay_ms = 0_u64;
+    let mut config_args = Vec::new();
+    let mut index = 0_usize;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| AhrbError::Usage(format!("{option} needs a value")))?;
+        match option {
+            "--marker" => marker = Some(value.clone()),
+            "--prompt" => prompt = Some(value.clone()),
+            "--key" => key = Some(value.clone()),
+            "--event-journal" => event_journal = Some(PathBuf::from(value)),
+            "--post-output-delay-ms" => {
+                post_output_delay_ms = value
+                    .parse()
+                    .map_err(|_| AhrbError::Usage("invalid post-output delay".to_owned()))?;
+            }
+            "--state-dir" | "--idle-timeout-ms" | "--session-memory-mib" => {
+                config_args.push(option.to_owned());
+                config_args.push(value.clone());
+            }
+            other => {
+                return Err(AhrbError::Usage(format!(
+                    "unknown exec-turn option {other:?}"
+                )));
+            }
+        }
+        index += 2;
+    }
+    let marker = marker.ok_or_else(|| AhrbError::Usage("--marker is required".to_owned()))?;
+    let prompt = prompt.ok_or_else(|| AhrbError::Usage("--prompt is required".to_owned()))?;
+    let key = key.ok_or_else(|| AhrbError::Usage("--key is required".to_owned()))?;
+    let config = parse_config(&config_args)?;
+    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let (session_id, journal, after) = {
+        let mut guard = harness.lock().await;
+        let id = guard.create_session(&marker)?;
+        let journal = guard.session_mut(&id)?.journal.clone();
+        let after = journal.all()?.last().map(|event| event.cursor);
+        (id, journal, after)
+    };
+    let spawn = accept_turn(&harness, &session_id, PendingTurn { prompt, key }, false).await?;
+    if spawn {
+        spawn_worker(Arc::clone(&harness), session_id.clone());
+    }
+    let started = std::time::Instant::now();
+    let terminal = loop {
+        let events = journal.read_after(after)?;
+        if let Some(terminal) = events.iter().rev().find(|event| is_terminal(&event.event)) {
+            break terminal.clone();
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err(AhrbError::Timeout("mock exec turn".to_owned()));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let events = journal.read_after(after)?;
+    if let Some(path) = event_journal {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        for event in &events {
+            serde_json::to_writer(&mut file, event)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        sync_parent(&path)?;
+    }
+    for event in events {
+        println!("{}", serde_json::to_string(&event)?);
+    }
+    std::io::stdout().flush()?;
+    if post_output_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(post_output_delay_ms)).await;
+    }
+    Ok(if terminal.event == EventVocab::TerminalSuccess {
+        0
+    } else {
+        14
+    })
 }
 
 fn parse_config(args: &[String]) -> Result<MockConfig> {
@@ -1723,7 +1827,11 @@ fn reconcile_fixture_effect(
     for byte in &digest[..8] {
         suffix.push_str(&format!("{byte:02x}"));
     }
-    let temporary = parent.join(format!(".ahrb-write-{suffix}.tmp"));
+    let sequence = RECONCILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".ahrb-write-{suffix}-{}-{sequence}.tmp",
+        std::process::id()
+    ));
     write_replace_synced(&temporary, content.as_bytes())?;
     #[cfg(not(unix))]
     if path.exists() {
@@ -2196,6 +2304,47 @@ mod tests {
                 .filter(|event| event.event == EventVocab::ToolResult)
                 .count(),
             1
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_reconciliation_uses_unique_temporary_files() -> Result<()> {
+        let directory = temporary_dir("concurrent-reconcile");
+        let _ = fs::remove_dir_all(&directory);
+        let barrier = Arc::new(std::sync::Barrier::new(33));
+        let args = json!({ "path": "nested/effect.txt", "content": "durable" });
+        let result = json!({ "ok": true });
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let worker_directory = directory.clone();
+            let worker_barrier = Arc::clone(&barrier);
+            let worker_args = args.clone();
+            let worker_result = result.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                reconcile_fixture_effect(
+                    &worker_directory,
+                    "session",
+                    "shared-call",
+                    "write_fixture",
+                    &worker_args,
+                    &worker_result,
+                )
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("reconciliation worker panicked")?;
+        }
+        assert_eq!(
+            fs::read_to_string(
+                directory
+                    .join("workspaces/session")
+                    .join("nested/effect.txt")
+            )?,
+            "durable"
         );
         fs::remove_dir_all(directory)?;
         Ok(())

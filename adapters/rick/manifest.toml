@@ -2,52 +2,142 @@
 schema = 1
 id = "rick"
 name = "Rick"
-revision = "v1"
+revision = "exec-stream-json-v1-unvalidated-provider"
+
 [availability]
 exec_paths = ["rick"]
-version_probe = ["rick", "--version"]
-version_pattern = "rick"
+version_probe = ["rick", "version"]
+version_pattern = "rick v"
+
+# TODO(orchestrator): Rick v0.1.18 did not honor OPENAI_BASE_URL for its built-in
+# OpenAI provider during the sandboxed probe. Replace this env-only injection with
+# Rick's documented noninteractive isolated rick.json/auth.json custom-provider
+# schema when that contract is published or confirmed by the real-harness run.
 [fake_model]
 dialect = "open-ai-chat-completions"
 base_url_env = "OPENAI_BASE_URL"
 credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
 allowed_paths = ["/v1/chat/completions"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+RICK_HOME = "{{profile}}/rick-home"
+RICK_DATA = "{{profile}}/rick-data"
+
 [isolation]
-roots = { HOME = "{{profile}}/home", XDG_CONFIG_HOME = "{{profile}}/config", XDG_DATA_HOME = "{{profile}}/data", XDG_STATE_HOME = "{{profile}}/state", XDG_RUNTIME_DIR = "{{profile}}/runtime", TMPDIR = "{{profile}}/tmp" }
-forbidden_roots = ["~/.rick"]
+generated_files = []
+forbidden_roots = ["~/.config/rick", "~/.local/share/rick"]
+
 [daemon]
 persistent = false
+
 [transport]
 kind = "exec"
-command = ["rick"]
+command = [
+  "rick", "--new", "exec", "--output-format", "stream-json",
+  "--model", "openai/{{model}}", "--permission-profile", "ci",
+  "--sandbox", "workspace-write", "--yolo", "{{prompt}}"
+]
 timeout_ms = 30000
+
 [sessions]
+resume = [
+  "rick", "--resume", "{{session_id}}", "exec", "--output-format", "stream-json",
+  "--model", "openai/{{model}}", "--permission-profile", "ci",
+  "--sandbox", "workspace-write", "--yolo", "{{prompt}}"
+]
+id_pointer = "/session_id"
+
 [next_input]
 [agents]
+
 [concurrency]
 topology = "client-process-fanout"
 max_agents = 8
 fanout_mode = "client"
-[tools]
+
+# TODO(orchestrator): confirm Rick's model-visible shell alias/input key and its
+# stream-json success/session event names against the orchestrator's real binary.
+[tools.aliases]
+write = "bash"
+read = "bash"
+fail = "bash"
+
+[tools.bindings]
+command = "command"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+
 [events]
 source = "stdout"
 framing = "jsonl"
+
+[[events.rules]]
+matches = "session_start"
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "turn_start"
+event = "model-request"
+
+[[events.rules]]
+matches = "tool_start"
+event = "tool-call"
+
+[[events.rules]]
+matches = "tool_result"
+event = "tool-result"
+
+[[events.rules]]
+matches = "assistant"
+event = "model-response"
+
+[[events.rules]]
+matches = "result"
+event = "terminal-success"
+
+[[events.rules]]
+matches = "error"
+event = "terminal-failure"
+
 [exit]
 success = 0
-failures = { provider = 20, timeout = 21, cancelled = 22, invalid = 23 }
+failure_stdout = ['"type":"error"']
+failures = { provider = 1 }
+
 [process]
 executable_names = ["rick"]
+
 [resources]
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
+
 [hooks]
 [cleanup]
+paths = ["{{profile}}"]
+
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
-[capabilities]
-required = { routing = "core", headless = "core", sessions = "core" }
-optional = { native_delegation = "facet", hooks = "facet", subturn = "facet" }
+
+[capabilities.required]
+headless = "rick exec --output-format stream-json is noninteractive"
+sessions = "Rick persists sessions beneath isolated RICK_DATA"
+resume = "rick --resume reopens a saved session in a fresh process"
+
+[capabilities.optional]
 

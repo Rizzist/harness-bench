@@ -1,4 +1,4 @@
-use ahrb::evaluate::{Pillar, TestOutcome, TestResult, certify};
+use ahrb::evaluate::{TestOutcome, TestResult, certify};
 use ahrb::matrix_evidence::{
     CapabilityStatus, ObservationSet, RowEvidence, capability_for_row, evaluate_row,
     suite_exit_code,
@@ -116,7 +116,7 @@ fn exact_structured_success_can_pass() {
 }
 
 #[test]
-fn capability_resolution_distinguishes_unsupported_and_absent() {
+fn capability_resolution_treats_missing_operations_as_unsupported() {
     let original = manifest();
     assert_eq!(
         capability_for_row(&original, 18),
@@ -142,23 +142,85 @@ fn capability_resolution_distinguishes_unsupported_and_absent() {
     missing_surface.agents.spawn.clear();
     assert!(matches!(
         capability_for_row(&missing_surface, 18),
-        CapabilityStatus::Absent(_)
+        CapabilityStatus::Unsupported(_)
     ));
     assert_eq!(
         capability_for_row(&missing_surface, 18).as_classify_value(),
-        None
+        Some(false)
     );
 }
 
 #[test]
-fn unsupported_mandatory_row_blocks_exit_and_badge() {
-    let result = TestResult {
-        row: 1,
-        id: "routing".to_owned(),
-        pillar: Pillar::ToolCallCorrectness,
-        outcome: TestOutcome::Unsupported("not supported".to_owned()),
-        evidence: vec!["capability: explicitly unsupported".to_owned()],
-    };
-    assert_eq!(suite_exit_code(std::slice::from_ref(&result)), 1);
-    assert!(certify(&[result], "macos", "shared-daemon-sessions", 8, 1.0).is_none());
+fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
+    let results = ahrb::scenarios::all()
+        .iter()
+        .map(|definition| TestResult {
+            row: definition.row,
+            id: definition.id.to_owned(),
+            pillar: definition.pillar,
+            outcome: if definition.row == 18 {
+                TestOutcome::Unsupported("native delegation operations are absent".to_owned())
+            } else {
+                TestOutcome::Pass
+            },
+            evidence: vec!["capability: explicit".to_owned()],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(suite_exit_code(&results), 0);
+    let badge = certify(&results, "macos", "shared-daemon-sessions", 8, 1.0)
+        .expect("unsupported facet does not suppress badge");
+    assert!(
+        !badge
+            .facets
+            .iter()
+            .any(|facet| facet == "native-delegation")
+    );
+    assert!(badge.facets.iter().any(|facet| facet == "queue"));
+
+    let mandatory_unsupported = results
+        .iter()
+        .cloned()
+        .map(|mut result| {
+            if result.row == 31 {
+                result.outcome = TestOutcome::Unsupported("steer operation is absent".to_owned());
+            }
+            result
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(suite_exit_code(&mandatory_unsupported), 1);
+    assert!(
+        certify(
+            &mandatory_unsupported,
+            "macos",
+            "shared-daemon-sessions",
+            8,
+            1.0
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn every_empty_special_operation_surface_is_unsupported() {
+    type ManifestMutator = fn(&mut ahrb::manifest::Manifest);
+    let original = manifest();
+    let cases: [(u8, ManifestMutator); 6] = [
+        (18, |item| item.agents.spawn.clear()),
+        (30, |item| item.sessions.attach.clear()),
+        (31, |item| item.next_input.steer.clear()),
+        (33, |item| item.next_input.queue.clear()),
+        (36, |item| item.agents.cancel.clear()),
+        (37, |item| item.sessions.resume.clear()),
+    ];
+    for (row, clear) in cases {
+        let mut changed = original.clone();
+        clear(&mut changed);
+        assert!(
+            matches!(
+                capability_for_row(&changed, row),
+                CapabilityStatus::Unsupported(_)
+            ),
+            "row {row} did not capability-gate its empty operation"
+        );
+    }
 }

@@ -119,6 +119,7 @@ barrier = ["barrier"]
 
 [events]
 source = "journal"
+path = "{{profile}}/state/sessions/{{session_id}}/journal.jsonl"
 framing = "jsonl"
 id_pointer = "/id"
 cursor_pointer = "/cursor"
@@ -142,6 +143,10 @@ event = "terminal-success"
 [[events.rules]]
 matches = "terminal-failure"
 event = "terminal-failure"
+
+[[events.rules]]
+matches = "terminal-cancelled"
+event = "terminal-cancelled"
 
 [exit]
 success = 0

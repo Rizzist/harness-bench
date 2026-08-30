@@ -31,6 +31,14 @@ path = "src/main.rs"
 name = "ahrb-mock-harness"
 path = "src/bin/ahrb-mock-harness.rs"
 
+[[bin]]
+name = "ahrb-fixture"
+path = "src/bin/ahrb-fixture.rs"
+
+[[bin]]
+name = "hbench"
+path = "src/bin/hbench.rs"
+
 [profile.dev]
 debug = 0
 incremental = false

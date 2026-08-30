@@ -49,6 +49,18 @@ pub struct Fingerprint {
     pub profile: String,
 }
 
+/// One numeric resource metric with its mandatory topology comparison scope.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TopologyMetric {
+    /// Numeric observation in the unit encoded by the metric name.
+    pub value: f64,
+    /// Architecture topology under which the observation was measured.
+    pub topology: String,
+    /// Normative comparison guard. Resource classes and marginal beta values
+    /// may only be compared when this topology label is identical.
+    pub comparison_scope: String,
+}
+
 /// Complete benchmark report and embedded evidence.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Report {
@@ -62,8 +74,12 @@ pub struct Report {
     pub results: Vec<TestResult>,
     /// Badge when every mandatory gate passes.
     pub badge: Option<Badge>,
-    /// Named numeric resource metrics.
+    /// Named non-resource automation diagnostics. Resource observations live
+    /// exclusively in `resource_metrics` so topology labels cannot be dropped.
     pub metrics: BTreeMap<String, f64>,
+    /// Resource metrics with topology labels and within-topology comparison scope.
+    #[serde(default)]
+    pub resource_metrics: BTreeMap<String, TopologyMetric>,
     /// Raw resource samples.
     pub samples: Vec<Sample>,
     /// Raw process observations.
@@ -148,9 +164,34 @@ pub fn render_markdown(report: &Report) -> String {
             outcome_label(&result.outcome)
         );
     }
-    if !report.metrics.is_empty() {
-        let _ = writeln!(output, "\n## Resource metrics\n");
-        for (name, value) in &report.metrics {
+    if !report.resource_metrics.is_empty() {
+        let topology = report
+            .resource_metrics
+            .values()
+            .next()
+            .map(|metric| metric.topology.as_str())
+            .unwrap_or("unknown");
+        let _ = writeln!(output, "\n## Resource metrics — `{topology}`\n");
+        let _ = writeln!(
+            output,
+            "> R-class and marginal β are comparable only within the same topology.\n"
+        );
+        for (name, metric) in &report.resource_metrics {
+            let _ = writeln!(
+                output,
+                "- `{name}`: {:.3} (topology: `{}`; scope: `{}`)",
+                metric.value, metric.topology, metric.comparison_scope
+            );
+        }
+    }
+    let diagnostic_metrics: BTreeMap<_, _> = report
+        .metrics
+        .iter()
+        .filter(|(name, _)| !report.resource_metrics.contains_key(*name))
+        .collect();
+    if !diagnostic_metrics.is_empty() {
+        let _ = writeln!(output, "\n## Automation diagnostics\n");
+        for (name, value) in diagnostic_metrics {
             let _ = writeln!(output, "- `{name}`: {value:.3}");
         }
     }
@@ -177,12 +218,23 @@ fn render_junit(report: &Report) -> String {
     let failures = report
         .results
         .iter()
-        .filter(|result| !matches!(result.outcome, TestOutcome::Pass))
+        .filter(|result| {
+            !matches!(
+                result.outcome,
+                TestOutcome::Pass | TestOutcome::Unsupported(_)
+            )
+        })
+        .count();
+    let skipped = report
+        .results
+        .iter()
+        .filter(|result| matches!(result.outcome, TestOutcome::Unsupported(_)))
         .count();
     let mut output = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"ahrb\" tests=\"{}\" failures=\"{}\">\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"ahrb\" tests=\"{}\" failures=\"{}\" skipped=\"{}\">\n",
         report.results.len(),
-        failures
+        failures,
+        skipped
     );
     let mut results: Vec<&TestResult> = report.results.iter().collect();
     results.sort_by_key(|result| result.row);
@@ -194,12 +246,18 @@ fn render_junit(report: &Report) -> String {
             result.row,
             xml_escape(&result.id)
         );
-        if !matches!(result.outcome, TestOutcome::Pass) {
-            let _ = writeln!(
-                output,
-                "    <failure message=\"{}\" />",
-                xml_escape(outcome_label(&result.outcome))
-            );
+        match &result.outcome {
+            TestOutcome::Pass => {}
+            TestOutcome::Unsupported(detail) => {
+                let _ = writeln!(output, "    <skipped message=\"{}\" />", xml_escape(detail));
+            }
+            other => {
+                let _ = writeln!(
+                    output,
+                    "    <failure message=\"{}\" />",
+                    xml_escape(outcome_label(other))
+                );
+            }
         }
         let _ = writeln!(output, "  </testcase>");
     }

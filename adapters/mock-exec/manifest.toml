@@ -1,0 +1,130 @@
+[identity]
+schema = 1
+id = "ahrb-mock-exec"
+name = "AHRB built-in per-invocation reference harness"
+revision = "1"
+
+[availability]
+exec_paths = ["target/debug/ahrb-mock-harness"]
+version_probe = ["target/debug/ahrb-mock-harness", "--help"]
+version_pattern = "ahrb-mock-harness"
+
+[fake_model]
+dialect = "open-ai-chat-completions"
+base_url_env = "AHRB_MOCK_BASE_URL"
+credential_env = "AHRB_MOCK_API_KEY"
+model = "ahrb-fake-v1"
+allowed_paths = ["/v1/chat/completions"]
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+
+[isolation]
+forbidden_roots = ["~/.ahrb-mock"]
+
+[[isolation.generated_files]]
+path = "{{profile}}/config/provider.toml"
+content = "base_url = '{{base_url}}'\nmodel = '{{model}}'\ncredential = '{{credential}}'\n"
+mode = "0600"
+
+[daemon]
+persistent = false
+
+[transport]
+kind = "exec"
+command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+timeout_ms = 10000
+
+[sessions]
+create = []
+submit = []
+attach = []
+resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+close_delete = []
+list = []
+id_pointer = "/session_id"
+
+[next_input]
+[agents]
+
+[concurrency]
+topology = "client-process-fanout"
+max_agents = 8
+fanout_mode = "client"
+
+[tools]
+
+[events]
+source = "stdout"
+framing = "jsonl"
+id_pointer = "/id"
+cursor_pointer = "/cursor"
+
+[[events.rules]]
+matches = "turn-accepted"
+event = "turn-accepted"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "model-request"
+event = "model-request"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "model-response"
+event = "model-response"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "tool-call"
+event = "tool-call"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "tool-result"
+event = "tool-result"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "terminal-success"
+event = "terminal-success"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "terminal-failure"
+event = "terminal-failure"
+payload_pointer = "/payload"
+
+[exit]
+success = 0
+success_stdout = ["terminal-success"]
+failure_stdout = ["terminal-failure"]
+failures = { provider = 14 }
+
+[process]
+executable_names = ["ahrb-mock-harness"]
+
+[resources]
+turn_timeout_ms = 10000
+idle_timeout_ms = 1000
+max_output_bytes = 1048576
+
+[hooks]
+[cleanup]
+paths = ["{{profile}}"]
+
+[capture]
+redact_env = ["AHRB_MOCK_API_KEY"]
+max_bytes = 1048576
+
+[capabilities.required]
+headless = "fresh process with closed stdin"
+sessions = "mock session journal is reopened by the next process"
+resume = "exec-turn reopens the fsync-backed session journal"
+
+[capabilities.optional]

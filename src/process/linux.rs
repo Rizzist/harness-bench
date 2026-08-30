@@ -19,6 +19,7 @@ pub struct LinuxSampler {
     proc_root: PathBuf,
     cgroup: Option<PathBuf>,
     known: BTreeSet<ProcIdentity>,
+    verified_groups: BTreeMap<ProcIdentity, u32>,
     clock_ticks_per_second: u64,
     cpu: TreeCpuTracker,
     last_cgroup_cpu_ns: Option<u64>,
@@ -31,6 +32,7 @@ impl Default for LinuxSampler {
             proc_root: PathBuf::from("/proc"),
             cgroup: None,
             known: BTreeSet::new(),
+            verified_groups: BTreeMap::new(),
             clock_ticks_per_second: clock_ticks_per_second(),
             cpu: TreeCpuTracker::default(),
             last_cgroup_cpu_ns: None,
@@ -81,11 +83,26 @@ impl Sampler for LinuxSampler {
         for pid in &root_pids {
             if let Some(process) = by_pid.get(pid) {
                 let identity = process.identity();
+                if process.process_group != 0 {
+                    self.verified_groups.insert(identity, process.process_group);
+                }
                 tree.roots.insert(identity);
                 owned_by_pid.insert(*pid, identity);
                 tree.members
                     .insert(identity, process.to_info(ProcOwnership::DeclaredRoot));
             }
+        }
+        self.verified_groups
+            .retain(|identity, _| root_pids.contains(&identity.pid));
+        let process_groups: BTreeSet<u32> = self.verified_groups.values().copied().collect();
+        for (pid, process) in &by_pid {
+            if owned_by_pid.contains_key(pid) || !process_groups.contains(&process.process_group) {
+                continue;
+            }
+            let identity = process.identity();
+            owned_by_pid.insert(*pid, identity);
+            tree.members
+                .insert(identity, process.to_info(ProcOwnership::ProcessGroupMember));
         }
 
         // A cgroup is authoritative across reparenting. Under the reduced-
@@ -273,6 +290,7 @@ impl Sampler for LinuxSampler {
 struct LinuxProcess {
     pid: u32,
     ppid: u32,
+    process_group: u32,
     command: String,
     start_ticks: u64,
     user_ticks: u64,
@@ -348,8 +366,8 @@ fn parse_stat(pid: u32, text: &str) -> Result<LinuxProcess> {
     }
     let command = text[open + 1..close].to_owned();
     let fields: Vec<&str> = text[close + 1..].split_whitespace().collect();
-    // The first item is field 3 (`state`), so indexes 1, 11, 12, and 19 are
-    // PPID, utime, stime, and starttime respectively.
+    // The first item is field 3 (`state`), so indexes 1, 2, 11, 12, and 19 are
+    // PPID, process group, utime, stime, and starttime respectively.
     if fields.len() <= 19 {
         return Err(AhrbError::Protocol(format!(
             "/proc/{pid}/stat ended before starttime"
@@ -358,6 +376,7 @@ fn parse_stat(pid: u32, text: &str) -> Result<LinuxProcess> {
     Ok(LinuxProcess {
         pid,
         ppid: parse_stat_number(pid, "ppid", fields[1])?,
+        process_group: parse_stat_number(pid, "pgrp", fields[2])?,
         command,
         user_ticks: parse_stat_number(pid, "utime", fields[11])?,
         system_ticks: parse_stat_number(pid, "stime", fields[12])?,

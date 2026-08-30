@@ -5,7 +5,7 @@
 //! timing, isolation, recovery, or resource measurements.
 
 use crate::evaluate::{Assertion, TestOutcome, TestResult, classify};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, TransportKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -273,15 +273,16 @@ pub enum CapabilityStatus {
     Supported,
     /// Optional facet is honestly not declared.
     Unsupported(String),
-    /// Required declaration or declared operation surface is absent.
+    /// Non-capability evidence declaration is absent. Missing operations are
+    /// classified as `Unsupported`, never as benchmark failure/absence.
     Absent(String),
 }
 
 impl CapabilityStatus {
     /// Convert to the capability input consumed by [`classify`].
     ///
-    /// Supported is `Some(true)`, explicitly unsupported is `Some(false)`, and an
-    /// absent declaration or operation surface is `None`.
+    /// Supported is `Some(true)`, explicitly unsupported is `Some(false)`, and
+    /// only non-capability absence is `None`.
     pub fn as_classify_value(&self) -> Option<bool> {
         match self {
             Self::Supported => Some(true),
@@ -293,6 +294,19 @@ impl CapabilityStatus {
 
 /// Resolve a row's capability from declarations and concrete operation surfaces.
 pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
+    if !basic_session_surface(manifest) {
+        return CapabilityStatus::Unsupported(
+            "basic session create/submit/attach surface is absent for this architecture".to_owned(),
+        );
+    }
+    if (20..=29).contains(&row)
+        && manifest.transport.kind != TransportKind::Exec
+        && manifest.sessions.close_delete.is_empty()
+    {
+        return CapabilityStatus::Unsupported(
+            "resource trial session close/delete surface is absent".to_owned(),
+        );
+    }
     let optional_key = match row {
         4 => Some("parallel_tool_execution"),
         18 => Some("native_delegation"),
@@ -314,26 +328,24 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
         let declared = manifest.capabilities.required.contains_key(key)
             || manifest.capabilities.optional.contains_key(key);
         if !declared {
-            return if optional_key.is_some() {
-                CapabilityStatus::Unsupported(format!("optional capability {key} is not declared"))
-            } else {
-                CapabilityStatus::Absent(format!("required capability {key} is not declared"))
-            };
+            return CapabilityStatus::Unsupported(format!(
+                "capability {key} is not declared by this architecture"
+            ));
         }
         if !operation_surface_present(manifest, row) {
-            return CapabilityStatus::Absent(format!(
+            return CapabilityStatus::Unsupported(format!(
                 "capability {key} is declared but its operation surface is absent"
             ));
         }
     }
     if row == 17 && manifest.concurrency.max_agents < 2 {
-        return CapabilityStatus::Absent("actor concurrency is below N=2".to_owned());
+        return CapabilityStatus::Unsupported("actor concurrency is below N=2".to_owned());
     }
     if row == 26 && manifest.concurrency.max_agents < 8 {
-        return CapabilityStatus::Absent("parallel resource surface is below N=8".to_owned());
+        return CapabilityStatus::Unsupported("parallel resource surface is below N=8".to_owned());
     }
     if row == 36 && manifest.agents.cancel.is_empty() {
-        return CapabilityStatus::Absent("agent cancellation operation is absent".to_owned());
+        return CapabilityStatus::Unsupported("agent cancellation operation is absent".to_owned());
     }
     CapabilityStatus::Supported
 }
@@ -344,7 +356,11 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
         15 | 34 => {
             !manifest.transport.command.is_empty() || !manifest.transport.endpoint.is_empty()
         }
-        18 => !manifest.agents.spawn.is_empty(),
+        18 => {
+            !manifest.agents.spawn.is_empty()
+                && !manifest.agents.status.is_empty()
+                && !manifest.agents.collect.is_empty()
+        }
         30 => {
             !manifest.sessions.create.is_empty()
                 && !manifest.sessions.submit.is_empty()
@@ -353,11 +369,33 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
         31 => !manifest.next_input.steer.is_empty(),
         32 => !manifest.next_input.subturn.is_empty(),
         33 => !manifest.next_input.queue.is_empty(),
-        35 | 37 => !manifest.sessions.resume.is_empty() && !manifest.sessions.attach.is_empty(),
+        35 => {
+            manifest.daemon.persistent
+                && !manifest.sessions.resume.is_empty()
+                && !manifest.sessions.attach.is_empty()
+                && !manifest.concurrency.release.is_empty()
+        }
+        37 => !manifest.sessions.resume.is_empty() && !manifest.sessions.attach.is_empty(),
         39 => !manifest.hooks.acceptance.is_empty() && !manifest.hooks.completion.is_empty(),
-        40 => !manifest.events.source.is_empty() && !manifest.events.cursor_pointer.is_empty(),
+        40 => {
+            manifest.daemon.persistent
+                && matches!(manifest.events.source.as_str(), "journal" | "journal-file")
+                && manifest.events.framing == "jsonl"
+                && !manifest.events.path.is_empty()
+                && !manifest.events.cursor_pointer.is_empty()
+        }
         _ => true,
     }
+}
+
+/// Whether the architecture exposes the minimum session lifecycle needed to
+/// execute ordinary matrix turns. EXEC manifests provide these semantics via
+/// the per-invocation driver rather than RPC method names.
+pub fn basic_session_surface(manifest: &Manifest) -> bool {
+    manifest.transport.kind == TransportKind::Exec
+        || (!manifest.sessions.create.is_empty()
+            && !manifest.sessions.submit.is_empty()
+            && !manifest.sessions.attach.is_empty())
 }
 
 /// Evaluate one row from a nominal payload and manifest capability state.
@@ -428,8 +466,8 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
     )
 }
 
-/// Exit zero only when every mandatory row is present and passes, and no measured
-/// optional row fails or errors. Unsupported optional facets are nonfatal findings.
+/// Exit zero only when mandatory rows pass and optional rows either pass or are
+/// explicitly unsupported.
 pub fn suite_exit_code(results: &[TestResult]) -> i32 {
     let mandatory_ok = crate::scenarios::all()
         .iter()
@@ -440,12 +478,12 @@ pub fn suite_exit_code(results: &[TestResult]) -> i32 {
             })
         });
     let no_measured_failure = results.iter().all(|result| {
-        let optional = crate::scenarios::all()
-            .iter()
-            .find(|definition| definition.row == result.row)
-            .is_some_and(|definition| !definition.mandatory);
         matches!(result.outcome, TestOutcome::Pass)
-            || (optional && matches!(result.outcome, TestOutcome::Unsupported(_)))
+            || (matches!(result.outcome, TestOutcome::Unsupported(_))
+                && crate::scenarios::all()
+                    .iter()
+                    .find(|definition| definition.row == result.row)
+                    .is_some_and(|definition| !definition.mandatory))
     });
     if mandatory_ok && no_measured_failure {
         0
