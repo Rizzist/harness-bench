@@ -72,7 +72,7 @@ pub struct Report {
     pub fingerprint: Fingerprint,
     /// Matrix results sorted by row.
     pub results: Vec<TestResult>,
-    /// Badge when every mandatory gate passes.
+    /// Badge when every topology-relative CORE gate passes.
     pub badge: Option<Badge>,
     /// Named non-resource automation diagnostics. Resource observations live
     /// exclusively in `resource_metrics` so topology labels cannot be dropped.

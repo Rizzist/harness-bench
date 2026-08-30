@@ -81,16 +81,34 @@ fn cold_isolation_requires_profile_scoped_home_and_xdg_roots() {
 }
 
 #[test]
-fn per_invocation_crash_and_journal_trials_are_capability_gated() {
+fn per_invocation_crash_and_journal_trials_require_declared_disk_surfaces() {
     let manifest = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
         .expect("load exec manifest");
     for row in [35_u8, 40] {
         assert!(matches!(
             capability_for_row(&manifest, row),
-            CapabilityStatus::Unsupported(_)
+            CapabilityStatus::Supported
         ));
     }
-    let unsupported = TestOutcome::Unsupported("daemon-only trial".to_owned());
+
+    let mut without_resume = manifest.clone();
+    without_resume.capabilities.required.remove("resume");
+    assert!(matches!(
+        capability_for_row(&without_resume, 35),
+        CapabilityStatus::Unsupported(_)
+    ));
+
+    let mut without_journal = manifest;
+    without_journal
+        .capabilities
+        .required
+        .remove("durable_journal");
+    assert!(matches!(
+        capability_for_row(&without_journal, 40),
+        CapabilityStatus::Unsupported(_)
+    ));
+
+    let unsupported = TestOutcome::Unsupported("disk surface is absent".to_owned());
     assert_eq!(
         serde_json::to_value(unsupported).expect("serialize")["class"],
         "UNSUPPORTED"

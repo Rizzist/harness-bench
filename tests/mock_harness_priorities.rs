@@ -1163,7 +1163,10 @@ fn matrix_definitions_are_not_a_metadata_only_substitute_for_execution() {
             .iter()
             .find(|definition| definition.row == row)
             .expect("matrix row");
-        assert!(definition.mandatory);
+        assert_eq!(
+            definition.requirement(),
+            ahrb::scenarios::RequirementKind::Core
+        );
         assert!(!definition.metric.is_empty());
     }
 }

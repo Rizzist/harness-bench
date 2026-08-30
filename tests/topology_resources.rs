@@ -110,34 +110,45 @@ fn per_invocation_resource_rows_measure_process_fanout_without_idle_penalty() {
 
 #[test]
 fn per_invocation_badge_uses_process_marginal_and_labels_topology() {
+    let manifest = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+        .expect("load exec manifest");
     let results = ahrb::scenarios::all()
         .iter()
         .map(|definition| {
-            classify(
-                definition.row,
-                definition.id,
-                definition.pillar,
-                Some(true),
-                &[Assertion {
-                    name: "criterion".to_owned(),
-                    passed: true,
-                    detail: "met".to_owned(),
-                }],
-                None,
-            )
+            if matches!(
+                definition.requirement(),
+                ahrb::scenarios::RequirementKind::OptionalFacet { .. }
+            ) {
+                classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(false),
+                    &[],
+                    None,
+                )
+            } else {
+                classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: "criterion".to_owned(),
+                        passed: true,
+                        detail: "met".to_owned(),
+                    }],
+                    None,
+                )
+            }
         })
         .collect::<Vec<_>>();
-    let badge = certify(
-        &results,
-        "macos",
-        "client-process-fanout",
-        4,
-        20.0 * 1024.0 * 1024.0,
-    )
-    .expect("complete per-invocation result earns a badge");
+    let badge = certify(&results, &manifest, "macos", 4, 20.0 * 1024.0 * 1024.0)
+        .expect("complete per-invocation result earns a badge");
     assert_eq!(badge.topology, "client-process-fanout");
     assert_eq!(badge.resource_class, "R32");
     assert_eq!(badge.comparison_scope, "within-topology-only");
+    assert_eq!(badge.facets, vec!["replay", "crash", "resume"]);
 }
 
 #[tokio::test]
@@ -162,6 +173,9 @@ async fn launch_gate_and_process_group_retain_an_orphan_after_launcher_exit() {
             "{{prompt}}".to_owned(),
         ],
         resume_command: Vec::new(),
+        release_command: Vec::new(),
+        cancel_command: Vec::new(),
+        replay_command: Vec::new(),
         environment: BTreeMap::new(),
         profile_root: profile.clone(),
         events: manifest.events,

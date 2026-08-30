@@ -39,6 +39,8 @@ fn unsupported_is_never_silently_passed() {
 
 #[test]
 fn resource_class_is_derived_from_marginal_memory() {
+    let manifest = ahrb::manifest::load(std::path::Path::new("adapters/mock/manifest.toml"))
+        .expect("load mock manifest");
     let results: Vec<_> = ahrb::scenarios::all()
         .iter()
         .map(|definition| {
@@ -56,13 +58,7 @@ fn resource_class_is_derived_from_marginal_memory() {
             )
         })
         .collect();
-    let badge = certify(
-        &results,
-        "macos",
-        "shared-daemon-sessions",
-        8,
-        64.0 * 1024.0 * 1024.0,
-    );
+    let badge = certify(&results, &manifest, "macos", 8, 64.0 * 1024.0 * 1024.0);
     assert!(badge.is_some());
     if let Some(badge) = badge {
         assert!(badge_label(&badge).contains("R96"));

@@ -307,24 +307,21 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
             "resource trial session close/delete surface is absent".to_owned(),
         );
     }
-    let optional_key = match row {
-        4 => Some("parallel_tool_execution"),
-        18 => Some("native_delegation"),
-        32 => Some("pre_tool_intervention"),
-        39 => Some("hooks"),
-        _ => None,
+    let requirement = crate::scenarios::all()
+        .iter()
+        .find(|definition| definition.row == row)
+        .map(|definition| definition.requirement());
+    let capability_key = match requirement {
+        Some(crate::scenarios::RequirementKind::OptionalFacet { capability }) => Some(capability),
+        _ => match row {
+            15 | 34 => Some("headless"),
+            30 => Some("sessions"),
+            35 | 37 => Some("resume"),
+            40 => Some("durable_journal"),
+            _ => None,
+        },
     };
-    let required_key = match row {
-        15 | 34 => Some("headless"),
-        30 => Some("sessions"),
-        31 => Some("steer"),
-        33 => Some("queue"),
-        35 | 37 => Some("resume"),
-        40 => Some("durable_journal"),
-        _ => None,
-    };
-    let key = optional_key.or(required_key);
-    if let Some(key) = key {
+    if let Some(key) = capability_key {
         let declared = manifest.capabilities.required.contains_key(key)
             || manifest.capabilities.optional.contains_key(key);
         if !declared {
@@ -362,27 +359,41 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
                 && !manifest.agents.collect.is_empty()
         }
         30 => {
-            !manifest.sessions.create.is_empty()
-                && !manifest.sessions.submit.is_empty()
-                && !manifest.sessions.attach.is_empty()
+            if manifest.transport.kind == TransportKind::Exec {
+                !manifest.sessions.resume.is_empty()
+                    && manifest.events.source == "journal-file"
+                    && !manifest.events.path.is_empty()
+            } else {
+                !manifest.sessions.create.is_empty()
+                    && !manifest.sessions.submit.is_empty()
+                    && !manifest.sessions.attach.is_empty()
+            }
         }
         31 => !manifest.next_input.steer.is_empty(),
         32 => !manifest.next_input.subturn.is_empty(),
         33 => !manifest.next_input.queue.is_empty(),
         35 => {
-            manifest.daemon.persistent
-                && !manifest.sessions.resume.is_empty()
-                && !manifest.sessions.attach.is_empty()
+            !manifest.sessions.resume.is_empty()
                 && !manifest.concurrency.release.is_empty()
+                && if manifest.transport.kind == TransportKind::Exec {
+                    manifest.events.source == "journal-file" && !manifest.events.path.is_empty()
+                } else {
+                    manifest.daemon.persistent && !manifest.sessions.attach.is_empty()
+                }
         }
-        37 => !manifest.sessions.resume.is_empty() && !manifest.sessions.attach.is_empty(),
+        37 => {
+            !manifest.sessions.resume.is_empty()
+                && (manifest.transport.kind == TransportKind::Exec
+                    || !manifest.sessions.attach.is_empty())
+        }
         39 => !manifest.hooks.acceptance.is_empty() && !manifest.hooks.completion.is_empty(),
         40 => {
-            manifest.daemon.persistent
-                && matches!(manifest.events.source.as_str(), "journal" | "journal-file")
+            matches!(manifest.events.source.as_str(), "journal" | "journal-file")
                 && manifest.events.framing == "jsonl"
                 && !manifest.events.path.is_empty()
                 && !manifest.events.cursor_pointer.is_empty()
+                && (manifest.transport.kind != TransportKind::Exec
+                    || !manifest.events.replay_command.is_empty())
         }
         _ => true,
     }
@@ -466,30 +477,13 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
     )
 }
 
-/// Exit zero only when mandatory rows pass and optional rows either pass or are
-/// explicitly unsupported.
-pub fn suite_exit_code(results: &[TestResult]) -> i32 {
-    let mandatory_ok = crate::scenarios::all()
-        .iter()
-        .filter(|definition| definition.mandatory)
-        .all(|definition| {
-            results.iter().any(|result| {
-                result.row == definition.row && matches!(result.outcome, TestOutcome::Pass)
-            })
-        });
-    let no_measured_failure = results.iter().all(|result| {
-        matches!(result.outcome, TestOutcome::Pass)
-            || (matches!(result.outcome, TestOutcome::Unsupported(_))
-                && crate::scenarios::all()
-                    .iter()
-                    .find(|definition| definition.row == result.row)
-                    .is_some_and(|definition| !definition.mandatory))
-    });
-    if mandatory_ok && no_measured_failure {
-        0
-    } else {
-        1
-    }
+/// Compatibility entry point for topology-relative report status evaluation.
+pub fn suite_exit_code(
+    results: &[TestResult],
+    badge: Option<&crate::evaluate::Badge>,
+    manifest: &Manifest,
+) -> i32 {
+    crate::evaluate::suite_exit_code(results, badge, manifest)
 }
 
 fn exact_assertion(row: u8, values: &ObservationSet) -> Assertion {

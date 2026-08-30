@@ -384,6 +384,12 @@ pub trait Driver: Send {
         session: &SessionId,
         after: Option<Cursor>,
     ) -> DriverFuture<'_, Vec<NormalizedEvent>>;
+    /// Reopen harness-owned durable storage and replay strictly after a cursor.
+    fn replay_persisted(
+        &mut self,
+        session: &SessionId,
+        after: Option<Cursor>,
+    ) -> DriverFuture<'_, Vec<NormalizedEvent>>;
     /// Resume a previously accepted turn.
     fn resume(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
     /// Inject input at the next safe boundary.
@@ -417,6 +423,10 @@ pub trait Driver: Send {
     }
     /// Currently live launcher/controller PIDs owned by this driver.
     fn owned_pids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    /// Currently live launcher PIDs for one logical session, when separable.
+    fn session_pids(&self, _session: &SessionId) -> Vec<u32> {
         Vec::new()
     }
 }
@@ -558,6 +568,15 @@ impl<T: Transport> Driver for GenericDriver<T> {
             let events = value.get("events").cloned().unwrap_or(value);
             Ok(serde_json::from_value(events)?)
         })
+    }
+
+    fn replay_persisted(
+        &mut self,
+        session: &SessionId,
+        after: Option<Cursor>,
+    ) -> DriverFuture<'_, Vec<NormalizedEvent>> {
+        let session = session.clone();
+        Box::pin(async move { self.attach(&session, after).await })
     }
 
     fn resume(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
@@ -733,6 +752,12 @@ pub struct PerInvocationConfig {
     pub command: Vec<String>,
     /// Subsequent-turn argv used to reopen a harness-owned session from disk.
     pub resume_command: Vec<String>,
+    /// Out-of-process command used to release a durable checkpoint token.
+    pub release_command: Vec<String>,
+    /// Out-of-process command used after terminating an active invocation.
+    pub cancel_command: Vec<String>,
+    /// Out-of-process command that strictly reopens and emits the durable journal.
+    pub replay_command: Vec<String>,
     /// Isolated environment inherited by every invocation.
     pub environment: BTreeMap<String, String>,
     /// Fresh run profile containing AHRB bookkeeping and harness state roots.
@@ -758,6 +783,8 @@ struct PersistedExecSession {
     marker: String,
     harness_id: String,
     turns: u64,
+    #[serde(default)]
+    invocations: u64,
     next_cursor: u64,
     closed: bool,
 }
@@ -834,7 +861,19 @@ impl PerInvocationDriver {
             if !path.is_file() {
                 continue;
             }
-            let persisted: PersistedExecSession = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let mut persisted: PersistedExecSession =
+                serde_json::from_slice(&std::fs::read(&path)?)?;
+            if self.config.events.source == "journal-file" {
+                // The harness journal is authoritative. Rebuild AHRB's normalized
+                // cache on every driver start so crash/replay evidence cannot be
+                // satisfied by AHRB's own prior cache.
+                match std::fs::remove_file(self.events_path(&persisted.local_id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                persisted.next_cursor = 1;
+            }
             self.sessions.insert(
                 persisted.local_id.clone(),
                 ExecSession {
@@ -967,9 +1006,12 @@ impl PerInvocationDriver {
     fn source_records(
         &self,
         session: &PersistedExecSession,
-        active: &ActiveInvocation,
+        stdout_path: Option<&Path>,
     ) -> Result<(Vec<Value>, Vec<u8>)> {
-        let stdout = Self::bounded_read(&active.stdout_path, self.config.max_output_bytes, false)?;
+        let stdout = match stdout_path {
+            Some(path) => Self::bounded_read(path, self.config.max_output_bytes, false)?,
+            None => Vec::new(),
+        };
         let bytes = match self.config.events.source.as_str() {
             "stdout" => stdout.clone(),
             "journal-file" => {
@@ -986,7 +1028,13 @@ impl PerInvocationDriver {
                 )));
             }
         };
-        let records = parse_event_records(&bytes, &self.config.events.framing)?;
+        let records = if self.config.events.source == "journal-file"
+            && matches!(self.config.events.framing.as_str(), "jsonl" | "json-seq")
+        {
+            parse_journal_records(&bytes)?
+        } else {
+            parse_event_records(&bytes, &self.config.events.framing)?
+        };
         Ok((records, stdout))
     }
 
@@ -1215,7 +1263,7 @@ impl PerInvocationDriver {
             .cloned()
             .map(|event| (event.id.clone(), event))
             .collect();
-        let (records, stdout) = self.source_records(session, active)?;
+        let (records, stdout) = self.source_records(session, Some(&active.stdout_path))?;
         self.learn_harness_id(session, &records);
         let namespace = if self.config.events.source == "stdout" {
             format!("turn-{}", active.turn)
@@ -1233,7 +1281,7 @@ impl PerInvocationDriver {
         if let Some(status) = completed {
             let (expected, payload) = self.terminal_contract(status, &stdout);
             let turn_prefix = format!("{}:turn-{}", session.local_id, active.turn);
-            let mapped_terminal = additions.iter().rev().find(|event| {
+            let mapped_terminal = additions.iter().chain(cached.iter()).rev().find(|event| {
                 matches!(
                     event.event,
                     EventVocab::TerminalSuccess | EventVocab::TerminalFailure
@@ -1252,6 +1300,73 @@ impl PerInvocationDriver {
             }
         }
         Self::append_cached_events(&cache_path, &additions)
+    }
+
+    fn refresh_inactive_journal(&self, session: &mut PersistedExecSession) -> Result<()> {
+        if self.config.events.source != "journal-file" {
+            return Ok(());
+        }
+        let cache_path = self.events_path(&session.local_id);
+        let cached = Self::read_cached_events(&cache_path)?;
+        let by_id: BTreeMap<String, NormalizedEvent> = cached
+            .iter()
+            .cloned()
+            .map(|event| (event.id.clone(), event))
+            .collect();
+        let (records, _) = self.source_records(session, None)?;
+        self.learn_harness_id(session, &records);
+        let additions = Self::normalize_records(
+            &self.config.events,
+            session,
+            &records,
+            &by_id,
+            "journal",
+            true,
+        )?;
+        Self::append_cached_events(&cache_path, &additions)
+    }
+
+    async fn run_control_command(
+        &self,
+        template: &[String],
+        session: &PersistedExecSession,
+        release_token: Option<&str>,
+    ) -> Result<()> {
+        if template.is_empty() {
+            return Err(AhrbError::Unsupported(
+                "per-invocation control command is absent".to_owned(),
+            ));
+        }
+        let mut variables = self.invocation_variables(session, "", "");
+        variables.insert(
+            "release_token".to_owned(),
+            release_token.unwrap_or_default().to_owned(),
+        );
+        let argv = template
+            .iter()
+            .map(|argument| crate::manifest::render_template(argument, &variables))
+            .collect::<Result<Vec<_>>>()?;
+        let (program, arguments) = argv.split_first().ok_or_else(|| {
+            AhrbError::Validation("per-invocation control command is empty".to_owned())
+        })?;
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .envs(&self.config.environment)
+            .current_dir(self.session_directory(&session.local_id).join("workspace"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(self.config.timeout, command.status())
+            .await
+            .map_err(|_| AhrbError::Timeout("per-invocation control command".to_owned()))??;
+        if !status.success() {
+            return Err(AhrbError::Protocol(format!(
+                "per-invocation control command exited with {status}"
+            )));
+        }
+        Ok(())
     }
 
     fn cached_after(&self, id: &str, after: Option<Cursor>) -> Result<Vec<NormalizedEvent>> {
@@ -1287,6 +1402,7 @@ impl Driver for PerInvocationDriver {
                 marker,
                 harness_id: String::new(),
                 turns: 0,
+                invocations: 0,
                 next_cursor: 1,
                 closed: false,
             };
@@ -1337,7 +1453,13 @@ impl Driver for PerInvocationDriver {
             let variables = self.invocation_variables(&persisted, &prompt, &key);
             let argv = self.render_invocation(template, &variables, &prompt)?;
             let directory = self.session_directory(&id);
-            let turn = persisted.turns.saturating_add(1);
+            let turn = persisted.invocations.saturating_add(1);
+            let mut launched = persisted.clone();
+            launched.invocations = turn;
+            Self::persist_session_at(&self.metadata_path(&id), &launched)?;
+            if let Some(item) = self.sessions.get_mut(&id) {
+                item.persisted = launched;
+            }
             let stdout_path = directory.join(format!("turn-{turn:06}.stdout"));
             let stderr_path = directory.join(format!("turn-{turn:06}.stderr"));
             let stdout = std::fs::OpenOptions::new()
@@ -1437,19 +1559,148 @@ impl Driver for PerInvocationDriver {
                     item.persisted = persisted;
                     item.active = Some(invocation);
                 }
+            } else if self.config.events.source == "journal-file" {
+                let mut persisted = self
+                    .sessions
+                    .get(&id)
+                    .ok_or_else(|| AhrbError::Protocol(format!("exec session {id:?} disappeared")))?
+                    .persisted
+                    .clone();
+                self.refresh_inactive_journal(&mut persisted)?;
+                Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
+                if let Some(item) = self.sessions.get_mut(&id) {
+                    item.persisted = persisted;
+                }
             }
             self.cached_after(&id, after)
+        })
+    }
+
+    fn replay_persisted(
+        &mut self,
+        session: &SessionId,
+        after: Option<Cursor>,
+    ) -> DriverFuture<'_, Vec<NormalizedEvent>> {
+        let id = session.0.clone();
+        Box::pin(async move {
+            let persisted = self
+                .sessions
+                .get(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?
+                .persisted
+                .clone();
+            if self.config.replay_command.is_empty() {
+                return Err(AhrbError::Unsupported(
+                    "per-invocation durable replay command is absent".to_owned(),
+                ));
+            }
+            let mut variables = self.invocation_variables(&persisted, "", "");
+            variables.insert(
+                "cursor".to_owned(),
+                after.map_or_else(|| "0".to_owned(), |cursor| cursor.0.to_string()),
+            );
+            let argv = self
+                .config
+                .replay_command
+                .iter()
+                .map(|argument| crate::manifest::render_template(argument, &variables))
+                .collect::<Result<Vec<_>>>()?;
+            let (program, arguments) = argv.split_first().ok_or_else(|| {
+                AhrbError::Validation("per-invocation replay command is empty".to_owned())
+            })?;
+            let mut command = Command::new(program);
+            command
+                .args(arguments)
+                .envs(&self.config.environment)
+                .current_dir(self.session_directory(&id).join("workspace"))
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(self.config.timeout, command.output())
+                .await
+                .map_err(|_| AhrbError::Timeout("per-invocation durable replay".to_owned()))??;
+            if !output.status.success() {
+                return Err(AhrbError::Protocol(format!(
+                    "per-invocation durable replay exited with {}",
+                    output.status
+                )));
+            }
+            if output.stdout.len() > self.config.max_output_bytes {
+                return Err(AhrbError::Protocol(
+                    "per-invocation durable replay exceeded capture bound".to_owned(),
+                ));
+            }
+            if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
+                return Err(AhrbError::Protocol(
+                    "durable replay output ended with a torn record".to_owned(),
+                ));
+            }
+            let records = parse_journal_records(&output.stdout)?;
+            for record in &records {
+                let cursor = record
+                    .pointer(&self.config.events.cursor_pointer)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "durable replay output omitted its source cursor".to_owned(),
+                        )
+                    })?;
+                if after.is_some_and(|after| cursor <= after.0) {
+                    return Err(AhrbError::Protocol(
+                        "durable replay returned an event at or before its cursor".to_owned(),
+                    ));
+                }
+            }
+            let mut replayed = persisted;
+            replayed.next_cursor = after.map_or(1, |cursor| cursor.0.saturating_add(1));
+            Self::normalize_records(
+                &self.config.events,
+                &mut replayed,
+                &records,
+                &BTreeMap::new(),
+                "journal",
+                true,
+            )
         })
     }
 
     fn resume(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
         let id = session.0.clone();
         Box::pin(async move {
-            if self.sessions.contains_key(&id) {
-                Ok(())
-            } else {
-                Err(AhrbError::Protocol(format!("unknown exec session {id:?}")))
+            if self
+                .sessions
+                .get(&id)
+                .is_some_and(|session| session.active.is_some())
+            {
+                return Err(AhrbError::Protocol(format!(
+                    "cannot replay active exec session {id:?}"
+                )));
             }
+            let path = self.metadata_path(&id);
+            let mut persisted: PersistedExecSession =
+                serde_json::from_slice(&std::fs::read(&path).map_err(|error| {
+                    AhrbError::Protocol(format!(
+                        "could not reopen exec session {id:?} metadata: {error}"
+                    ))
+                })?)?;
+            if self.config.events.source == "journal-file" {
+                match std::fs::remove_file(self.events_path(&id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                persisted.next_cursor = 1;
+                self.refresh_inactive_journal(&mut persisted)?;
+            }
+            Self::persist_session_at(&path, &persisted)?;
+            self.sessions.insert(
+                id,
+                ExecSession {
+                    persisted,
+                    active: None,
+                },
+            );
+            Ok(())
         })
     }
 
@@ -1479,13 +1730,21 @@ impl Driver for PerInvocationDriver {
 
     fn release_checkpoint(
         &mut self,
-        _session: &SessionId,
-        _release_token: &str,
+        session: &SessionId,
+        release_token: &str,
     ) -> DriverFuture<'_, ()> {
-        Box::pin(async {
-            Err(AhrbError::Unsupported(
-                "per-invocation CLI has no harness checkpoint RPC".to_owned(),
-            ))
+        let id = session.0.clone();
+        let release_token = release_token.to_owned();
+        Box::pin(async move {
+            let persisted = self
+                .sessions
+                .get(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?
+                .persisted
+                .clone();
+            let command = self.config.release_command.clone();
+            self.run_control_command(&command, &persisted, Some(&release_token))
+                .await
         })
     }
 
@@ -1520,18 +1779,29 @@ impl Driver for PerInvocationDriver {
                     .ok_or_else(|| AhrbError::Protocol(format!("exec session {id:?} disappeared")))?
                     .persisted
                     .clone();
-                let event = NormalizedEvent {
-                    id: format!("{}:turn-{}:cancelled", id, invocation.turn),
-                    cursor: persisted.next_cursor,
-                    session_id: id.clone(),
-                    actor: persisted.marker.clone(),
-                    event: EventVocab::TerminalCancelled,
-                    payload: json!({"status":"cancelled"}),
-                };
-                persisted.next_cursor = persisted.next_cursor.saturating_add(1);
+                if self.config.cancel_command.is_empty() {
+                    let event = NormalizedEvent {
+                        id: format!("{}:turn-{}:cancelled", id, invocation.turn),
+                        cursor: persisted.next_cursor,
+                        session_id: id.clone(),
+                        actor: persisted.marker.clone(),
+                        event: EventVocab::TerminalCancelled,
+                        payload: json!({"status":"cancelled"}),
+                    };
+                    persisted.next_cursor = persisted.next_cursor.saturating_add(1);
+                    Self::append_cached_events(&self.events_path(&id), &[event])?;
+                } else {
+                    let command = self.config.cancel_command.clone();
+                    self.run_control_command(&command, &persisted, None).await?;
+                    self.refresh_inactive_journal(&mut persisted)?;
+                }
                 persisted.turns = persisted.turns.saturating_add(1);
-                Self::append_cached_events(&self.events_path(&id), &[event])?;
                 Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
+                let workspace = self.session_directory(&id).join("workspace");
+                if workspace.exists() {
+                    std::fs::remove_dir_all(&workspace)?;
+                }
+                std::fs::create_dir(&workspace)?;
                 if let Some(item) = self.sessions.get_mut(&id) {
                     item.persisted = persisted;
                 }
@@ -1602,6 +1872,15 @@ impl Driver for PerInvocationDriver {
             .filter_map(|active| active.child.id())
             .collect()
     }
+
+    fn session_pids(&self, session: &SessionId) -> Vec<u32> {
+        self.sessions
+            .get(&session.0)
+            .and_then(|item| item.active.as_ref())
+            .and_then(|active| active.child.id())
+            .into_iter()
+            .collect()
+    }
 }
 
 fn parse_event_records(bytes: &[u8], framing: &str) -> Result<Vec<Value>> {
@@ -1649,6 +1928,24 @@ fn parse_event_records(bytes: &[u8], framing: &str) -> Result<Vec<Value>> {
             "unsupported event framing {other:?}"
         ))),
     }
+}
+
+fn parse_journal_records(bytes: &[u8]) -> Result<Vec<Value>> {
+    let mut records = Vec::new();
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.last() != Some(&b'\n') {
+            // Only a non-newline-terminated final record is a permitted torn tail.
+            break;
+        }
+        let line = trim_ascii(&line[..line.len().saturating_sub(1)]);
+        if line.is_empty() {
+            continue;
+        }
+        records.push(serde_json::from_slice(line).map_err(|error| {
+            AhrbError::Protocol(format!("corrupt durable journal record: {error}"))
+        })?);
+    }
+    Ok(records)
 }
 
 /// One-process-per-operation transport using JSON on stdin and stdout.
@@ -2196,6 +2493,7 @@ mod tests {
             framing: "jsonl".to_owned(),
             id_pointer: String::new(),
             cursor_pointer: String::new(),
+            replay_command: Vec::new(),
             rules: vec![
                 EventRule {
                     matches: "message".to_owned(),
@@ -2224,6 +2522,7 @@ mod tests {
             marker: "actor".to_owned(),
             harness_id: String::new(),
             turns: 1,
+            invocations: 1,
             next_cursor: 1,
             closed: false,
         };
@@ -2311,12 +2610,16 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn worker_pid(path: &Path) -> u32 {
-        std::fs::read_to_string(path)
-            .expect("read worker PID")
-            .trim()
-            .parse()
-            .expect("parse worker PID")
+    async fn worker_pid(path: &Path) -> u32 {
+        for _ in 0..200 {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("worker PID did not become parseable: {}", path.display());
     }
 
     #[cfg(unix)]
@@ -2353,7 +2656,7 @@ mod tests {
             .await
             .expect_err("leader exit must fail readiness");
         assert!(error.to_string().contains("exited before readiness"));
-        let worker = worker_pid(&worker_file);
+        let worker = worker_pid(&worker_file).await;
         assert!(wait_until_pid_is_dead(worker).await);
         std::fs::remove_dir_all(logs).expect("remove daemon logs");
     }
@@ -2388,7 +2691,7 @@ mod tests {
             },
         );
         transport.start().await.expect("start managed daemon");
-        let worker = worker_pid(&worker_file);
+        let worker = worker_pid(&worker_file).await;
         drop(transport);
         assert!(wait_until_pid_is_dead(worker).await);
         std::fs::remove_dir_all(logs).expect("remove daemon logs");

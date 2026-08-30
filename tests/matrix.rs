@@ -1,5 +1,5 @@
 use ahrb::evaluate::{TestOutcome, classify};
-use ahrb::scenarios::{PRIORITIZED_ROWS, all};
+use ahrb::scenarios::{PRIORITIZED_ROWS, RequirementKind, all};
 
 #[test]
 fn matrix_has_exactly_41_ordered_unique_rows() {
@@ -14,15 +14,12 @@ fn matrix_has_exactly_41_ordered_unique_rows() {
 }
 
 #[test]
-fn prioritized_rows_are_present_and_mandatory() {
+fn prioritized_rows_are_present_and_core() {
     for row in PRIORITIZED_ROWS {
         let definition = all().iter().find(|test| test.row == *row);
         assert!(definition.is_some(), "missing priority row {row}");
         if let Some(definition) = definition {
-            assert!(
-                definition.mandatory,
-                "priority row {row} must gate the badge"
-            );
+            assert_eq!(definition.requirement(), RequirementKind::Core);
         }
     }
 }

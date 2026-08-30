@@ -1,7 +1,9 @@
 //! Four-pillar evaluation and badge certification types.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+
+use crate::manifest::{Manifest, TopologyFamily, topology_family};
+use crate::scenarios::{BadgeFacetScope, RequirementKind};
 
 /// Badge-gating benchmark pillar.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -113,31 +115,84 @@ pub fn classify(
     }
 }
 
-/// Return whether the complete mandatory matrix can earn a badge. Unsupported
-/// optional operations are omitted from facets; unsupported mandatory rows
-/// remain honest non-passes and block the core badge.
-pub fn mandatory_passes(results: &[TestResult]) -> bool {
-    crate::scenarios::all()
-        .iter()
-        .filter(|definition| definition.mandatory)
-        .all(|definition| {
-            results.iter().any(|result| {
-                result.row == definition.row && matches!(result.outcome, TestOutcome::Pass)
-            })
-        })
+fn certification_topology(manifest: &Manifest) -> Option<TopologyFamily> {
+    let family = topology_family(&manifest.concurrency.topology)?;
+    let lifecycle_matches = matches!(
+        (manifest.daemon.persistent, family),
+        (false, TopologyFamily::PerInvocation) | (true, TopologyFamily::SharedController)
+    );
+    lifecycle_matches.then_some(family)
 }
 
-/// Construct a badge only when every mandatory row passed.
+fn result_for_row(results: &[TestResult], row: u8) -> Option<&TestResult> {
+    results.iter().find(|result| result.row == row)
+}
+
+fn optional_unsupported_is_honest(manifest: &Manifest, result: &TestResult) -> bool {
+    let Some(definition) = crate::scenarios::all()
+        .iter()
+        .find(|definition| definition.row == result.row)
+    else {
+        return false;
+    };
+    let RequirementKind::OptionalFacet { capability } = definition.requirement() else {
+        return false;
+    };
+    let declared = manifest.capabilities.required.contains_key(capability)
+        || manifest.capabilities.optional.contains_key(capability);
+    !declared
+        && matches!(result.outcome, TestOutcome::Unsupported(_))
+        && matches!(
+            crate::matrix_evidence::capability_for_row(manifest, result.row),
+            crate::matrix_evidence::CapabilityStatus::Unsupported(_)
+        )
+}
+
+/// Return whether every topology-independent CORE row passed.
+pub fn mandatory_passes(results: &[TestResult], manifest: &Manifest) -> bool {
+    certification_topology(manifest).is_some()
+        && crate::scenarios::all()
+            .iter()
+            .filter(|definition| matches!(definition.requirement(), RequirementKind::Core))
+            .all(|definition| {
+                result_for_row(results, definition.row)
+                    .is_some_and(|result| matches!(result.outcome, TestOutcome::Pass))
+            })
+}
+
+fn badge_compatible_results(results: &[TestResult], manifest: &Manifest) -> bool {
+    results.iter().all(|result| {
+        if matches!(result.outcome, TestOutcome::Pass) {
+            let requirement = crate::scenarios::all()
+                .iter()
+                .find(|definition| definition.row == result.row)
+                .map(|definition| definition.requirement());
+            return matches!(requirement, Some(RequirementKind::Core))
+                || (matches!(requirement, Some(RequirementKind::OptionalFacet { .. }))
+                    && matches!(
+                        crate::matrix_evidence::capability_for_row(manifest, result.row),
+                        crate::matrix_evidence::CapabilityStatus::Supported
+                    ));
+        }
+        optional_unsupported_is_honest(manifest, result)
+    })
+}
+
+/// Construct a topology-relative badge only when every CORE row passed and
+/// every other observed row either passed or was an honestly absent facet.
 pub fn certify(
     results: &[TestResult],
+    manifest: &Manifest,
     os: &str,
-    topology: &str,
     parallel_width: usize,
     marginal_bytes: f64,
 ) -> Option<Badge> {
     // Quick certification uses the required N=1,2,4 sweep; the full certification
     // profile reports N=8. The width remains explicit in every badge label.
-    if parallel_width < 4 || !mandatory_passes(results) {
+    if parallel_width < 4
+        || !mandatory_passes(results, manifest)
+        || !badge_compatible_results(results, manifest)
+    {
         return None;
     }
     // This class is meaningful only inside the topology printed on the badge.
@@ -152,35 +207,57 @@ pub fn certify(
     } else {
         "R256+"
     };
-    let facet_rows: BTreeMap<u8, &str> = BTreeMap::from([
-        (18, "native-delegation"),
-        (30, "replay"),
-        (31, "steer"),
-        (32, "subturn"),
-        (33, "queue"),
-        (35, "crash"),
-        (36, "cancel"),
-        (37, "resume"),
-        (39, "hooks"),
-        (40, "journal"),
-    ]);
-    let mut facets = Vec::new();
-    for (row, facet) in facet_rows {
-        if results
-            .iter()
-            .any(|result| result.row == row && matches!(result.outcome, TestOutcome::Pass))
-        {
-            facets.push(facet.to_owned());
-        }
-    }
+    let mut badge_facets = crate::scenarios::BADGE_FACETS.to_vec();
+    badge_facets.sort_by_key(|facet| facet.order);
+    let topology_family = certification_topology(manifest)?;
+    let facets = badge_facets
+        .into_iter()
+        .filter(|facet| {
+            let topology_applies = matches!(facet.scope, BadgeFacetScope::All)
+                || matches!(
+                    (facet.scope, topology_family),
+                    (
+                        BadgeFacetScope::PerInvocation,
+                        TopologyFamily::PerInvocation
+                    )
+                );
+            topology_applies
+                && result_for_row(results, facet.row)
+                    .is_some_and(|result| matches!(result.outcome, TestOutcome::Pass))
+                && crate::scenarios::all()
+                    .iter()
+                    .find(|definition| definition.row == facet.row)
+                    .is_some_and(|definition| {
+                        matches!(definition.requirement(), RequirementKind::Core)
+                            || matches!(
+                                crate::matrix_evidence::capability_for_row(manifest, facet.row),
+                                crate::matrix_evidence::CapabilityStatus::Supported
+                            )
+                    })
+        })
+        .map(|facet| facet.label.to_owned())
+        .collect();
     Some(Badge {
         os: os.to_owned(),
-        topology: topology.to_owned(),
+        topology: manifest.concurrency.topology.clone(),
         parallel_width,
         resource_class: resource_class.to_owned(),
         facets,
         comparison_scope: "within-topology-only".to_owned(),
     })
+}
+
+/// Return the process status for a completed report. Badge eligibility and
+/// process health are separate: only an observed FAIL or ERROR is nonzero.
+pub fn suite_exit_code(
+    results: &[TestResult],
+    _badge: Option<&Badge>,
+    _manifest: &Manifest,
+) -> i32 {
+    let has_failure_or_error = results
+        .iter()
+        .any(|result| matches!(result.outcome, TestOutcome::Fail(_) | TestOutcome::Error(_)));
+    if has_failure_or_error { 1 } else { 0 }
 }
 
 /// Render the normative badge label.

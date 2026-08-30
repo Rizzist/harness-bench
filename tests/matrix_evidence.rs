@@ -152,6 +152,14 @@ fn capability_resolution_treats_missing_operations_as_unsupported() {
 
 #[test]
 fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
+    let mut reduced_manifest = manifest();
+    reduced_manifest
+        .capabilities
+        .optional
+        .remove("native_delegation");
+    reduced_manifest.agents.spawn.clear();
+    reduced_manifest.agents.status.clear();
+    reduced_manifest.agents.collect.clear();
     let results = ahrb::scenarios::all()
         .iter()
         .map(|definition| TestResult {
@@ -166,9 +174,12 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
             evidence: vec!["capability: explicit".to_owned()],
         })
         .collect::<Vec<_>>();
-    assert_eq!(suite_exit_code(&results), 0);
-    let badge = certify(&results, "macos", "shared-daemon-sessions", 8, 1.0)
+    let badge = certify(&results, &reduced_manifest, "macos", 8, 1.0)
         .expect("unsupported facet does not suppress badge");
+    assert_eq!(
+        suite_exit_code(&results, Some(&badge), &reduced_manifest),
+        0
+    );
     assert!(
         !badge
             .facets
@@ -177,27 +188,21 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
     );
     assert!(badge.facets.iter().any(|facet| facet == "queue"));
 
-    let mandatory_unsupported = results
+    let core_unsupported = results
         .iter()
         .cloned()
         .map(|mut result| {
-            if result.row == 31 {
-                result.outcome = TestOutcome::Unsupported("steer operation is absent".to_owned());
+            if result.row == 40 {
+                result.outcome = TestOutcome::Unsupported("durable journal is absent".to_owned());
             }
             result
         })
         .collect::<Vec<_>>();
-    assert_eq!(suite_exit_code(&mandatory_unsupported), 1);
-    assert!(
-        certify(
-            &mandatory_unsupported,
-            "macos",
-            "shared-daemon-sessions",
-            8,
-            1.0
-        )
-        .is_none()
+    assert_eq!(
+        suite_exit_code(&core_unsupported, None, &reduced_manifest),
+        0
     );
+    assert!(certify(&core_unsupported, &reduced_manifest, "macos", 8, 1.0).is_none());
 }
 
 #[test]

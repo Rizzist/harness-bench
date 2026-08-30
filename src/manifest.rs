@@ -313,6 +313,26 @@ pub struct Concurrency {
     pub release: Vec<String>,
 }
 
+/// Lifecycle family used by topology-relative certification policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyFamily {
+    /// Every turn is owned by a fresh client or worker process.
+    PerInvocation,
+    /// Sessions share a persistent daemon or native sibling controller.
+    SharedController,
+}
+
+/// Classify a normative topology label without erasing the original report label.
+pub fn topology_family(topology: &str) -> Option<TopologyFamily> {
+    match topology {
+        "client-process-fanout" | "worker-processes" => Some(TopologyFamily::PerInvocation),
+        "shared-daemon-sessions" | "native-sibling-fanout" => {
+            Some(TopologyFamily::SharedController)
+        }
+        _ => None,
+    }
+}
+
 /// Tool aliases, schema bindings, and safe fixture commands.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ToolSemantics {
@@ -343,6 +363,9 @@ pub struct EventMapping {
     /// Resume cursor pointer.
     #[serde(default)]
     pub cursor_pointer: String,
+    /// Optional argv that reopens the harness journal and emits normalized JSONL.
+    #[serde(default)]
+    pub replay_command: Vec<String>,
     /// Ordered normalization rules.
     #[serde(default)]
     pub rules: Vec<EventRule>,
@@ -556,17 +579,13 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "concurrency.max_agents must be positive".to_owned(),
         ));
     }
-    let per_invocation_topology = matches!(
-        manifest.concurrency.topology.as_str(),
-        "client-process-fanout" | "worker-processes"
+    let topology_family = topology_family(&manifest.concurrency.topology);
+    let topology_matches_lifecycle = matches!(
+        (manifest.daemon.persistent, topology_family),
+        (false, Some(TopologyFamily::PerInvocation))
+            | (true, Some(TopologyFamily::SharedController))
     );
-    let daemon_topology = matches!(
-        manifest.concurrency.topology.as_str(),
-        "shared-daemon-sessions" | "native-sibling-fanout"
-    );
-    if (!manifest.daemon.persistent && !per_invocation_topology)
-        || (manifest.daemon.persistent && !daemon_topology)
-    {
+    if !topology_matches_lifecycle {
         return Err(AhrbError::Validation(format!(
             "daemon.persistent={} conflicts with concurrency.topology {:?}",
             manifest.daemon.persistent, manifest.concurrency.topology

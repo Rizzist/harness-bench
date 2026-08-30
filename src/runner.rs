@@ -6,7 +6,7 @@ use crate::driver::{
     ManagedDaemonTransport, PerInvocationConfig, PerInvocationDriver, SocketJsonRpcTransport,
     StdinRpcTransport, Transport,
 };
-use crate::evaluate::{Assertion, TestOutcome, TestResult, certify, classify};
+use crate::evaluate::{Assertion, TestResult, certify, classify, suite_exit_code};
 use crate::events::{EventVocab, NormalizedEvent};
 use crate::fake_model::{FakeModelEngine, FakeModelServer, FakeModelUnixServer};
 use crate::manifest::{Manifest, TransportKind};
@@ -65,6 +65,8 @@ struct RunState {
     events: BTreeMap<u8, Vec<NormalizedEvent>>,
     sessions: BTreeMap<u8, Vec<crate::driver::SessionId>>,
     samples: Vec<Sample>,
+    session_replay_valid: Option<bool>,
+    session_replay_detail: Option<String>,
     crash_recovery_ms: Option<f64>,
     crash_recovery_tree_cleared: Option<bool>,
     crash_recovery_valid: Option<bool>,
@@ -73,6 +75,10 @@ struct RunState {
     journal_recovery_valid: Option<bool>,
     journal_recovery_detail: Option<String>,
     journal_torn_tail_injected: Option<bool>,
+    cancel_cleanup_valid: Option<bool>,
+    cancel_cleanup_detail: Option<String>,
+    resume_idempotency_valid: Option<bool>,
+    resume_idempotency_detail: Option<String>,
     parallel_agents: usize,
     resource_evidence: Option<ResourceEvidence>,
     per_invocation_resources: Vec<PerInvocationObservation>,
@@ -86,8 +92,8 @@ struct PerInvocationResourceCollection {
 fn per_invocation_topology(manifest: &Manifest) -> bool {
     !manifest.daemon.persistent
         && matches!(
-            manifest.concurrency.topology.as_str(),
-            "client-process-fanout" | "worker-processes"
+            crate::manifest::topology_family(&manifest.concurrency.topology),
+            Some(crate::manifest::TopologyFamily::PerInvocation)
         )
 }
 
@@ -295,6 +301,44 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     }
 
     let mut precollected_events = BTreeMap::new();
+    let mut session_replay_valid = None;
+    let mut session_replay_detail = None;
+    let mut cancel_cleanup_valid = None;
+    let mut cancel_cleanup_detail = None;
+    let mut resume_idempotency_valid = None;
+    let mut resume_idempotency_detail = None;
+    if let Some(session) = sessions.get(&36).and_then(|items| items.first()) {
+        wait_for_session_event(
+            &mut driver,
+            session,
+            EventVocab::TurnAccepted,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+        let roots = driver.session_pids(session);
+        driver.cancel(session).await?;
+        if per_invocation_topology(&manifest) {
+            let process_cleared = !roots.is_empty()
+                && await_owned_tree_empty(
+                    platform_sampler.as_mut(),
+                    &roots,
+                    Duration::from_millis(manifest.daemon.grace_ms.max(100)),
+                )
+                .await?;
+            let workspace_cleared = per_invocation_workspaces_clean(&profile_root, session)?;
+            cancel_cleanup_valid = Some(process_cleared && workspace_cleared);
+            cancel_cleanup_detail = Some(format!(
+                "terminated {} one-shot process root(s): cleared={process_cleared}; driver and harness workspaces clean={workspace_cleared}",
+                roots.len()
+            ));
+        } else {
+            cancel_cleanup_valid = Some(true);
+            cancel_cleanup_detail = Some(
+                "shared controller acknowledged session cancellation; terminal evidence verifies cleanup"
+                    .to_owned(),
+            );
+        }
+    }
     if let Some(session) = sessions.get(&16).and_then(|items| items.first()) {
         let mut after = None;
         let mut transcript = Vec::new();
@@ -332,6 +376,117 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         precollected_events.insert(16_u8, transcript);
     }
 
+    if let Some(session) = sessions.get(&30).and_then(|items| items.first()) {
+        let original = collect_session_terminal(
+            &mut driver,
+            session,
+            None,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+        let after = original
+            .first()
+            .map(|event| Cursor(event.cursor))
+            .ok_or_else(|| AhrbError::Protocol("row-30 replay source was empty".to_owned()))?;
+        driver.resume(session).await?;
+        let suffix = driver.attach(session, Some(after)).await?;
+        let suffix_validation = validate_recovered_suffix(&original, Some(after), &suffix);
+        let last_a = original
+            .last()
+            .map(|event| Cursor(event.cursor))
+            .ok_or_else(|| AhrbError::Protocol("row-30 replay source was empty".to_owned()))?;
+        let turn_b_prompt = format!(
+            "AHRB matrix row 30 continued turn B {}",
+            route_marker(&workflow.scenario, "r30b", "start")
+        );
+        driver
+            .submit(session, &turn_b_prompt, "row-30-turn-2")
+            .await?;
+        let turn_b = collect_session_terminal(
+            &mut driver,
+            session,
+            Some(last_a),
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+        let mut transcript = original;
+        transcript.extend(turn_b);
+        let accepted = transcript
+            .iter()
+            .filter(|event| event.event == EventVocab::TurnAccepted)
+            .count();
+        let terminals = transcript
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count();
+        let continued_b = accepted == 2 && terminals == 2;
+        match suffix_validation {
+            Ok(()) if continued_b => {
+                session_replay_valid = Some(true);
+                session_replay_detail = Some(format!(
+                    "reopened the persisted session journal, replayed {} exact events strictly after cursor {}, then continued turn B in the same session",
+                    suffix.len(),
+                    after.0
+                ));
+            }
+            Ok(()) => {
+                session_replay_valid = Some(false);
+                session_replay_detail = Some(format!(
+                    "replay suffix was exact, but turn B did not complete distinctly: accepted={accepted}, terminals={terminals}"
+                ));
+            }
+            Err(detail) => {
+                session_replay_valid = Some(false);
+                session_replay_detail = Some(detail);
+            }
+        }
+        precollected_events.insert(30_u8, transcript);
+    }
+
+    if let Some(session) = sessions.get(&37).and_then(|items| items.first()) {
+        let original = collect_session_terminal(
+            &mut driver,
+            session,
+            None,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+        driver.resume(session).await?;
+        let actor = workflow
+            .actors
+            .get("r37")
+            .ok_or_else(|| AhrbError::Protocol("row-37 workflow actor is absent".to_owned()))?;
+        driver
+            .submit(session, &actor.prompt, "row-37-turn-1")
+            .await?;
+        let replayed = collect_session_terminal(
+            &mut driver,
+            session,
+            None,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+        let accepted = replayed
+            .iter()
+            .filter(|event| event.event == EventVocab::TurnAccepted)
+            .count();
+        let effects = replayed
+            .iter()
+            .filter(|event| event.event == EventVocab::ToolResult)
+            .count();
+        let terminals = replayed
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count();
+        let unchanged = replayed == original;
+        let valid = unchanged && accepted == 1 && effects == 1 && terminals == 1;
+        resume_idempotency_valid = Some(valid);
+        resume_idempotency_detail = Some(format!(
+            "disk reopen plus duplicate submit preserved the exact journal: unchanged={unchanged}, accepted={accepted}, committed_effects={effects}, terminals={terminals}"
+        ));
+        precollected_events.insert(37_u8, replayed);
+    }
+
     if let Some(parent) = sessions.get(&18).and_then(|items| items.first()) {
         let _child = driver
             .spawn_agent(parent, "ahrb-matrix-v1:r18-child", None)
@@ -354,13 +509,6 @@ pub async fn run(options: RunOptions) -> Result<i32> {
             .queue(session, &actor.prompt, "row-33-queued-turn")
             .await?;
     }
-    if let Some(session) = sessions.get(&37).and_then(|items| items.first()) {
-        driver.resume(session).await?;
-    }
-    if let Some(session) = sessions.get(&36).and_then(|items| items.first()) {
-        driver.cancel(session).await?;
-    }
-
     let needs_recovery = [35_u8, 40].iter().any(|row| {
         selected_rows.contains(row)
             && matches!(
@@ -421,7 +569,9 @@ pub async fn run(options: RunOptions) -> Result<i32> {
 
     let sessions_to_collect: BTreeMap<_, _> = sessions
         .iter()
-        .filter(|(row, _)| **row != 16 && !(needs_recovery && matches!(**row, 35 | 40)))
+        .filter(|(row, _)| {
+            !(precollected_events.contains_key(row) || needs_recovery && matches!(**row, 35 | 40))
+        })
         .map(|(row, sessions)| (*row, sessions.clone()))
         .collect();
     let mut events = collect_terminals(
@@ -453,14 +603,19 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     let mut journal_torn_tail_injected = None;
     if needs_recovery {
         let recovery_started = Instant::now();
-        let owned_tree = platform_sampler.discover(&main_roots)?;
+        let recovery_roots = if main_roots.is_empty() {
+            driver.owned_pids()
+        } else {
+            main_roots.clone()
+        };
+        let owned_tree = platform_sampler.discover(&recovery_roots)?;
         let had_owned_process = !owned_tree.members.is_empty();
         signal_owned_tree(&owned_tree)?;
         drop(driver);
         let tree_cleared = had_owned_process
             && await_owned_tree_empty(
                 platform_sampler.as_mut(),
-                &main_roots,
+                &recovery_roots,
                 Duration::from_millis(manifest.daemon.grace_ms.max(100)),
             )
             .await?;
@@ -543,7 +698,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
                 let after = original
                     .first()
                     .map(|event| crate::driver::Cursor(event.cursor));
-                match recovered.attach(session, after).await {
+                match recovered.replay_persisted(session, after).await {
                     Ok(suffix) => {
                         journal_recovered_events = Some(suffix.len());
                         match validate_recovered_suffix(&original, after, &suffix) {
@@ -589,6 +744,8 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         events,
         sessions,
         samples,
+        session_replay_valid,
+        session_replay_detail,
         crash_recovery_ms,
         crash_recovery_tree_cleared,
         crash_recovery_valid,
@@ -597,6 +754,10 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         journal_recovery_valid,
         journal_recovery_detail,
         journal_torn_tail_injected,
+        cancel_cleanup_valid,
+        cancel_cleanup_detail,
+        resume_idempotency_valid,
+        resume_idempotency_detail,
         parallel_agents,
         resource_evidence,
         per_invocation_resources: per_invocation_collection
@@ -701,8 +862,8 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     }
     let badge = certify(
         &results,
+        &manifest,
         std::env::consts::OS,
-        &manifest.concurrency.topology,
         state.parallel_agents,
         marginal_bytes,
     );
@@ -780,20 +941,11 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         model_requests,
     };
     crate::report::write_bundle(&report, &options.output, options.junit)?;
-    Ok(
-        if report.results.iter().all(|result| {
-            matches!(result.outcome, TestOutcome::Pass)
-                || (matches!(result.outcome, TestOutcome::Unsupported(_))
-                    && crate::scenarios::all()
-                        .iter()
-                        .find(|definition| definition.row == result.row)
-                        .is_some_and(|definition| !definition.mandatory))
-        }) {
-            0
-        } else {
-            1
-        },
-    )
+    Ok(suite_exit_code(
+        &report.results,
+        report.badge.as_ref(),
+        &manifest,
+    ))
 }
 
 fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
@@ -964,6 +1116,9 @@ fn make_driver(
         return Ok(Box::new(PerInvocationDriver::new(PerInvocationConfig {
             command: first_command,
             resume_command,
+            release_command: resolve_local_program(&manifest.concurrency.release)?,
+            cancel_command: resolve_local_program(&manifest.agents.cancel)?,
+            replay_command: resolve_local_program(&manifest.events.replay_command)?,
             environment: environment.clone(),
             profile_root: profile_root.to_path_buf(),
             events: manifest.events.clone(),
@@ -1167,6 +1322,30 @@ fn build_workflow(
                 barrier: None,
             });
         }
+    }
+    if rows.contains(&30) {
+        actors.insert(
+            "r30b".to_owned(),
+            Actor {
+                id: "r30b".to_owned(),
+                parent: Some("r30".to_owned()),
+                prompt: "AHRB session replay continuation B".to_owned(),
+                workspace: profile_root
+                    .join("workspaces")
+                    .join("r30")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        );
+        responses.push(ScriptedResponse {
+            scenario: scenario.to_owned(),
+            actor: "r30b".to_owned(),
+            checkpoint: "start".to_owned(),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: None,
+            barrier: None,
+        });
     }
     if rows.iter().any(|row| (20..=29).contains(row)) {
         add_resource_workflow(
@@ -1550,7 +1729,7 @@ fn scripted_row(
                 response("terminal", success_value(), None),
             ]
         }
-        2 | 8 | 13 | 15 => {
+        2 | 8 | 13 | 15 | 37 => {
             let call = mapped_tool_call(
                 manifest,
                 "write",
@@ -1723,6 +1902,34 @@ async fn collect_session_terminal(
             return Err(AhrbError::Timeout(format!(
                 "exec session {} did not terminalize",
                 session.0
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_session_event(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    expected: EventVocab,
+    deadline: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let events = driver.attach(session, None).await?;
+        if events.iter().any(|event| event.event == expected) {
+            return Ok(());
+        }
+        if events.iter().any(|event| is_terminal(&event.event)) {
+            return Err(AhrbError::Protocol(format!(
+                "session {} terminalized before {:?}",
+                session.0, expected
+            )));
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "session {} did not emit {:?}",
+                session.0, expected
             )));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1905,8 +2112,10 @@ fn evaluate_rows(
                     ),
                 ),
                 30 => (
-                    state.sessions.get(&30).is_some_and(|sessions| !sessions.is_empty()),
-                    "attach-after-cursor replayed the durable session suffix".to_owned(),
+                    state.session_replay_valid == Some(true),
+                    state.session_replay_detail.clone().unwrap_or_else(|| {
+                        "no disk-backed attach-after-cursor replay evidence was recorded".to_owned()
+                    }),
                 ),
                 35 => (
                     state.crash_recovery_tree_cleared == Some(true)
@@ -1929,10 +2138,21 @@ fn evaluate_rows(
                         .filter(|event| event.event == EventVocab::TerminalCancelled)
                         .count();
                     (
-                        cancelled == 1,
-                        format!("observed {cancelled} cancellation terminal and bounded cleanup"),
+                        cancelled == 1 && state.cancel_cleanup_valid == Some(true),
+                        format!(
+                            "observed {cancelled} cancellation terminal; {}",
+                            state.cancel_cleanup_detail.as_deref().unwrap_or(
+                                "no process/workspace cleanup evidence was recorded"
+                            )
+                        ),
                     )
                 }
+                37 => (
+                    state.resume_idempotency_valid == Some(true),
+                    state.resume_idempotency_detail.clone().unwrap_or_else(|| {
+                        "no disk-reopen duplicate-submit evidence was recorded".to_owned()
+                    }),
+                ),
                 39 => {
                     let hooks = events.iter().filter(|event| event.event == EventVocab::HookCompleted).count();
                     (hooks >= 2, format!("observed {hooks} fsync-ordered hook completions"))
@@ -3868,6 +4088,34 @@ async fn await_owned_tree_empty(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn per_invocation_workspaces_clean(
+    profile_root: &Path,
+    session: &crate::driver::SessionId,
+) -> Result<bool> {
+    let paths = [
+        profile_root
+            .join("ahrb-exec-sessions")
+            .join(&session.0)
+            .join("workspace"),
+        profile_root
+            .join("state")
+            .join("workspaces")
+            .join(&session.0),
+    ];
+    for path in paths {
+        match std::fs::read_dir(&path) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Ok(false);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 fn inject_torn_journal_tail(

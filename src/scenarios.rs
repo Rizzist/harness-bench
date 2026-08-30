@@ -13,13 +13,144 @@ pub struct TestDefinition {
     pub name: &'static str,
     /// Badge-gating pillar.
     pub pillar: Pillar,
-    /// Whether absence/unsupported blocks the core badge.
-    pub mandatory: bool,
     /// Measurement named by the specification.
     pub metric: &'static str,
     /// Concise deterministic pass criterion.
     pub pass_criteria: &'static str,
 }
+
+/// Topology-relative certification role carried by a matrix row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequirementKind {
+    /// A topology-independent row that every certifiable harness must pass.
+    Core,
+    /// An architectural facet that may be honestly unsupported.
+    OptionalFacet {
+        /// Manifest capability declaration associated with this facet.
+        capability: &'static str,
+    },
+}
+
+/// One deterministic suffix component shown when its matrix row passes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BadgeFacet {
+    /// Matrix row proving this facet.
+    pub row: u8,
+    /// Stable badge-label component.
+    pub label: &'static str,
+    /// Explicit display order independent of matrix row order.
+    pub order: u8,
+    /// Topology families on which this label is shown.
+    pub scope: BadgeFacetScope,
+}
+
+/// Topology scope for one badge suffix component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BadgeFacetScope {
+    /// Show whenever the proving row passes.
+    All,
+    /// Show only for fresh-process-per-turn architectures.
+    PerInvocation,
+}
+
+impl TestDefinition {
+    /// Return this row's certification role from authoritative matrix metadata.
+    pub fn requirement(self) -> RequirementKind {
+        OPTIONAL_FACETS
+            .iter()
+            .find(|facet| facet.row == self.row)
+            .map_or(RequirementKind::Core, |facet| {
+                RequirementKind::OptionalFacet {
+                    capability: facet.capability,
+                }
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OptionalFacet {
+    row: u8,
+    capability: &'static str,
+}
+
+const OPTIONAL_FACETS: [OptionalFacet; 6] = [
+    OptionalFacet {
+        row: 4,
+        capability: "parallel_tool_execution",
+    },
+    OptionalFacet {
+        row: 18,
+        capability: "native_delegation",
+    },
+    OptionalFacet {
+        row: 31,
+        capability: "steer",
+    },
+    OptionalFacet {
+        row: 32,
+        capability: "pre_tool_intervention",
+    },
+    OptionalFacet {
+        row: 33,
+        capability: "queue",
+    },
+    OptionalFacet {
+        row: 39,
+        capability: "hooks",
+    },
+];
+
+/// Badge suffix components and their normative display order.
+pub const BADGE_FACETS: &[BadgeFacet] = &[
+    BadgeFacet {
+        row: 30,
+        label: "replay",
+        order: 10,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 35,
+        label: "crash",
+        order: 20,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 37,
+        label: "resume",
+        order: 25,
+        scope: BadgeFacetScope::PerInvocation,
+    },
+    BadgeFacet {
+        row: 31,
+        label: "steer",
+        order: 30,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 33,
+        label: "queue",
+        order: 40,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 18,
+        label: "native-delegation",
+        order: 50,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 32,
+        label: "subturn",
+        order: 60,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 39,
+        label: "hooks",
+        order: 70,
+        scope: BadgeFacetScope::All,
+    },
+];
 
 /// Return all matrix definitions in row order.
 pub fn all() -> &'static [TestDefinition] {
@@ -40,7 +171,6 @@ const TESTS: [TestDefinition; 41] = [
         "routing",
         "Exact model+endpoint+credential routing",
         TC,
-        true,
         "observed model routes",
         "all roles use only the configured local tuple",
     ),
@@ -49,7 +179,6 @@ const TESTS: [TestDefinition; 41] = [
         "single-tool-call",
         "Single tool call in one turn",
         TC,
-        true,
         "tool effects and correlations",
         "one byte-matching call, effect, result, and terminal",
     ),
@@ -58,7 +187,6 @@ const TESTS: [TestDefinition; 41] = [
         "sequential-tool-calls",
         "Multiple sequential tool calls",
         TC,
-        true,
         "ordered tool effects",
         "A then dependent B execute exactly once",
     ),
@@ -67,7 +195,6 @@ const TESTS: [TestDefinition; 41] = [
         "parallel-tool-calls",
         "Parallel tool calls in one turn",
         TC,
-        false,
         "overlap and result association",
         "both calls overlap and correlate despite reversed release",
     ),
@@ -76,7 +203,6 @@ const TESTS: [TestDefinition; 41] = [
         "fragmented-tool-args",
         "Fragmented streamed args",
         TC,
-        true,
         "reassembled arguments",
         "exact JSON is invoked once after complete assembly",
     ),
@@ -85,7 +211,6 @@ const TESTS: [TestDefinition; 41] = [
         "failed-tool-result",
         "Failed tool execution as structured result",
         TC,
-        true,
         "structured failed result",
         "typed failure reaches the next model request",
     ),
@@ -94,7 +219,6 @@ const TESTS: [TestDefinition; 41] = [
         "malformed-tool-call",
         "Malformed or unknown tool call",
         TC,
-        true,
         "protocol failure",
         "structured failure with no unintended tool run",
     ),
@@ -103,7 +227,6 @@ const TESTS: [TestDefinition; 41] = [
         "tool-id-dedup",
         "Tool-call ID dedup and order preservation",
         TC,
-        true,
         "IDs, order, and effects",
         "replayed frames never duplicate semantic effects",
     ),
@@ -112,7 +235,6 @@ const TESTS: [TestDefinition; 41] = [
         "terminal-success",
         "Structured terminal success",
         TC,
-        true,
         "terminal events and exit",
         "exactly one SUCCESS with the documented success exit",
     ),
@@ -121,7 +243,6 @@ const TESTS: [TestDefinition; 41] = [
         "terminal-failure",
         "Structured terminal failure",
         TC,
-        true,
         "terminal events and exit",
         "exactly one distinct FAILURE with stable nonzero exit",
     ),
@@ -130,7 +251,6 @@ const TESTS: [TestDefinition; 41] = [
         "upstream-retry",
         "Transient upstream retry and normalization",
         TC,
-        true,
         "retry count and effects",
         "bounded retry terminalizes with at most one effect",
     ),
@@ -139,7 +259,6 @@ const TESTS: [TestDefinition; 41] = [
         "idle-deadline",
         "Client-side idle-deadline self-abort",
         TC,
-        true,
         "last-byte to own terminal",
         "structured self-failure occurs before the outer deadline",
     ),
@@ -148,7 +267,6 @@ const TESTS: [TestDefinition; 41] = [
         "workspace-effects",
         "Workspace and patch effects independent of stdout",
         TC,
-        true,
         "fixture hashes",
         "file effects match even when stdout truncates",
     ),
@@ -157,7 +275,6 @@ const TESTS: [TestDefinition; 41] = [
         "state-network-confinement",
         "Per-run state and network confinement",
         TC,
-        true,
         "outside writes and connections",
         "all undeclared access fails closed",
     ),
@@ -166,7 +283,6 @@ const TESTS: [TestDefinition; 41] = [
         "headless-workflow",
         "Headless tool workflow",
         FN,
-        true,
         "effect, terminal, and exit",
         "sole marker effect succeeds without human input",
     ),
@@ -175,7 +291,6 @@ const TESTS: [TestDefinition; 41] = [
         "transcript-determinism",
         "Multi-turn transcript determinism",
         FN,
-        true,
         "five semantic transcript hashes",
         "all hashes and event counts are identical",
     ),
@@ -184,7 +299,6 @@ const TESTS: [TestDefinition; 41] = [
         "actor-isolation",
         "Concurrent actor isolation",
         FN,
-        true,
         "per-actor effects",
         "no token or workspace crosses actor boundaries",
     ),
@@ -193,7 +307,6 @@ const TESTS: [TestDefinition; 41] = [
         "native-delegation",
         "Native delegation",
         FN,
-        false,
         "durable children and reports",
         "one native child and one report per spawn",
     ),
@@ -202,7 +315,6 @@ const TESTS: [TestDefinition; 41] = [
         "exit-codes",
         "Deterministic exit codes",
         FN,
-        true,
         "six exits over five repetitions",
         "each category has one invariant documented exit",
     ),
@@ -211,7 +323,6 @@ const TESTS: [TestDefinition; 41] = [
         "idle-rss",
         "Idle RSS baseline at rest",
         RS,
-        true,
         "whole-tree RSS plateau",
         "topology is classified and relative spread is at most 5%",
     ),
@@ -220,7 +331,6 @@ const TESTS: [TestDefinition; 41] = [
         "idle-cpu",
         "Idle CPU and busy-poll detection",
         RS,
-        true,
         "whole-tree CPU over quiet window",
         "at most 1% of one core with no polling signature",
     ),
@@ -229,7 +339,6 @@ const TESTS: [TestDefinition; 41] = [
         "idle-drift",
         "Idle memory drift at rest",
         RS,
-        true,
         "RSS slope and net growth",
         "at most 1 MiB/min and 8 MiB net",
     ),
@@ -238,7 +347,6 @@ const TESTS: [TestDefinition; 41] = [
         "return-to-idle",
         "Return to idle after workflow",
         RS,
-        true,
         "post-workload residual",
         "residual is within max(64 MiB, 20% active delta)",
     ),
@@ -247,7 +355,6 @@ const TESTS: [TestDefinition; 41] = [
         "cold-start",
         "Cold start to steady idle",
         RS,
-        true,
         "readiness, cold peak, plateau",
         "startup bound and profile cold peak are met",
     ),
@@ -256,7 +363,6 @@ const TESTS: [TestDefinition; 41] = [
         "single-agent-resource",
         "Single-agent footprint and CPU per turn",
         RS,
-        true,
         "B, S1, peak, and CPU",
         "CPU is at most 250ms and barrier CPU below 5%",
     ),
@@ -265,7 +371,6 @@ const TESTS: [TestDefinition; 41] = [
         "parallel-memory",
         "Parallel-agent memory delta and total peak",
         RS,
-        true,
         "N=1,2,4,8 sweep",
         "N8 completes, peak at most 4 GiB, beta at most 256 MiB",
     ),
@@ -274,7 +379,6 @@ const TESTS: [TestDefinition; 41] = [
         "scaling-curve",
         "Parallel scaling curve",
         RS,
-        true,
         "alpha and adjacent marginals",
         "alpha at most 1.20 with no unexplained marginal jump",
     ),
@@ -283,7 +387,6 @@ const TESTS: [TestDefinition; 41] = [
         "post-close-reclaim",
         "Post-completion reclaim",
         RS,
-        true,
         "reclaim and residual",
         "at least 80% reclaim and no owned worker remains",
     ),
@@ -292,7 +395,6 @@ const TESTS: [TestDefinition; 41] = [
         "long-horizon",
         "Long-horizon stability",
         RS,
-        true,
         "1000-turn drift and leaks",
         "at most 64 KiB/turn with bounded final residual",
     ),
@@ -301,7 +403,6 @@ const TESTS: [TestDefinition; 41] = [
         "session-replay",
         "Session persist and replay",
         AR,
-        true,
         "cursor-addressed recovered suffix",
         "ordered suffix appears exactly once in the same session",
     ),
@@ -310,7 +411,6 @@ const TESTS: [TestDefinition; 41] = [
         "steer",
         "Safe-boundary next prompt",
         AR,
-        true,
         "injected safe-boundary input",
         "input affects the active run exactly once",
     ),
@@ -319,7 +419,6 @@ const TESTS: [TestDefinition; 41] = [
         "subturn",
         "Pre-tool next prompt",
         AR,
-        false,
         "input/effect ordering",
         "input is observed before the pending effect",
     ),
@@ -328,7 +427,6 @@ const TESTS: [TestDefinition; 41] = [
         "queued-turn",
         "Queued next turn",
         AR,
-        true,
         "turn order and counts",
         "A terminal precedes one distinct execution of B",
     ),
@@ -337,7 +435,6 @@ const TESTS: [TestDefinition; 41] = [
         "noninteractive",
         "Autonomous no-interactive-prompt",
         AR,
-        true,
         "closed-stdin execution",
         "allowed succeeds and denied fails without a prompt",
     ),
@@ -346,7 +443,6 @@ const TESTS: [TestDefinition; 41] = [
         "crash-recovery",
         "Crash recovery kill and resume",
         AR,
-        true,
         "recovery latency and effects",
         "ready within 10s and committed effect occurs at most once",
     ),
@@ -355,7 +451,6 @@ const TESTS: [TestDefinition; 41] = [
         "cancel-cleanup",
         "Cancellation and cleanup",
         AR,
-        true,
         "terminal latency, orphans, residual",
         "all cancel within 5s and no owned PID remains",
     ),
@@ -364,7 +459,6 @@ const TESTS: [TestDefinition; 41] = [
         "resume-idempotency",
         "Resume idempotency",
         AR,
-        true,
         "semantic turns and effects",
         "duplicate transport requests yield one turn and effect",
     ),
@@ -373,7 +467,6 @@ const TESTS: [TestDefinition; 41] = [
         "resource-bounds",
         "Resource-bound honoring",
         AR,
-        true,
         "observed concurrency and deadlines",
         "limits are never exceeded and excess is typed",
     ),
@@ -382,7 +475,6 @@ const TESTS: [TestDefinition; 41] = [
         "hooks",
         "Hook firing",
         AR,
-        false,
         "committed hook events",
         "acceptance and completion hooks each fire once",
     ),
@@ -391,7 +483,6 @@ const TESTS: [TestDefinition; 41] = [
         "durable-journal",
         "Durable journal",
         AR,
-        true,
         "recovered order and tail integrity",
         "no committed loss or duplicate and no torn corrupt tail",
     ),
@@ -400,7 +491,6 @@ const TESTS: [TestDefinition; 41] = [
         "profile-network-isolation",
         "Profile and network isolation",
         AR,
-        true,
         "outside access and secret scans",
         "all roles use isolated roots and only fake endpoint egress",
     ),
@@ -411,7 +501,6 @@ const fn test(
     id: &'static str,
     name: &'static str,
     pillar: Pillar,
-    mandatory: bool,
     metric: &'static str,
     pass_criteria: &'static str,
 ) -> TestDefinition {
@@ -420,7 +509,6 @@ const fn test(
         id,
         name,
         pillar,
-        mandatory,
         metric,
         pass_criteria,
     }

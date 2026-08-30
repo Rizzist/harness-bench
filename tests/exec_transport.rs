@@ -98,6 +98,8 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
         "{{profile}}/state".to_owned(),
         "--marker".to_owned(),
         "{{marker}}".to_owned(),
+        "--session-id".to_owned(),
+        "{{session_id}}".to_owned(),
         "--prompt".to_owned(),
         "{{prompt}}".to_owned(),
         "--key".to_owned(),
@@ -115,6 +117,9 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
     PerInvocationDriver::new(PerInvocationConfig {
         command: command.clone(),
         resume_command: command,
+        release_command: Vec::new(),
+        cancel_command: Vec::new(),
+        replay_command: Vec::new(),
         environment: BTreeMap::from([("AHRB_MOCK_MODEL".to_owned(), "ahrb-fake-v1".to_owned())]),
         profile_root: profile.to_path_buf(),
         events,

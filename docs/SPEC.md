@@ -13,20 +13,22 @@ platform FFI (libc / mach for macOS, procfs reads for Linux). Cross-platform: ma
 (arm64/x86-64) and Linux (x86-64/aarch64). This machine is macOS arm64 — the macOS
 sampler MUST work; gate Linux-only code behind `#[cfg(target_os="linux")]`.
 
-## Four pillars (all badge-gating; single combined test suite drives all four)
+## Four pillars (topology-relative core badge gate; one suite drives all four)
 1. **tool-call correctness** — exact model/provider/credential routing; tool-call
    execution/args/results; streamed-arg reassembly; error normalization; retry safety;
    structured terminal success AND failure; filesystem/patch effects; sandbox isolation;
    and the **client-side idle-deadline self-abort** (harness must terminalize a stalled
    upstream on its own before an outer supervisor kill — the exact Haider 963→966 regress).
 2. **functionality** — deterministic end-to-end orchestration, concurrent-actor
-   isolation, native delegation, deterministic exit codes.
+   isolation, deterministic exit codes, plus native delegation when architecturally
+   supported.
 3. **simulated-workflow resource** — idle footprint (RSS/CPU/drift/return-to-baseline/
    cold-start), single-agent footprint, **parallel-agent memory delta + total peak +
    scaling curve + reclaim**, long-horizon stability.
 4. **automation-readiness** — unattended lifecycle, session persist + resume/replay,
-   steer/pre-tool/queue next-prompt, cancellation+cleanup, crash-recovery, resume
-   idempotency, resource-bound honoring, hooks, deny-egress isolation, **durable journal**.
+   cancellation+cleanup, crash-recovery, resume idempotency, resource-bound honoring,
+   deny-egress isolation, **durable journal**, plus steer/pre-tool/queue next-prompt and
+   hooks when architecturally supported.
 
 AHRB is a SUPERSET of the existing Python conformance gate (it ABSORBS correctness);
 correctness is first-class and cannot be compensated for by good resource numbers.
@@ -124,9 +126,33 @@ extractors/stable-ids/cursors/terminal maps); exit contract; process ownership; 
 controls; hooks; cleanup; redaction+capture caps; capabilities (required/optional + reason).
 Credentials NEVER in argv; credential files private; commands are argv arrays not shell.
 
-## Exit classes: PASS | FAIL | UNSUPPORTED | ERROR | ABSENT. Unsupported MANDATORY rows in
-any pillar block the core badge. Facets: native delegation, parallel tool exec, pre-tool
-intervention, hooks.
+## Exit classes and topology-relative requirements
+
+Result classes are `PASS | FAIL | UNSUPPORTED | ERROR | ABSENT`. Requirements are derived
+from the row's pillar/kind, the manifest-declared capability surface, and the declared
+topology; they are never selected by harness identity.
+
+The **CORE-mandatory** set is required for every automatable topology, using the resource
+and lifecycle method appropriate to that topology. It comprises the core tool-call
+correctness rows (including structured terminal SUCCESS and FAILURE), functionality and
+deterministic exit codes, the resource-pillar requirements for the declared topology,
+and disk-persistable automation readiness: session persist/resume, session replay,
+crash recovery, cancellation+cleanup, resume idempotency, and durable journal recovery.
+Every CORE-mandatory row must be `PASS`; `UNSUPPORTED`, `ABSENT`, `FAIL`, or `ERROR` on a
+CORE row blocks the badge.
+
+The **OPTIONAL-facet** rows are parallel tool execution, native delegation, safe-boundary
+steer, pre-tool intervention/subturn, queued input into a running turn, and hooks. For a
+topology where one of these is architecturally unavailable—particularly
+`client-process-fanout` or `worker-processes`—an honest `UNSUPPORTED` is non-blocking and
+the facet is omitted from the badge suffix. If the manifest declares an optional
+capability, its missing or failing operation surface is not excused as an architectural
+absence.
+
+Process exit is independent of badge eligibility: exit 0 when the completed report has
+no `FAIL` or `ERROR`, including a report whose CORE `UNSUPPORTED` result suppresses its
+badge. Exit is nonzero only for `FAIL` or `ERROR`. Requesting `--junit` writes another
+report format and MUST NOT alter this exit decision.
 
 ## Determinism/fairness: identical semantic workflows/fixtures/turns/text; each harness
 keeps its own system prompt/architecture (that IS overhead); unique per-run creds; reject
@@ -141,10 +167,24 @@ scheduler contaminated). Evidence fingerprints: harness artifact/version, manife
 workflows, fake-model engine ver, normalizer, AHRB revision, OS/kernel/arch/host-mem,
 profile.
 
-## Badge: `Automation Ready v1 · <os> · <topology> · N8 · R<class> · replay+crash+steer+queue`.
-Resource classes by marginal effective RSS: R32/R96/R256/R256+. Topologies:
-native-sibling-fanout | shared-daemon-sessions | worker-processes | client-process-fanout.
-Never put different OS/topology numbers on one unlabeled leaderboard.
+## Badge
+
+`Automation Ready v1 · <os> · <topology> · N<width> · R<class> · <facets>`
+
+A badge is awarded iff the report has no `FAIL` or `ERROR`, every CORE-mandatory row for
+the declared topology is `PASS`, and every non-PASS result is an honestly undeclared
+OPTIONAL facet. The suffix reports the passed recovery/control facets in stable order;
+unsupported optional facets are absent. A well-behaved per-invocation harness therefore
+earns a reduced badge such as
+`Automation Ready v1 · macos · client-process-fanout · N4 · R32 · replay+crash+resume`,
+while a shared daemon that passes the live-control/fanout rows advertises those additional
+facets.
+
+Resource classes by marginal effective RSS are R32/R96/R256/R256+. Topologies are
+`native-sibling-fanout | shared-daemon-sessions | worker-processes |
+client-process-fanout`. R-class, beta, and all other comparative resource numbers are
+meaningful only within the same OS and topology. Never cross-rank topologies or put
+different OS/topology numbers on one unlabeled leaderboard.
 
 ## THE TEST MATRIX (implement all; each: method=simulated, metric, pass-criteria)
 
@@ -205,6 +245,5 @@ servers); barriers state-based; cache vs leak (measure post-turn / post-close / 
 cycle separately).
 
 ## Open questions for the owner (leave configurable; don't hard-block on them):
-N8 vs N16 cert; 4 GiB/N8 envelope vs class-only; hooks/pre-tool mandatory vs facet; Linux
-cgroup mandatory vs ancestry-diagnostic; ship all 3 fake dialects vs Chat-only v1; whether
-client-process-fanout earns a limited "Headless Ready" badge.
+N8 vs N16 cert; 4 GiB/N8 envelope vs class-only; Linux cgroup mandatory vs
+ancestry-diagnostic; ship all 3 fake dialects vs Chat-only v1.

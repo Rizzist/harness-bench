@@ -143,6 +143,18 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     assert_eq!(badge.os, std::env::consts::OS);
     assert_eq!(badge.topology, "shared-daemon-sessions");
     assert_eq!(badge.parallel_width, 4);
+    assert_eq!(
+        badge.facets,
+        vec![
+            "replay",
+            "crash",
+            "steer",
+            "queue",
+            "native-delegation",
+            "subturn",
+            "hooks"
+        ]
+    );
 
     for artifact in [
         "report.md",

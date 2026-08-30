@@ -383,27 +383,31 @@ impl MockHarness {
     }
 
     fn create_session(&mut self, marker: &str) -> Result<String> {
+        self.create_session_with_id(marker, &stable_session_id(marker))
+    }
+
+    fn create_session_with_id(&mut self, marker: &str, id: &str) -> Result<String> {
         validate_marker(marker)?;
-        let id = stable_session_id(marker);
-        if let Some(session) = self.sessions.get(&id) {
+        validate_session_id(id)?;
+        if let Some(session) = self.sessions.get(id) {
             if session.meta.marker != marker {
                 return Err(AhrbError::Protocol("session hash collision".to_owned()));
             }
-            return Ok(id);
+            return Ok(id.to_owned());
         }
-        let directory = self.config.state_dir.join("sessions").join(&id);
+        let directory = self.config.state_dir.join("sessions").join(id);
         fs::create_dir(&directory)?;
         let meta = SessionMeta {
-            id: id.clone(),
+            id: id.to_owned(),
             marker: marker.to_owned(),
         };
         write_new_synced(&directory.join("meta.json"), &serde_json::to_vec(&meta)?)?;
         let journal = DurableJournal::open(directory.join("journal.jsonl"))?;
-        fs::create_dir(self.config.state_dir.join("workspaces").join(&id))?;
+        fs::create_dir(self.config.state_dir.join("workspaces").join(id))?;
         sync_directory(&directory)?;
         sync_directory(&self.config.state_dir.join("sessions"))?;
         self.sessions.insert(
-            id.clone(),
+            id.to_owned(),
             SessionState {
                 meta,
                 journal,
@@ -418,7 +422,7 @@ impl MockHarness {
                 resource_reservation: None,
             },
         );
-        Ok(id)
+        Ok(id.to_owned())
     }
 
     fn append(&mut self, session_id: &str, event: EventVocab, payload: Value) -> Result<u64> {
@@ -541,6 +545,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "serve" => serve(parse_config(&args[1..])?, false).await,
         "rpc" => serve(parse_config(&args[1..])?, true).await,
         "exec-turn" => exec_turn(&args[1..]).await,
+        "release-checkpoint" => release_checkpoint_command(&args[1..]).await,
+        "cancel-session" => cancel_session_command(&args[1..]).await,
         "inspect-journal" => inspect_journal(&args[1..]),
         "hook" => hook_command(&args[1..]),
         "--help" | "help" => {
@@ -548,7 +554,10 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 "ahrb-mock-harness serve|rpc --state-dir PATH [--idle-timeout-ms N] \
                  [--session-memory-mib N]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
-                 --prompt PROMPT --key KEY\n\
+                 --session-id ID --prompt PROMPT --key KEY\n\
+                 ahrb-mock-harness release-checkpoint --state-dir PATH \
+                 --session-id ID --release-token TOKEN\n\
+                 ahrb-mock-harness cancel-session --state-dir PATH --session-id ID\n\
                  model endpoint comes from AHRB_MOCK_BASE_URL or AHRB_MOCK_UNIX_SOCKET; \
                  key/model come from AHRB_MOCK_API_KEY and AHRB_MOCK_MODEL"
             );
@@ -562,6 +571,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
 
 async fn exec_turn(args: &[String]) -> Result<i32> {
     let mut marker = None;
+    let mut requested_session_id = None;
     let mut prompt = None;
     let mut key = None;
     let mut event_journal = None;
@@ -575,6 +585,7 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             .ok_or_else(|| AhrbError::Usage(format!("{option} needs a value")))?;
         match option {
             "--marker" => marker = Some(value.clone()),
+            "--session-id" => requested_session_id = Some(value.clone()),
             "--prompt" => prompt = Some(value.clone()),
             "--key" => key = Some(value.clone()),
             "--event-journal" => event_journal = Some(PathBuf::from(value)),
@@ -596,33 +607,64 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         index += 2;
     }
     let marker = marker.ok_or_else(|| AhrbError::Usage("--marker is required".to_owned()))?;
+    let requested_session_id = requested_session_id
+        .ok_or_else(|| AhrbError::Usage("--session-id is required".to_owned()))?;
     let prompt = prompt.ok_or_else(|| AhrbError::Usage("--prompt is required".to_owned()))?;
     let key = key.ok_or_else(|| AhrbError::Usage("--key is required".to_owned()))?;
     let config = parse_config(&config_args)?;
     let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let turn = PendingTurn { prompt, key };
     let (session_id, journal, after) = {
         let mut guard = harness.lock().await;
-        let id = guard.create_session(&marker)?;
+        let id = guard.create_session_with_id(&marker, &requested_session_id)?;
         let journal = guard.session_mut(&id)?.journal.clone();
         let after = journal.all()?.last().map(|event| event.cursor);
         (id, journal, after)
     };
-    let spawn = accept_turn(&harness, &session_id, PendingTurn { prompt, key }, false).await?;
-    if spawn {
+    let spawn = accept_turn(&harness, &session_id, turn.clone(), false).await?;
+    let resume_pending = if spawn {
+        false
+    } else {
+        let mut guard = harness.lock().await;
+        let session = guard.session_mut(&session_id)?;
+        session
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.key == turn.key && pending.prompt == turn.prompt)
+            && !session_is_terminal(session)?
+    };
+    if spawn || resume_pending {
         spawn_worker(Arc::clone(&harness), session_id.clone());
     }
-    let started = std::time::Instant::now();
-    let terminal = loop {
-        let events = journal.read_after(after)?;
-        if let Some(terminal) = events.iter().rev().find(|event| is_terminal(&event.event)) {
-            break terminal.clone();
+    let terminal = if spawn || resume_pending {
+        let started = std::time::Instant::now();
+        loop {
+            let events = journal.read_after(after)?;
+            if let Some(terminal) = events.iter().rev().find(|event| is_terminal(&event.event)) {
+                break terminal.clone();
+            }
+            if started.elapsed() >= Duration::from_secs(60) {
+                return Err(AhrbError::Timeout("mock exec turn".to_owned()));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        if started.elapsed() >= Duration::from_secs(60) {
-            return Err(AhrbError::Timeout("mock exec turn".to_owned()));
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    } else {
+        journal
+            .all()?
+            .into_iter()
+            .rev()
+            .find(|event| is_terminal(&event.event))
+            .ok_or_else(|| {
+                AhrbError::Protocol(
+                    "idempotent exec retry found neither pending work nor a terminal".to_owned(),
+                )
+            })?
     };
-    let events = journal.read_after(after)?;
+    let events = if spawn || resume_pending {
+        journal.read_after(after)?
+    } else {
+        vec![terminal.clone()]
+    };
     if let Some(path) = event_journal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -647,6 +689,70 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     } else {
         14
     })
+}
+
+async fn release_checkpoint_command(args: &[String]) -> Result<i32> {
+    let (config, session_id, release_token) = parse_session_control(args, true)?;
+    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let release_token = release_token.ok_or_else(|| {
+        AhrbError::Usage("--release-token is required for release-checkpoint".to_owned())
+    })?;
+    release_checkpoint(&harness, &session_id, &release_token).await?;
+    Ok(0)
+}
+
+async fn cancel_session_command(args: &[String]) -> Result<i32> {
+    let (config, session_id, _) = parse_session_control(args, false)?;
+    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let workspace = {
+        let mut guard = harness.lock().await;
+        guard.append_terminal(
+            &session_id,
+            EventVocab::TerminalCancelled,
+            json!({"status":"cancelled", "cleanup":"workspace-removed"}),
+        )?;
+        guard.config.state_dir.join("workspaces").join(&session_id)
+    };
+    if workspace.exists() {
+        fs::remove_dir_all(&workspace)?;
+    }
+    fs::create_dir(&workspace)?;
+    sync_parent(&workspace)?;
+    Ok(0)
+}
+
+fn parse_session_control(
+    args: &[String],
+    allow_release_token: bool,
+) -> Result<(MockConfig, String, Option<String>)> {
+    let mut session_id = None;
+    let mut release_token = None;
+    let mut config_args = Vec::new();
+    let mut index = 0_usize;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| AhrbError::Usage(format!("{option} needs a value")))?;
+        match option {
+            "--session-id" => session_id = Some(value.clone()),
+            "--release-token" if allow_release_token => release_token = Some(value.clone()),
+            "--state-dir" | "--idle-timeout-ms" | "--session-memory-mib" => {
+                config_args.push(option.to_owned());
+                config_args.push(value.clone());
+            }
+            other => {
+                return Err(AhrbError::Usage(format!(
+                    "unknown session control option {other:?}"
+                )));
+            }
+        }
+        index += 2;
+    }
+    let session_id =
+        session_id.ok_or_else(|| AhrbError::Usage("--session-id is required".to_owned()))?;
+    validate_session_id(&session_id)?;
+    Ok((parse_config(&config_args)?, session_id, release_token))
 }
 
 fn parse_config(args: &[String]) -> Result<MockConfig> {
@@ -1453,7 +1559,16 @@ async fn record_checkpoint_and_wait(
         remove_checkpoint_waiter(harness, &release_relative, &notify).await;
         return Ok(true);
     }
-    notify.notified().await;
+    loop {
+        tokio::select! {
+            () = notify.notified() => break,
+            () = tokio::time::sleep(Duration::from_millis(10)) => {
+                if release_token_exists(&release_path)? {
+                    break;
+                }
+            }
+        }
+    }
     let stopped = {
         let mut guard = harness.lock().await;
         session_should_stop(guard.session_mut(session_id)?)?
@@ -2093,6 +2208,20 @@ fn stable_session_id(marker: &str) -> String {
 fn validate_marker(marker: &str) -> Result<()> {
     if marker.is_empty() || marker.len() > 4096 || marker.contains('\0') {
         return Err(AhrbError::Validation("invalid actor marker".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_session_id(id: &str) -> Result<()> {
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err(AhrbError::Validation(
+            "session ID must use 1..128 ASCII letters, digits, '.', '_' or '-'".to_owned(),
+        ));
     }
     Ok(())
 }

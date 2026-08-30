@@ -6,16 +6,38 @@ use std::process::Command;
 #[test]
 fn undeclared_exec_operations_emit_unsupported_and_junit_skips() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let output =
-        std::env::temp_dir().join(format!("ahrb-capability-gating-{}", std::process::id()));
-    if output.exists() {
-        std::fs::remove_dir_all(&output).expect("remove stale capability output");
+    let root = std::env::temp_dir().join(format!("ahrb-capability-gating-{}", std::process::id()));
+    if root.exists() {
+        std::fs::remove_dir_all(&root).expect("remove stale capability output");
     }
+    std::fs::create_dir_all(&root).expect("create capability root");
+    let source = std::fs::read_to_string(repository.join("adapters/mock-exec/manifest.toml"))
+        .expect("read mock exec manifest");
+    let source = source
+        .lines()
+        .filter(|line| {
+            !line.starts_with("sessions = ")
+                && !line.starts_with("resume = \"")
+                && !line.starts_with("durable_journal = ")
+                && !line.starts_with("cancel_cleanup = ")
+        })
+        .map(|line| {
+            if line.starts_with("cancel = ") {
+                "cancel = []"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let manifest = root.join("manifest.toml");
+    std::fs::write(&manifest, source).expect("write under-declared exec manifest");
+    let output = root.join("output");
     let command = Command::new(env!("CARGO_BIN_EXE_ahrb"))
         .current_dir(repository)
         .arg("run")
         .arg("--manifest")
-        .arg(repository.join("adapters/mock-exec/manifest.toml"))
+        .arg(&manifest)
         .arg("--output")
         .arg(&output)
         .arg("--profile")
@@ -27,7 +49,7 @@ fn undeclared_exec_operations_emit_unsupported_and_junit_skips() {
         .expect("run capability-gated exec rows");
     assert_eq!(
         command.status.code(),
-        Some(1),
+        Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&command.stderr)
     );
@@ -47,7 +69,7 @@ fn undeclared_exec_operations_emit_unsupported_and_junit_skips() {
     assert!(junit.contains("failures=\"0\""));
     assert!(junit.contains("skipped=\"10\""));
     assert_eq!(junit.matches("<skipped ").count(), 10);
-    std::fs::remove_dir_all(output).expect("remove capability output");
+    std::fs::remove_dir_all(root).expect("remove capability output");
 }
 
 #[test]
@@ -83,7 +105,7 @@ fn missing_daemon_session_surface_reports_unsupported_instead_of_aborting() {
         .expect("run daemon with missing session attach");
     assert_eq!(
         command.status.code(),
-        Some(1),
+        Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&command.stderr)
     );

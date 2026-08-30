@@ -37,33 +37,37 @@ persistent = false
 
 [transport]
 kind = "exec"
-command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
 timeout_ms = 10000
 
 [sessions]
 create = []
 submit = []
 attach = []
-resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
 close_delete = []
 list = []
 id_pointer = "/session_id"
 
 [next_input]
 [agents]
+cancel = ["target/debug/ahrb-mock-harness", "cancel-session", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
 
 [concurrency]
 topology = "client-process-fanout"
 max_agents = 8
 fanout_mode = "client"
+release = ["target/debug/ahrb-mock-harness", "release-checkpoint", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}", "--release-token", "{{release_token}}"]
 
 [tools]
 
 [events]
-source = "stdout"
+source = "journal-file"
 framing = "jsonl"
+path = "{{profile}}/state/sessions/{{session_id}}/journal.jsonl"
 id_pointer = "/id"
 cursor_pointer = "/cursor"
+replay_command = ["target/debug/ahrb-mock-harness", "inspect-journal", "--state-dir", "{{profile}}/state", "--session", "{{session_id}}", "--after", "{{cursor}}"]
 
 [[events.rules]]
 matches = "turn-accepted"
@@ -91,6 +95,11 @@ event = "tool-result"
 payload_pointer = "/payload"
 
 [[events.rules]]
+matches = "barrier-reached"
+event = "barrier-reached"
+payload_pointer = "/payload"
+
+[[events.rules]]
 matches = "terminal-success"
 event = "terminal-success"
 payload_pointer = "/payload"
@@ -98,6 +107,11 @@ payload_pointer = "/payload"
 [[events.rules]]
 matches = "terminal-failure"
 event = "terminal-failure"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "terminal-cancelled"
+event = "terminal-cancelled"
 payload_pointer = "/payload"
 
 [exit]
@@ -126,5 +140,7 @@ max_bytes = 1048576
 headless = "fresh process with closed stdin"
 sessions = "mock session journal is reopened by the next process"
 resume = "exec-turn reopens the fsync-backed session journal"
+durable_journal = "append-only per-session JSONL journal is fsync-backed and replayed after restart"
+cancel_cleanup = "the active one-shot process is terminated and its isolated workspace is removed"
 
 [capabilities.optional]
