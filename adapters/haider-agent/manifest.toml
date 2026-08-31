@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.966-resident-native-unvalidated"
+revision = "0.0.966-thin-client-daemon-native-tools-v2"
 
 [availability]
 exec_paths = ["haider"]
@@ -10,15 +10,15 @@ required_exec_paths = ["haiderd"]
 version_probe = ["haider", "--version"]
 version_pattern = "haider"
 
-# TODO(orchestrator): wire the confirmed `haider account add ahrb --base-url ...
-# --api-key-env OPENAI_API_KEY --api-family openai --json` operation into a
-# noninteractive pre-daemon bootstrap; env injection alone is a placeholder.
 [fake_model]
 dialect = "open-ai-chat-completions"
 base_url_env = "OPENAI_BASE_URL"
 credential_env = "OPENAI_API_KEY"
+auth_required = false
 model = "ahrb-fake-v1"
-allowed_paths = ["/v1/chat/completions"]
+# Account creation probes the OpenAI-compatible model catalog before accepting
+# the provider. That control-plane request is served but is not a model turn.
+allowed_paths = ["/v1/models", "/v1/chat/completions"]
 
 [model_roles.primary]
 model = "ahrb-fake-v1"
@@ -27,58 +27,139 @@ required = true
 [isolation.roots]
 HOME = "{{profile}}/home"
 XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_CACHE_HOME = "{{profile}}/cache"
 XDG_DATA_HOME = "{{profile}}/data"
 XDG_STATE_HOME = "{{profile}}/state"
 XDG_RUNTIME_DIR = "{{profile}}/runtime"
 TMPDIR = "{{profile}}/tmp"
-HAIDER_PROFILE_DIR = "{{profile}}/haider/profile"
+HAIDER_PROFILE_DIR = "{{profile}}/haider/store"
 HAIDER_RUNTIME_DIR = "{{profile}}/haider/runtime"
+HAIDER_DISCOVERY_DISABLED = "{{profile}}/discovery-disabled"
 
 [isolation]
 generated_files = []
 forbidden_roots = ["~/.config/haider", "~/.local/share/haider"]
 
-# The installed daemon requires profile/store/runtime together and uses h.sock.
-# TODO(orchestrator): add Haider's authenticated Hello/native-frame transport,
-# exact session operations, and segmented-journal extractor. Until then those
-# operations stay undeclared/UNSUPPORTED instead of inventing method names.
+# AHRB owns the resident daemon process group, waits through the public status
+# CLI, then registers the fake provider exactly once in this isolated profile.
+# Every benchmark turn remains a `haider run` thin-client invocation; AHRB does
+# not speak or decode Haider's private socket protocol.
 [daemon]
 persistent = true
-start = [
-  "haiderd", "--profile", "{{profile}}/haider/profile",
-  "--store-dir", "{{profile}}/haider/store",
-  "--runtime-dir", "{{profile}}/haider/runtime"
+start = ["haiderd"]
+initialize = [
+  "haider", "account", "add", "ahrb",
+  "--base-url", "{{base_url}}", "--no-auth", "--api-family", "openai",
+  "--response-open-timeout", "2s", "--chunk-idle-timeout", "2s",
+  "--semantic-progress-timeout", "2s", "--json"
 ]
+pid_locator = "owned haiderd child process group"
 grace_ms = 2000
 
 [daemon.readiness]
-kind = "socket"
-target = "{{profile}}/haider/runtime/h.sock"
+kind = "command"
+command = ["haider", "status", "--json", "--no-spawn"]
 timeout_ms = 10000
 
 [transport]
-kind = "socket-jsonrpc"
-endpoint = "{{profile}}/haider/runtime/h.sock"
+kind = "exec"
+command = [
+  "haider", "run", "-p", "{{prompt}}", "--model", "ahrb/{{model}}",
+  "--output", "jsonl", "--allow-writes", "--allow-exec",
+  "--timeout", "30s"
+]
 timeout_ms = 30000
 
 [sessions]
+list = ["haider", "sessions", "--json", "--no-spawn"]
+id_pointer = "/session_id"
+
 [next_input]
 [agents]
 
 [concurrency]
 topology = "shared-daemon-sessions"
 max_agents = 32
-fanout_mode = "native-sibling-fanout"
+fanout_mode = "thin-client-session-fanout"
 
-[tools]
+[tools.aliases]
+write = "process_exec"
+read = "process_exec"
+fail = "process_exec"
 
+[tools.bindings]
+"process_exec.command" = "command"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+
+# `haider run --output jsonl` starts with a top-level accepted announcement,
+# followed by durable RawEnvelope records whose discriminator is payload.type.
 [events]
-source = "journal"
+source = "stdout"
 framing = "jsonl"
+type_pointer = "/payload/type"
+id_pointer = "/event_id"
+cursor_pointer = "/seq"
+
+[[events.rules]]
+matches = "accepted"
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "thinking" }
+event = "model-request"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "completed", "/payload/item/item" = "tool_call" }
+event = "tool-call"
+payload_pointer = "/payload/item"
+payload_bindings = { call_id = "/payload/item/call_id", name = "/payload/item/name", arguments = "/payload/item/args" }
+
+[[events.rules]]
+matches = "tool_result"
+event = "tool-result"
+payload_pointer = "/payload"
+payload_bindings = { call_id = "/payload/call_id", result = "/payload/result" }
+
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "completed", "/payload/item/item" = "agent_message" }
+event = "model-response"
+payload_pointer = "/payload/item"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "done" }
+event = "terminal-success"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "errored" }
+event = "terminal-failure"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "cancelled" }
+event = "terminal-cancelled"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "error"
+event = "terminal-failure"
 
 [exit]
 success = 0
-failures = { provider = 1 }
+success_stdout = ['"state":"done"']
+failure_stdout = ['"event":"error"', '"state":"errored"']
+failures = { usage = 2, provider = 65, unavailable = 69, software = 70, io = 74, protocol = 76, blocked = 77, timeout = 124, cancelled = 130 }
 
 [process]
 executable_names = ["haiderd", "haider"]
@@ -97,9 +178,17 @@ redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
 
 [capabilities.required]
-headless = "haiderd is the resident automation owner"
+headless = "haider run --output jsonl is a noninteractive thin client over the resident daemon"
 
 [capabilities.optional]
-sessions = "facet pending verified native daemon operations"
-resume = "facet pending verified journal replay contract"
-native_delegation = "facet pending verified agent operations"
+sessions = "durable daemon sessions are listable with haider sessions --json --no-spawn"
+resume = "haider resume and session recovery exist, but 0.0.966 exposes no headless continue-existing-session command"
+durable_journal = "the daemon owns a transactional journal, but 0.0.966 exposes no finite raw per-session replay CLI"
+
+# TODO(orchestrator): Haider 0.0.966 `resume <session-id>` enters the TUI, while
+# `run` has no existing-session selector. Keep rows 30/35/37 UNSUPPORTED until a
+# noninteractive continuation CLI is available; do not automate the TUI.
+# TODO(orchestrator): `haider events --no-spawn` is finite but spans every
+# session; `haider session <id> --watch --no-spawn` is scoped but follows.
+# Wire row 40 only when Haider exposes a finite raw per-session replay command
+# with cursor semantics and a safe native torn-tail fault-injection surface.

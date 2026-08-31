@@ -165,6 +165,7 @@ async fn launch_gate_and_process_group_retain_an_orphan_after_launcher_exit() {
         "\"type\":\"terminal-success\",\"payload\":{\"status\":\"success\"}}'"
     );
     let mut driver = PerInvocationDriver::new(PerInvocationConfig {
+        daemon: None,
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),

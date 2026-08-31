@@ -291,6 +291,7 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
         events.path = "{{journal}}".to_owned();
     }
     PerInvocationDriver::new(PerInvocationConfig {
+        daemon: None,
         command: command.clone(),
         resume_command: command,
         release_command: Vec::new(),

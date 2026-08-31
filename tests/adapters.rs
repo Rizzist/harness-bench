@@ -69,9 +69,29 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
     let haider = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))?;
     assert!(haider.daemon.persistent);
     assert_eq!(haider.concurrency.topology, "shared-daemon-sessions");
-    assert_eq!(haider.transport.kind, TransportKind::SocketJsonrpc);
+    assert_eq!(haider.transport.kind, TransportKind::Exec);
     assert_eq!(haider.availability.exec_paths, ["haider"]);
     assert_eq!(haider.availability.required_exec_paths, ["haiderd"]);
+    assert_eq!(haider.daemon.start, ["haiderd"]);
+    assert_eq!(haider.daemon.readiness.kind, "command");
+    assert_eq!(
+        haider.daemon.readiness.command,
+        ["haider", "status", "--json", "--no-spawn"]
+    );
+    assert!(
+        haider
+            .daemon
+            .initialize
+            .windows(3)
+            .any(|arguments| { arguments == ["account", "add", "ahrb"] })
+    );
+    assert!(
+        haider
+            .transport
+            .command
+            .windows(2)
+            .any(|arguments| { arguments == ["--output", "jsonl"] })
+    );
     assert!(haider.sessions.create.is_empty());
     assert!(haider.sessions.submit.is_empty());
     Ok(())
@@ -196,7 +216,14 @@ fn codex_manifest_binds_fixture_semantics_to_declared_shell_variants() -> Result
 
 #[test]
 fn fixture_templates_execute_write_read_and_fail_effects_for_native_adapters() -> Result<()> {
-    for adapter in ["codex", "claude-code", "pi", "rick"] {
+    for adapter in [
+        "codex",
+        "claude-code",
+        "haider-agent",
+        "opencode",
+        "pi",
+        "rick",
+    ] {
         let manifest =
             ahrb::manifest::load(Path::new(&format!("adapters/{adapter}/manifest.toml")))?;
         let workspace = std::env::temp_dir().join(format!(
@@ -345,6 +372,109 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
     assert!(rick.events.rules.iter().any(|rule| {
         rule.matches == "tool_end" && rule.event == "tool-result" && rule.payload_pointer == "/tool"
     }));
+
+    let opencode = ahrb::manifest::load(Path::new("adapters/opencode/manifest.toml"))?;
+    assert_eq!(opencode.fake_model.allowed_paths, ["/v1/chat/completions"]);
+    assert_eq!(opencode.isolation.generated_files.len(), 1);
+    let config = &opencode.isolation.generated_files[0];
+    assert!(config.path.ends_with("/config/opencode/opencode.json"));
+    assert!(config.content.contains("@ai-sdk/openai-compatible"));
+    assert!(config.content.contains("{{base_url}}/v1"));
+    assert!(config.content.contains("\"{{model}}\""));
+    for command in [&opencode.transport.command, &opencode.sessions.resume] {
+        assert!(command.windows(2).any(|pair| pair == ["--format", "json"]));
+        assert!(command.iter().any(|argument| argument == "--auto"));
+        assert!(command.iter().all(|argument| argument != "--pure"));
+    }
+    assert_eq!(opencode.tools.aliases["write"].primary(), Some("bash"));
+    assert_eq!(
+        opencode
+            .tools
+            .bindings
+            .get("bash.command")
+            .map(String::as_str),
+        Some("command")
+    );
+    for status in ["completed", "error"] {
+        assert!(opencode.events.rules.iter().any(|rule| {
+            rule.matches == "tool_use"
+                && rule
+                    .match_fields
+                    .get("/part/state/status")
+                    .map(String::as_str)
+                    == Some(status)
+                && rule.event == "tool-call"
+                && rule.payload_bindings.get("call_id").map(String::as_str) == Some("/part/callID")
+        }));
+        assert!(opencode.events.rules.iter().any(|rule| {
+            rule.matches == "tool_use"
+                && rule
+                    .match_fields
+                    .get("/part/state/status")
+                    .map(String::as_str)
+                    == Some(status)
+                && rule.event == "tool-result"
+                && rule.payload_bindings.get("result").map(String::as_str) == Some("/part/state")
+        }));
+    }
+    assert!(opencode.events.rules.iter().any(|rule| {
+        rule.matches == "step_finish"
+            && rule.match_fields.get("/part/reason").map(String::as_str) == Some("stop")
+            && rule.event == "terminal-success"
+    }));
+    assert!(
+        opencode
+            .events
+            .rules
+            .iter()
+            .any(|rule| { rule.matches == "error" && rule.event == "terminal-failure" })
+    );
+
+    let haider = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))?;
+    assert_eq!(
+        haider.fake_model.allowed_paths,
+        ["/v1/models", "/v1/chat/completions"]
+    );
+    assert!(!haider.fake_model.auth_required);
+    assert_eq!(
+        haider.tools.aliases["write"].primary(),
+        Some("process_exec")
+    );
+    assert_eq!(
+        haider
+            .tools
+            .bindings
+            .get("process_exec.command")
+            .map(String::as_str),
+        Some("command")
+    );
+    assert_eq!(haider.events.type_pointer, "/payload/type");
+    assert!(haider.events.rules.iter().any(|rule| {
+        rule.matches == "item"
+            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("completed")
+            && rule
+                .match_fields
+                .get("/payload/item/item")
+                .map(String::as_str)
+                == Some("tool_call")
+            && rule.event == "tool-call"
+    }));
+    assert!(haider.events.rules.iter().any(|rule| {
+        rule.matches == "tool_result"
+            && rule.event == "tool-result"
+            && rule.payload_bindings.get("call_id").map(String::as_str) == Some("/payload/call_id")
+    }));
+    for (state, event) in [
+        ("done", "terminal-success"),
+        ("errored", "terminal-failure"),
+        ("cancelled", "terminal-cancelled"),
+    ] {
+        assert!(haider.events.rules.iter().any(|rule| {
+            rule.matches == "run_state"
+                && rule.match_fields.get("/payload/state").map(String::as_str) == Some(state)
+                && rule.event == event
+        }));
+    }
     Ok(())
 }
 
@@ -359,7 +489,7 @@ fn remaining_adapter_provider_files_render_as_scoped_valid_json() -> Result<()> 
         ("model".to_owned(), "ahrb-fake-v1".to_owned()),
     ]);
 
-    for adapter in ["pi", "rick"] {
+    for adapter in ["opencode", "pi", "rick"] {
         let manifest =
             ahrb::manifest::load(Path::new(&format!("adapters/{adapter}/manifest.toml")))?;
         assert!(!manifest.isolation.generated_files.is_empty(), "{adapter}");

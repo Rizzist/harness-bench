@@ -922,6 +922,15 @@ async fn handle_http(
             DeterministicBody::full(Bytes::from_static(b"{\"status\":\"ok\"}")),
         );
     }
+    if request.method() == Method::GET && path == "/v1/models" {
+        return response_from_parts(
+            200,
+            &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+            DeterministicBody::full(Bytes::from_static(
+                b"{\"object\":\"list\",\"data\":[{\"id\":\"ahrb-fake-v1\",\"object\":\"model\"}]}",
+            )),
+        );
+    }
     if request.method() != Method::POST {
         return Err(AhrbError::Protocol(format!(
             "fake model only accepts POST for {path:?}"
@@ -2708,6 +2717,26 @@ mod tests {
             }
             Err(error) => return Err(error),
         };
+        let mut catalog_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+        let catalog_request = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            server.local_addr()
+        );
+        catalog_stream.write_all(catalog_request.as_bytes()).await?;
+        let mut catalog_response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            catalog_stream.read_to_end(&mut catalog_response),
+        )
+        .await
+        .map_err(|_| AhrbError::Timeout("test fake-model catalog response".to_owned()))??;
+        let catalog_response = String::from_utf8(catalog_response).map_err(|error| {
+            AhrbError::Protocol(format!("test catalog response was not UTF-8: {error}"))
+        })?;
+        assert!(catalog_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(catalog_response.contains("ahrb-fake-v1"));
+        assert!(engine.request_records().await.is_empty());
+
         let mut stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
         let body = request_body();
         let head = format!(

@@ -71,9 +71,11 @@ impl EventNormalizer {
         raw: &Value,
         mapping: &EventMapping,
     ) -> Result<Option<NormalizedEvent>> {
-        let event_type = raw
-            .get("type")
+        let event_type = (!mapping.type_pointer.is_empty())
+            .then(|| raw.pointer(&mapping.type_pointer))
+            .flatten()
             .and_then(Value::as_str)
+            .or_else(|| raw.get("type").and_then(Value::as_str))
             .or_else(|| raw.get("event").and_then(Value::as_str))
             .ok_or_else(|| AhrbError::Protocol("source event has no type".to_owned()))?;
         let rule = mapping

@@ -105,6 +105,9 @@ pub struct FakeModelBinding {
     pub base_url_env: String,
     /// Environment variable receiving the credential.
     pub credential_env: String,
+    /// Whether row 1 requires an authentication header at the fake endpoint.
+    #[serde(default = "default_true")]
+    pub auth_required: bool,
     /// Model ID expected by the fake server.
     pub model: String,
     /// HTTP request paths the harness may use.
@@ -113,6 +116,10 @@ pub struct FakeModelBinding {
     /// Provider configuration templates.
     #[serde(default)]
     pub provider_templates: Vec<GeneratedFile>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A logical model role and its configured model ID.
@@ -163,6 +170,10 @@ pub struct DaemonLifecycle {
     /// Start command argv.
     #[serde(default)]
     pub start: Vec<String>,
+    /// One-time initialization argv run after readiness. The driver records a
+    /// profile-local marker only after this command succeeds.
+    #[serde(default)]
+    pub initialize: Vec<String>,
     /// Readiness probe.
     #[serde(default)]
     pub readiness: Probe,
@@ -184,12 +195,15 @@ fn default_grace_ms() -> u64 {
 /// A readiness probe.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Probe {
-    /// Probe kind: process, file, socket, or HTTP.
+    /// Probe kind: process, file, socket, HTTP, or command.
     #[serde(default)]
     pub kind: String,
     /// Probe target.
     #[serde(default)]
     pub target: String,
+    /// Direct argv used by a command readiness probe.
+    #[serde(default)]
+    pub command: Vec<String>,
     /// Maximum wait.
     #[serde(default = "default_ready_ms")]
     pub timeout_ms: u64,
@@ -382,6 +396,10 @@ pub struct EventMapping {
     pub path: String,
     /// jsonl, JSON sequence, or SSE.
     pub framing: String,
+    /// Optional JSON pointer for an event discriminator nested in an envelope.
+    /// Top-level `type`/`event` remain fallbacks for mixed streams.
+    #[serde(default)]
+    pub type_pointer: String,
     /// Stable event identity pointer.
     #[serde(default)]
     pub id_pointer: String,
@@ -582,15 +600,16 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         ));
     }
     if manifest.daemon.persistent
-        && matches!(
-            manifest.transport.kind,
-            TransportKind::SocketJsonrpc | TransportKind::Http
-        )
         && manifest.daemon.start.is_empty()
+        && topology_family(&manifest.concurrency.topology) == Some(TopologyFamily::SharedController)
     {
         return Err(AhrbError::Validation(
-            "persistent socket/HTTP transports require daemon.start for a cold owned run"
-                .to_owned(),
+            "persistent transports require daemon.start for a cold owned run".to_owned(),
+        ));
+    }
+    if manifest.daemon.readiness.kind == "command" && manifest.daemon.readiness.command.is_empty() {
+        return Err(AhrbError::Validation(
+            "command daemon readiness requires daemon.readiness.command".to_owned(),
         ));
     }
     if manifest.transport.timeout_ms == 0
@@ -762,6 +781,11 @@ fn command_vectors(manifest: &Manifest) -> Vec<(&'static str, &[String])> {
             &manifest.availability.version_probe,
         ),
         ("daemon.start", &manifest.daemon.start),
+        ("daemon.initialize", &manifest.daemon.initialize),
+        (
+            "daemon.readiness.command",
+            &manifest.daemon.readiness.command,
+        ),
         ("daemon.shutdown", &manifest.daemon.shutdown),
         ("transport.command", &manifest.transport.command),
         ("sessions.create", &manifest.sessions.create),

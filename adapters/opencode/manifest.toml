@@ -2,7 +2,7 @@
 schema = 1
 id = "opencode"
 name = "OpenCode"
-revision = "run-json-v1"
+revision = "1.17-run-json-native-tools-v2"
 
 [availability]
 exec_paths = ["opencode"]
@@ -16,7 +16,7 @@ credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
 allowed_paths = ["/v1/chat/completions"]
 
-[[fake_model.provider_templates]]
+[[isolation.generated_files]]
 path = "{{profile}}/config/opencode/opencode.json"
 mode = "0600"
 content = '''{
@@ -30,11 +30,14 @@ content = '''{
         "apiKey": "{{credential}}"
       },
       "models": {
-        "ahrb-fake-v1": { "name": "AHRB Fake Model" }
+        "{{model}}": { "name": "AHRB Fake Model" }
       }
     }
   },
-  "model": "ahrb/ahrb-fake-v1"
+  "model": "ahrb/{{model}}",
+  "permission": {
+    "bash": "allow"
+  }
 }
 '''
 
@@ -52,7 +55,6 @@ TMPDIR = "{{profile}}/tmp"
 OPENCODE_CONFIG = "{{profile}}/config/opencode/opencode.json"
 
 [isolation]
-generated_files = []
 forbidden_roots = ["~/.config/opencode", "~/.local/share/opencode"]
 
 [daemon]
@@ -61,14 +63,14 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
-  "opencode", "run", "--pure", "--format", "json", "--auto",
+  "opencode", "run", "--format", "json", "--auto",
   "--model", "ahrb/{{model}}", "--dir", "{{workspace}}", "{{prompt}}"
 ]
 timeout_ms = 30000
 
 [sessions]
 resume = [
-  "opencode", "run", "--pure", "--format", "json", "--auto",
+  "opencode", "run", "--format", "json", "--auto",
   "--model", "ahrb/{{model}}", "--dir", "{{workspace}}",
   "--session", "{{session_id}}", "{{prompt}}"
 ]
@@ -88,16 +90,19 @@ read = "bash"
 fail = "bash"
 
 [tools.bindings]
-command = "command"
+"bash.command" = "command"
 
 [tools.fixtures]
 write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
 read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
 fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 
-# TODO(orchestrator): confirm OpenCode's `tool_use` state transitions and bash
-# input field against the installed release; completed events are deliberately
-# expanded into both call and result evidence when no earlier state is emitted.
+# OpenCode 1.17.20 `run --format json` emits a `tool_use` record only when the
+# tool part reaches completed/error. AHRB therefore expands that one
+# retrospective record into correlated call/result evidence.
+# TODO(orchestrator): capture one installed 1.17.x transcript to reconfirm that
+# the final `step_finish` with reason=stop is never lost when the process exits,
+# and pin provider/authentication error exit codes.
 [events]
 source = "stdout"
 framing = "jsonl"
@@ -113,29 +118,80 @@ event = "model-request"
 
 [[events.rules]]
 matches = "tool_use"
-match_fields = { "/part/state/status" = "running" }
-event = "tool-call"
-payload_pointer = "/part"
-
-[[events.rules]]
-matches = "tool_use"
 match_fields = { "/part/state/status" = "completed" }
 event = "tool-call"
 payload_pointer = "/part"
+payload_bindings = { call_id = "/part/callID", name = "/part/tool", arguments = "/part/state/input" }
+
+[[events.rules]]
+matches = "tool_use"
+match_fields = { "/part/state/status" = "error" }
+event = "tool-call"
+payload_pointer = "/part"
+payload_bindings = { call_id = "/part/callID", name = "/part/tool", arguments = "/part/state/input" }
 
 [[events.rules]]
 matches = "tool_use"
 match_fields = { "/part/state/status" = "completed" }
 event = "tool-result"
 payload_pointer = "/part"
+payload_bindings = { call_id = "/part/callID", name = "/part/tool", arguments = "/part/state/input", result = "/part/state" }
+
+[[events.rules]]
+matches = "tool_use"
+match_fields = { "/part/state/status" = "error" }
+event = "tool-result"
+payload_pointer = "/part"
+payload_bindings = { call_id = "/part/callID", name = "/part/tool", arguments = "/part/state/input", result = "/part/state" }
 
 [[events.rules]]
 matches = "text"
 event = "model-response"
 payload_pointer = "/part"
 
+[[events.rules]]
+matches = "step_finish"
+match_fields = { "/part/reason" = "stop" }
+event = "terminal-success"
+payload_pointer = "/part"
+
+[[events.rules]]
+matches = "step_finish"
+match_fields = { "/part/reason" = "length" }
+event = "terminal-failure"
+payload_pointer = "/part"
+
+[[events.rules]]
+matches = "step_finish"
+match_fields = { "/part/reason" = "content-filter" }
+event = "terminal-failure"
+payload_pointer = "/part"
+
+[[events.rules]]
+matches = "step_finish"
+match_fields = { "/part/reason" = "error" }
+event = "terminal-failure"
+payload_pointer = "/part"
+
+[[events.rules]]
+matches = "step_finish"
+match_fields = { "/part/reason" = "other" }
+event = "terminal-failure"
+payload_pointer = "/part"
+
+[[events.rules]]
+matches = "step_finish"
+match_fields = { "/part/reason" = "unknown" }
+event = "terminal-failure"
+payload_pointer = "/part"
+
+[[events.rules]]
+matches = "error"
+event = "terminal-failure"
+
 [exit]
 success = 0
+success_stdout = ['"reason":"stop"']
 failure_stdout = ['"type":"error"']
 failures = { provider = 1 }
 
@@ -161,4 +217,3 @@ sessions = "OpenCode persists sessions under isolated XDG roots"
 resume = "opencode run --session continues the prior session in a fresh process"
 
 [capabilities.optional]
-

@@ -1139,7 +1139,13 @@ fn make_driver(
     if manifest.transport.kind == TransportKind::Exec {
         let first_command = resolve_local_program(&manifest.transport.command)?;
         let resume_command = resolve_local_program(&manifest.sessions.resume)?;
+        let daemon = manifest
+            .daemon
+            .persistent
+            .then(|| rendered_managed_daemon_config(manifest, environment, variables, profile_root))
+            .transpose()?;
         return Ok(Box::new(PerInvocationDriver::new(PerInvocationConfig {
+            daemon,
             command: first_command,
             resume_command,
             release_command: resolve_local_program(&manifest.concurrency.release)?,
@@ -1181,17 +1187,9 @@ fn make_driver(
             TransportKind::SocketJsonrpc | TransportKind::Http
         )
     {
-        let mut readiness = manifest.daemon.readiness.clone();
-        readiness.target = crate::manifest::render_template(&readiness.target, variables)?;
         transport = Box::new(ManagedDaemonTransport::new(
             transport,
-            ManagedDaemonConfig {
-                command: resolve_local_program(&render_argv(&manifest.daemon.start, variables)?)?,
-                environment: environment.clone(),
-                readiness,
-                grace: Duration::from_millis(manifest.daemon.grace_ms.max(1)),
-                log_directory: profile_root.join("daemon-logs"),
-            },
+            rendered_managed_daemon_config(manifest, environment, variables, profile_root)?,
         ));
     }
     let optional = |values: &[String]| values.first().cloned().unwrap_or_default();
@@ -1212,6 +1210,29 @@ fn make_driver(
     Ok(Box::new(
         GenericDriver::new(transport).with_operations(operations),
     ))
+}
+
+fn rendered_managed_daemon_config(
+    manifest: &Manifest,
+    environment: &BTreeMap<String, String>,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<ManagedDaemonConfig> {
+    let mut readiness = manifest.daemon.readiness.clone();
+    readiness.target = crate::manifest::render_template(&readiness.target, variables)?;
+    readiness.command = resolve_local_program(&render_argv(&readiness.command, variables)?)?;
+    Ok(ManagedDaemonConfig {
+        command: resolve_local_program(&render_argv(&manifest.daemon.start, variables)?)?,
+        initialize_command: resolve_local_program(&render_argv(
+            &manifest.daemon.initialize,
+            variables,
+        )?)?,
+        initialize_marker: profile_root.join("daemon-initialized"),
+        environment: environment.clone(),
+        readiness,
+        grace: Duration::from_millis(manifest.daemon.grace_ms.max(1)),
+        log_directory: profile_root.join("daemon-logs"),
+    })
 }
 
 fn resolve_local_program(template: &[String]) -> Result<Vec<String>> {
@@ -2076,7 +2097,8 @@ fn evaluate_rows(
                         && requests.iter().any(|record| {
                             record.request.actor == "r01"
                                 && record.request.model == manifest.fake_model.model
-                                && record.request.credential_fingerprint != "absent"
+                                && (!manifest.fake_model.auth_required
+                                    || record.request.credential_fingerprint != "absent")
                         }))
                         || events.iter().any(|event| {
                             event.event == EventVocab::ModelRequest
