@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.966-detached-daemon-native-tools-v3"
+revision = "0.0.966-detached-daemon-native-tools-v4"
 
 [availability]
 exec_paths = ["haider"]
@@ -30,7 +30,7 @@ XDG_CONFIG_HOME = "{{profile}}/config"
 XDG_CACHE_HOME = "{{profile}}/cache"
 XDG_DATA_HOME = "{{profile}}/data"
 XDG_STATE_HOME = "{{profile}}/state"
-XDG_RUNTIME_DIR = "{{profile}}/runtime"
+XDG_RUNTIME_DIR = "{{profile}}/run"
 TMPDIR = "{{profile}}/tmp"
 
 [isolation]
@@ -39,8 +39,8 @@ forbidden_roots = ["~/.config/haider", "~/.local/share/haider"]
 
 # Haider's public status command auto-spawns a double-forked daemon. AHRB parses
 # status JSON, verifies every reported state/runtime path remains in the cold
-# HOME/TMPDIR, and locates the detached daemon by exact executable plus inherited
-# isolation environment before registering the fake provider once per profile.
+# HOME/XDG_RUNTIME_DIR, and locates the detached daemon by exact executable plus
+# inherited isolation environment before registering the fake provider once per profile.
 # Every benchmark turn remains a `haider run` thin-client invocation; AHRB does
 # not speak or decode Haider's private socket protocol.
 [daemon]
@@ -61,6 +61,7 @@ executable_name = "haiderd"
 [daemon.process_match.environment]
 HOME = "{{profile}}/home"
 TMPDIR = "{{profile}}/tmp"
+XDG_RUNTIME_DIR = "{{profile}}/run"
 
 [daemon.readiness]
 kind = "command-json"
@@ -69,7 +70,7 @@ timeout_ms = 30000
 
 [daemon.readiness.json_pointer_roots]
 "/profile_path" = "HOME"
-"/runtime_dir" = "TMPDIR"
+"/runtime_dir" = "XDG_RUNTIME_DIR"
 "/daemon/pipe_dir" = "HOME"
 
 [transport]

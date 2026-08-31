@@ -3881,15 +3881,17 @@ mod tests {
         }
         let home = profile.join("home").to_string_lossy().into_owned();
         let temporary = profile.join("tmp").to_string_lossy().into_owned();
+        let runtime = profile.join("run").to_string_lossy().into_owned();
         let status = json!({
             "profile_path": format!("{home}/.haider/dev-profile"),
-            "runtime_dir": format!("{temporary}/haider/abc123"),
+            "runtime_dir": format!("{runtime}/haider/abc123"),
             "daemon": {"pipe_dir": format!("{home}/.haider/dev-profile/pipe")}
         })
         .to_string();
         let environment = BTreeMap::from([
             ("HOME".to_owned(), home),
             ("TMPDIR".to_owned(), temporary),
+            ("XDG_RUNTIME_DIR".to_owned(), runtime),
             (
                 "AHRB_PROFILE".to_owned(),
                 profile.to_string_lossy().into_owned(),
@@ -3918,7 +3920,7 @@ mod tests {
                     command: vec!["/usr/bin/printf".to_owned(), status],
                     json_pointer_roots: BTreeMap::from([
                         ("/profile_path".to_owned(), "HOME".to_owned()),
-                        ("/runtime_dir".to_owned(), "TMPDIR".to_owned()),
+                        ("/runtime_dir".to_owned(), "XDG_RUNTIME_DIR".to_owned()),
                         ("/daemon/pipe_dir".to_owned(), "HOME".to_owned()),
                     ]),
                     timeout_ms: 2_000,

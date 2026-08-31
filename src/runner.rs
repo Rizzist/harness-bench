@@ -4629,6 +4629,27 @@ mod resource_sampler_tests {
     }
 
     #[test]
+    fn haider_profile_prepares_declared_runtime_root() {
+        let manifest = crate::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))
+            .expect("load Haider manifest");
+        let profile =
+            std::env::temp_dir().join(format!("ahrb-haider-runtime-root-{}", std::process::id()));
+        if profile.exists() {
+            std::fs::remove_dir_all(&profile).expect("remove stale Haider profile");
+        }
+        prepare_profile(&manifest, &profile).expect("prepare Haider profile");
+        let variables = generated_file_variables(&profile);
+        let environment = isolated_environment(&manifest, &variables)
+            .expect("render Haider isolated environment");
+        assert_eq!(
+            environment.get("XDG_RUNTIME_DIR").map(String::as_str),
+            profile.join("run").to_str()
+        );
+        assert!(profile.join("run").is_dir());
+        std::fs::remove_dir_all(profile).expect("remove Haider profile");
+    }
+
+    #[test]
     fn generated_file_io_error_names_the_colliding_path() {
         let mut manifest = crate::manifest::load(Path::new("adapters/opencode/manifest.toml"))
             .expect("load OpenCode manifest");

@@ -77,12 +77,29 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
     assert_eq!(haider.daemon.process_match.executable_name, "haiderd");
     assert_eq!(
         haider
+            .isolation
+            .roots
+            .get("XDG_RUNTIME_DIR")
+            .map(String::as_str),
+        Some("{{profile}}/run")
+    );
+    assert_eq!(
+        haider
             .daemon
             .process_match
             .environment
             .get("TMPDIR")
             .map(String::as_str),
         Some("{{profile}}/tmp")
+    );
+    assert_eq!(
+        haider
+            .daemon
+            .process_match
+            .environment
+            .get("XDG_RUNTIME_DIR")
+            .map(String::as_str),
+        Some("{{profile}}/run")
     );
     assert_eq!(haider.daemon.readiness.kind, "command-json");
     assert_eq!(
@@ -97,7 +114,7 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             .json_pointer_roots
             .get("/runtime_dir")
             .map(String::as_str),
-        Some("TMPDIR")
+        Some("XDG_RUNTIME_DIR")
     );
     assert!(
         haider
@@ -411,19 +428,13 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
     assert!(config.content.contains("@ai-sdk/openai-compatible"));
     assert!(config.content.contains("{{base_url}}/v1"));
     assert!(config.content.contains("\"{{model}}\""));
-    assert!(config.content.contains("\"ahrb-title-v1\""));
-    assert!(
-        config
-            .content
-            .contains("\"small_model\": \"ahrb/ahrb-title-v1\"")
-    );
+    let config_json: serde_json::Value = serde_json::from_str(&config.content)?;
     assert_eq!(
-        opencode
-            .model_roles
-            .get("title")
-            .map(|role| role.model.as_str()),
-        Some("ahrb-title-v1")
+        config_json.pointer("/agent/title/disable"),
+        Some(&serde_json::Value::Bool(true))
     );
+    assert!(config_json.get("small_model").is_none());
+    assert!(!opencode.model_roles.contains_key("title"));
     for command in [&opencode.transport.command, &opencode.sessions.resume] {
         assert!(command.windows(2).any(|pair| pair == ["--format", "json"]));
         assert!(command.iter().any(|argument| argument == "--auto"));

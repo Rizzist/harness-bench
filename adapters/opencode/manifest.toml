@@ -2,7 +2,7 @@
 schema = 1
 id = "opencode"
 name = "OpenCode"
-revision = "1.17-run-format-json-native-tools-v3"
+revision = "1.17-run-format-json-native-tools-v4"
 
 [availability]
 exec_paths = ["opencode"]
@@ -16,6 +16,9 @@ credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
 allowed_paths = ["/v1/chat/completions"]
 
+# OpenCode 1.17 removes a built-in agent from its catalog when its config entry
+# has disable=true. Session title generation returns before model selection when
+# that hidden title agent is absent, so no auxiliary request reaches AHRB.
 [[isolation.generated_files]]
 path = "{{profile}}/config/opencode/opencode.json"
 mode = "0600"
@@ -30,13 +33,14 @@ content = '''{
         "apiKey": "{{credential}}"
       },
       "models": {
-        "{{model}}": { "name": "AHRB Fake Model" },
-        "ahrb-title-v1": { "name": "AHRB Deterministic Title Model" }
+        "{{model}}": { "name": "AHRB Fake Model" }
       }
     }
   },
   "model": "ahrb/{{model}}",
-  "small_model": "ahrb/ahrb-title-v1",
+  "agent": {
+    "title": { "disable": true }
+  },
   "permission": {
     "bash": "allow"
   }
@@ -46,10 +50,6 @@ content = '''{
 [model_roles.primary]
 model = "ahrb-fake-v1"
 required = true
-
-[model_roles.title]
-model = "ahrb-title-v1"
-required = false
 
 [isolation.roots]
 HOME = "{{profile}}/home"
