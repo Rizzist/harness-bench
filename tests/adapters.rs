@@ -113,10 +113,25 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             .windows(2)
             .any(|arguments| { arguments == ["--output", "jsonl"] })
     );
-    // Contract-correct selector on 0.0.967: `--account <alias>` names a credential
-    // descriptor, and a no-auth custom provider has none, so runs select the
-    // provider/model pair directly. The `account add` in `initialize` still
-    // registers the provider; `--account` must NOT appear as a run flag.
+    // The bench account must carry a stored credential (a credential-less custom
+    // provider is auto-hermetic by contract: lockdown fs scope, no process_exec),
+    // and that credential must never travel on argv.
+    assert!(
+        haider
+            .daemon
+            .initialize
+            .windows(2)
+            .any(|arguments| { arguments == ["--api-key-env", "OPENAI_API_KEY"] })
+    );
+    assert!(
+        !haider
+            .daemon
+            .initialize
+            .iter()
+            .any(|argument| argument == "--no-auth" || argument == "--api-key")
+    );
+    // Runs select the provider/model pair directly; `--account` must NOT appear
+    // as a run flag (the `account add` in `initialize` registers the provider).
     assert!(
         haider
             .transport
@@ -525,9 +540,11 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
         ["/result/head_seq", "/result/terminal_seq"]
     );
     assert_eq!(haider.events.replay_cursor_start, Some(2));
+    // The tool call maps from the `started` item: the daemon journals the
+    // tool_result before the `completed` tool_call item (verified on 0.0.967).
     assert!(haider.events.rules.iter().any(|rule| {
         rule.matches == "item"
-            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("completed")
+            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("started")
             && rule
                 .match_fields
                 .get("/payload/item/item")
@@ -535,28 +552,46 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
                 == Some("tool_call")
             && rule.event == "tool-call"
     }));
+    assert!(!haider.events.rules.iter().any(|rule| {
+        rule.matches == "item"
+            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("completed")
+            && rule
+                .match_fields
+                .get("/payload/item/item")
+                .map(String::as_str)
+                == Some("tool_call")
+    }));
     assert!(haider.events.rules.iter().any(|rule| {
         rule.matches == "tool_result"
             && rule.event == "tool-result"
             && rule.payload_bindings.get("call_id").map(String::as_str) == Some("/payload/call_id")
     }));
-    for (terminal_kind, event) in [
-        ("success", "terminal-success"),
-        ("failure", "terminal-failure"),
-        ("provider_error", "terminal-failure"),
-        ("cancellation", "terminal-cancelled"),
-        ("timeout", "terminal-timeout"),
+    // Terminals key on the DURABLE `state`; `terminal_kind`/`error_code` exist
+    // only on the live carrier, and a rule keyed on them makes `run --replay`
+    // one event shorter than the live stream (verified on 0.0.967).
+    for (state, event) in [
+        ("done", "terminal-success"),
+        ("errored", "terminal-failure"),
+        ("cancelled", "terminal-cancelled"),
     ] {
         assert!(haider.events.rules.iter().any(|rule| {
             rule.matches == "run_state"
-                && rule
-                    .match_fields
-                    .get("/payload/terminal_kind")
-                    .map(String::as_str)
-                    == Some(terminal_kind)
+                && rule.match_fields.get("/payload/state").map(String::as_str) == Some(state)
                 && rule.event == event
         }));
     }
+    assert!(!haider.events.rules.iter().any(|rule| {
+        rule.match_fields.contains_key("/payload/terminal_kind")
+            || rule.match_fields.contains_key("/payload/error_code")
+    }));
+    // `run_failed` is the adjacent cause record, never a second typed terminal.
+    assert!(
+        !haider
+            .events
+            .rules
+            .iter()
+            .any(|rule| rule.matches == "run_failed" && rule.event.starts_with("terminal-"))
+    );
     Ok(())
 }
 

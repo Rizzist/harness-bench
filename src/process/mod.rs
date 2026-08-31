@@ -679,24 +679,30 @@ pub struct Sample {
 ///
 /// A process that disappears contributes its last observed cumulative counter to
 /// `retired_ns`; this prevents whole-tree CPU from dropping when workers exit.
+///
+/// The same `(pid, start_time)` identity is the same process: it cannot exit
+/// and come back, so a retired identity observed again means membership
+/// discovery flapped for a sample (seen with haider 0.0.967 workers under
+/// load). Such a member is reinstated rather than rejected: its counter is
+/// cumulative, so moving its last retired value back to `live` keeps the
+/// whole-tree total monotonic.
 #[derive(Debug, Default)]
 pub(crate) struct TreeCpuTracker {
     live: BTreeMap<ProcIdentity, u64>,
-    retired: BTreeSet<ProcIdentity>,
+    retired: BTreeMap<ProcIdentity, u64>,
     retired_ns: u64,
 }
 
 impl TreeCpuTracker {
     pub(crate) fn update(&mut self, current: &BTreeMap<ProcIdentity, u64>) -> Result<u64> {
         for (identity, cpu_ns) in current {
-            if self.retired.contains(identity) {
-                return Err(AhrbError::Protocol(format!(
-                    "retired process identity ({},{}) reappeared in CPU accounting",
-                    identity.pid, identity.start_time
-                )));
-            }
-            if let Some(previous) = self.live.get(identity) {
-                if cpu_ns < previous {
+            let previous = self
+                .live
+                .get(identity)
+                .copied()
+                .or_else(|| self.retired.get(identity).copied());
+            if let Some(previous) = previous {
+                if *cpu_ns < previous {
                     return Err(AhrbError::Protocol(format!(
                         "process ({},{}) cumulative CPU regressed from {previous} to {cpu_ns}",
                         identity.pid, identity.start_time
@@ -705,10 +711,15 @@ impl TreeCpuTracker {
             }
         }
 
+        for identity in current.keys() {
+            if let Some(retired_at) = self.retired.remove(identity) {
+                self.retired_ns = self.retired_ns.saturating_sub(retired_at);
+            }
+        }
         for (identity, cpu_ns) in &self.live {
             if !current.contains_key(identity) {
                 self.retired_ns = self.retired_ns.saturating_add(*cpu_ns);
-                self.retired.insert(*identity);
+                self.retired.insert(*identity, *cpu_ns);
             }
         }
         self.live = current.clone();
@@ -821,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_cpu_rejects_counter_regression_and_retired_reappearance() -> Result<()> {
+    fn tree_cpu_rejects_counter_regression_and_reinstates_flapped_member() -> Result<()> {
         let root = identity(10);
         let worker = identity(20);
         let mut tracker = TreeCpuTracker::default();
@@ -831,11 +842,20 @@ mod tests {
             .expect_err("same-identity CPU regression must be rejected");
         assert!(regression.to_string().contains("CPU regressed"));
 
-        tracker.update(&BTreeMap::from([(root, 120)]))?;
-        let reappearance = tracker
-            .update(&BTreeMap::from([(root, 130), (worker, 60)]))
-            .expect_err("retired identity must not reappear");
-        assert!(reappearance.to_string().contains("reappeared"));
+        // Worker drops out of discovery for one sample (retired at 50) ...
+        assert_eq!(tracker.update(&BTreeMap::from([(root, 120)]))?, 170);
+        // ... and comes back with the same identity: reinstated, total stays
+        // monotonic and counts its live cumulative value exactly once.
+        assert_eq!(
+            tracker.update(&BTreeMap::from([(root, 130), (worker, 60)]))?,
+            190
+        );
+        let regression = tracker
+            .update(&BTreeMap::from([(root, 140), (worker, 59)]))
+            .expect_err("a reinstated member is still held to monotonic CPU");
+        assert!(regression.to_string().contains("CPU regressed"));
+        // A genuine later exit retires it again without double counting.
+        assert_eq!(tracker.update(&BTreeMap::from([(root, 150)]))?, 210);
         Ok(())
     }
 }

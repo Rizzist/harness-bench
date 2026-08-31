@@ -756,7 +756,14 @@ fn rusage(pid: u32) -> Result<Option<RusageInfoV4>> {
         return Ok(Some(usage));
     }
     let error = std::io::Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+    // ESRCH/ENOENT: the process is gone. EPERM: the PID now belongs to another
+    // user (recycled between discovery and this call under host process
+    // churn), so it is no longer an owned process either; both retire the
+    // identity instead of aborting the run.
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM)
+    ) {
         Ok(None)
     } else {
         Err(error.into())

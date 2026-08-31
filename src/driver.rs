@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::future::Future;
@@ -26,7 +27,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use std::collections::BTreeSet;
 
 /// An opaque harness session identifier.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -355,7 +355,10 @@ fn signal_managed_process_group(pid: u32, signal: i32) -> Result<()> {
     // negative PIDs address exactly that owned group.
     if unsafe { libc::kill(-process_group, signal) } != 0 {
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
+        // ESRCH: the owned group is already empty. EPERM: the group id was
+        // recycled by another user's process after the owned tree exited;
+        // nothing of ours remains to signal, so neither is a stop failure.
+        if !matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
             return Err(error.into());
         }
     }
@@ -1740,6 +1743,19 @@ fn canonical_native_result(native: Value) -> Value {
             .into_iter()
             .collect(),
     };
+    // Some harnesses (verified: haider 0.0.967) carry the structured execution
+    // record as a JSON *string* under `preview`; surface it as `preview_record`
+    // so exit_code/status/output inside it are visible to `ok` derivation AND to
+    // downstream oracles (e.g. reading tool stdout back for a dependency check).
+    if !result.contains_key("preview_record")
+        && let Some(parsed) = result
+            .get("preview")
+            .and_then(Value::as_str)
+            .and_then(|preview| serde_json::from_str::<Value>(preview.trim()).ok())
+            .filter(Value::is_object)
+    {
+        result.insert("preview_record".to_owned(), parsed);
+    }
     if !result.contains_key("ok") {
         let value = Value::Object(result.clone());
         let is_error = nested_value(&value, "is_error")
@@ -2162,6 +2178,33 @@ impl PerInvocationDriver {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
+        // Some harnesses (verified: haider 0.0.967) issue the tool call as a
+        // `started` item with EMPTY args and only populate the full arguments —
+        // including the AHRB fixture marker — on the later `completed` item, which
+        // the journal commits AFTER the tool_result. AHRB anchors the tool-call
+        // event on the `started` item so it precedes the result in cursor order;
+        // pre-scan the `completed` items so that started call's abstract identity
+        // and arguments are backfilled by native call_id during canonicalization.
+        for raw in records {
+            let is_completed_tool_call = raw.pointer("/payload/event").and_then(Value::as_str)
+                == Some("completed")
+                && raw.pointer("/payload/item/item").and_then(Value::as_str) == Some("tool_call");
+            if !is_completed_tool_call {
+                continue;
+            }
+            let Some(item) = raw.pointer("/payload/item") else {
+                continue;
+            };
+            let Some(native_call_id) = item.get("call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if fixture_calls.contains_key(native_call_id) {
+                continue;
+            }
+            if let Some(call) = embedded_fixture_call(item) {
+                fixture_calls.insert(native_call_id.to_owned(), call);
+            }
+        }
         let mut effective = mapping.clone();
         effective.id_pointer = "/_ahrb_id".to_owned();
         effective.cursor_pointer = "/_ahrb_cursor".to_owned();
@@ -2878,9 +2921,45 @@ impl Driver for PerInvocationDriver {
             self.record_event_contract(&records)?;
             if self.config.events.replay_compare_live_records {
                 let live = self.raw_live_replay_records(&persisted)?;
-                if records != live {
+                // The durable journal stores the bare envelope payload, while the
+                // live stream may enrich it with documented client augmentation
+                // (verified on haider 0.0.967: the terminal run_state gains
+                // terminal_kind/error_code on the live carrier only). Envelope
+                // fields must match exactly; the replayed payload must be an
+                // exact subset of the live payload.
+                let replay_matches_live = records.len() == live.len()
+                    && records.iter().zip(live.iter()).all(|(replayed, lived)| {
+                        if replayed == lived {
+                            return true;
+                        }
+                        let (Some(replay_object), Some(live_object)) =
+                            (replayed.as_object(), lived.as_object())
+                        else {
+                            return false;
+                        };
+                        if replay_object.len() != live_object.len() {
+                            return false;
+                        }
+                        replay_object.iter().all(|(key, replay_value)| {
+                            match (key.as_str(), live_object.get(key)) {
+                                ("payload", Some(live_value)) => {
+                                    match (replay_value.as_object(), live_value.as_object()) {
+                                        (Some(replay_payload), Some(live_payload)) => {
+                                            replay_payload.iter().all(|(field, value)| {
+                                                live_payload.get(field) == Some(value)
+                                            })
+                                        }
+                                        _ => replay_value == live_value,
+                                    }
+                                }
+                                (_, Some(live_value)) => replay_value == live_value,
+                                (_, None) => false,
+                            }
+                        })
+                    });
+                if !replay_matches_live {
                     return Err(AhrbError::Protocol(format!(
-                        "durable replay records differed from raw live run projection: live={}, replay={}",
+                        "durable replay records differed from raw live run projection beyond documented client augmentation: live={}, replay={}",
                         live.len(),
                         records.len()
                     )));
@@ -4776,8 +4855,36 @@ mod tests {
                         "session_id":"haider-session","run_id":"run-1",
                         "payload":{"type":"run_state","state":"thinking"}
                     }),
+                    // Real 0.0.967 order: the `started` tool_call item carries
+                    // no args, the tool_result commits next, and the `completed`
+                    // item (last) carries the full command with the fixture
+                    // marker. AHRB anchors the call on `started` and backfills its
+                    // arguments from `completed` so the call precedes the result.
                     json!({
-                        "event_id":"evt-tool-call","seq":2,
+                        "event_id":"evt-tool-start","seq":2,
+                        "session_id":"haider-session","run_id":"run-1",
+                        "payload":{
+                            "type":"item","event":"started","item_id":"item-1",
+                            "item":{
+                                "item":"tool_call","call_id":"haider-tool-1",
+                                "name":"process_exec","args":{},
+                                "status":"in_progress"
+                            }
+                        }
+                    }),
+                    json!({
+                        "event_id":"evt-tool-result","seq":3,
+                        "session_id":"haider-session","run_id":"run-1",
+                        "payload":{
+                            "type":"tool_result","call_id":"haider-tool-1",
+                            "result":{
+                                "preview":"{\"exit_code\":0,\"status\":\"completed\",\"output\":\"ok\"}",
+                                "truncated":false
+                            }
+                        }
+                    }),
+                    json!({
+                        "event_id":"evt-tool-done","seq":4,
                         "session_id":"haider-session","run_id":"run-1",
                         "payload":{
                             "type":"item","event":"completed","item_id":"item-1",
@@ -4789,15 +4896,7 @@ mod tests {
                         }
                     }),
                     json!({
-                        "event_id":"evt-tool-result","seq":3,
-                        "session_id":"haider-session","run_id":"run-1",
-                        "payload":{
-                            "type":"tool_result","call_id":"haider-tool-1",
-                            "result":{"preview":"ok","truncated":false,"status":"completed"}
-                        }
-                    }),
-                    json!({
-                        "event_id":"evt-message","seq":4,
+                        "event_id":"evt-message","seq":5,
                         "session_id":"haider-session","run_id":"run-1",
                         "payload":{
                             "type":"item","event":"completed","item_id":"item-2",
@@ -4805,7 +4904,7 @@ mod tests {
                         }
                     }),
                     json!({
-                        "event_id":"evt-done","seq":5,
+                        "event_id":"evt-done","seq":6,
                         "session_id":"haider-session","run_id":"run-1",
                         "payload":{"type":"run_state","state":"done","terminal_kind":"success"}
                     }),
@@ -5335,9 +5434,9 @@ mod tests {
             json!({
                 "schema_version":1,
                 "event_id":"evt-tool-call","seq":16,"session_id":"session-1","run_id":"run-1",
-                "payload":{"type":"item","event":"completed","item":{
+                "payload":{"type":"item","event":"started","item":{
                     "item":"tool_call","call_id":"provider-call-1","name":"process_exec",
-                    "args":{"command":["true"]}
+                    "args":{"command":["true"]},"status":"in_progress"
                 }}
             }),
             json!({
