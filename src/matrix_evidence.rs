@@ -360,9 +360,10 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
         }
         30 => {
             if manifest.transport.kind == TransportKind::Exec {
-                !manifest.sessions.resume.is_empty()
-                    && manifest.events.source == "journal-file"
-                    && !manifest.events.path.is_empty()
+                !manifest.events.replay_command.is_empty()
+                    || (!manifest.sessions.resume.is_empty()
+                        && manifest.events.source == "journal-file"
+                        && !manifest.events.path.is_empty())
             } else {
                 !manifest.sessions.create.is_empty()
                     && !manifest.sessions.submit.is_empty()
@@ -373,27 +374,33 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
         32 => !manifest.next_input.subturn.is_empty(),
         33 => !manifest.next_input.queue.is_empty(),
         35 => {
-            !manifest.sessions.resume.is_empty()
-                && !manifest.concurrency.release.is_empty()
-                && if manifest.transport.kind == TransportKind::Exec {
-                    manifest.events.source == "journal-file" && !manifest.events.path.is_empty()
-                } else {
-                    manifest.daemon.persistent && !manifest.sessions.attach.is_empty()
-                }
+            if manifest.transport.kind == TransportKind::Exec {
+                manifest.daemon.persistent && !manifest.sessions.recover_probe.is_empty()
+                    || (!manifest.sessions.resume.is_empty()
+                        && !manifest.concurrency.release.is_empty()
+                        && manifest.events.source == "journal-file"
+                        && !manifest.events.path.is_empty())
+            } else {
+                !manifest.sessions.resume.is_empty()
+                    && !manifest.concurrency.release.is_empty()
+                    && manifest.daemon.persistent
+                    && !manifest.sessions.attach.is_empty()
+            }
         }
         37 => {
-            !manifest.sessions.resume.is_empty()
+            (!manifest.sessions.resume.is_empty() || !manifest.sessions.resume_control.is_empty())
                 && (manifest.transport.kind == TransportKind::Exec
                     || !manifest.sessions.attach.is_empty())
         }
         39 => !manifest.hooks.acceptance.is_empty() && !manifest.hooks.completion.is_empty(),
         40 => {
-            matches!(manifest.events.source.as_str(), "journal" | "journal-file")
-                && manifest.events.framing == "jsonl"
-                && !manifest.events.path.is_empty()
+            manifest.events.framing == "jsonl"
                 && !manifest.events.cursor_pointer.is_empty()
-                && (manifest.transport.kind != TransportKind::Exec
-                    || !manifest.events.replay_command.is_empty())
+                && if manifest.transport.kind == TransportKind::Exec {
+                    !manifest.events.replay_command.is_empty()
+                } else {
+                    manifest.events.source == "journal" && !manifest.events.path.is_empty()
+                }
         }
         _ => true,
     }
@@ -684,7 +691,6 @@ fn exact_assertion(row: u8, values: &ObservationSet) -> Assertion {
             bt("ordered"),
             ue("duplicates", 0),
             ue("gaps", 0),
-            bt("continued_b"),
         ],
         31 => vec![
             ue("input_accepts", 1),

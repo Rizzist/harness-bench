@@ -225,7 +225,7 @@ fn collects_priority_row_12_from_owned_timeout_and_boundaries() {
     let events = [event(
         1,
         EventVocab::TerminalFailure,
-        json!({"status":"failure","category":"idle-timeout"}),
+        json!({"status":"failure","category":"idle-timeout","elapsed_ms":2000}),
     )];
     let timings = [
         TimingObservation {

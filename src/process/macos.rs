@@ -8,7 +8,6 @@ use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::mem::{size_of, zeroed};
-use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 const PROC_PPID_ONLY: u32 = 6;
@@ -20,8 +19,6 @@ const RUSAGE_INFO_V4: c_int = 4;
 const TASK_VM_INFO: c_int = 22;
 const KERN_SUCCESS: c_int = 0;
 const MAXCOMLEN: usize = 16;
-const CTL_KERN: c_int = 1;
-const KERN_PROCARGS2: c_int = 49;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -648,183 +645,7 @@ fn list_pids_for(kind: u32, type_info: u32) -> Result<Vec<u32>> {
     ))
 }
 
-pub(crate) fn matching_processes(
-    executable_name: &str,
-    expected_environment: &BTreeMap<String, String>,
-) -> Result<Vec<u32>> {
-    let open_path_matches = lsof_matching_processes(
-        executable_name,
-        &expected_environment
-            .values()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>(),
-    )?;
-    let mut matches = Vec::new();
-    for pid in list_pids_for(PROC_ALL_PIDS, 0)? {
-        let Some(info) = bsd_info(pid)? else {
-            continue;
-        };
-        if process_info(&info, ProcOwnership::DeclaredRoot).command != executable_name {
-            continue;
-        }
-        let environment_matches = process_environment(pid)?.is_some_and(|environment| {
-            expected_environment
-                .iter()
-                .all(|(name, value)| environment.get(name) == Some(value))
-        });
-        if environment_matches || open_path_matches.contains(&pid) {
-            matches.push(pid);
-        }
-    }
-    matches.sort_unstable();
-    matches.dedup();
-    Ok(matches)
-}
-
-pub(crate) fn matching_processes_fast(
-    executable_name: &str,
-    expected_environment: &BTreeMap<String, String>,
-) -> Result<Vec<u32>> {
-    let mut matches = Vec::new();
-    for pid in list_pids_for(PROC_ALL_PIDS, 0)? {
-        let Some(info) = bsd_info(pid)? else {
-            continue;
-        };
-        if process_info(&info, ProcOwnership::DeclaredRoot).command != executable_name {
-            continue;
-        }
-        if process_environment(pid)?.is_some_and(|environment| {
-            expected_environment
-                .iter()
-                .all(|(name, value)| environment.get(name) == Some(value))
-        }) {
-            matches.push(pid);
-        }
-    }
-    matches.sort_unstable();
-    matches.dedup();
-    Ok(matches)
-}
-
-fn lsof_matching_processes(executable_name: &str, roots: &[PathBuf]) -> Result<BTreeSet<u32>> {
-    let roots = roots
-        .iter()
-        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
-        .collect::<Vec<_>>();
-    let output = match crate::process::owned_command_output(
-        std::process::Command::new("/usr/sbin/lsof").args([
-            "-n",
-            "-P",
-            "-c",
-            executable_name,
-            "-Fpcn",
-        ]),
-    ) {
-        Ok(output) => output,
-        Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BTreeSet::new());
-        }
-        Err(error) => return Err(error),
-    };
-    if !output.status.success() && output.stdout.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut matches = BTreeSet::new();
-    let mut pid = None;
-    let mut command_matches = false;
-    let mut path_matches = false;
-    let finish = |pid: Option<u32>,
-                  command_matches: bool,
-                  path_matches: bool,
-                  matches: &mut BTreeSet<u32>| {
-        if command_matches
-            && path_matches
-            && let Some(pid) = pid
-        {
-            matches.insert(pid);
-        }
-    };
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let (tag, value) = line.split_at(1);
-        match tag {
-            "p" => {
-                finish(pid, command_matches, path_matches, &mut matches);
-                pid = value.parse().ok();
-                command_matches = false;
-                path_matches = false;
-            }
-            "c" => command_matches = value == executable_name,
-            "n" => {
-                path_matches |= roots.iter().any(|root| Path::new(value).starts_with(root));
-            }
-            _ => {}
-        }
-    }
-    finish(pid, command_matches, path_matches, &mut matches);
-    Ok(matches)
-}
-
-fn process_environment(pid: u32) -> Result<Option<BTreeMap<String, String>>> {
-    let pid = c_int::try_from(pid)
-        .map_err(|_| AhrbError::Validation("PID exceeds Darwin pid_t range".to_owned()))?;
-    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
-    let mut size = 0_usize;
-    // SAFETY: the MIB has three initialized elements and `size` is a writable
-    // output. A null old-value pointer requests only the required buffer size.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        let error = std::io::Error::last_os_error();
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-        ) {
-            return Ok(None);
-        }
-        return Err(error.into());
-    }
-    if size < size_of::<c_int>() || size > 16 * 1024 * 1024 {
-        return Ok(None);
-    }
-    let mut buffer = vec![0_u8; size];
-    // SAFETY: `buffer` owns `size` writable bytes and the MIB/output-size
-    // pointers remain valid for the duration of the call.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buffer.as_mut_ptr().cast::<c_void>(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        let error = std::io::Error::last_os_error();
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-        ) {
-            return Ok(None);
-        }
-        return Err(error.into());
-    }
-    buffer.truncate(size);
-    Ok(parse_procargs_environment(&buffer))
-}
-
+#[cfg(test)]
 fn parse_procargs_environment(buffer: &[u8]) -> Option<BTreeMap<String, String>> {
     let argc_bytes: [u8; size_of::<c_int>()] = buffer.get(..size_of::<c_int>())?.try_into().ok()?;
     let argc = c_int::from_ne_bytes(argc_bytes);
@@ -858,12 +679,14 @@ fn parse_procargs_environment(buffer: &[u8]) -> Option<BTreeMap<String, String>>
     Some(environment)
 }
 
+#[cfg(test)]
 fn skip_c_string(buffer: &[u8], offset: &mut usize) -> Option<()> {
     let relative = buffer.get(*offset..)?.iter().position(|byte| *byte == 0)?;
     *offset = offset.checked_add(relative)?.checked_add(1)?;
     Some(())
 }
 
+#[cfg(test)]
 fn skip_nuls(buffer: &[u8], offset: &mut usize) {
     while buffer.get(*offset) == Some(&0) {
         *offset = offset.saturating_add(1);

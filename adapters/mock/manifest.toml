@@ -59,9 +59,16 @@ pid_locator = "{{profile}}/state/daemon.pid"
 shutdown = ["harness.shutdown"]
 grace_ms = 2000
 
+[daemon.shutdown_result]
+outcome_pointer = "/outcome"
+clean_outcomes = ["stopped_cleanly", "not_running"]
+escalate_outcomes = ["did_not_stop"]
+
 [daemon.readiness]
-kind = "file"
-target = "{{profile}}/state/daemon.pid"
+kind = "command-json"
+command = ["target/debug/ahrb-mock-harness", "status", "--state-dir", "{{profile}}/state"]
+pid_pointer = "/daemon/pid"
+ready_pointer = "/daemon/ready"
 timeout_ms = 10000
 
 [transport]
@@ -77,6 +84,7 @@ attach = ["session.attach"]
 resume = ["session.resume"]
 close_delete = ["session.close"]
 list = []
+wait_ready = ["sessions.wait-ready"]
 id_pointer = "/session_id"
 
 [next_input]

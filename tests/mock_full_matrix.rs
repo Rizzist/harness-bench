@@ -55,19 +55,10 @@ fn json_text(values: &[Value]) -> String {
     serde_json::to_string(values).expect("serialize evidence for inspection")
 }
 
-fn derived_row43_journal(output: &Path) -> String {
-    let mut profiles = std::fs::read_dir(output)
-        .expect("read daemon output")
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("profile-"))
-        })
-        .collect::<Vec<_>>();
-    profiles.sort();
+fn derived_row43_journal(report: &Report) -> String {
+    let profiles = [PathBuf::from(&report.profile_path)];
     assert_eq!(profiles.len(), 1, "daemon run uses one canonical profile");
+    assert!(profiles[0].is_dir(), "canonical daemon profile exists");
     let sessions = profiles[0].join("derived-row43/state/sessions");
     std::fs::read_dir(sessions)
         .expect("read derived row-43 sessions")
@@ -251,7 +242,7 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
             .and_then(Value::as_str)
             != Some("warmup")
     }));
-    let row43_journal = derived_row43_journal(&output);
+    let row43_journal = derived_row43_journal(&report);
     assert_eq!(
         row43_journal.matches("\"key\":\"row-43-warmup\"").count(),
         1
@@ -328,6 +319,7 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         );
     }
 
+    std::fs::remove_dir_all(&report.profile_path).expect("remove full-matrix profile");
     std::fs::remove_dir_all(&output).expect("remove isolated full-matrix report");
 }
 

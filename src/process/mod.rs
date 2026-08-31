@@ -100,7 +100,8 @@ pub struct ProcessTree {
 struct OwnedRegistry {
     groups: BTreeMap<u32, ProcIdentity>,
     observed: BTreeSet<ProcIdentity>,
-    detached_matches: Vec<crate::manifest::ProcessMatch>,
+    identity_groups: BTreeMap<ProcIdentity, u32>,
+    trees: BTreeMap<ProcIdentity, BTreeSet<ProcIdentity>>,
 }
 
 static OWNED_REGISTRY: OnceLock<Mutex<OwnedRegistry>> = OnceLock::new();
@@ -108,7 +109,6 @@ static CLEANUP_INSTALL: Once = Once::new();
 static CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLEANUP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
-static DETACHED_DISCOVERY_PENDING: AtomicI32 = AtomicI32::new(0);
 const SIGNAL_TARGET_CAPACITY: usize = 4_096;
 static SIGNAL_GROUPS: [AtomicI32; SIGNAL_TARGET_CAPACITY] =
     [const { AtomicI32::new(0) }; SIGNAL_TARGET_CAPACITY];
@@ -154,13 +154,8 @@ fn registry_lock() -> Result<std::sync::MutexGuard<'static, OwnedRegistry>> {
         .map_err(|_| AhrbError::Protocol("owned-process registry lock was poisoned".to_owned()))
 }
 
-/// Register a newly spawned process and the isolated process group it leads or joins.
-pub fn register_process(pid: u32) -> Result<()> {
-    let Some((identity, process_group)) = process_identity_and_group(pid)? else {
-        return Err(AhrbError::Protocol(format!(
-            "spawned process PID {pid} disappeared before ownership registration"
-        )));
-    };
+fn register_process_identity(identity: ProcIdentity, process_group: u32) -> Result<()> {
+    let pid = identity.pid;
     if process_group == 0 {
         return Err(AhrbError::Protocol(format!(
             "spawned process PID {pid} has no process group"
@@ -179,69 +174,77 @@ pub fn register_process(pid: u32) -> Result<()> {
     let mut registry = registry_lock()?;
     registry.groups.entry(process_group).or_insert(identity);
     registry.observed.insert(identity);
+    registry.identity_groups.insert(identity, process_group);
+    registry.trees.entry(identity).or_default().insert(identity);
     record_signal_target(&SIGNAL_GROUPS, process_group);
     record_signal_target(&SIGNAL_PIDS, identity.pid);
     Ok(())
 }
 
-/// Register exact detached-daemon ownership evidence before its launcher runs.
-pub fn register_detached_match(process_match: crate::manifest::ProcessMatch) -> Result<()> {
-    if process_match.executable_name.trim().is_empty() {
-        return Ok(());
+/// Register a newly spawned process and the isolated process group it leads or joins.
+pub fn register_process(pid: u32) -> Result<()> {
+    let Some((identity, process_group)) = process_identity_and_group(pid)? else {
+        return Err(AhrbError::Protocol(format!(
+            "spawned process PID {pid} disappeared before ownership registration"
+        )));
+    };
+    register_process_identity(identity, process_group)
+}
+
+/// Resolve and register an externally launched root, returning its stable
+/// `(pid,start_time)` identity for later PID-reuse-safe lifecycle operations.
+pub fn register_external_process(pid: u32) -> Result<ProcIdentity> {
+    let Some((identity, process_group)) = process_identity_and_group(pid)? else {
+        return Err(AhrbError::Protocol(format!(
+            "external process PID {pid} disappeared before ownership registration"
+        )));
+    };
+    register_process_identity(identity, process_group)?;
+    Ok(identity)
+}
+
+/// Signal the registered group and every sampler-attributed member of one
+/// external root. Every direct PID is start-time revalidated before signaling.
+#[cfg(unix)]
+pub(crate) fn signal_registered_tree(identity: ProcIdentity, signal: i32) -> Result<()> {
+    let snapshot = registry_lock()?.clone();
+    let process_group = snapshot
+        .identity_groups
+        .get(&identity)
+        .copied()
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "no registered process group for external PID {}",
+                identity.pid
+            ))
+        })?;
+    if let Some(leader) = snapshot.groups.get(&process_group)
+        && !verified_group_members(&snapshot, process_group, *leader)?.is_empty()
+    {
+        signal_group(process_group, signal)?;
     }
-    let cleanup_lock = CLEANUP_LOCK.get_or_init(|| Mutex::new(()));
-    let _registration = cleanup_lock
-        .lock()
-        .map_err(|_| AhrbError::Protocol("owned-process cleanup lock was poisoned".to_owned()))?;
-    if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
-        return Err(AhrbError::Protocol(
-            "refusing to start a detached daemon during owned-process cleanup".to_owned(),
-        ));
-    }
-    let mut registry = registry_lock()?;
-    let is_new = !registry.detached_matches.iter().any(|existing| {
-        existing.executable_name == process_match.executable_name
-            && existing.environment == process_match.environment
-    });
-    if is_new {
-        registry.detached_matches.push(process_match.clone());
-    }
-    drop(registry);
-    DETACHED_DISCOVERY_PENDING.fetch_add(1, Ordering::SeqCst);
-    let watcher = std::thread::Builder::new()
-        .name("ahrb-detached-owner".to_owned())
-        .spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            let mut termination_deadline = None;
-            while Instant::now() < deadline {
-                if let Ok([pid]) = matching_processes_fast(
-                    &process_match.executable_name,
-                    &process_match.environment,
-                )
-                .as_deref()
-                {
-                    let _ = register_process(*pid);
-                    DETACHED_DISCOVERY_PENDING.fetch_sub(1, Ordering::SeqCst);
-                    return;
-                }
-                if RECEIVED_SIGNAL.load(Ordering::SeqCst) != 0
-                    || CLEANUP_REQUESTED.load(Ordering::SeqCst)
-                {
-                    let signal_deadline = termination_deadline
-                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
-                    if Instant::now() >= *signal_deadline {
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            DETACHED_DISCOVERY_PENDING.fetch_sub(1, Ordering::SeqCst);
-        });
-    if let Err(error) = watcher {
-        DETACHED_DISCOVERY_PENDING.fetch_sub(1, Ordering::SeqCst);
-        return Err(error.into());
+    if let Some(members) = snapshot.trees.get(&identity) {
+        for member in members {
+            signal_identity(*member, signal)?;
+        }
     }
     Ok(())
+}
+
+pub(crate) fn registered_tree_is_live(identity: ProcIdentity) -> Result<bool> {
+    let snapshot = registry_lock()?.clone();
+    let group_live = snapshot
+        .identity_groups
+        .get(&identity)
+        .and_then(|group| snapshot.groups.get(group).map(|leader| (*group, *leader)))
+        .map(|(group, leader)| verified_group_members(&snapshot, group, leader))
+        .transpose()?
+        .is_some_and(|members| !members.is_empty());
+    let member_live = snapshot
+        .trees
+        .get(&identity)
+        .is_some_and(|members| members.iter().copied().any(identity_is_live));
+    Ok(group_live || member_live)
 }
 
 /// Register a Tokio child immediately after `spawn`.
@@ -312,6 +315,13 @@ pub fn track_process_tree(tree: &ProcessTree) -> Result<()> {
     }
     let mut registry = registry_lock()?;
     registry.observed.extend(tree.members.keys().copied());
+    for root in &tree.roots {
+        registry
+            .trees
+            .entry(*root)
+            .or_default()
+            .extend(tree.members.keys().copied());
+    }
     for identity in tree.members.keys() {
         record_signal_target(&SIGNAL_PIDS, identity.pid);
     }
@@ -333,24 +343,6 @@ fn process_identity_and_group(pid: u32) -> Result<Option<(ProcIdentity, u32)>> {
     ))
 }
 
-fn matching_processes_fast(
-    executable_name: &str,
-    environment: &BTreeMap<String, String>,
-) -> Result<Vec<u32>> {
-    #[cfg(target_os = "macos")]
-    {
-        return macos::matching_processes_fast(executable_name, environment);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return linux::matching_processes_fast(executable_name, environment);
-    }
-    #[allow(unreachable_code)]
-    Err(AhrbError::Unsupported(
-        "detached-process matching is implemented only on macOS and Linux".to_owned(),
-    ))
-}
-
 fn process_group_members(process_group: u32, minimum_start: u64) -> Result<Vec<ProcIdentity>> {
     #[cfg(target_os = "macos")]
     {
@@ -366,7 +358,7 @@ fn process_group_members(process_group: u32, minimum_start: u64) -> Result<Vec<P
     ))
 }
 
-fn identity_is_live(identity: ProcIdentity) -> bool {
+pub(crate) fn identity_is_live(identity: ProcIdentity) -> bool {
     matches!(
         process_identity_and_group(identity.pid),
         Ok(Some((current, _))) if current == identity
@@ -465,24 +457,8 @@ pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
         .map_err(|_| AhrbError::Protocol("owned-process cleanup lock was poisoned".to_owned()))?;
     CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
     let _phase = CleanupPhase;
-    while DETACHED_DISCOVERY_PENDING.load(Ordering::SeqCst) > 0 {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let mut snapshot = registry_lock()?.clone();
-    for process_match in &snapshot.detached_matches {
-        for pid in matching_processes(&process_match.executable_name, &process_match.environment)? {
-            if let Some((identity, process_group)) = process_identity_and_group(pid)? {
-                snapshot.groups.entry(process_group).or_insert(identity);
-                snapshot.observed.insert(identity);
-                record_signal_target(&SIGNAL_GROUPS, process_group);
-                record_signal_target(&SIGNAL_PIDS, pid);
-            }
-        }
-    }
-    if snapshot.groups.is_empty()
-        && snapshot.observed.is_empty()
-        && snapshot.detached_matches.is_empty()
-    {
+    let snapshot = registry_lock()?.clone();
+    if snapshot.groups.is_empty() && snapshot.observed.is_empty() {
         return Ok(Vec::new());
     }
     #[cfg(unix)]
@@ -529,7 +505,8 @@ pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
         if survivors.is_empty() {
             registry.groups.clear();
             registry.observed.clear();
-            registry.detached_matches.clear();
+            registry.identity_groups.clear();
+            registry.trees.clear();
             for target in &SIGNAL_GROUPS {
                 target.store(0, Ordering::Release);
             }
@@ -538,6 +515,13 @@ pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
             }
         } else {
             registry.observed = survivors.clone();
+            registry
+                .identity_groups
+                .retain(|identity, _| survivors.contains(identity));
+            registry.trees.retain(|root, members| {
+                members.retain(|identity| survivors.contains(identity));
+                survivors.contains(root) || !members.is_empty()
+            });
             registry.groups.retain(|process_group, leader| {
                 process_group_members(*process_group, leader.start_time)
                     .is_ok_and(|members| !members.is_empty())
@@ -574,18 +558,6 @@ impl Drop for CleanupPhase {
 extern "C" fn remember_termination_signal(signal: i32) {
     RECEIVED_SIGNAL.store(signal, Ordering::SeqCst);
     if signal == libc::SIGABRT {
-        // A detached launcher can exit between its group registration and the
-        // exact daemon match becoming visible. Keep repeating the lock-free
-        // sweep while its pre-registered watcher is resolving that handoff.
-        // This uses only atomics, kill(2), and spin hints in the signal path.
-        let mut rounds = 0_u32;
-        while DETACHED_DISCOVERY_PENDING.load(Ordering::SeqCst) > 0 && rounds < 150_000 {
-            kill_signal_targets();
-            for _ in 0..10_000 {
-                std::hint::spin_loop();
-            }
-            rounds = rounds.saturating_add(1);
-        }
         kill_signal_targets();
         // SAFETY: `_exit` is async-signal-safe. Returning from SIGABRT would
         // allow abort(3) to force termination before a watchdog cleanup pass.
@@ -836,29 +808,6 @@ pub trait Sampler: Send {
     fn discover(&mut self, roots: &[u32]) -> Result<ProcessTree>;
     /// Capture one boundary or cadence sample.
     fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample>;
-}
-
-/// Locate processes by exact executable basename and isolated-root evidence.
-///
-/// This is intentionally stricter than a name-only lookup. Linux reads the
-/// inherited environment directly. macOS uses that evidence when permitted and
-/// otherwise requires an open file beneath one of the same isolated roots.
-pub fn matching_processes(
-    executable_name: &str,
-    environment: &BTreeMap<String, String>,
-) -> Result<Vec<u32>> {
-    #[cfg(target_os = "macos")]
-    {
-        return macos::matching_processes(executable_name, environment);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return linux::matching_processes(executable_name, environment);
-    }
-    #[allow(unreachable_code)]
-    Err(AhrbError::Unsupported(
-        "detached process matching is implemented only on macOS and Linux".to_owned(),
-    ))
 }
 
 /// Reap a direct child with `wait4` and return supplemental terminal usage.

@@ -20,6 +20,8 @@ static RESULT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct RunPersistence {
     /// Primary output requested by the user, or the default durable bundle.
     pub output: PathBuf,
+    /// Short, output-independent root for isolated harness state.
+    pub profile_path: PathBuf,
     /// Canonical auto-save directory when saving is enabled.
     pub results_dir: Option<PathBuf>,
     /// UTC run-start timestamp.
@@ -138,6 +140,12 @@ pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersisten
     } else {
         absolute_path(&options.output)?
     };
+    #[cfg(unix)]
+    let temporary_root = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let temporary_root = std::env::temp_dir();
+    let temporary_root = std::fs::canonicalize(&temporary_root).unwrap_or(temporary_root);
+    let profile_path = temporary_root.join(format!("ahrb-{short_id}-{:x}", std::process::id()));
     let harness_version = options
         .harness_version
         .clone()
@@ -154,6 +162,7 @@ pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersisten
         .unwrap_or_else(|| "unknown".to_owned());
     Ok(RunPersistence {
         output,
+        profile_path,
         results_dir,
         timestamp,
         harness_version,
@@ -712,5 +721,24 @@ mod tests {
         let revision = ahrb_revision();
         assert_ne!(revision, "unknown");
         assert!(!revision.trim().is_empty());
+    }
+
+    #[test]
+    fn long_output_does_not_lengthen_profile_path() -> Result<()> {
+        let manifest = crate::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))?;
+        let options = RunOptions {
+            manifest: PathBuf::from("adapters/haider-agent/manifest.toml"),
+            output: PathBuf::from("/tmp").join("very-long-results-component-".repeat(12)),
+            profile: crate::cli::Profile::Quick,
+            tests: vec![1],
+            junit: false,
+            deadline_secs: None,
+            no_save: true,
+            harness_version: Some("0.0.967".to_owned()),
+        };
+        let persistence = prepare(&options, &manifest)?;
+        assert!(!persistence.profile_path.starts_with(&options.output));
+        assert!(persistence.profile_path.as_os_str().len() < 60);
+        Ok(())
     }
 }

@@ -196,39 +196,3 @@ fn normal_doctor_exit_reaps_probe_descendants() {
     }
     std::fs::remove_dir_all(root).expect("remove normal probe fixture");
 }
-
-fn signal_waits_for_detached_match_handoff(signal: &str) {
-    let root = std::env::temp_dir().join(format!("ahrb-{signal}-handoff-{}", std::process::id()));
-    if root.exists() {
-        std::fs::remove_dir_all(&root).expect("remove stale abort handoff fixture");
-    }
-    std::fs::create_dir(&root).expect("create abort handoff fixture");
-    let pid_file = root.join("detached.pid");
-    let status = Command::new(env!("CARGO_BIN_EXE_ahrb-fixture"))
-        .current_dir(&root)
-        .arg("detached-signal-owner")
-        .arg("--pid-file")
-        .arg("detached.pid")
-        .arg("--signal")
-        .arg(signal)
-        .status()
-        .expect("run detached abort owner");
-    assert_ne!(status.code(), Some(0));
-    let pid = read_pid(&pid_file).expect("detached fixture wrote its PID");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while pid_exists(pid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!pid_exists(pid), "{signal} left detached PID {pid} alive");
-    std::fs::remove_dir_all(root).expect("remove abort handoff fixture");
-}
-
-#[test]
-fn sigabrt_waits_for_detached_match_handoff() {
-    signal_waits_for_detached_match_handoff("abort");
-}
-
-#[test]
-fn sigterm_waits_for_detached_match_handoff() {
-    signal_waits_for_detached_match_handoff("term");
-}

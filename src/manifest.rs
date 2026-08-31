@@ -198,6 +198,11 @@ pub struct Isolation {
     /// Historical state locations that must remain untouched.
     #[serde(default)]
     pub forbidden_roots: Vec<String>,
+    /// Relative Unix-socket suffixes that must fit beneath every rendered
+    /// isolation root. Declaring these opts a socket-using adapter into the
+    /// conservative cross-platform 100-byte path budget.
+    #[serde(default)]
+    pub socket_path_suffixes: Vec<String>,
 }
 
 /// A generated configuration file.
@@ -238,27 +243,29 @@ pub struct DaemonLifecycle {
     /// PID locator description or path.
     #[serde(default)]
     pub pid_locator: String,
-    /// Declarative lookup for a detached daemon that inherited isolated
-    /// environment bindings from its finite launcher.
-    #[serde(default)]
-    pub process_match: ProcessMatch,
     /// Graceful shutdown command argv.
     #[serde(default)]
     pub shutdown: Vec<String>,
+    /// Typed interpretation of a JSON shutdown response.
+    #[serde(default)]
+    pub shutdown_result: ShutdownResult,
     /// Shutdown grace period.
     #[serde(default = "default_grace_ms")]
     pub grace_ms: u64,
 }
 
-/// Identity evidence used to locate one detached, profile-owned daemon.
+/// Typed JSON contract returned by a graceful daemon shutdown operation.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ProcessMatch {
-    /// Exact executable basename.
+pub struct ShutdownResult {
+    /// JSON pointer containing the typed outcome string.
     #[serde(default)]
-    pub executable_name: String,
-    /// Exact inherited environment values, rendered before launch.
+    pub outcome_pointer: String,
+    /// Outcomes proving graceful shutdown or an already-stopped daemon.
     #[serde(default)]
-    pub environment: BTreeMap<String, String>,
+    pub clean_outcomes: Vec<String>,
+    /// Outcomes requiring an owned-tree TERM/KILL escalation.
+    #[serde(default)]
+    pub escalate_outcomes: Vec<String>,
 }
 
 fn default_grace_ms() -> u64 {
@@ -281,6 +288,12 @@ pub struct Probe {
     /// isolated environment root that must contain each returned path.
     #[serde(default)]
     pub json_pointer_roots: BTreeMap<String, String>,
+    /// JSON pointer containing the detached daemon's root PID.
+    #[serde(default)]
+    pub pid_pointer: String,
+    /// Optional JSON pointer containing the process-global readiness boolean.
+    #[serde(default)]
+    pub ready_pointer: String,
     /// Maximum wait.
     #[serde(default = "default_ready_ms")]
     pub timeout_ms: u64,
@@ -339,15 +352,31 @@ pub struct SessionOps {
     /// Resume operation name or argv template.
     #[serde(default)]
     pub resume: Vec<String>,
+    /// Subsequent-turn argv for EXEC adapters when it differs from resume.
+    #[serde(default)]
+    pub continue_turn: Vec<String>,
+    /// Headless, idempotent resume/reconciliation command.
+    #[serde(default)]
+    pub resume_control: Vec<String>,
+    /// Headless recovery probe run after daemon restart.
+    #[serde(default)]
+    pub recover_probe: Vec<String>,
     /// Close/delete operation name or argv template.
     #[serde(default)]
     pub close_delete: Vec<String>,
     /// List operation name or argv template.
     #[serde(default)]
     pub list: Vec<String>,
+    /// Informational command/RPC used to observe a cohort settling. Resource
+    /// certification never treats this process-global signal as its PASS fence.
+    #[serde(default)]
+    pub wait_ready: Vec<String>,
     /// JSON pointer used to extract a new session ID.
     #[serde(default)]
     pub id_pointer: String,
+    /// JSON pointer used to learn a persistent run identifier.
+    #[serde(default)]
+    pub run_id_pointer: String,
 }
 
 /// Operations for steer, subturn, and queued input.
@@ -483,12 +512,61 @@ pub struct EventMapping {
     /// Resume cursor pointer.
     #[serde(default)]
     pub cursor_pointer: String,
+    /// Envelope schema-version pointer. Records resolved through
+    /// `type_pointer` must carry one of `schema_versions` when configured.
+    #[serde(default)]
+    pub schema_version_pointer: String,
+    /// Envelope schema versions understood by this adapter revision.
+    #[serde(default)]
+    pub schema_versions: Vec<u64>,
+    /// Warn and retain unique evidence for source payload kinds which have no
+    /// normalization rule at an understood schema version.
+    #[serde(default)]
+    pub warn_unmapped_payload_kinds: bool,
     /// Optional argv that reopens the harness journal and emits normalized JSONL.
     #[serde(default)]
     pub replay_command: Vec<String>,
+    /// Replay output shape: `lines` applies replay extraction to each record,
+    /// while `document` extracts an array from one JSON document.
+    #[serde(default = "default_replay_mode")]
+    pub replay_mode: String,
+    /// JSON pointer to the replay event array when `replay_mode = "document"`.
+    #[serde(default)]
+    pub replay_records_pointer: String,
+    /// Scalar JSON-pointer assertions evaluated on a replay document before
+    /// any contained events are normalized.
+    #[serde(default)]
+    pub replay_assertions: BTreeMap<String, String>,
+    /// Optional argv that snapshots durable replay state before and after the
+    /// replay command.
+    #[serde(default)]
+    pub replay_state_command: Vec<String>,
+    /// Scalar assertions evaluated on both durable-state snapshots.
+    #[serde(default)]
+    pub replay_state_assertions: BTreeMap<String, String>,
+    /// JSON pointers that must remain identical across the before/after
+    /// durable-state snapshots.
+    #[serde(default)]
+    pub replay_state_pointers: Vec<String>,
+    /// Require replay records to equal the raw, run-scoped live records before
+    /// normalization. This retains source sequence gaps and nested call IDs.
+    #[serde(default)]
+    pub replay_compare_live_records: bool,
+    /// Optional JSON pointer that unwraps each replay record before applying
+    /// the live-stream normalization rules.
+    #[serde(default)]
+    pub replay_envelope_pointer: String,
+    /// Optional first AHRB cursor assigned to replay when nondurable live
+    /// announcements are omitted from the durable stream.
+    #[serde(default)]
+    pub replay_cursor_start: Option<u64>,
     /// Ordered normalization rules.
     #[serde(default)]
     pub rules: Vec<EventRule>,
+}
+
+fn default_replay_mode() -> String {
+    "lines".to_owned()
 }
 
 /// One table-driven event normalization rule.
@@ -736,30 +814,9 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "command daemon readiness requires daemon.readiness.command".to_owned(),
         ));
     }
-    if manifest.daemon.launcher_exits {
-        if manifest
-            .daemon
-            .process_match
-            .executable_name
-            .trim()
-            .is_empty()
-            || manifest.daemon.process_match.environment.is_empty()
-        {
-            return Err(AhrbError::Validation(
-                "a detached daemon launcher requires daemon.process_match executable_name and environment evidence"
-                    .to_owned(),
-            ));
-        }
-        if !manifest.daemon.pid_locator.trim().is_empty() {
-            return Err(AhrbError::Validation(
-                "a detached daemon process match conflicts with daemon.pid_locator".to_owned(),
-            ));
-        }
-    }
-    if !manifest.daemon.process_match.executable_name.is_empty() && !manifest.daemon.launcher_exits
-    {
+    if manifest.daemon.launcher_exits && manifest.daemon.readiness.pid_pointer.trim().is_empty() {
         return Err(AhrbError::Validation(
-            "daemon.process_match is only valid when daemon.launcher_exits is true".to_owned(),
+            "a detached daemon launcher requires daemon.readiness.pid_pointer".to_owned(),
         ));
     }
     if !manifest.daemon.readiness.json_pointer_roots.is_empty()
@@ -767,6 +824,29 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
     {
         return Err(AhrbError::Validation(
             "daemon.readiness.json_pointer_roots requires kind = command-json".to_owned(),
+        ));
+    }
+    if (!manifest.daemon.readiness.pid_pointer.is_empty()
+        || !manifest.daemon.readiness.ready_pointer.is_empty())
+        && manifest.daemon.readiness.kind != "command-json"
+    {
+        return Err(AhrbError::Validation(
+            "daemon readiness pid_pointer/ready_pointer require kind = command-json".to_owned(),
+        ));
+    }
+    if !manifest.daemon.shutdown_result.outcome_pointer.is_empty()
+        && manifest.daemon.shutdown.is_empty()
+    {
+        return Err(AhrbError::Validation(
+            "daemon.shutdown_result requires daemon.shutdown".to_owned(),
+        ));
+    }
+    if manifest.daemon.shutdown_result.outcome_pointer.is_empty()
+        && (!manifest.daemon.shutdown_result.clean_outcomes.is_empty()
+            || !manifest.daemon.shutdown_result.escalate_outcomes.is_empty())
+    {
+        return Err(AhrbError::Validation(
+            "daemon.shutdown_result outcomes require outcome_pointer".to_owned(),
         ));
     }
     if manifest.transport.timeout_ms == 0
@@ -844,13 +924,6 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             )));
         }
     }
-    for (name, template) in &manifest.daemon.process_match.environment {
-        if !profile_scoped_template(template) {
-            return Err(AhrbError::Validation(format!(
-                "daemon.process_match.environment.{name} must be lexically contained under {{{{profile}}}}"
-            )));
-        }
-    }
     for (pointer, root_name) in &manifest.daemon.readiness.json_pointer_roots {
         if !pointer.starts_with('/') || pointer == "/" {
             return Err(AhrbError::Validation(format!(
@@ -860,6 +933,63 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         if !manifest.isolation.roots.contains_key(root_name) {
             return Err(AhrbError::Validation(format!(
                 "daemon readiness JSON pointer {pointer:?} refers to undeclared isolation root {root_name:?}"
+            )));
+        }
+    }
+    for (label, pointer) in [
+        (
+            "pid_pointer",
+            manifest.daemon.readiness.pid_pointer.as_str(),
+        ),
+        (
+            "ready_pointer",
+            manifest.daemon.readiness.ready_pointer.as_str(),
+        ),
+        (
+            "shutdown outcome_pointer",
+            manifest.daemon.shutdown_result.outcome_pointer.as_str(),
+        ),
+        (
+            "sessions.run_id_pointer",
+            manifest.sessions.run_id_pointer.as_str(),
+        ),
+    ] {
+        if !pointer.is_empty() && (!pointer.starts_with('/') || pointer == "/") {
+            return Err(AhrbError::Validation(format!(
+                "daemon {label} {pointer:?} is not a non-root JSON pointer"
+            )));
+        }
+    }
+    let clean: std::collections::BTreeSet<_> = manifest
+        .daemon
+        .shutdown_result
+        .clean_outcomes
+        .iter()
+        .collect();
+    if manifest
+        .daemon
+        .shutdown_result
+        .escalate_outcomes
+        .iter()
+        .any(|outcome| clean.contains(outcome))
+    {
+        return Err(AhrbError::Validation(
+            "daemon shutdown clean and escalation outcomes must be disjoint".to_owned(),
+        ));
+    }
+    for suffix in &manifest.isolation.socket_path_suffixes {
+        let path = Path::new(suffix);
+        if suffix.trim().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(AhrbError::Validation(format!(
+                "isolation socket path suffix {suffix:?} must be a non-empty relative path"
             )));
         }
     }
@@ -881,6 +1011,103 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         return Err(AhrbError::Validation(
             "events.path must be lexically contained under {{profile}}".to_owned(),
         ));
+    }
+    if !manifest.events.replay_envelope_pointer.is_empty()
+        && (!manifest.events.replay_envelope_pointer.starts_with('/')
+            || manifest.events.replay_envelope_pointer == "/")
+    {
+        return Err(AhrbError::Validation(format!(
+            "events.replay_envelope_pointer {:?} is not a non-root JSON pointer",
+            manifest.events.replay_envelope_pointer
+        )));
+    }
+    match manifest.events.replay_mode.as_str() {
+        "lines" => {
+            if !manifest.events.replay_records_pointer.is_empty() {
+                return Err(AhrbError::Validation(
+                    "events.replay_records_pointer requires replay_mode = \"document\"".to_owned(),
+                ));
+            }
+        }
+        "document" => {
+            if manifest.events.replay_records_pointer.is_empty()
+                || !manifest.events.replay_records_pointer.starts_with('/')
+                || manifest.events.replay_records_pointer == "/"
+            {
+                return Err(AhrbError::Validation(format!(
+                    "events.replay_records_pointer {:?} is not a non-root JSON pointer",
+                    manifest.events.replay_records_pointer
+                )));
+            }
+            if !manifest.events.replay_envelope_pointer.is_empty() {
+                return Err(AhrbError::Validation(
+                    "events.replay_envelope_pointer is only valid for replay_mode = \"lines\""
+                        .to_owned(),
+                ));
+            }
+        }
+        other => {
+            return Err(AhrbError::Validation(format!(
+                "unsupported events.replay_mode {other:?}"
+            )));
+        }
+    }
+    for pointer in manifest.events.replay_assertions.keys() {
+        if !pointer.starts_with('/') || pointer == "/" {
+            return Err(AhrbError::Validation(format!(
+                "events.replay_assertions pointer {pointer:?} is not a non-root JSON pointer"
+            )));
+        }
+    }
+    if (!manifest.events.replay_state_pointers.is_empty()
+        || !manifest.events.replay_state_assertions.is_empty())
+        && manifest.events.replay_state_command.is_empty()
+    {
+        return Err(AhrbError::Validation(
+            "events replay state checks require replay_state_command".to_owned(),
+        ));
+    }
+    for pointer in manifest
+        .events
+        .replay_state_pointers
+        .iter()
+        .chain(manifest.events.replay_state_assertions.keys())
+    {
+        if !pointer.starts_with('/') || pointer == "/" {
+            return Err(AhrbError::Validation(format!(
+                "events replay state pointer {pointer:?} is not a non-root JSON pointer"
+            )));
+        }
+    }
+    if manifest.events.replay_cursor_start == Some(0) {
+        return Err(AhrbError::Validation(
+            "events.replay_cursor_start must be greater than zero".to_owned(),
+        ));
+    }
+    if manifest.events.schema_version_pointer.is_empty() {
+        if !manifest.events.schema_versions.is_empty()
+            || manifest.events.warn_unmapped_payload_kinds
+        {
+            return Err(AhrbError::Validation(
+                "events schema versions/unmapped warnings require schema_version_pointer"
+                    .to_owned(),
+            ));
+        }
+    } else {
+        if !manifest.events.schema_version_pointer.starts_with('/')
+            || manifest.events.schema_version_pointer == "/"
+        {
+            return Err(AhrbError::Validation(format!(
+                "events.schema_version_pointer {:?} is not a non-root JSON pointer",
+                manifest.events.schema_version_pointer
+            )));
+        }
+        if manifest.events.schema_versions.is_empty() {
+            return Err(AhrbError::Validation(
+                "events.schema_version_pointer requires at least one schema_versions entry"
+                    .to_owned(),
+            ));
+        }
     }
     if manifest
         .exit
@@ -980,8 +1207,12 @@ fn command_vectors(manifest: &Manifest) -> Vec<(&'static str, &[String])> {
         ("sessions.submit", &manifest.sessions.submit),
         ("sessions.attach", &manifest.sessions.attach),
         ("sessions.resume", &manifest.sessions.resume),
+        ("sessions.continue_turn", &manifest.sessions.continue_turn),
+        ("sessions.resume_control", &manifest.sessions.resume_control),
+        ("sessions.recover_probe", &manifest.sessions.recover_probe),
         ("sessions.close_delete", &manifest.sessions.close_delete),
         ("sessions.list", &manifest.sessions.list),
+        ("sessions.wait_ready", &manifest.sessions.wait_ready),
         ("next_input.steer", &manifest.next_input.steer),
         ("next_input.subturn", &manifest.next_input.subturn),
         ("next_input.queue", &manifest.next_input.queue),

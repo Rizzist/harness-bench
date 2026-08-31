@@ -39,6 +39,8 @@ pub enum EventVocab {
     TerminalFailure,
     /// Terminal cancellation.
     TerminalCancelled,
+    /// Terminal caller deadline/timeout.
+    TerminalTimeout,
 }
 
 /// One normalized, cursor-addressable event.
@@ -174,6 +176,7 @@ fn parse_vocab(name: &str) -> Result<EventVocab> {
         "terminal-success" => Ok(EventVocab::TerminalSuccess),
         "terminal-failure" => Ok(EventVocab::TerminalFailure),
         "terminal-cancelled" => Ok(EventVocab::TerminalCancelled),
+        "terminal-timeout" => Ok(EventVocab::TerminalTimeout),
         other => Err(AhrbError::Validation(format!(
             "unknown normalized event vocabulary {other:?}"
         ))),

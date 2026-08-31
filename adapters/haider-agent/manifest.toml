@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.966-detached-daemon-native-tools-v4"
+revision = "0.0.967-readiness-json-v1"
 
 [availability]
 exec_paths = ["haider"]
@@ -37,11 +37,14 @@ TMPDIR = "{{profile}}/tmp"
 [isolation]
 generated_files = []
 forbidden_roots = ["~/.config/haider", "~/.local/share/haider"]
+socket_path_suffixes = ["0123456789abcdef0123456789abcdef/haiderd.sock"]
 
-# Haider's public status command auto-spawns a double-forked daemon. AHRB parses
-# status JSON, verifies every reported state/runtime path remains in the cold
-# HOME/XDG_RUNTIME_DIR, and locates the detached daemon by exact executable plus
-# inherited isolation environment before registering the fake provider once per profile.
+[isolation.environment]
+HAIDER_RUN_DAEMON_IDLE_TTL_MS = "600000"
+
+# Haider's public status command auto-spawns a detached daemon. AHRB parses its
+# PID and process-global ready bit directly from status JSON and verifies every
+# reported state/runtime path remains inside the cold HOME/runtime roots.
 # Every benchmark turn remains a `haider run` thin-client invocation; AHRB does
 # not speak or decode Haider's private socket protocol.
 [daemon]
@@ -54,20 +57,19 @@ initialize = [
   "--response-open-timeout", "2s", "--chunk-idle-timeout", "2s",
   "--semantic-progress-timeout", "2s", "--json"
 ]
+shutdown = ["haider", "daemon", "stop", "--json"]
 grace_ms = 5000
 
-[daemon.process_match]
-executable_name = "haiderd"
-
-[daemon.process_match.environment]
-HOME = "{{profile}}/home"
-TMPDIR = "{{profile}}/tmp"
-XDG_RUNTIME_DIR = "{{profile}}/run"
-HAIDER_RUNTIME_DIR = "{{profile}}/run"
+[daemon.shutdown_result]
+outcome_pointer = "/outcome"
+clean_outcomes = ["stopped_cleanly", "not_running"]
+escalate_outcomes = ["did_not_stop"]
 
 [daemon.readiness]
 kind = "command-json"
 command = ["haider", "status", "--json"]
+pid_pointer = "/daemon/pid"
+ready_pointer = "/daemon/ready"
 timeout_ms = 30000
 
 [daemon.readiness.json_pointer_roots]
@@ -86,10 +88,15 @@ timeout_ms = 30000
 
 [sessions]
 list = ["haider", "sessions", "--json", "--no-spawn"]
+wait_ready = ["haider", "sessions", "wait-ready", "--count", "{{count}}", "--timeout", "{{timeout}}", "--json", "--no-spawn"]
+resume_control = ["haider", "resume", "{{session_id}}", "--json"]
+recover_probe = ["haider", "session", "{{session_id}}", "recover", "--probe", "--json"]
 id_pointer = "/session_id"
+run_id_pointer = "/run_id"
 
 [next_input]
 [agents]
+cancel = ["haider", "run", "--stop", "{{run_id}}"]
 
 [concurrency]
 topology = "shared-daemon-sessions"
@@ -113,10 +120,22 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 # followed by durable RawEnvelope records whose discriminator is payload.type.
 [events]
 source = "stdout"
+replay_command = ["haider", "run", "--replay", "{{run_id}}"]
+replay_mode = "document"
+replay_records_pointer = "/events"
+replay_assertions = { "/schema" = "haider.run.replay.v1", "/mode" = "durable_journal", "/provider_requests" = "0", "/integrity/sequences_strictly_increasing" = "true", "/integrity/run_id_stable" = "true", "/integrity/exactly_one_typed_terminal" = "true", "/integrity/terminal_seq_matches_status" = "true", "/equivalence/equivalent" = "true" }
+replay_state_command = ["haider", "run", "--status", "{{run_id}}", "--output", "json"]
+replay_state_assertions = { "/schema" = "haider.run.status.v1" }
+replay_state_pointers = ["/result/head_seq", "/result/terminal_seq"]
+replay_compare_live_records = true
+replay_cursor_start = 2
 framing = "jsonl"
 type_pointer = "/payload/type"
 id_pointer = "/event_id"
 cursor_pointer = "/seq"
+schema_version_pointer = "/schema_version"
+schema_versions = [1]
+warn_unmapped_payload_kinds = true
 
 [[events.rules]]
 matches = "accepted"
@@ -148,32 +167,51 @@ event = "model-response"
 payload_pointer = "/payload/item"
 
 [[events.rules]]
+matches = "agent_message"
+event = "model-response"
+payload_pointer = "/payload"
+
+[[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/state" = "done" }
+match_fields = { "/payload/terminal_kind" = "success" }
 event = "terminal-success"
 payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/state" = "errored" }
+match_fields = { "/payload/terminal_kind" = "failure" }
 event = "terminal-failure"
 payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/state" = "cancelled" }
+match_fields = { "/payload/terminal_kind" = "provider_error" }
+event = "terminal-failure"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/terminal_kind" = "budget" }
+event = "terminal-failure"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/terminal_kind" = "cancellation" }
 event = "terminal-cancelled"
 payload_pointer = "/payload"
 
 [[events.rules]]
-matches = "error"
-event = "terminal-failure"
+matches = "run_state"
+match_fields = { "/payload/terminal_kind" = "timeout" }
+event = "terminal-timeout"
+payload_pointer = "/payload"
 
 [exit]
 success = 0
-success_stdout = ['"state":"done"']
-failure_stdout = ['"event":"error"', '"state":"errored"']
-failures = { usage = 2, provider = 65, unavailable = 69, software = 70, io = 74, protocol = 76, blocked = 77, timeout = 124, cancelled = 130 }
+success_stdout = []
+failure_stdout = ['"event":"error"', '"state":"errored"', '"status":"failure"']
+failures = { usage = 2, provider = 65, unavailable = 69, software = 70, io = 74, protocol = 76, blocked = 77, idle-timeout = 124, cancelled = 130 }
 
 [process]
 executable_names = ["haiderd", "haider"]
@@ -196,16 +234,15 @@ headless = "haider run --output jsonl is a noninteractive thin client over the r
 
 [capabilities.optional]
 sessions = "durable daemon sessions are listable with haider sessions --json --no-spawn"
-resume = "haider resume and session recovery exist, but 0.0.966 exposes no headless continue-existing-session command"
-durable_journal = "the daemon owns a transactional journal, but 0.0.966 exposes no finite raw per-session replay CLI"
+resume = "haider resume <session-id> --json and session recover --probe --json are headless"
+durable_journal = "haider run --replay <run-id> replays the daemon-owned durable journal"
 
-# TODO(orchestrator): Haider 0.0.966 `resume <session-id>` enters the TUI, while
-# `run` has no existing-session selector. Keep rows 30/35/37 UNSUPPORTED until a
-# noninteractive continuation CLI is available; do not automate the TUI.
-# TODO(orchestrator): `haider events --no-spawn` is finite but spans every
-# session; `haider session <id> --watch --no-spawn` is scoped but follows.
-# Wire row 40 only when Haider exposes a finite raw per-session replay command
-# with cursor semantics and a safe native torn-tail fault-injection surface.
-# TODO(orchestrator): confirm the installed 0.0.966 status JSON keeps
-# `/profile_path`, `/runtime_dir`, and `/daemon/pipe_dir` stable and that SIGTERM
-# of the matched `haiderd` performs a clean shutdown after the final thin client.
+# TODO(orchestrator): confirm the exact resume/recovery control JSON schemas
+# before replacing AHRB's conservative error/negative-field checks with
+# adapter-declared typed pointers. Also copy 0.0.968's status `runtime_dir`
+# resolution field into evidence when that release becomes the probed target.
+# TODO(orchestrator): check the scrubbed 0.0.967 live-turn and native-replay
+# JSONL samples into the verification workspace, and confirm that the observed
+# item/direct agent-message and run_state/direct terminal alternatives are
+# mutually exclusive within one turn. AHRB intentionally preserves duplicate
+# normalized events rather than hiding a changed Haider emission contract.

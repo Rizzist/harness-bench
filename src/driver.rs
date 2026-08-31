@@ -7,12 +7,14 @@
 use crate::events::{
     EventNormalizer, EventVocab, NATIVE_FIXTURE_METADATA_PREFIX, NormalizedEvent, rule_matches,
 };
-use crate::manifest::{EventMapping, ExitContract, Probe, ProcessMatch};
+use crate::manifest::{EventMapping, ExitContract, Probe, ShutdownResult};
+use crate::process::ProcIdentity;
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::future::Future;
@@ -82,12 +84,25 @@ pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + '
 pub trait Transport: Send {
     /// Start any persistent transport resources.
     fn start(&mut self) -> DriverFuture<'_, ()>;
+    /// Await a readiness probe after the owned process has been launched.
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Send one operation and receive its response.
     fn request(&mut self, request: TransportRequest) -> DriverFuture<'_, TransportResponse>;
     /// Stop persistent transport resources.
     fn stop(&mut self) -> DriverFuture<'_, ()>;
     /// Launcher/controller PIDs directly owned by this transport.
     fn owned_pids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    /// Daemon root PID captured from the readiness contract, when distinct
+    /// from the client transport.
+    fn daemon_pid(&self) -> Option<u32> {
+        None
+    }
+    /// Lifecycle notes emitted while reclaiming owned daemon processes.
+    fn lifecycle_notes(&self) -> Vec<String> {
         Vec::new()
     }
 }
@@ -101,8 +116,6 @@ pub struct ManagedDaemonConfig {
     pub command: Vec<String>,
     /// The start command is a finite launcher for a double-forked daemon.
     pub launcher_exits: bool,
-    /// Exact executable/environment evidence for the detached daemon.
-    pub process_match: ProcessMatch,
     /// Fully rendered one-time setup argv run after readiness.
     pub initialize_command: Vec<String>,
     /// Profile-local success marker for the initialization command.
@@ -111,26 +124,124 @@ pub struct ManagedDaemonConfig {
     pub environment: BTreeMap<String, String>,
     /// Readiness condition evaluated before the inner client starts.
     pub readiness: Probe,
+    /// Fully rendered graceful shutdown argv.
+    pub shutdown_command: Vec<String>,
+    /// Typed shutdown-result contract.
+    pub shutdown_result: ShutdownResult,
     /// Grace period before a process-group SIGKILL.
     pub grace: Duration,
     /// Fresh run directory that receives bounded daemon stdout/stderr files.
     pub log_directory: PathBuf,
 }
 
-async fn managed_daemon_readiness_satisfied(
+#[derive(Debug)]
+pub(crate) struct ReadinessObservation {
+    pub metadata: Value,
+    pub pid: Option<u32>,
+}
+
+fn readiness_json_observation(probe: &Probe, value: Value) -> Result<Option<ReadinessObservation>> {
+    if !probe.ready_pointer.is_empty() {
+        let ready = value
+            .pointer(&probe.ready_pointer)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "daemon readiness JSON omitted boolean at {}",
+                    probe.ready_pointer
+                ))
+            })?;
+        if !ready {
+            return Ok(None);
+        }
+    }
+    let pid = readiness_json_pid(probe, &value)?;
+    Ok(Some(ReadinessObservation {
+        metadata: value,
+        pid,
+    }))
+}
+
+fn readiness_json_pid(probe: &Probe, value: &Value) -> Result<Option<u32>> {
+    if probe.pid_pointer.is_empty() {
+        Ok(None)
+    } else {
+        let raw = value.pointer(&probe.pid_pointer).ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "daemon readiness JSON omitted PID at {}",
+                probe.pid_pointer
+            ))
+        })?;
+        let pid = raw.as_u64().and_then(|pid| u32::try_from(pid).ok());
+        match pid {
+            Some(pid) if pid > 0 => Ok(Some(pid)),
+            _ => Err(AhrbError::Protocol(format!(
+                "daemon readiness JSON PID at {} is not a positive u32",
+                probe.pid_pointer
+            ))),
+        }
+    }
+}
+
+fn validate_readiness_json_roots(
     probe: &Probe,
     environment: &BTreeMap<String, String>,
-) -> Result<Option<Value>> {
+    value: &Value,
+) -> Result<()> {
+    for (pointer, root_name) in &probe.json_pointer_roots {
+        let returned = value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "daemon readiness JSON omitted string path at {pointer}"
+                ))
+            })?;
+        let root = environment.get(root_name).ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "daemon readiness root environment {root_name:?} is absent"
+            ))
+        })?;
+        let returned_path = Path::new(returned);
+        let root_path = Path::new(root);
+        let canonical_returned =
+            std::fs::canonicalize(returned_path).unwrap_or_else(|_| returned_path.to_path_buf());
+        let canonical_root =
+            std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
+        if !canonical_returned.starts_with(&canonical_root) {
+            return Err(AhrbError::Protocol(format!(
+                "daemon readiness JSON path {pointer}={returned:?} is outside isolated {root_name}={root:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn managed_daemon_readiness_satisfied(
+    probe: &Probe,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<ReadinessObservation>> {
     match probe.kind.as_str() {
-        "" | "process" => Ok(Some(Value::Null)),
-        "file" => Ok(Path::new(&probe.target).is_file().then_some(Value::Null)),
+        "" | "process" => Ok(Some(ReadinessObservation {
+            metadata: Value::Null,
+            pid: None,
+        })),
+        "file" => Ok(Path::new(&probe.target)
+            .is_file()
+            .then_some(ReadinessObservation {
+                metadata: Value::Null,
+                pid: None,
+            })),
         "socket" => {
             #[cfg(unix)]
             {
                 match tokio::net::UnixStream::connect(&probe.target).await {
                     Ok(stream) => {
                         drop(stream);
-                        Ok(Some(Value::Null))
+                        Ok(Some(ReadinessObservation {
+                            metadata: Value::Null,
+                            pid: None,
+                        }))
                     }
                     Err(error)
                         if matches!(
@@ -157,7 +268,10 @@ async fn managed_daemon_readiness_satisfied(
             match tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port)).await {
                 Ok(stream) => {
                     drop(stream);
-                    Ok(Some(Value::Null))
+                    Ok(Some(ReadinessObservation {
+                        metadata: Value::Null,
+                        pid: None,
+                    }))
                 }
                 Err(error)
                     if matches!(
@@ -182,7 +296,10 @@ async fn managed_daemon_readiness_satisfied(
             let attempt_timeout = Duration::from_millis(probe.timeout_ms.clamp(1, 1_000));
             match run_owned_output(&mut command, attempt_timeout, "daemon readiness command").await
             {
-                Ok(output) => Ok(output.status.success().then_some(Value::Null)),
+                Ok(output) => Ok(output.status.success().then_some(ReadinessObservation {
+                    metadata: Value::Null,
+                    pid: None,
+                })),
                 Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     Ok(None)
                 }
@@ -220,33 +337,8 @@ async fn managed_daemon_readiness_satisfied(
                     "daemon readiness command returned invalid JSON: {error}"
                 ))
             })?;
-            for (pointer, root_name) in &probe.json_pointer_roots {
-                let returned = value
-                    .pointer(pointer)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        AhrbError::Protocol(format!(
-                            "daemon readiness JSON omitted string path at {pointer}"
-                        ))
-                    })?;
-                let root = environment.get(root_name).ok_or_else(|| {
-                    AhrbError::Validation(format!(
-                        "daemon readiness root environment {root_name:?} is absent"
-                    ))
-                })?;
-                let returned_path = Path::new(returned);
-                let root_path = Path::new(root);
-                let canonical_returned = std::fs::canonicalize(returned_path)
-                    .unwrap_or_else(|_| returned_path.to_path_buf());
-                let canonical_root =
-                    std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
-                if !canonical_returned.starts_with(&canonical_root) {
-                    return Err(AhrbError::Protocol(format!(
-                        "daemon readiness JSON path {pointer}={returned:?} is outside isolated {root_name}={root:?}"
-                    )));
-                }
-            }
-            Ok(Some(value))
+            validate_readiness_json_roots(probe, environment, &value)?;
+            readiness_json_observation(probe, value)
         }
         other => Err(AhrbError::Validation(format!(
             "unsupported daemon readiness probe {other:?}"
@@ -361,147 +453,303 @@ async fn run_owned_output(
 #[derive(Debug)]
 struct ManagedDaemonProcess {
     child: Option<Child>,
-    detached_pid: Option<u32>,
+    launch_identity: Option<ProcIdentity>,
+    external_identity: Option<ProcIdentity>,
+    lifecycle_notes: Vec<String>,
 }
 
 impl ManagedDaemonProcess {
     fn pid(&self) -> Option<u32> {
-        self.detached_pid
+        self.external_identity
+            .map(|identity| identity.pid)
             .or_else(|| self.child.as_ref().and_then(Child::id))
     }
 }
 
-#[cfg(unix)]
-fn process_exists(pid: u32) -> Result<bool> {
-    let pid = i32::try_from(pid)
-        .map_err(|_| AhrbError::Protocol(format!("daemon PID {pid} does not fit pid_t")))?;
-    // SAFETY: signal zero does not mutate the target process.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
-        _ => Err(error.into()),
+impl Drop for ManagedDaemonProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(identity) = self.external_identity.or(self.launch_identity) {
+            let _ = crate::process::signal_registered_tree(identity, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
     }
 }
 
-#[cfg(unix)]
-fn signal_detached_process(pid: u32, signal: i32) -> Result<()> {
-    let pid = i32::try_from(pid)
-        .map_err(|_| AhrbError::Protocol(format!("daemon PID {pid} does not fit pid_t")))?;
-    // SAFETY: the PID was revalidated against exact executable and isolated
-    // environment evidence immediately before this call.
-    if unsafe { libc::kill(pid, signal) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error.into());
+fn reap_managed_daemon_child(process: &mut ManagedDaemonProcess) -> Result<()> {
+    let Some(child) = process.child.as_mut() else {
+        return Ok(());
+    };
+    let pid = child.id();
+    if child.try_wait()?.is_some() {
+        if let Some(pid) = pid {
+            crate::process::retire_process(pid)?;
         }
+        process.child = None;
     }
     Ok(())
 }
 
-fn matching_detached_pids(process_match: &ProcessMatch) -> Result<Vec<u32>> {
-    crate::process::matching_processes(&process_match.executable_name, &process_match.environment)
+#[cfg(unix)]
+fn signal_external_process(identity: ProcIdentity, signal: i32) -> Result<()> {
+    crate::process::signal_registered_tree(identity, signal)
 }
 
-async fn await_detached_pid(
-    process_match: &ProcessMatch,
-    deadline: std::time::Instant,
-) -> Result<u32> {
-    loop {
-        let matches = matching_detached_pids(process_match)?;
-        match matches.as_slice() {
-            [pid] => {
-                crate::process::register_process(*pid)?;
-                return Ok(*pid);
-            }
-            [] => {}
-            _ => {
-                return Err(AhrbError::Protocol(format!(
-                    "detached daemon match for {:?} and isolated environment was ambiguous: {matches:?}",
-                    process_match.executable_name
-                )));
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(AhrbError::Timeout(format!(
-                "detached daemon {:?} with isolated environment did not appear before readiness deadline",
-                process_match.executable_name
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownDisposition {
+    Clean,
+    Escalate,
+}
+
+fn shutdown_disposition(contract: &ShutdownResult, value: &Value) -> Result<ShutdownDisposition> {
+    if contract.outcome_pointer.is_empty() {
+        return Ok(ShutdownDisposition::Clean);
     }
+    let outcome = value
+        .pointer(&contract.outcome_pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "daemon shutdown JSON omitted string outcome at {}",
+                contract.outcome_pointer
+            ))
+        })?;
+    if contract.clean_outcomes.iter().any(|item| item == outcome) {
+        Ok(ShutdownDisposition::Clean)
+    } else if contract
+        .escalate_outcomes
+        .iter()
+        .any(|item| item == outcome)
+    {
+        Ok(ShutdownDisposition::Escalate)
+    } else {
+        Err(AhrbError::Protocol(format!(
+            "daemon shutdown returned undeclared outcome {outcome:?}"
+        )))
+    }
+}
+
+async fn run_daemon_shutdown(config: &ManagedDaemonConfig) -> Result<ShutdownDisposition> {
+    if config.shutdown_command.is_empty() {
+        return Ok(ShutdownDisposition::Escalate);
+    }
+    let mut command = command_from_argv(&config.shutdown_command)?;
+    command
+        .envs(&config.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_owned_output(&mut command, config.grace, "daemon shutdown command").await?;
+    if !output.status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "daemon shutdown command exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if config.shutdown_result.outcome_pointer.is_empty() {
+        return Ok(ShutdownDisposition::Clean);
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "daemon shutdown command returned invalid JSON: {error}"
+        ))
+    })?;
+    shutdown_disposition(&config.shutdown_result, &value)
+}
+
+#[cfg(unix)]
+async fn reacquire_daemon_identity_for_cleanup(
+    config: &ManagedDaemonConfig,
+) -> Result<Option<ProcIdentity>> {
+    let probe = &config.readiness;
+    if probe.kind != "command-json" || probe.command.is_empty() || probe.pid_pointer.is_empty() {
+        return Ok(None);
+    }
+    let mut command = command_from_argv(&probe.command)?;
+    command
+        .envs(&config.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let timeout = Duration::from_millis(probe.timeout_ms.clamp(1, 5_000));
+    let output = match run_owned_output(
+        &mut command,
+        timeout,
+        "daemon cleanup readiness JSON command",
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(_) | Err(AhrbError::Timeout(_)) => return Ok(None),
+        Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "daemon cleanup readiness command returned invalid JSON: {error}"
+        ))
+    })?;
+    validate_readiness_json_roots(probe, &config.environment, &value)?;
+    let Some(pid) = readiness_json_pid(probe, &value)? else {
+        return Ok(None);
+    };
+    crate::process::register_external_process(pid).map(Some)
 }
 
 async fn stop_managed_daemon(
     process: &mut ManagedDaemonProcess,
     config: &ManagedDaemonConfig,
 ) -> Result<()> {
-    if let Some(child) = process.child.as_mut() {
-        stop_managed_child(child, config.grace).await?;
-        process.child = None;
-    }
-    let Some(pid) = process.detached_pid.take() else {
-        return Ok(());
-    };
+    let identity = process.external_identity.or(process.launch_identity);
     #[cfg(unix)]
     {
-        if !process_exists(pid)? {
+        let mut identity = identity;
+        let mut tree_is_live = match identity {
+            Some(identity) => crate::process::registered_tree_is_live(identity)?,
+            None => false,
+        };
+        if !tree_is_live && config.shutdown_command.is_empty() {
+            if let Some(child) = process.child.as_mut() {
+                stop_managed_child(child, Duration::from_millis(100)).await?;
+                process.child = None;
+            }
+            process.external_identity = None;
+            process.launch_identity = None;
             return Ok(());
         }
-        if !matching_detached_pids(&config.process_match)?.contains(&pid) {
-            return Err(AhrbError::Protocol(format!(
-                "refusing to signal detached daemon PID {pid}: executable/environment ownership evidence no longer matches"
-            )));
+        let disposition = match run_daemon_shutdown(config).await {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                let note = format!(
+                    "graceful daemon shutdown failed ({error}); escalating the registered owned tree"
+                );
+                eprintln!("ahrb: {note}");
+                process.lifecycle_notes.push(note);
+                ShutdownDisposition::Escalate
+            }
+        };
+        if disposition == ShutdownDisposition::Escalate && !tree_is_live {
+            identity = reacquire_daemon_identity_for_cleanup(config).await?;
+            if let Some(reacquired) = identity {
+                process.external_identity = Some(reacquired);
+                tree_is_live = crate::process::registered_tree_is_live(reacquired)?;
+                let note = format!(
+                    "daemon shutdown required escalation; reacquired readiness PID {} for the owned-tree sweep",
+                    reacquired.pid
+                );
+                eprintln!("ahrb: {note}");
+                process.lifecycle_notes.push(note);
+            }
         }
-        signal_detached_process(pid, libc::SIGTERM)?;
+        if disposition == ShutdownDisposition::Clean {
+            if let Some(identity) = identity {
+                let deadline = std::time::Instant::now() + config.grace;
+                while crate::process::registered_tree_is_live(identity)?
+                    && std::time::Instant::now() < deadline
+                {
+                    reap_managed_daemon_child(process)?;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tree_is_live = crate::process::registered_tree_is_live(identity)?;
+            }
+        }
+        if !tree_is_live {
+            if disposition == ShutdownDisposition::Escalate {
+                let note = "daemon shutdown requested escalation, but containment-checked readiness reported no live owned PID".to_owned();
+                eprintln!("ahrb: {note}");
+                process.lifecycle_notes.push(note);
+                return Err(AhrbError::Protocol(
+                    "daemon shutdown requested escalation, but no containment-validated owned PID was available for the required SIGTERM/SIGKILL sweep"
+                        .to_owned(),
+                ));
+            }
+            if let Some(child) = process.child.as_mut() {
+                stop_managed_child(child, Duration::from_millis(100)).await?;
+                process.child = None;
+            }
+            process.external_identity = None;
+            process.launch_identity = None;
+            return Ok(());
+        }
+        let identity = identity.ok_or_else(|| {
+            AhrbError::Protocol(
+                "live managed daemon tree lost its registered PID identity".to_owned(),
+            )
+        })?;
+        if disposition == ShutdownDisposition::Escalate {
+            let note = format!(
+                "daemon shutdown outcome requested owned-tree SIGTERM/SIGKILL escalation for PID {}",
+                identity.pid
+            );
+            eprintln!("ahrb: {note}");
+            process.lifecycle_notes.push(note);
+        } else {
+            let note = format!(
+                "daemon reported a clean shutdown but PID {} remained live; escalating the registered owned tree",
+                identity.pid
+            );
+            eprintln!("ahrb: {note}");
+            process.lifecycle_notes.push(note);
+        }
+        signal_external_process(identity, libc::SIGTERM)?;
         let deadline = std::time::Instant::now() + config.grace;
-        while process_exists(pid)? && std::time::Instant::now() < deadline {
+        while crate::process::registered_tree_is_live(identity)?
+            && std::time::Instant::now() < deadline
+        {
+            reap_managed_daemon_child(process)?;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if process_exists(pid)? {
-            if !matching_detached_pids(&config.process_match)?.contains(&pid) {
+        if crate::process::registered_tree_is_live(identity)? {
+            signal_external_process(identity, libc::SIGKILL)?;
+            let kill_deadline = std::time::Instant::now() + Duration::from_millis(250);
+            while crate::process::registered_tree_is_live(identity)?
+                && std::time::Instant::now() < kill_deadline
+            {
+                reap_managed_daemon_child(process)?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if crate::process::registered_tree_is_live(identity)? {
                 return Err(AhrbError::Protocol(format!(
-                    "refusing to SIGKILL detached daemon PID {pid}: ownership evidence changed after SIGTERM"
+                    "owned daemon tree rooted at PID {} survived SIGKILL",
+                    identity.pid
                 )));
             }
-            signal_detached_process(pid, libc::SIGKILL)?;
         }
+        if let Some(child) = process.child.as_mut() {
+            let pid = child.id();
+            let _ = child.wait().await?;
+            if let Some(pid) = pid {
+                crate::process::retire_process(pid)?;
+            }
+            process.child = None;
+        }
+        process.external_identity = None;
+        process.launch_identity = None;
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let _ = (pid, config);
-        Err(AhrbError::Unsupported(
-            "detached daemon termination requires Unix".to_owned(),
-        ))
-    }
-}
-
-async fn stop_matching_detached_daemon(config: &ManagedDaemonConfig) -> Result<()> {
-    let matches = matching_detached_pids(&config.process_match)?;
-    match matches.as_slice() {
-        [] => Ok(()),
-        [pid] => {
-            let mut process = ManagedDaemonProcess {
-                child: None,
-                detached_pid: Some(*pid),
-            };
-            stop_managed_daemon(&mut process, config).await
+        let _ = identity;
+        if let Some(child) = process.child.as_mut() {
+            stop_managed_child(child, config.grace).await?;
+            process.child = None;
         }
-        _ => Err(AhrbError::Protocol(format!(
-            "refusing failed-launch cleanup for ambiguous detached daemon match {:?}: {matches:?}",
-            config.process_match.executable_name
-        ))),
+        process.external_identity = None;
+        process.launch_identity = None;
+        Ok(())
     }
 }
 
-async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDaemonProcess> {
-    if config.launcher_exits {
-        crate::process::register_detached_match(config.process_match.clone())?;
-    }
+async fn start_managed_daemon_inner(
+    config: &ManagedDaemonConfig,
+    launch_pid: Option<tokio::sync::oneshot::Sender<u32>>,
+) -> Result<ManagedDaemonProcess> {
     std::fs::create_dir_all(&config.log_directory)?;
     let sequence = DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stdout = std::fs::OpenOptions::new()
@@ -526,41 +774,49 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    let mut child = command.spawn()?;
-    crate::process::register_child(&child)?;
+    let child = command.spawn()?;
+    let child_pid = child
+        .id()
+        .ok_or_else(|| AhrbError::Protocol("managed daemon launcher has no PID".to_owned()))?;
+    let launch_identity = crate::process::register_external_process(child_pid)?;
+    if let Some(sender) = launch_pid {
+        let _ = sender.send(child_pid);
+    }
+    let mut process = ManagedDaemonProcess {
+        child: Some(child),
+        launch_identity: Some(launch_identity),
+        external_identity: None,
+        lifecycle_notes: Vec::new(),
+    };
 
     let readiness_timeout = Duration::from_millis(config.readiness.timeout_ms.max(1));
     let started = std::time::Instant::now();
     let readiness_deadline = started + readiness_timeout;
     if config.launcher_exits {
-        let launcher_pid = child.id();
-        let status = match tokio::time::timeout(readiness_timeout, child.wait()).await {
-            Ok(status) => status?,
+        let launcher = process.child.as_mut().ok_or_else(|| {
+            AhrbError::Protocol("detached daemon launcher disappeared".to_owned())
+        })?;
+        let status = match tokio::time::timeout(readiness_timeout, launcher.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                stop_managed_daemon(&mut process, config).await?;
+                return Err(error.into());
+            }
             Err(_) => {
-                stop_managed_child(&mut child, config.grace).await?;
-                stop_matching_detached_daemon(config).await?;
+                stop_managed_daemon(&mut process, config).await?;
                 return Err(AhrbError::Timeout("detached daemon launcher".to_owned()));
             }
         };
-        if let Some(pid) = launcher_pid {
-            crate::process::retire_process(pid)?;
-        }
+        process.child = None;
+        crate::process::retire_process(child_pid)?;
         if !status.success() {
-            #[cfg(unix)]
-            if let Some(pid) = launcher_pid {
-                signal_managed_process_group(pid, libc::SIGKILL)?;
-            }
-            stop_matching_detached_daemon(config).await?;
+            stop_managed_daemon(&mut process, config).await?;
             return Err(AhrbError::Protocol(format!(
                 "detached daemon launcher exited with {status}"
             )));
         }
     }
-    let mut process = ManagedDaemonProcess {
-        child: (!config.launcher_exits).then_some(child),
-        detached_pid: None,
-    };
-    let readiness_metadata = loop {
+    let readiness = loop {
         if let Some(child) = process.child.as_mut() {
             let daemon_pid = child.id();
             let status = match child.try_wait() {
@@ -581,26 +837,14 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
             }
         }
         match managed_daemon_readiness_satisfied(&config.readiness, &config.environment).await {
-            Ok(Some(metadata)) => break metadata,
+            Ok(Some(observation)) => break observation,
             Ok(None) => {}
             Err(error) => {
-                if config.launcher_exits
-                    && let Ok(matches) = matching_detached_pids(&config.process_match)
-                    && let [pid] = matches.as_slice()
-                {
-                    process.detached_pid = Some(*pid);
-                }
                 stop_managed_daemon(&mut process, config).await?;
                 return Err(error);
             }
         }
         if std::time::Instant::now() >= readiness_deadline {
-            if config.launcher_exits
-                && let Ok(matches) = matching_detached_pids(&config.process_match)
-                && let [pid] = matches.as_slice()
-            {
-                process.detached_pid = Some(*pid);
-            }
             stop_managed_daemon(&mut process, config).await?;
             return Err(AhrbError::Timeout(format!(
                 "daemon readiness {:?} at {:?}",
@@ -611,25 +855,26 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
     };
 
     if config.launcher_exits {
-        match await_detached_pid(&config.process_match, readiness_deadline).await {
-            Ok(pid) => process.detached_pid = Some(pid),
+        let Some(pid) = readiness.pid else {
+            stop_managed_daemon(&mut process, config).await?;
+            return Err(AhrbError::Protocol(
+                "detached daemon readiness completed without a declared PID".to_owned(),
+            ));
+        };
+        match crate::process::register_external_process(pid) {
+            Ok(identity) => process.external_identity = Some(identity),
             Err(error) => {
-                if let Ok(matches) = matching_detached_pids(&config.process_match)
-                    && let [pid] = matches.as_slice()
-                {
-                    process.detached_pid = Some(*pid);
-                    stop_managed_daemon(&mut process, config).await?;
-                }
+                stop_managed_daemon(&mut process, config).await?;
                 return Err(error);
             }
         }
     }
 
-    if readiness_metadata != Value::Null {
+    if readiness.metadata != Value::Null {
         let status_path = config
             .log_directory
             .join(format!("daemon-{sequence:04}.readiness.json"));
-        let metadata = match serde_json::to_vec_pretty(&readiness_metadata) {
+        let metadata = match serde_json::to_vec_pretty(&readiness.metadata) {
             Ok(metadata) => metadata,
             Err(error) => {
                 stop_managed_daemon(&mut process, config).await?;
@@ -680,11 +925,16 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
     Ok(process)
 }
 
+async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDaemonProcess> {
+    start_managed_daemon_inner(config, None).await
+}
+
 /// A lifecycle wrapper for daemons reached through a separate client transport.
 pub struct ManagedDaemonTransport<T: Transport> {
     inner: T,
     config: ManagedDaemonConfig,
     daemon: Option<ManagedDaemonProcess>,
+    lifecycle_notes: Vec<String>,
 }
 
 impl<T: Transport> ManagedDaemonTransport<T> {
@@ -694,6 +944,7 @@ impl<T: Transport> ManagedDaemonTransport<T> {
             inner,
             config,
             daemon: None,
+            lifecycle_notes: Vec::new(),
         }
     }
 }
@@ -707,7 +958,9 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
             self.daemon = Some(start_managed_daemon(&self.config).await?);
             if let Err(error) = self.inner.start().await {
                 if let Some(mut daemon) = self.daemon.take() {
-                    stop_managed_daemon(&mut daemon, &self.config).await?;
+                    let stopped = stop_managed_daemon(&mut daemon, &self.config).await;
+                    self.lifecycle_notes.append(&mut daemon.lifecycle_notes);
+                    stopped?;
                 }
                 return Err(error);
             }
@@ -719,11 +972,17 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
         self.inner.request(request)
     }
 
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        self.inner.await_readiness()
+    }
+
     fn stop(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
             let inner_result = self.inner.stop().await;
             let daemon_result = if let Some(mut daemon) = self.daemon.take() {
-                stop_managed_daemon(&mut daemon, &self.config).await
+                let result = stop_managed_daemon(&mut daemon, &self.config).await;
+                self.lifecycle_notes.append(&mut daemon.lifecycle_notes);
+                result
             } else {
                 Ok(())
             };
@@ -740,6 +999,16 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
         pids.dedup();
         pids
     }
+
+    fn daemon_pid(&self) -> Option<u32> {
+        self.daemon.as_ref().and_then(ManagedDaemonProcess::pid)
+    }
+
+    fn lifecycle_notes(&self) -> Vec<String> {
+        let mut notes = self.inner.lifecycle_notes();
+        notes.extend(self.lifecycle_notes.clone());
+        notes
+    }
 }
 
 impl<T: Transport> Drop for ManagedDaemonTransport<T> {
@@ -750,10 +1019,12 @@ impl<T: Transport> Drop for ManagedDaemonTransport<T> {
             // from leaving daemon workers resident. Tokio's kill-on-drop handles
             // the leader; this signal covers every descendant in the owned group.
             if self.config.launcher_exits {
-                if matching_detached_pids(&self.config.process_match)
-                    .is_ok_and(|matches| matches.contains(&pid))
+                if let Some(identity) = self
+                    .daemon
+                    .as_ref()
+                    .and_then(|daemon| daemon.external_identity)
                 {
-                    let _ = signal_detached_process(pid, libc::SIGKILL);
+                    let _ = signal_external_process(identity, libc::SIGKILL);
                 }
             } else {
                 let _ = signal_managed_process_group(pid, libc::SIGKILL);
@@ -779,6 +1050,10 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
         (**self).request(request)
     }
 
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        (**self).await_readiness()
+    }
+
     fn stop(&mut self) -> DriverFuture<'_, ()> {
         (**self).stop()
     }
@@ -786,12 +1061,25 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
     fn owned_pids(&self) -> Vec<u32> {
         (**self).owned_pids()
     }
+
+    fn daemon_pid(&self) -> Option<u32> {
+        (**self).daemon_pid()
+    }
+
+    fn lifecycle_notes(&self) -> Vec<String> {
+        (**self).lifecycle_notes()
+    }
 }
 
 /// The semantic harness lifecycle used by workflows.
 pub trait Driver: Send {
     /// Start and await readiness.
     fn start(&mut self) -> DriverFuture<'_, ()>;
+    /// Await readiness after launch. Resource workflows call this while their
+    /// owned-tree samplers are already armed.
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Create an isolated session.
     fn create_session(&mut self, marker: &str) -> DriverFuture<'_, SessionId>;
     /// Submit a prompt with an idempotency key.
@@ -810,6 +1098,10 @@ pub trait Driver: Send {
     ) -> DriverFuture<'_, Vec<NormalizedEvent>>;
     /// Resume a previously accepted turn.
     fn resume(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
+    /// Probe and reconcile a session after daemon restart.
+    fn recover_probe(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
+        self.resume(session)
+    }
     /// Inject input at the next safe boundary.
     fn steer(&mut self, session: &SessionId, prompt: &str) -> DriverFuture<'_, ()>;
     /// Inject input before a pending tool is allowed to run.
@@ -841,6 +1133,16 @@ pub trait Driver: Send {
     fn reap_after_external_kill(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+    /// Observe a cohort with an adapter-declared readiness command. This is
+    /// advisory only: resource PASS fencing uses durable terminal state and
+    /// thin-client exit status.
+    fn wait_ready(
+        &mut self,
+        _sessions: &[SessionId],
+        _timeout: Duration,
+    ) -> DriverFuture<'_, Option<Value>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Release benchmark launch gates after resource membership is armed.
     fn release_invocations(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
@@ -848,6 +1150,10 @@ pub trait Driver: Send {
     /// Currently live launcher/controller PIDs owned by this driver.
     fn owned_pids(&self) -> Vec<u32> {
         Vec::new()
+    }
+    /// Root PID captured by the declared daemon readiness probe.
+    fn daemon_pid(&self) -> Option<u32> {
+        None
     }
     /// Currently live launcher PIDs for one logical session, when separable.
     fn session_pids(&self, _session: &SessionId) -> Vec<u32> {
@@ -861,6 +1167,23 @@ pub trait Driver: Send {
     fn completed_turn_boundaries(&self) -> Vec<CompletedTurnBoundary> {
         Vec::new()
     }
+    /// Last observed thin-client process state for a logical session.
+    fn client_exit(&self, _session: &SessionId) -> ClientExit {
+        ClientExit::NotApplicable
+    }
+    /// Parsed JSON returned by headless control commands for this session.
+    fn control_evidence(&self, _session: &SessionId) -> Vec<Value> {
+        Vec::new()
+    }
+    /// Notes from typed shutdown and owned-tree escalation.
+    fn lifecycle_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Unique source payload kinds observed at a supported schema version but
+    /// left unmapped by the adapter's normalization table.
+    fn unmapped_payload_kinds(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Exact external lifecycle boundaries for one completed per-invocation turn.
@@ -872,12 +1195,24 @@ pub struct CompletedTurnBoundary {
     pub exit_ns: u64,
 }
 
+/// Explicit process-exit evidence used by daemon-topology resource fencing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientExit {
+    /// The transport has no per-session thin client.
+    NotApplicable,
+    /// A thin client is still running or has not yet been reaped.
+    Running,
+    /// The thin client exited; signals have no numeric exit code.
+    Exited(Option<i32>),
+}
+
 /// Generic data-driven driver backed by one transport.
 pub struct GenericDriver<T: Transport> {
     /// Selected transport.
     pub transport: T,
     /// Manifest-selected operation names.
     pub operations: DriverOperations,
+    lifecycle_notes: Vec<String>,
 }
 
 /// Semantic operation names used by a transport-backed driver.
@@ -910,6 +1245,10 @@ pub struct DriverOperations {
     pub close: String,
     /// Shut down the harness.
     pub shutdown: String,
+    /// Informational cohort readiness operation.
+    pub wait_ready: String,
+    /// Typed shutdown response contract.
+    pub shutdown_result: ShutdownResult,
 }
 
 impl Default for DriverOperations {
@@ -927,6 +1266,8 @@ impl Default for DriverOperations {
             cancel: "session.cancel".to_owned(),
             close: "session.close".to_owned(),
             shutdown: "harness.shutdown".to_owned(),
+            wait_ready: String::new(),
+            shutdown_result: ShutdownResult::default(),
         }
     }
 }
@@ -937,6 +1278,7 @@ impl<T: Transport> GenericDriver<T> {
         Self {
             transport,
             operations: DriverOperations::default(),
+            lifecycle_notes: Vec::new(),
         }
     }
 
@@ -966,6 +1308,10 @@ impl<T: Transport> GenericDriver<T> {
 impl<T: Transport> Driver for GenericDriver<T> {
     fn start(&mut self) -> DriverFuture<'_, ()> {
         self.transport.start()
+    }
+
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        self.transport.await_readiness()
     }
 
     fn create_session(&mut self, marker: &str) -> DriverFuture<'_, SessionId> {
@@ -1098,16 +1444,69 @@ impl<T: Transport> Driver for GenericDriver<T> {
 
     fn shutdown(&mut self) -> DriverFuture<'_, ()> {
         let operation = self.operations.shutdown.clone();
+        let contract = self.operations.shutdown_result.clone();
         Box::pin(async move {
+            let mut escalate = false;
             if !operation.is_empty() {
-                let _ = self.call(&operation, json!({})).await;
+                let value = self.call(&operation, json!({})).await?;
+                if !contract.outcome_pointer.is_empty()
+                    && shutdown_disposition(&contract, &value)? == ShutdownDisposition::Escalate
+                {
+                    escalate = true;
+                    self.lifecycle_notes
+                        .push("daemon shutdown outcome requested owned-tree escalation".to_owned());
+                }
             }
-            self.transport.stop().await
+            let stopped = self.transport.stop().await;
+            self.lifecycle_notes
+                .extend(self.transport.lifecycle_notes());
+            if escalate && stopped.is_err() {
+                return Err(AhrbError::Protocol(
+                    "daemon requested escalation and the owned-tree sweep failed".to_owned(),
+                ));
+            }
+            stopped
+        })
+    }
+
+    fn wait_ready(
+        &mut self,
+        sessions: &[SessionId],
+        timeout: Duration,
+    ) -> DriverFuture<'_, Option<Value>> {
+        let operation = self.operations.wait_ready.clone();
+        let session_ids = sessions
+            .iter()
+            .map(|session| session.0.clone())
+            .collect::<Vec<_>>();
+        Box::pin(async move {
+            if operation.is_empty() {
+                return Ok(None);
+            }
+            let value = self
+                .call(
+                    &operation,
+                    json!({
+                        "count": session_ids.len(),
+                        "session_ids": session_ids,
+                        "timeout_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    }),
+                )
+                .await?;
+            Ok(Some(value))
         })
     }
 
     fn owned_pids(&self) -> Vec<u32> {
         self.transport.owned_pids()
+    }
+
+    fn daemon_pid(&self) -> Option<u32> {
+        self.transport.daemon_pid()
+    }
+
+    fn lifecycle_notes(&self) -> Vec<String> {
+        self.lifecycle_notes.clone()
     }
 }
 
@@ -1196,12 +1595,18 @@ pub struct PerInvocationConfig {
     pub command: Vec<String>,
     /// Subsequent-turn argv used to reopen a harness-owned session from disk.
     pub resume_command: Vec<String>,
+    /// Headless resume/reconciliation control argv.
+    pub resume_control_command: Vec<String>,
+    /// Headless post-restart recovery probe argv.
+    pub recover_probe_command: Vec<String>,
     /// Out-of-process command used to release a durable checkpoint token.
     pub release_command: Vec<String>,
     /// Out-of-process command used after terminating an active invocation.
     pub cancel_command: Vec<String>,
     /// Out-of-process command that strictly reopens and emits the durable journal.
     pub replay_command: Vec<String>,
+    /// Informational command used to observe a resource cohort settling.
+    pub wait_ready_command: Vec<String>,
     /// Isolated environment inherited by every invocation.
     pub environment: BTreeMap<String, String>,
     /// Fully populated manifest-level template variables. Per-session and
@@ -1216,6 +1621,8 @@ pub struct PerInvocationConfig {
     pub exit: ExitContract,
     /// Pointer used to learn the harness's persisted session/thread identifier.
     pub session_id_pointer: String,
+    /// Pointer used to learn the harness's persistent run identifier.
+    pub run_id_pointer: String,
     /// Client-side upper bound for a single invocation.
     pub timeout: Duration,
     /// Maximum source bytes parsed per invocation.
@@ -1230,6 +1637,8 @@ struct PersistedExecSession {
     local_id: String,
     marker: String,
     harness_id: String,
+    #[serde(default)]
+    run_id: String,
     turns: u64,
     #[serde(default)]
     invocations: u64,
@@ -1252,6 +1661,8 @@ struct ActiveInvocation {
 struct ExecSession {
     persisted: PersistedExecSession,
     active: Option<ActiveInvocation>,
+    client_exit: ClientExit,
+    control_evidence: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -1437,8 +1848,12 @@ pub struct PerInvocationDriver {
     state_root: PathBuf,
     sessions: BTreeMap<String, ExecSession>,
     daemon_process: Option<ManagedDaemonProcess>,
+    daemon_start: Option<tokio::task::JoinHandle<Result<ManagedDaemonProcess>>>,
+    daemon_launch_pid: Option<u32>,
     completed_turn_wall_ns: Vec<u64>,
     completed_turn_boundaries: Vec<CompletedTurnBoundary>,
+    lifecycle_notes: Vec<String>,
+    unmapped_payload_kinds: BTreeSet<String>,
 }
 
 impl PerInvocationDriver {
@@ -1450,8 +1865,12 @@ impl PerInvocationDriver {
             state_root,
             sessions: BTreeMap::new(),
             daemon_process: None,
+            daemon_start: None,
+            daemon_launch_pid: None,
             completed_turn_wall_ns: Vec::new(),
             completed_turn_boundaries: Vec::new(),
+            lifecycle_notes: Vec::new(),
+            unmapped_payload_kinds: BTreeSet::new(),
         }
     }
 
@@ -1507,6 +1926,8 @@ impl PerInvocationDriver {
                 ExecSession {
                     persisted,
                     active: None,
+                    client_exit: ClientExit::Exited(Some(0)),
+                    control_evidence: Vec::new(),
                 },
             );
         }
@@ -1566,6 +1987,7 @@ impl PerInvocationDriver {
                     session.harness_id.clone()
                 },
             ),
+            ("run_id".to_owned(), session.run_id.clone()),
             ("marker".to_owned(), session.marker.clone()),
             ("actor".to_owned(), session.marker.clone()),
             ("turn_key".to_owned(), key.to_owned()),
@@ -1669,6 +2091,31 @@ impl PerInvocationDriver {
         Ok((records, stdout))
     }
 
+    fn raw_live_replay_records(&self, session: &PersistedExecSession) -> Result<Vec<Value>> {
+        let mut records = Vec::new();
+        for turn in 1..=session.invocations {
+            let path = self
+                .session_directory(&session.local_id)
+                .join(format!("turn-{turn:06}.stdout"));
+            let bytes = Self::bounded_read(&path, self.config.max_output_bytes, false)?;
+            for record in parse_event_records(&bytes, &self.config.events.framing)? {
+                let has_cursor = record
+                    .pointer(&self.config.events.cursor_pointer)
+                    .and_then(Value::as_u64)
+                    .is_some();
+                let same_run = self.config.run_id_pointer.is_empty()
+                    || record
+                        .pointer(&self.config.run_id_pointer)
+                        .and_then(Value::as_str)
+                        == Some(session.run_id.as_str());
+                if has_cursor && same_run {
+                    records.push(record);
+                }
+            }
+        }
+        Ok(records)
+    }
+
     fn read_cached_events(path: &Path) -> Result<Vec<NormalizedEvent>> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -1759,7 +2206,10 @@ impl PerInvocationDriver {
                 if !allow_terminal
                     && matches!(
                         rule.event.as_str(),
-                        "terminal-success" | "terminal-failure" | "terminal-cancelled"
+                        "terminal-success"
+                            | "terminal-failure"
+                            | "terminal-cancelled"
+                            | "terminal-timeout"
                     )
                 {
                     continue;
@@ -1837,16 +2287,24 @@ impl PerInvocationDriver {
         Ok(output)
     }
 
-    fn learn_harness_id(&self, session: &mut PersistedExecSession, records: &[Value]) {
-        if self.config.session_id_pointer.is_empty() || !session.harness_id.is_empty() {
-            return;
+    fn learn_harness_identifiers(&self, session: &mut PersistedExecSession, records: &[Value]) {
+        if !self.config.session_id_pointer.is_empty() && session.harness_id.is_empty() {
+            if let Some(id) = records.iter().find_map(|record| {
+                record
+                    .pointer(&self.config.session_id_pointer)
+                    .and_then(Value::as_str)
+            }) {
+                session.harness_id = id.to_owned();
+            }
         }
-        if let Some(id) = records.iter().find_map(|record| {
-            record
-                .pointer(&self.config.session_id_pointer)
-                .and_then(Value::as_str)
-        }) {
-            session.harness_id = id.to_owned();
+        if !self.config.run_id_pointer.is_empty() && session.run_id.is_empty() {
+            if let Some(id) = records.iter().find_map(|record| {
+                record
+                    .pointer(&self.config.run_id_pointer)
+                    .and_then(Value::as_str)
+            }) {
+                session.run_id = id.to_owned();
+            }
         }
     }
 
@@ -1859,7 +2317,7 @@ impl PerInvocationDriver {
     }
 
     fn refresh_source(
-        &self,
+        &mut self,
         session: &mut PersistedExecSession,
         active: &ActiveInvocation,
         completed: Option<std::process::ExitStatus>,
@@ -1872,7 +2330,8 @@ impl PerInvocationDriver {
             .map(|event| (event.id.clone(), event))
             .collect();
         let (records, stdout) = self.source_records(session, Some(&active.stdout_path))?;
-        self.learn_harness_id(session, &records);
+        self.record_event_contract(&records)?;
+        self.learn_harness_identifiers(session, &records);
         let namespace = if self.config.events.source == "stdout" {
             format!("turn-{}", active.turn)
         } else {
@@ -1887,15 +2346,51 @@ impl PerInvocationDriver {
             completed.is_some(),
         )?;
         if let Some(status) = completed {
-            let (expected, payload) = self.terminal_contract(status, &stdout);
+            let (expected, mut payload) = self.terminal_contract(status, &stdout);
+            if payload.get("category").and_then(Value::as_str) == Some("idle-timeout")
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    "client_turn_wall_ms".to_owned(),
+                    Value::from(
+                        u64::try_from(active.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ),
+                );
+            }
             let turn_prefix = format!("{}:turn-{}", session.local_id, active.turn);
+            if let Some(mapped) = additions.iter_mut().rev().find(|event| {
+                matches!(
+                    event.event,
+                    EventVocab::TerminalSuccess
+                        | EventVocab::TerminalFailure
+                        | EventVocab::TerminalTimeout
+                )
+            }) && mapped.event == expected
+                && let (Some(mapped_payload), Some(exit_payload)) =
+                    (mapped.payload.as_object_mut(), payload.as_object())
+            {
+                for (key, value) in exit_payload {
+                    mapped_payload
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
             let mapped_terminal = additions.iter().chain(cached.iter()).rev().find(|event| {
                 matches!(
                     event.event,
-                    EventVocab::TerminalSuccess | EventVocab::TerminalFailure
+                    EventVocab::TerminalSuccess
+                        | EventVocab::TerminalFailure
+                        | EventVocab::TerminalCancelled
+                        | EventVocab::TerminalTimeout
                 )
             });
-            if mapped_terminal.is_none_or(|event| event.event != expected) {
+            if mapped_terminal.is_none_or(|event| {
+                event.event != expected
+                    && !matches!(
+                        event.event,
+                        EventVocab::TerminalCancelled | EventVocab::TerminalTimeout
+                    )
+            }) {
                 additions.push(NormalizedEvent {
                     id: format!("{turn_prefix}:terminal"),
                     cursor: session.next_cursor,
@@ -1910,7 +2405,7 @@ impl PerInvocationDriver {
         Self::append_cached_events(&cache_path, &additions)
     }
 
-    fn refresh_inactive_journal(&self, session: &mut PersistedExecSession) -> Result<()> {
+    fn refresh_inactive_journal(&mut self, session: &mut PersistedExecSession) -> Result<()> {
         if self.config.events.source != "journal-file" {
             return Ok(());
         }
@@ -1922,7 +2417,8 @@ impl PerInvocationDriver {
             .map(|event| (event.id.clone(), event))
             .collect();
         let (records, _) = self.source_records(session, None)?;
-        self.learn_harness_id(session, &records);
+        self.record_event_contract(&records)?;
+        self.learn_harness_identifiers(session, &records);
         let additions = Self::normalize_records(
             &self.config.events,
             session,
@@ -1934,12 +2430,23 @@ impl PerInvocationDriver {
         Self::append_cached_events(&cache_path, &additions)
     }
 
+    fn record_event_contract(&mut self, records: &[Value]) -> Result<()> {
+        for kind in inspect_event_contract(&self.config.events, records)? {
+            if self.unmapped_payload_kinds.insert(kind.clone()) {
+                eprintln!(
+                    "warning: supported source schema contained unmapped payload kind {kind:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn run_control_command(
         &self,
         template: &[String],
         session: &PersistedExecSession,
         release_token: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<Value>> {
         if template.is_empty() {
             return Err(AhrbError::Unsupported(
                 "per-invocation control command is absent".to_owned(),
@@ -1950,6 +2457,16 @@ impl PerInvocationDriver {
             "release_token".to_owned(),
             release_token.unwrap_or_default().to_owned(),
         );
+        if template
+            .iter()
+            .any(|argument| argument.contains("{{run_id}}"))
+            && session.run_id.is_empty()
+        {
+            return Err(AhrbError::Protocol(format!(
+                "control command requires a harness run ID, but session {:?} never exposed {}",
+                session.local_id, self.config.run_id_pointer
+            )));
+        }
         let argv = template
             .iter()
             .map(|argument| crate::manifest::render_template(argument, &variables))
@@ -1965,8 +2482,8 @@ impl PerInvocationDriver {
             .envs(&self.config.environment)
             .current_dir(self.session_directory(&session.local_id).join("workspace"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let output = run_owned_output(
             &mut command,
@@ -1974,13 +2491,40 @@ impl PerInvocationDriver {
             "per-invocation control command",
         )
         .await?;
+        // Control commands may print a human-readable preamble line before the
+        // JSON document on the same stream (e.g. haider's recover --probe emits
+        // "no crash window to reconcile" ahead of its haider.session_recovery.v1
+        // document), so extract the LAST parseable JSON line rather than parsing
+        // the whole buffer.
+        let stdout_text = String::from_utf8_lossy(&output.stdout);
+        let last_json = stdout_text
+            .lines()
+            .rev()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
         if !output.status.success() {
+            // A structured JSON control response with a nonzero exit is still
+            // evidence (e.g. a typed "no_recovery" probe answer); let the row
+            // oracle judge it instead of masking it behind a protocol error.
+            if let Some(value) = last_json {
+                return Ok(Some(value));
+            }
             return Err(AhrbError::Protocol(format!(
-                "per-invocation control command exited with {}",
-                output.status
+                "per-invocation control command exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        Ok(())
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        let value = last_json.ok_or_else(|| {
+            AhrbError::Protocol(
+                "per-invocation control command returned no parseable JSON line".to_owned(),
+            )
+        })?;
+        Ok(Some(value))
     }
 
     fn cached_after(&self, id: &str, after: Option<Cursor>) -> Result<Vec<NormalizedEvent>> {
@@ -1994,19 +2538,52 @@ impl PerInvocationDriver {
 impl Driver for PerInvocationDriver {
     fn start(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
+            self.load_sessions()?;
             if self.daemon_process.is_none()
+                && self.daemon_start.is_none()
                 && let Some(config) = self.config.daemon.clone()
             {
-                self.daemon_process = Some(start_managed_daemon(&config).await?);
-            }
-            if let Err(error) = self.load_sessions() {
-                if let (Some(mut daemon), Some(config)) =
-                    (self.daemon_process.take(), self.config.daemon.as_ref())
-                {
-                    stop_managed_daemon(&mut daemon, config).await?;
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                self.daemon_start = Some(tokio::spawn(async move {
+                    start_managed_daemon_inner(&config, Some(sender)).await
+                }));
+                match receiver.await {
+                    Ok(pid) => self.daemon_launch_pid = Some(pid),
+                    Err(_) => {
+                        let task = self.daemon_start.take().ok_or_else(|| {
+                            AhrbError::Protocol(
+                                "managed daemon startup task disappeared".to_owned(),
+                            )
+                        })?;
+                        let result = task.await.map_err(|error| {
+                            AhrbError::Protocol(format!(
+                                "managed daemon startup task failed: {error}"
+                            ))
+                        })?;
+                        return match result {
+                            Ok(process) => {
+                                self.daemon_process = Some(process);
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        };
+                    }
                 }
-                return Err(error);
             }
+            Ok(())
+        })
+    }
+
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            let Some(task) = self.daemon_start.take() else {
+                return Ok(());
+            };
+            let result = task.await.map_err(|error| {
+                AhrbError::Protocol(format!("managed daemon startup task failed: {error}"))
+            })?;
+            self.daemon_launch_pid = None;
+            self.daemon_process = Some(result?);
             Ok(())
         })
     }
@@ -2030,6 +2607,7 @@ impl Driver for PerInvocationDriver {
                 local_id: id.clone(),
                 marker,
                 harness_id: String::new(),
+                run_id: String::new(),
                 turns: 0,
                 invocations: 0,
                 next_cursor: 1,
@@ -2043,6 +2621,8 @@ impl Driver for PerInvocationDriver {
                 ExecSession {
                     persisted,
                     active: None,
+                    client_exit: ClientExit::Exited(Some(0)),
+                    control_evidence: Vec::new(),
                 },
             );
             Ok(SessionId(id))
@@ -2156,6 +2736,7 @@ impl Driver for PerInvocationDriver {
                 wall_prefix_ns,
                 turn,
             });
+            item.client_exit = ClientExit::Running;
             Ok(())
         })
     }
@@ -2212,6 +2793,7 @@ impl Driver for PerInvocationDriver {
                     })?;
                     item.persisted = persisted;
                     item.active = None;
+                    item.client_exit = ClientExit::Exited(status.and_then(|value| value.code()));
                 } else {
                     let item = self.sessions.get_mut(&id).ok_or_else(|| {
                         AhrbError::Protocol(format!("exec session {id:?} disappeared"))
@@ -2254,6 +2836,18 @@ impl Driver for PerInvocationDriver {
                     "per-invocation durable replay command is absent".to_owned(),
                 ));
             }
+            if self
+                .config
+                .replay_command
+                .iter()
+                .any(|argument| argument.contains("{{run_id}}"))
+                && persisted.run_id.is_empty()
+            {
+                return Err(AhrbError::Protocol(format!(
+                    "durable replay requires a harness run ID, but session {id:?} never exposed {}",
+                    self.config.run_id_pointer
+                )));
+            }
             let mut variables = self.invocation_variables(&persisted, "", "");
             variables.insert(
                 "cursor".to_owned(),
@@ -2268,13 +2862,36 @@ impl Driver for PerInvocationDriver {
             let (program, arguments) = argv.split_first().ok_or_else(|| {
                 AhrbError::Validation("per-invocation replay command is empty".to_owned())
             })?;
+            let working_directory = self.session_directory(&id).join("workspace");
+            let state_argv = self
+                .config
+                .events
+                .replay_state_command
+                .iter()
+                .map(|argument| crate::manifest::render_template(argument, &variables))
+                .collect::<Result<Vec<_>>>()?;
+            let before_state = if state_argv.is_empty() {
+                None
+            } else {
+                Some(
+                    run_json_output_command(
+                        &state_argv,
+                        &self.config.environment,
+                        &working_directory,
+                        self.config.timeout,
+                        self.config.max_output_bytes,
+                        "pre-replay durable state",
+                    )
+                    .await?,
+                )
+            };
             let mut command = Command::new(program);
             #[cfg(unix)]
             command.process_group(0);
             command
                 .args(arguments)
                 .envs(&self.config.environment)
-                .current_dir(self.session_directory(&id).join("workspace"))
+                .current_dir(&working_directory)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -2285,48 +2902,102 @@ impl Driver for PerInvocationDriver {
                 "per-invocation durable replay",
             )
             .await?;
-            if !output.status.success() {
-                return Err(AhrbError::Protocol(format!(
-                    "per-invocation durable replay exited with {}",
-                    output.status
-                )));
+            validate_replay_output(&output, self.config.max_output_bytes)?;
+            let mut records = extract_replay_records(&self.config.events, &output.stdout)?;
+            self.record_event_contract(&records)?;
+            if self.config.events.replay_compare_live_records {
+                let live = self.raw_live_replay_records(&persisted)?;
+                if records != live {
+                    return Err(AhrbError::Protocol(format!(
+                        "durable replay records differed from raw live run projection: live={}, replay={}",
+                        live.len(),
+                        records.len()
+                    )));
+                }
             }
-            if output.stdout.len() > self.config.max_output_bytes {
-                return Err(AhrbError::Protocol(
-                    "per-invocation durable replay exceeded capture bound".to_owned(),
-                ));
-            }
-            if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
-                return Err(AhrbError::Protocol(
-                    "durable replay output ended with a torn record".to_owned(),
-                ));
-            }
-            let records = parse_journal_records(&output.stdout)?;
-            for record in &records {
-                let cursor = record
-                    .pointer(&self.config.events.cursor_pointer)
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        AhrbError::Protocol(
-                            "durable replay output omitted its source cursor".to_owned(),
-                        )
+            if let Some(before) = before_state {
+                let after = run_json_output_command(
+                    &state_argv,
+                    &self.config.environment,
+                    &working_directory,
+                    self.config.timeout,
+                    self.config.max_output_bytes,
+                    "post-replay durable state",
+                )
+                .await?;
+                validate_scalar_assertions(
+                    &before,
+                    &self.config.events.replay_state_assertions,
+                    "pre-replay durable state",
+                )?;
+                validate_scalar_assertions(
+                    &after,
+                    &self.config.events.replay_state_assertions,
+                    "post-replay durable state",
+                )?;
+                for pointer in &self.config.events.replay_state_pointers {
+                    let before_value = before.pointer(pointer).ok_or_else(|| {
+                        AhrbError::Protocol(format!(
+                            "pre-replay durable state omitted comparison field at {pointer}"
+                        ))
                     })?;
-                if after.is_some_and(|after| cursor <= after.0) {
-                    return Err(AhrbError::Protocol(
-                        "durable replay returned an event at or before its cursor".to_owned(),
-                    ));
+                    let after_value = after.pointer(pointer).ok_or_else(|| {
+                        AhrbError::Protocol(format!(
+                            "post-replay durable state omitted comparison field at {pointer}"
+                        ))
+                    })?;
+                    if before_value != after_value {
+                        return Err(AhrbError::Protocol(format!(
+                            "durable replay mutated state at {pointer}: before={}, after={}",
+                            before_value, after_value
+                        )));
+                    }
                 }
             }
             let mut replayed = persisted;
-            replayed.next_cursor = after.map_or(1, |cursor| cursor.0.saturating_add(1));
-            Self::normalize_records(
-                &self.config.events,
-                &mut replayed,
-                &records,
-                &BTreeMap::new(),
-                "journal",
-                true,
-            )
+            if self.config.events.source == "stdout" {
+                // Normalize the replay stream into AHRB cursors before applying
+                // the caller's AHRB cursor. An adapter-declared replay envelope
+                // has already been unwrapped above.
+                replayed.next_cursor = self.config.events.replay_cursor_start.unwrap_or(1);
+                let mut normalized = Self::normalize_records(
+                    &self.config.events,
+                    &mut replayed,
+                    &records,
+                    &BTreeMap::new(),
+                    "turn-1",
+                    true,
+                )?;
+                normalized.retain(|event| after.is_none_or(|cursor| event.cursor > cursor.0));
+                Ok(normalized)
+            } else {
+                for record in &records {
+                    if record
+                        .pointer(&self.config.events.cursor_pointer)
+                        .and_then(Value::as_u64)
+                        .is_none()
+                    {
+                        return Err(AhrbError::Protocol(
+                            "durable journal replay omitted its source cursor".to_owned(),
+                        ));
+                    }
+                }
+                records.retain(|record| {
+                    let cursor = record
+                        .pointer(&self.config.events.cursor_pointer)
+                        .and_then(Value::as_u64);
+                    after.is_none_or(|after| cursor.is_some_and(|cursor| cursor > after.0))
+                });
+                replayed.next_cursor = after.map_or(1, |cursor| cursor.0.saturating_add(1));
+                Self::normalize_records(
+                    &self.config.events,
+                    &mut replayed,
+                    &records,
+                    &BTreeMap::new(),
+                    "journal",
+                    true,
+                )
+            }
         })
     }
 
@@ -2349,7 +3020,34 @@ impl Driver for PerInvocationDriver {
                         "could not reopen exec session {id:?} metadata: {error}"
                     ))
                 })?)?;
-            if self.config.events.source == "journal-file" {
+            if !self.config.resume_control_command.is_empty() {
+                let command = self.config.resume_control_command.clone();
+                let evidence = self
+                    .run_control_command(&command, &persisted, None)
+                    .await?
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "declared resume control command returned no JSON evidence".to_owned(),
+                        )
+                    })?;
+                let mut evidence_log = self
+                    .sessions
+                    .get(&id)
+                    .map(|session| session.control_evidence.clone())
+                    .unwrap_or_default();
+                evidence_log.push(evidence);
+                Self::persist_session_at(&path, &persisted)?;
+                self.sessions.insert(
+                    id,
+                    ExecSession {
+                        persisted,
+                        active: None,
+                        client_exit: ClientExit::Exited(Some(0)),
+                        control_evidence: evidence_log,
+                    },
+                );
+                return Ok(());
+            } else if self.config.events.source == "journal-file" {
                 match std::fs::remove_file(self.events_path(&id)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2364,8 +3062,40 @@ impl Driver for PerInvocationDriver {
                 ExecSession {
                     persisted,
                     active: None,
+                    client_exit: ClientExit::Exited(Some(0)),
+                    control_evidence: Vec::new(),
                 },
             );
+            Ok(())
+        })
+    }
+
+    fn recover_probe(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
+        let id = session.0.clone();
+        Box::pin(async move {
+            let persisted = self
+                .sessions
+                .get(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?
+                .persisted
+                .clone();
+            if self.config.recover_probe_command.is_empty() {
+                return self.resume(&SessionId(id)).await;
+            }
+            let command = self.config.recover_probe_command.clone();
+            let evidence = self
+                .run_control_command(&command, &persisted, None)
+                .await?
+                .ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "declared recovery probe returned no JSON evidence".to_owned(),
+                    )
+                })?;
+            let item = self
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?;
+            item.control_evidence.push(evidence);
             Ok(())
         })
     }
@@ -2411,6 +3141,7 @@ impl Driver for PerInvocationDriver {
             let command = self.config.release_command.clone();
             self.run_control_command(&command, &persisted, Some(&release_token))
                 .await
+                .map(|_| ())
         })
     }
 
@@ -2437,7 +3168,7 @@ impl Driver for PerInvocationDriver {
                 .active
                 .take();
             if let Some(mut invocation) = active {
-                stop_managed_child(&mut invocation.child, Duration::from_millis(100)).await?;
+                let invocation_pid = invocation.child.id();
                 let mut persisted = self
                     .sessions
                     .get(&id)
@@ -2445,6 +3176,7 @@ impl Driver for PerInvocationDriver {
                     .persisted
                     .clone();
                 if self.config.cancel_command.is_empty() {
+                    stop_managed_child(&mut invocation.child, Duration::from_millis(100)).await?;
                     let event = NormalizedEvent {
                         id: format!("{}:turn-{}:cancelled", id, invocation.turn),
                         cursor: persisted.next_cursor,
@@ -2457,8 +3189,30 @@ impl Driver for PerInvocationDriver {
                     Self::append_cached_events(&self.events_path(&id), &[event])?;
                 } else {
                     let command = self.config.cancel_command.clone();
-                    self.run_control_command(&command, &persisted, None).await?;
-                    self.refresh_inactive_journal(&mut persisted)?;
+                    let _ = self.run_control_command(&command, &persisted, None).await?;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let status = loop {
+                        if let Some(status) = invocation.child.try_wait()? {
+                            break status;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            stop_managed_child(&mut invocation.child, Duration::from_millis(100))
+                                .await?;
+                            break invocation.child.try_wait()?.ok_or_else(|| {
+                                AhrbError::Protocol(
+                                    "cancelled thin client could not be reaped".to_owned(),
+                                )
+                            })?;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    };
+                    self.refresh_source(&mut persisted, &invocation, Some(status))?;
+                    if self.config.events.source == "journal-file" {
+                        self.refresh_inactive_journal(&mut persisted)?;
+                    }
+                }
+                if let Some(pid) = invocation_pid {
+                    crate::process::retire_process(pid)?;
                 }
                 persisted.turns = persisted.turns.saturating_add(1);
                 Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
@@ -2469,6 +3223,12 @@ impl Driver for PerInvocationDriver {
                 std::fs::create_dir(&workspace)?;
                 if let Some(item) = self.sessions.get_mut(&id) {
                     item.persisted = persisted;
+                    item.client_exit = ClientExit::Exited(
+                        invocation
+                            .child
+                            .try_wait()?
+                            .and_then(|status| status.code()),
+                    );
                 }
             }
             Ok(())
@@ -2497,6 +3257,7 @@ impl Driver for PerInvocationDriver {
 
     fn shutdown(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
+            self.await_readiness().await?;
             let ids: Vec<String> = self
                 .sessions
                 .iter()
@@ -2513,7 +3274,9 @@ impl Driver for PerInvocationDriver {
             let daemon_result = if let (Some(mut daemon), Some(config)) =
                 (self.daemon_process.take(), self.config.daemon.as_ref())
             {
-                stop_managed_daemon(&mut daemon, config).await
+                let result = stop_managed_daemon(&mut daemon, config).await;
+                self.lifecycle_notes.append(&mut daemon.lifecycle_notes);
+                result
             } else {
                 Ok(())
             };
@@ -2572,9 +3335,18 @@ impl Driver for PerInvocationDriver {
         {
             pids.push(pid);
         }
+        if let Some(pid) = self.daemon_launch_pid {
+            pids.push(pid);
+        }
         pids.sort_unstable();
         pids.dedup();
         pids
+    }
+
+    fn daemon_pid(&self) -> Option<u32> {
+        self.daemon_process
+            .as_ref()
+            .and_then(ManagedDaemonProcess::pid)
     }
 
     fn session_pids(&self, session: &SessionId) -> Vec<u32> {
@@ -2593,6 +3365,87 @@ impl Driver for PerInvocationDriver {
     fn completed_turn_boundaries(&self) -> Vec<CompletedTurnBoundary> {
         self.completed_turn_boundaries.clone()
     }
+
+    fn client_exit(&self, session: &SessionId) -> ClientExit {
+        self.sessions
+            .get(&session.0)
+            .map_or(ClientExit::NotApplicable, |item| item.client_exit)
+    }
+
+    fn control_evidence(&self, session: &SessionId) -> Vec<Value> {
+        self.sessions
+            .get(&session.0)
+            .map(|item| item.control_evidence.clone())
+            .unwrap_or_default()
+    }
+
+    fn lifecycle_notes(&self) -> Vec<String> {
+        self.lifecycle_notes.clone()
+    }
+
+    fn unmapped_payload_kinds(&self) -> Vec<String> {
+        self.unmapped_payload_kinds.iter().cloned().collect()
+    }
+
+    fn wait_ready(
+        &mut self,
+        sessions: &[SessionId],
+        timeout: Duration,
+    ) -> DriverFuture<'_, Option<Value>> {
+        let count = sessions.len();
+        let session = sessions
+            .first()
+            .and_then(|session| self.sessions.get(&session.0))
+            .map(|session| session.persisted.clone());
+        let template = self.config.wait_ready_command.clone();
+        Box::pin(async move {
+            if template.is_empty() {
+                return Ok(None);
+            }
+            let session = session.ok_or_else(|| {
+                AhrbError::Protocol("wait-ready cohort omitted its sessions".to_owned())
+            })?;
+            let mut variables = self.invocation_variables(&session, "", "");
+            variables.insert("count".to_owned(), count.to_string());
+            variables.insert(
+                "timeout".to_owned(),
+                format!(
+                    "{}ms",
+                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+                ),
+            );
+            let argv = template
+                .iter()
+                .map(|argument| crate::manifest::render_template(argument, &variables))
+                .collect::<Result<Vec<_>>>()?;
+            let (program, arguments) = argv.split_first().ok_or_else(|| {
+                AhrbError::Validation("per-invocation wait-ready command is empty".to_owned())
+            })?;
+            let mut command = Command::new(program);
+            #[cfg(unix)]
+            command.process_group(0);
+            command
+                .args(arguments)
+                .envs(&self.config.environment)
+                .current_dir(self.session_directory(&session.local_id).join("workspace"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let output =
+                run_owned_output(&mut command, timeout, "per-invocation wait-ready").await?;
+            if !output.status.success() {
+                return Err(AhrbError::Protocol(format!(
+                    "per-invocation wait-ready exited with {}",
+                    output.status
+                )));
+            }
+            let value = serde_json::from_slice(&output.stdout).map_err(|error| {
+                AhrbError::Protocol(format!("wait-ready emitted invalid JSON: {error}"))
+            })?;
+            Ok(Some(value))
+        })
+    }
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -2601,6 +3454,9 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 
 impl Drop for PerInvocationDriver {
     fn drop(&mut self) {
+        if let Some(task) = self.daemon_start.take() {
+            task.abort();
+        }
         #[cfg(unix)]
         if let Some(pid) = self
             .daemon_process
@@ -2613,11 +3469,12 @@ impl Drop for PerInvocationDriver {
                 .as_ref()
                 .is_some_and(|config| config.launcher_exits)
             {
-                if self.config.daemon.as_ref().is_some_and(|config| {
-                    matching_detached_pids(&config.process_match)
-                        .is_ok_and(|matches| matches.contains(&pid))
-                }) {
-                    let _ = signal_detached_process(pid, libc::SIGKILL);
+                if let Some(identity) = self
+                    .daemon_process
+                    .as_ref()
+                    .and_then(|daemon| daemon.external_identity)
+                {
+                    let _ = signal_external_process(identity, libc::SIGKILL);
                 }
             } else {
                 let _ = signal_managed_process_group(pid, libc::SIGKILL);
@@ -2764,6 +3621,182 @@ fn parse_journal_records(bytes: &[u8]) -> Result<Vec<Value>> {
     Ok(records)
 }
 
+fn validate_replay_output(output: &std::process::Output, maximum: usize) -> Result<()> {
+    if !output.status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "per-invocation durable replay exited with {}",
+            output.status
+        )));
+    }
+    if output.stdout.len() > maximum {
+        return Err(AhrbError::Protocol(
+            "per-invocation durable replay exceeded capture bound".to_owned(),
+        ));
+    }
+    if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
+        return Err(AhrbError::Protocol(
+            "durable replay output ended with a torn record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_replay_records(mapping: &EventMapping, bytes: &[u8]) -> Result<Vec<Value>> {
+    let records = parse_journal_records(bytes)?;
+    if mapping.replay_mode == "document" {
+        let [document] = records.as_slice() else {
+            return Err(AhrbError::Protocol(format!(
+                "durable replay document mode expected one JSON document, received {}",
+                records.len()
+            )));
+        };
+        validate_scalar_assertions(
+            document,
+            &mapping.replay_assertions,
+            "durable replay document",
+        )?;
+        return document
+            .pointer(&mapping.replay_records_pointer)
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "durable replay document omitted event array at {}",
+                    mapping.replay_records_pointer
+                ))
+            });
+    }
+    if mapping.replay_envelope_pointer.is_empty() {
+        return Ok(records);
+    }
+    records
+        .iter()
+        .map(|record| {
+            record
+                .pointer(&mapping.replay_envelope_pointer)
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    AhrbError::Protocol(format!(
+                        "durable replay record omitted object envelope at {}",
+                        mapping.replay_envelope_pointer
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn validate_scalar_assertions(
+    document: &Value,
+    assertions: &BTreeMap<String, String>,
+    label: &str,
+) -> Result<()> {
+    for (pointer, expected) in assertions {
+        let actual = document.pointer(pointer).ok_or_else(|| {
+            AhrbError::Protocol(format!("{label} omitted asserted field at {pointer}"))
+        })?;
+        if !scalar_matches(actual, expected) {
+            return Err(AhrbError::Protocol(format!(
+                "{label} assertion at {pointer} expected {expected:?}, received {actual}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn run_json_output_command(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+    working_directory: &Path,
+    timeout: Duration,
+    maximum: usize,
+    label: &str,
+) -> Result<Value> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| AhrbError::Validation(format!("{label} command is empty")))?;
+    let mut command = Command::new(program);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .args(arguments)
+        .envs(environment)
+        .current_dir(working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = run_owned_output(&mut command, timeout, label).await?;
+    if !output.status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "{label} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if output.stdout.len() > maximum {
+        return Err(AhrbError::Protocol(format!(
+            "{label} exceeded capture bound"
+        )));
+    }
+    parse_last_json_value(&output.stdout)
+        .ok_or_else(|| AhrbError::Protocol(format!("{label} emitted no JSON document")))
+}
+
+fn parse_last_json_value(bytes: &[u8]) -> Option<Value> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice(trim_ascii(line)).ok())
+        .next_back()
+}
+
+fn scalar_matches(actual: &Value, expected: &str) -> bool {
+    match actual {
+        Value::String(value) => value == expected,
+        Value::Bool(value) => value.to_string() == expected,
+        Value::Number(value) => value.to_string() == expected,
+        _ => false,
+    }
+}
+
+fn inspect_event_contract(mapping: &EventMapping, records: &[Value]) -> Result<BTreeSet<String>> {
+    if mapping.schema_version_pointer.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut unmapped = BTreeSet::new();
+    for record in records {
+        let Some(kind) = record
+            .pointer(&mapping.type_pointer)
+            .and_then(Value::as_str)
+        else {
+            // Mixed stdout streams can contain transport announcements which
+            // are not durable envelopes and therefore have no schema version.
+            continue;
+        };
+        let version = record
+            .pointer(&mapping.schema_version_pointer)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "source payload kind {kind:?} omitted u64 schema version at {}",
+                    mapping.schema_version_pointer
+                ))
+            })?;
+        if !mapping.schema_versions.contains(&version) {
+            return Err(AhrbError::Protocol(format!(
+                "unsupported source schema version {version} for payload kind {kind:?}; supported versions are {:?}",
+                mapping.schema_versions
+            )));
+        }
+        if mapping.warn_unmapped_payload_kinds
+            && !mapping.rules.iter().any(|rule| rule.matches == kind)
+        {
+            unmapped.insert(kind.to_owned());
+        }
+    }
+    Ok(unmapped)
+}
+
 /// One-process-per-operation transport using JSON on stdin and stdout.
 pub struct ExecTransport {
     command: Vec<String>,
@@ -2842,6 +3875,8 @@ pub struct StdinRpcTransport {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<tokio::io::Lines<BufReader<ChildStdout>>>,
+    readiness: Option<Probe>,
+    readiness_pid: Option<u32>,
 }
 
 impl StdinRpcTransport {
@@ -2855,12 +3890,21 @@ impl StdinRpcTransport {
             child: None,
             stdin: None,
             stdout: None,
+            readiness: None,
+            readiness_pid: None,
         }
     }
 
     /// Add deterministic per-process environment bindings.
     pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         self.environment = environment;
+        self
+    }
+
+    /// Require the persistent peer to satisfy a manifest-declared readiness
+    /// probe and retain the PID returned by its JSON contract.
+    pub fn with_readiness(mut self, readiness: Probe) -> Self {
+        self.readiness = Some(readiness);
         self
     }
 
@@ -2895,6 +3939,81 @@ impl Transport for StdinRpcTransport {
             self.stdin = Some(stdin);
             self.stdout = Some(BufReader::new(stdout).lines());
             self.child = Some(child);
+            Ok(())
+        })
+    }
+
+    fn await_readiness(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            if self.readiness_pid.is_some() || self.readiness.is_none() {
+                return Ok(());
+            }
+            if let Some(readiness) = self.readiness.clone() {
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(readiness.timeout_ms.max(1));
+                let launched = self.pid().ok_or_else(|| {
+                    AhrbError::Protocol("stdin-RPC daemon disappeared during readiness".to_owned())
+                })?;
+                let observation = loop {
+                    match managed_daemon_readiness_satisfied(&readiness, &self.environment).await {
+                        Ok(Some(observation))
+                            if observation.pid.is_none_or(|pid| pid == launched) =>
+                        {
+                            break observation;
+                        }
+                        Ok(Some(_)) if std::time::Instant::now() < deadline => {
+                            // A cold restart may briefly expose the previous
+                            // daemon's atomically published PID. It is not
+                            // readiness for this owned process identity.
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Ok(Some(_)) => {
+                            if let Some(mut child) = self.child.take() {
+                                stop_managed_child(&mut child, Duration::from_millis(100)).await?;
+                            }
+                            self.stdin.take();
+                            self.stdout.take();
+                            return Err(AhrbError::Timeout(format!(
+                                "stdin-RPC readiness never published owned PID {launched}"
+                            )));
+                        }
+                        Ok(None) if std::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Ok(None) => {
+                            if let Some(mut child) = self.child.take() {
+                                stop_managed_child(&mut child, Duration::from_millis(100)).await?;
+                            }
+                            self.stdin.take();
+                            self.stdout.take();
+                            return Err(AhrbError::Timeout(
+                                "stdin-RPC daemon readiness".to_owned(),
+                            ));
+                        }
+                        Err(error) => {
+                            if let Some(mut child) = self.child.take() {
+                                stop_managed_child(&mut child, Duration::from_millis(100)).await?;
+                            }
+                            self.stdin.take();
+                            self.stdout.take();
+                            return Err(error);
+                        }
+                    }
+                };
+                if let Some(pid) = observation.pid {
+                    if pid != launched {
+                        if let Some(mut child) = self.child.take() {
+                            stop_managed_child(&mut child, Duration::from_millis(100)).await?;
+                        }
+                        self.stdin.take();
+                        self.stdout.take();
+                        return Err(AhrbError::Protocol(format!(
+                            "readiness reported daemon PID {pid}, but stdin-RPC owns PID {launched}"
+                        )));
+                    }
+                }
+                self.readiness_pid = observation.pid;
+            }
             Ok(())
         })
     }
@@ -2945,12 +4064,17 @@ impl Transport for StdinRpcTransport {
                     }
                 }
             }
+            self.readiness_pid = None;
             Ok(())
         })
     }
 
     fn owned_pids(&self) -> Vec<u32> {
         self.pid().into_iter().collect()
+    }
+
+    fn daemon_pid(&self) -> Option<u32> {
+        self.readiness_pid.or_else(|| self.pid())
     }
 }
 
@@ -3283,6 +4407,32 @@ mod tests {
         }
     }
 
+    struct TypedEscalationTransport {
+        stopped: bool,
+    }
+
+    impl Transport for TypedEscalationTransport {
+        fn start(&mut self) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn request(&mut self, _request: TransportRequest) -> DriverFuture<'_, TransportResponse> {
+            Box::pin(async {
+                Ok(TransportResponse {
+                    id: "shutdown".to_owned(),
+                    result: json!({"outcome":"did_not_stop"}),
+                })
+            })
+        }
+
+        fn stop(&mut self) -> DriverFuture<'_, ()> {
+            Box::pin(async move {
+                self.stopped = true;
+                Ok(())
+            })
+        }
+    }
+
     #[test]
     fn rejects_non_loopback_http() {
         assert!(ParsedHttpUrl::parse("http://example.com:80/rpc").is_err());
@@ -3314,7 +4464,19 @@ mod tests {
             type_pointer: String::new(),
             id_pointer: String::new(),
             cursor_pointer: String::new(),
+            schema_version_pointer: String::new(),
+            schema_versions: Vec::new(),
+            warn_unmapped_payload_kinds: false,
             replay_command: Vec::new(),
+            replay_mode: "lines".to_owned(),
+            replay_records_pointer: String::new(),
+            replay_assertions: BTreeMap::new(),
+            replay_state_command: Vec::new(),
+            replay_state_assertions: BTreeMap::new(),
+            replay_state_pointers: Vec::new(),
+            replay_compare_live_records: false,
+            replay_envelope_pointer: String::new(),
+            replay_cursor_start: None,
             rules: vec![
                 EventRule {
                     matches: "message".to_owned(),
@@ -3344,6 +4506,7 @@ mod tests {
             local_id: "00000000-0000-4000-8000-000000000000".to_owned(),
             marker: "actor".to_owned(),
             harness_id: String::new(),
+            run_id: String::new(),
             turns: 1,
             invocations: 1,
             next_cursor: 1,
@@ -3431,6 +4594,7 @@ mod tests {
             local_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             marker: "root".to_owned(),
             harness_id: String::new(),
+            run_id: String::new(),
             turns: 1,
             invocations: 1,
             next_cursor: 1,
@@ -3691,7 +4855,7 @@ mod tests {
                     json!({
                         "event_id":"evt-done","seq":5,
                         "session_id":"haider-session","run_id":"run-1",
-                        "payload":{"type":"run_state","state":"done"}
+                        "payload":{"type":"run_state","state":"done","terminal_kind":"success"}
                     }),
                 ],
             ),
@@ -3705,6 +4869,7 @@ mod tests {
                 local_id: format!("00000000-0000-4000-8000-00000000000{index}"),
                 marker: "root".to_owned(),
                 harness_id: String::new(),
+                run_id: String::new(),
                 turns: 1,
                 invocations: 1,
                 next_cursor: 1,
@@ -3722,7 +4887,12 @@ mod tests {
             let call = events
                 .iter()
                 .find(|event| event.event == EventVocab::ToolCall)
-                .expect("normalized tool call");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "normalized tool call missing for {adapter}; normalized kinds: {:?}",
+                        events.iter().map(|event| &event.event).collect::<Vec<_>>()
+                    )
+                });
             let result = events
                 .iter()
                 .find(|event| event.event == EventVocab::ToolResult)
@@ -3839,6 +5009,7 @@ mod tests {
             local_id: "00000000-0000-4000-8000-000000000000".to_owned(),
             marker: "root".to_owned(),
             harness_id: String::new(),
+            run_id: String::new(),
             turns: 1,
             invocations: 1,
             next_cursor: 1,
@@ -3874,6 +5045,7 @@ mod tests {
             local_id: "00000000-0000-4000-8000-000000000000".to_owned(),
             marker: "root".to_owned(),
             harness_id: String::new(),
+            run_id: String::new(),
             turns: 1,
             invocations: 1,
             next_cursor: 1,
@@ -3921,7 +5093,6 @@ mod tests {
             ManagedDaemonConfig {
                 command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
                 launcher_exits: false,
-                process_match: ProcessMatch::default(),
                 initialize_command: Vec::new(),
                 initialize_marker: logs.join("initialized"),
                 environment: BTreeMap::new(),
@@ -3931,7 +5102,10 @@ mod tests {
                     command: Vec::new(),
                     json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
+                    ..Probe::default()
                 },
+                shutdown_command: Vec::new(),
+                shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.clone(),
             },
@@ -3972,7 +5146,6 @@ mod tests {
             ManagedDaemonConfig {
                 command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
                 launcher_exits: false,
-                process_match: ProcessMatch::default(),
                 initialize_command: vec!["/usr/bin/true".to_owned()],
                 initialize_marker: marker.clone(),
                 environment: BTreeMap::new(),
@@ -3982,7 +5155,10 @@ mod tests {
                     command: vec!["/usr/bin/true".to_owned()],
                     json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
+                    ..Probe::default()
                 },
+                shutdown_command: Vec::new(),
+                shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.join("logs"),
             },
@@ -4015,7 +5191,6 @@ mod tests {
         let daemon = ManagedDaemonConfig {
             command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
             launcher_exits: false,
-            process_match: ProcessMatch::default(),
             initialize_command: Vec::new(),
             initialize_marker: profile.join("initialized"),
             environment: BTreeMap::new(),
@@ -4025,7 +5200,10 @@ mod tests {
                 command: Vec::new(),
                 json_pointer_roots: BTreeMap::new(),
                 timeout_ms: 1_000,
+                ..Probe::default()
             },
+            shutdown_command: Vec::new(),
+            shutdown_result: ShutdownResult::default(),
             grace: Duration::from_millis(100),
             log_directory: profile.join("daemon-logs"),
         };
@@ -4033,15 +5211,19 @@ mod tests {
             daemon: Some(daemon),
             command: vec!["/usr/bin/true".to_owned()],
             resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
             release_command: Vec::new(),
             cancel_command: Vec::new(),
             replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
             environment: BTreeMap::new(),
             base_variables: BTreeMap::new(),
             profile_root: profile.clone(),
             events: manifest.events,
             exit: manifest.exit,
             session_id_pointer: String::new(),
+            run_id_pointer: String::new(),
             timeout: Duration::from_secs(1),
             max_output_bytes: 4_096,
             gate_launch: false,
@@ -4051,6 +5233,36 @@ mod tests {
         driver.shutdown().await.expect("stop thin-client driver");
         assert!(driver.owned_pids().is_empty());
         std::fs::remove_dir_all(profile).expect("remove thin-client profile");
+    }
+
+    #[tokio::test]
+    async fn command_json_readiness_extracts_pid_and_ready_state() {
+        let probe = Probe {
+            kind: "command-json".to_owned(),
+            command: vec![
+                "/usr/bin/printf".to_owned(),
+                json!({"daemon":{"pid":std::process::id(),"ready":true}}).to_string(),
+            ],
+            pid_pointer: "/daemon/pid".to_owned(),
+            ready_pointer: "/daemon/ready".to_owned(),
+            timeout_ms: 1_000,
+            ..Probe::default()
+        };
+        let observation = managed_daemon_readiness_satisfied(&probe, &BTreeMap::new())
+            .await
+            .expect("parse readiness JSON")
+            .expect("ready=true");
+        assert_eq!(observation.pid, Some(std::process::id()));
+
+        let mut not_ready = probe;
+        not_ready.command[1] =
+            json!({"daemon":{"pid":std::process::id(),"ready":false}}).to_string();
+        assert!(
+            managed_daemon_readiness_satisfied(&not_ready, &BTreeMap::new())
+                .await
+                .expect("parse not-ready JSON")
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -4067,15 +5279,19 @@ mod tests {
             daemon: None,
             command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
             resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
             release_command: Vec::new(),
             cancel_command: Vec::new(),
             replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
             environment: BTreeMap::new(),
             base_variables: BTreeMap::new(),
             profile_root: profile.clone(),
             events: manifest.events,
             exit: manifest.exit,
             session_id_pointer: String::new(),
+            run_id_pointer: String::new(),
             timeout: Duration::from_secs(1),
             max_output_bytes: 4_096,
             gate_launch: false,
@@ -4130,12 +5346,10 @@ mod tests {
         let home = profile.join("home").to_string_lossy().into_owned();
         let temporary = profile.join("tmp").to_string_lossy().into_owned();
         let runtime = profile.join("run").to_string_lossy().into_owned();
-        let status = json!({
-            "profile_path": format!("{home}/.haider/dev-profile"),
-            "runtime_dir": format!("{runtime}/haider/abc123"),
-            "daemon": {"pipe_dir": format!("{home}/.haider/dev-profile/pipe")}
-        })
-        .to_string();
+        let pid_file = profile.join("daemon.pid");
+        let readiness_script = format!(
+            r#"pid=$(/bin/cat "$1"); /usr/bin/printf '{{"profile_path":"{home}/.haider/dev-profile","runtime_dir":"{runtime}/haider/abc123","daemon":{{"pid":%s,"ready":true,"pipe_dir":"{home}/.haider/dev-profile/pipe"}}}}' "$pid""#
+        );
         let environment = BTreeMap::from([
             ("HOME".to_owned(), home),
             ("TMPDIR".to_owned(), temporary),
@@ -4145,27 +5359,32 @@ mod tests {
                 profile.to_string_lossy().into_owned(),
             ),
         ]);
-        let process_match = ProcessMatch {
-            executable_name: "sleep".to_owned(),
-            environment: environment.clone(),
-        };
         let mut transport = ManagedDaemonTransport::new(
             NoopTransport,
             ManagedDaemonConfig {
                 command: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "/bin/sleep 30 &".to_owned(),
+                    "/bin/sleep 30 & /usr/bin/printf '%s' \"$!\" > \"$1\"".to_owned(),
+                    "ahrb-detached-daemon".to_owned(),
+                    pid_file.to_string_lossy().into_owned(),
                 ],
                 launcher_exits: true,
-                process_match,
                 initialize_command: Vec::new(),
                 initialize_marker: profile.join("initialized"),
                 environment,
                 readiness: Probe {
                     kind: "command-json".to_owned(),
                     target: String::new(),
-                    command: vec!["/usr/bin/printf".to_owned(), status],
+                    command: vec![
+                        "/bin/sh".to_owned(),
+                        "-c".to_owned(),
+                        readiness_script,
+                        "ahrb-readiness".to_owned(),
+                        pid_file.to_string_lossy().into_owned(),
+                    ],
+                    pid_pointer: "/daemon/pid".to_owned(),
+                    ready_pointer: "/daemon/ready".to_owned(),
                     json_pointer_roots: BTreeMap::from([
                         ("/profile_path".to_owned(), "HOME".to_owned()),
                         ("/runtime_dir".to_owned(), "XDG_RUNTIME_DIR".to_owned()),
@@ -4173,6 +5392,8 @@ mod tests {
                     ]),
                     timeout_ms: 2_000,
                 },
+                shutdown_command: Vec::new(),
+                shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(500),
                 log_directory: profile.join("logs"),
             },
@@ -4197,6 +5418,247 @@ mod tests {
         std::fs::remove_dir_all(profile).expect("remove detached daemon profile");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_startup_failure_still_runs_typed_shutdown_after_launcher_exit() {
+        let logs = std::env::temp_dir().join(format!(
+            "ahrb-detached-start-failure-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.load(Ordering::Relaxed)
+        ));
+        if logs.exists() {
+            std::fs::remove_dir_all(&logs).expect("remove stale detached-start logs");
+        }
+        let shutdown_marker = logs.join("typed-shutdown-ran");
+        let mut transport = ManagedDaemonTransport::new(
+            NoopTransport,
+            ManagedDaemonConfig {
+                command: vec!["/usr/bin/true".to_owned()],
+                launcher_exits: true,
+                initialize_command: Vec::new(),
+                initialize_marker: logs.join("initialized"),
+                environment: BTreeMap::new(),
+                readiness: Probe {
+                    kind: "file".to_owned(),
+                    target: logs.join("never-ready").to_string_lossy().into_owned(),
+                    timeout_ms: 25,
+                    ..Probe::default()
+                },
+                shutdown_command: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf shutdown > \"$1\"; printf '%s\\n' '{\"outcome\":\"not_running\"}'"
+                        .to_owned(),
+                    "ahrb-shutdown".to_owned(),
+                    shutdown_marker.to_string_lossy().into_owned(),
+                ],
+                shutdown_result: ShutdownResult {
+                    outcome_pointer: "/outcome".to_owned(),
+                    clean_outcomes: vec!["not_running".to_owned()],
+                    escalate_outcomes: vec!["did_not_stop".to_owned()],
+                },
+                grace: Duration::from_millis(250),
+                log_directory: logs.clone(),
+            },
+        );
+        let error = transport
+            .start()
+            .await
+            .expect_err("readiness timeout must fail detached startup");
+        assert!(error.to_string().contains("daemon readiness"));
+        assert_eq!(
+            std::fs::read_to_string(&shutdown_marker).expect("typed shutdown marker"),
+            "shutdown"
+        );
+        std::fs::remove_dir_all(logs).expect("remove detached-start logs");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_startup_escalation_without_reacquired_pid_fails_closed() {
+        let logs = std::env::temp_dir().join(format!(
+            "ahrb-detached-no-cleanup-pid-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.load(Ordering::Relaxed)
+        ));
+        if logs.exists() {
+            std::fs::remove_dir_all(&logs).expect("remove stale escalation logs");
+        }
+        let mut transport = ManagedDaemonTransport::new(
+            NoopTransport,
+            ManagedDaemonConfig {
+                command: vec!["/usr/bin/true".to_owned()],
+                launcher_exits: true,
+                initialize_command: Vec::new(),
+                initialize_marker: logs.join("initialized"),
+                environment: BTreeMap::new(),
+                readiness: Probe {
+                    kind: "file".to_owned(),
+                    target: logs.join("never-ready").to_string_lossy().into_owned(),
+                    timeout_ms: 25,
+                    ..Probe::default()
+                },
+                shutdown_command: vec![
+                    "/usr/bin/printf".to_owned(),
+                    r#"{"outcome":"did_not_stop"}"#.to_owned(),
+                ],
+                shutdown_result: ShutdownResult {
+                    outcome_pointer: "/outcome".to_owned(),
+                    clean_outcomes: vec!["not_running".to_owned()],
+                    escalate_outcomes: vec!["did_not_stop".to_owned()],
+                },
+                grace: Duration::from_millis(250),
+                log_directory: logs.clone(),
+            },
+        );
+        let error = transport
+            .start()
+            .await
+            .expect_err("missing cleanup PID must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("containment-validated owned PID")
+        );
+        std::fs::remove_dir_all(logs).expect("remove escalation logs");
+    }
+
+    #[test]
+    fn haider_replay_document_reuses_live_rules_and_cursor_origin() {
+        let manifest = crate::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))
+            .expect("load Haider manifest");
+        let live_records = vec![
+            json!({
+                "schema_version":1,
+                "event_id":"evt-thinking","seq":8,"session_id":"session-1","run_id":"run-1",
+                "payload":{"type":"run_state","state":"thinking"}
+            }),
+            json!({
+                "schema_version":1,
+                "event_id":"evt-tool-call","seq":16,"session_id":"session-1","run_id":"run-1",
+                "payload":{"type":"item","event":"completed","item":{
+                    "item":"tool_call","call_id":"provider-call-1","name":"process_exec",
+                    "args":{"command":["true"]}
+                }}
+            }),
+            json!({
+                "schema_version":1,
+                "event_id":"evt-tool-result","seq":17,"session_id":"session-1","run_id":"run-1",
+                "payload":{"type":"tool_result","call_id":"provider-call-1","result":{"ok":true}}
+            }),
+            json!({
+                "schema_version":1,
+                "event_id":"evt-done","seq":23,"session_id":"session-1","run_id":"run-1",
+                "payload":{"type":"run_state","state":"done","terminal_kind":"success"}
+            }),
+        ];
+        let document = json!({
+            "schema":"haider.run.replay.v1",
+            "mode":"durable_journal",
+            "provider_requests":0,
+            "events":live_records,
+            "integrity":{
+                "sequences_strictly_increasing":true,
+                "run_id_stable":true,
+                "exactly_one_typed_terminal":true,
+                "terminal_seq_matches_status":true
+            },
+            "equivalence":{"equivalent":true}
+        });
+        let mut bytes = serde_json::to_vec(&document).expect("serialize replay document");
+        bytes.push(b'\n');
+        let records = extract_replay_records(&manifest.events, &bytes)
+            .expect("extract replay document events");
+        assert_eq!(records, live_records);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.get("seq").and_then(Value::as_u64))
+                .collect::<Vec<_>>(),
+            [8, 16, 17, 23]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.pointer("/payload/call_id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["provider-call-1"]
+        );
+        let mut session = PersistedExecSession {
+            local_id: "local-1".to_owned(),
+            marker: "r30".to_owned(),
+            harness_id: "session-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            turns: 1,
+            invocations: 1,
+            next_cursor: manifest.events.replay_cursor_start.unwrap_or(1),
+            closed: false,
+        };
+        let normalized = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &mut session,
+            &records,
+            &BTreeMap::new(),
+            "turn-1",
+            true,
+        )
+        .expect("normalize replayed Haider envelopes");
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[0].cursor, 2);
+        assert_eq!(normalized[0].event, EventVocab::ModelRequest);
+        assert_eq!(normalized[1].event, EventVocab::ToolCall);
+        assert_eq!(
+            normalized[1].payload.get("call_id").and_then(Value::as_str),
+            Some("provider-call-1")
+        );
+        assert_eq!(normalized[2].event, EventVocab::ToolResult);
+        assert_eq!(
+            normalized[2].payload.get("call_id").and_then(Value::as_str),
+            Some("provider-call-1")
+        );
+        assert_eq!(normalized[3].cursor, 5);
+        assert_eq!(normalized[3].event, EventVocab::TerminalSuccess);
+    }
+
+    #[test]
+    fn typed_shutdown_outcome_selects_clean_or_escalation() {
+        let contract = ShutdownResult {
+            outcome_pointer: "/outcome".to_owned(),
+            clean_outcomes: vec!["stopped_cleanly".to_owned(), "not_running".to_owned()],
+            escalate_outcomes: vec!["did_not_stop".to_owned()],
+        };
+        assert_eq!(
+            shutdown_disposition(&contract, &json!({"outcome":"stopped_cleanly"}))
+                .expect("clean outcome"),
+            ShutdownDisposition::Clean
+        );
+        assert_eq!(
+            shutdown_disposition(&contract, &json!({"outcome":"did_not_stop"}))
+                .expect("escalation outcome"),
+            ShutdownDisposition::Escalate
+        );
+        assert!(shutdown_disposition(&contract, &json!({"outcome":"mystery"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn typed_shutdown_escalation_still_runs_transport_sweep_and_records_note() {
+        let transport = TypedEscalationTransport { stopped: false };
+        let mut driver = GenericDriver::new(transport);
+        driver.operations.shutdown_result = ShutdownResult {
+            outcome_pointer: "/outcome".to_owned(),
+            clean_outcomes: vec!["stopped_cleanly".to_owned()],
+            escalate_outcomes: vec!["did_not_stop".to_owned()],
+        };
+        driver.shutdown().await.expect("owned-tree sweep succeeds");
+        assert!(driver.transport.stopped);
+        assert!(
+            driver
+                .lifecycle_notes()
+                .iter()
+                .any(|note| note.contains("owned-tree escalation"))
+        );
+    }
+
     #[tokio::test]
     async fn command_json_readiness_rejects_paths_outside_isolation() {
         let probe = Probe {
@@ -4208,6 +5670,7 @@ mod tests {
             ],
             json_pointer_roots: BTreeMap::from([("/runtime_dir".to_owned(), "TMPDIR".to_owned())]),
             timeout_ms: 1_000,
+            ..Probe::default()
         };
         let environment =
             BTreeMap::from([("TMPDIR".to_owned(), "/tmp/isolated-profile/tmp".to_owned())]);
@@ -4235,6 +5698,7 @@ mod tests {
             ],
             json_pointer_roots: BTreeMap::from([("/pipe_dir".to_owned(), "TMPDIR".to_owned())]),
             timeout_ms: 1_000,
+            ..Probe::default()
         };
         let environment =
             BTreeMap::from([("TMPDIR".to_owned(), root.to_string_lossy().into_owned())]);
@@ -4294,7 +5758,6 @@ mod tests {
                     worker_file.to_string_lossy().into_owned(),
                 ],
                 launcher_exits: false,
-                process_match: ProcessMatch::default(),
                 initialize_command: Vec::new(),
                 initialize_marker: logs.join("initialized"),
                 environment: BTreeMap::new(),
@@ -4304,7 +5767,10 @@ mod tests {
                     command: Vec::new(),
                     json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
+                    ..Probe::default()
                 },
+                shutdown_command: Vec::new(),
+                shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.clone(),
             },
@@ -4339,7 +5805,6 @@ mod tests {
                     worker_file.to_string_lossy().into_owned(),
                 ],
                 launcher_exits: false,
-                process_match: ProcessMatch::default(),
                 initialize_command: Vec::new(),
                 initialize_marker: logs.join("initialized"),
                 environment: BTreeMap::new(),
@@ -4349,7 +5814,10 @@ mod tests {
                     command: Vec::new(),
                     json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
+                    ..Probe::default()
                 },
+                shutdown_command: Vec::new(),
+                shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.clone(),
             },

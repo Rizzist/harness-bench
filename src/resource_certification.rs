@@ -583,6 +583,10 @@ pub struct ResourceEvidence {
     /// Legacy diagnostic count reported by collectors. Certification derives
     /// completeness from explicit repetition IDs and never trusts this scalar.
     pub completed_repetitions: u32,
+    /// Typed shutdown outcomes and owned-tree escalation notes from each fresh
+    /// resource repetition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_notes: Vec<String>,
     /// Phase-aware whole-tree samples.
     pub series: SampleSeries,
     /// Existing external AHRB turn clocks captured for ordinary sampled turns.
@@ -3810,6 +3814,7 @@ mod tests {
         };
         Ok(ResourceEvidence {
             completed_repetitions: timing.repetitions,
+            lifecycle_notes: Vec::new(),
             series,
             turn_wall_ns: Vec::new(),
             phases: ResourcePhases {
