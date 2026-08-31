@@ -103,6 +103,13 @@ pub(crate) fn matching_processes(
     Ok(matches)
 }
 
+pub(crate) fn matching_processes_fast(
+    executable_name: &str,
+    expected_environment: &BTreeMap<String, String>,
+) -> Result<Vec<u32>> {
+    matching_processes(executable_name, expected_environment)
+}
+
 fn transient_process_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -209,6 +216,7 @@ impl Sampler for LinuxSampler {
         }
 
         self.known = tree.members.keys().copied().collect();
+        crate::process::track_process_tree(&tree)?;
         Ok(tree)
     }
 
@@ -411,6 +419,31 @@ fn read_process_table(proc_root: &Path) -> Result<BTreeMap<u32, LinuxProcess>> {
         table.insert(pid, parse_stat(pid, &stat)?);
     }
     Ok(table)
+}
+
+pub(crate) fn process_identity_and_group(pid: u32) -> Result<Option<(ProcIdentity, u32)>> {
+    let path = Path::new("/proc").join(pid.to_string()).join("stat");
+    let Some(stat) = read_transient_text(&path)? else {
+        return Ok(None);
+    };
+    let process = parse_stat(pid, &stat)?;
+    Ok(Some((process.identity(), process.process_group)))
+}
+
+pub(crate) fn process_group_members(
+    process_group: u32,
+    minimum_start: u64,
+) -> Result<Vec<ProcIdentity>> {
+    let mut members = read_process_table(Path::new("/proc"))?
+        .into_values()
+        .filter(|process| {
+            process.process_group == process_group && process.start_ticks >= minimum_start
+        })
+        .map(|process| process.identity())
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    members.dedup();
+    Ok(members)
 }
 
 fn parse_stat(pid: u32, text: &str) -> Result<LinuxProcess> {

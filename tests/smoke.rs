@@ -25,6 +25,9 @@ async fn mock_harness_exercises_the_non_resource_report_pipeline() -> Result<()>
         profile: Profile::Quick,
         tests: vec![1, 2, 3, 9, 10, 12, 30, 35, 40],
         junit: true,
+        deadline_secs: Some(120),
+        no_save: true,
+        harness_version: Some("mock-harness 0.1.0".to_owned()),
     })
     .await?;
     assert_eq!(code, 0);

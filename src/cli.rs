@@ -20,6 +20,13 @@ pub enum Command {
     },
     /// Print the versioned test matrix.
     ListTests,
+    /// Print durable result history.
+    Results {
+        /// Optional harness ID filter.
+        harness: Option<String>,
+        /// Include every historical entry instead of only the latest.
+        all: bool,
+    },
 }
 
 /// Measurement profile selected for a run.
@@ -44,6 +51,12 @@ pub struct RunOptions {
     pub tests: Vec<u8>,
     /// Emit JUnit XML.
     pub junit: bool,
+    /// Run-level wall-clock budget in seconds. `None` selects the profile default.
+    pub deadline_secs: Option<u64>,
+    /// Do not persist a copy under the repository `results/` directory.
+    pub no_save: bool,
+    /// Availability-probe version already captured by a shorthand caller.
+    pub harness_version: Option<String>,
 }
 
 /// Parse arguments without environment-dependent defaults.
@@ -59,8 +72,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
         Some("run") => {
             let values = parse_flags(
                 &args[1..],
-                &["manifest", "output", "profile", "tests"],
-                &["junit"],
+                &["manifest", "output", "profile", "tests", "deadline"],
+                &["junit", "no-save"],
             )?;
             let profile = match values.get("profile").map(String::as_str).unwrap_or("quick") {
                 "quick" => Profile::Quick,
@@ -78,10 +91,16 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 .unwrap_or_default();
             Ok(Command::Run(RunOptions {
                 manifest: PathBuf::from(required(&values, "manifest")?),
-                output: PathBuf::from(required(&values, "output")?),
+                output: values.get("output").map(PathBuf::from).unwrap_or_default(),
                 profile,
                 tests,
                 junit: values.contains_key("junit"),
+                deadline_secs: values
+                    .get("deadline")
+                    .map(|value| parse_seconds("deadline", value))
+                    .transpose()?,
+                no_save: values.contains_key("no-save"),
+                harness_version: None,
             }))
         }
         Some("report") => {
@@ -90,11 +109,42 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 input: PathBuf::from(required(&values, "input")?),
             })
         }
+        Some("results") => {
+            let (harness, all) = parse_results_args(&args[1..])?;
+            Ok(Command::Results { harness, all })
+        }
         Some(other) => Err(AhrbError::Usage(format!("unknown subcommand {other:?}"))),
         None => Err(AhrbError::Usage(
-            "expected doctor, run, report, or list-tests".to_owned(),
+            "expected doctor, run, report, results, or list-tests".to_owned(),
         )),
     }
+}
+
+fn parse_seconds(name: &str, value: &str) -> Result<u64> {
+    value.parse::<u64>().map_err(|_| {
+        AhrbError::Usage(format!(
+            "--{name} must be a non-negative integer number of seconds"
+        ))
+    })
+}
+
+/// Resolve an explicit deadline, `AHRB_DEADLINE`, or the profile default.
+pub fn deadline_secs(options: &RunOptions) -> Result<u64> {
+    if let Some(seconds) = options.deadline_secs {
+        return Ok(seconds);
+    }
+    if let Some(value) = std::env::var_os("AHRB_DEADLINE") {
+        let value = value.to_string_lossy();
+        return value.parse::<u64>().map_err(|_| {
+            AhrbError::Usage(
+                "AHRB_DEADLINE must be a non-negative integer number of seconds".to_owned(),
+            )
+        });
+    }
+    Ok(match options.profile {
+        Profile::Quick => 15 * 60,
+        Profile::Cert => 30 * 60,
+    })
 }
 
 /// Execute a parsed top-level command.
@@ -118,7 +168,34 @@ pub async fn execute(command: Command) -> Result<i32> {
             print!("{}", crate::report::render_markdown(&report));
             Ok(0)
         }
+        Command::Results { harness, all } => {
+            crate::results::print_history(harness.as_deref(), all)?;
+            Ok(0)
+        }
     }
+}
+
+/// Parse `[HARNESS] [--all]` for both `ahrb results` and `hbench results`.
+pub(crate) fn parse_results_args(args: &[String]) -> Result<(Option<String>, bool)> {
+    let mut harness = None;
+    let mut all = false;
+    for argument in args {
+        if argument == "--all" {
+            if all {
+                return Err(AhrbError::Usage("duplicate --all".to_owned()));
+            }
+            all = true;
+        } else if argument.starts_with("--") {
+            return Err(AhrbError::Usage(format!(
+                "unknown results flag {argument:?}"
+            )));
+        } else if harness.replace(argument.clone()).is_some() {
+            return Err(AhrbError::Usage(
+                "results accepts at most one harness ID".to_owned(),
+            ));
+        }
+    }
+    Ok((harness, all))
 }
 
 fn parse_flags(
@@ -167,22 +244,44 @@ fn required<'a>(
         .ok_or_else(|| AhrbError::Usage(format!("--{name} is required")))
 }
 
-fn parse_test_rows(text: &str) -> Result<Vec<u8>> {
+/// Parse a comma-separated selection of matrix rows, including inclusive ranges.
+pub(crate) fn parse_test_rows(text: &str) -> Result<Vec<u8>> {
     let mut rows = Vec::new();
-    for part in text.split(',') {
-        let row: u8 = part
-            .parse()
-            .map_err(|_| AhrbError::Usage(format!("invalid test row {part:?}")))?;
-        if !(1..=41).contains(&row) {
-            return Err(AhrbError::Usage(format!(
-                "test row {row} is outside 1..=41"
-            )));
+    for raw_part in text.split(',') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return Err(AhrbError::Usage(
+                "test row selection contains an empty item".to_owned(),
+            ));
         }
-        rows.push(row);
+        if let Some((start, end)) = part.split_once('-') {
+            let start = parse_test_row(start.trim())?;
+            let end = parse_test_row(end.trim())?;
+            if start > end {
+                return Err(AhrbError::Usage(format!(
+                    "test row range {part:?} is descending"
+                )));
+            }
+            rows.extend(start..=end);
+        } else {
+            rows.push(parse_test_row(part)?);
+        }
     }
     rows.sort_unstable();
     rows.dedup();
     Ok(rows)
+}
+
+fn parse_test_row(part: &str) -> Result<u8> {
+    let row: u8 = part
+        .parse()
+        .map_err(|_| AhrbError::Usage(format!("invalid test row {part:?}")))?;
+    if !(1..=41).contains(&row) {
+        return Err(AhrbError::Usage(format!(
+            "test row {row} is outside 1..=41"
+        )));
+    }
+    Ok(row)
 }
 
 #[cfg(test)]
@@ -207,11 +306,57 @@ mod tests {
             Command::Run(options) => {
                 assert_eq!(options.tests, vec![1, 40]);
                 assert!(options.junit);
+                assert_eq!(options.deadline_secs, None);
+                assert!(!options.no_save);
                 Ok(())
             }
             other => Err(AhrbError::Protocol(format!(
                 "unexpected parsed command: {other:?}"
             ))),
         }
+    }
+
+    #[test]
+    fn parses_explicit_deadline() -> Result<()> {
+        let args = [
+            "run",
+            "--manifest",
+            "mock.toml",
+            "--output",
+            "out",
+            "--deadline",
+            "45",
+        ]
+        .map(str::to_owned);
+        let Command::Run(options) = parse(&args)? else {
+            return Err(AhrbError::Protocol("run command was not parsed".to_owned()));
+        };
+        assert_eq!(options.deadline_secs, Some(45));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_deduplicated_inclusive_test_ranges() -> Result<()> {
+        assert_eq!(
+            parse_test_rows("3,1-3,30-32,31")?,
+            vec![1, 2, 3, 30, 31, 32]
+        );
+        assert!(parse_test_rows("4-2").is_err());
+        assert!(parse_test_rows("1,").is_err());
+        assert!(parse_test_rows("40-42").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_results_history_filter() -> Result<()> {
+        let args = ["results", "mock", "--all"].map(str::to_owned);
+        assert_eq!(
+            parse(&args)?,
+            Command::Results {
+                harness: Some("mock".to_owned()),
+                all: true,
+            }
+        );
+        Ok(())
     }
 }

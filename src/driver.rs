@@ -180,11 +180,14 @@ async fn managed_daemon_readiness_satisfied(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             let attempt_timeout = Duration::from_millis(probe.timeout_ms.clamp(1, 1_000));
-            match tokio::time::timeout(attempt_timeout, command.status()).await {
-                Ok(Ok(status)) => Ok(status.success().then_some(Value::Null)),
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Ok(Err(error)) => Err(error.into()),
-                Err(_) => Ok(None),
+            match run_owned_output(&mut command, attempt_timeout, "daemon readiness command").await
+            {
+                Ok(output) => Ok(output.status.success().then_some(Value::Null)),
+                Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(None)
+                }
+                Err(AhrbError::Timeout(_)) => Ok(None),
+                Err(error) => Err(error),
             }
         }
         "command-json" => {
@@ -195,11 +198,19 @@ async fn managed_daemon_readiness_satisfied(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             let attempt_timeout = Duration::from_millis(probe.timeout_ms.clamp(1, 5_000));
-            let output = match tokio::time::timeout(attempt_timeout, command.output()).await {
-                Ok(Ok(output)) => output,
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) => return Ok(None),
+            let output = match run_owned_output(
+                &mut command,
+                attempt_timeout,
+                "daemon readiness JSON command",
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(AhrbError::Timeout(_)) => return Ok(None),
+                Err(error) => return Err(error),
             };
             if !output.status.success() {
                 return Ok(None);
@@ -286,7 +297,65 @@ async fn stop_managed_child(child: &mut Child, grace: Duration) -> Result<()> {
     // still-owned group after reaping the leader so a child cannot outlive the run.
     #[cfg(unix)]
     signal_managed_process_group(pid, libc::SIGKILL)?;
+    crate::process::retire_process(pid)?;
     Ok(())
+}
+
+async fn read_owned_pipe<R>(pipe: Option<R>) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut bytes).await?;
+    }
+    Ok(bytes)
+}
+
+async fn wait_owned_output(
+    child: &mut Child,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output> {
+    let child_pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let captured = tokio::time::timeout(timeout, async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            child.wait(),
+            read_owned_pipe(stdout),
+            read_owned_pipe(stderr)
+        )?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    match captured {
+        Ok(output) => {
+            let output = output?;
+            if let Some(pid) = child_pid {
+                crate::process::retire_process(pid)?;
+            }
+            Ok(output)
+        }
+        Err(_) => {
+            stop_managed_child(child, Duration::from_millis(100)).await?;
+            Err(AhrbError::Timeout(label.to_owned()))
+        }
+    }
+}
+
+async fn run_owned_output(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output> {
+    let mut child = command.spawn()?;
+    crate::process::register_child(&child)?;
+    wait_owned_output(&mut child, timeout, label).await
 }
 
 #[derive(Debug)]
@@ -344,7 +413,10 @@ async fn await_detached_pid(
     loop {
         let matches = matching_detached_pids(process_match)?;
         match matches.as_slice() {
-            [pid] => return Ok(*pid),
+            [pid] => {
+                crate::process::register_process(*pid)?;
+                return Ok(*pid);
+            }
             [] => {}
             _ => {
                 return Err(AhrbError::Protocol(format!(
@@ -427,6 +499,9 @@ async fn stop_matching_detached_daemon(config: &ManagedDaemonConfig) -> Result<(
 }
 
 async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDaemonProcess> {
+    if config.launcher_exits {
+        crate::process::register_detached_match(config.process_match.clone())?;
+    }
     std::fs::create_dir_all(&config.log_directory)?;
     let sequence = DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stdout = std::fs::OpenOptions::new()
@@ -452,6 +527,7 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     let mut child = command.spawn()?;
+    crate::process::register_child(&child)?;
 
     let readiness_timeout = Duration::from_millis(config.readiness.timeout_ms.max(1));
     let started = std::time::Instant::now();
@@ -466,6 +542,9 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
                 return Err(AhrbError::Timeout("detached daemon launcher".to_owned()));
             }
         };
+        if let Some(pid) = launcher_pid {
+            crate::process::retire_process(pid)?;
+        }
         if !status.success() {
             #[cfg(unix)]
             if let Some(pid) = launcher_pid {
@@ -577,14 +656,16 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDae
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let status = tokio::time::timeout(readiness_timeout, initialize.status())
-                .await
-                .map_err(|_| {
-                    AhrbError::Timeout("managed daemon initialization command".to_owned())
-                })??;
-            if !status.success() {
+            let output = run_owned_output(
+                &mut initialize,
+                readiness_timeout,
+                "managed daemon initialization command",
+            )
+            .await?;
+            if !output.status.success() {
                 return Err(AhrbError::Protocol(format!(
-                    "managed daemon initialization exited with {status}"
+                    "managed daemon initialization exited with {}",
+                    output.status
                 )));
             }
             std::fs::write(&config.initialize_marker, b"initialized\n")?;
@@ -1855,6 +1936,8 @@ impl PerInvocationDriver {
             AhrbError::Validation("per-invocation control command is empty".to_owned())
         })?;
         let mut command = Command::new(program);
+        #[cfg(unix)]
+        command.process_group(0);
         command
             .args(arguments)
             .envs(&self.config.environment)
@@ -1863,12 +1946,16 @@ impl PerInvocationDriver {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let status = tokio::time::timeout(self.config.timeout, command.status())
-            .await
-            .map_err(|_| AhrbError::Timeout("per-invocation control command".to_owned()))??;
-        if !status.success() {
+        let output = run_owned_output(
+            &mut command,
+            self.config.timeout,
+            "per-invocation control command",
+        )
+        .await?;
+        if !output.status.success() {
             return Err(AhrbError::Protocol(format!(
-                "per-invocation control command exited with {status}"
+                "per-invocation control command exited with {}",
+                output.status
             )));
         }
         Ok(())
@@ -2027,6 +2114,7 @@ impl Driver for PerInvocationDriver {
             // execution time, excluding the observer-arming wait.
             let started = std::time::Instant::now();
             let child = command.spawn()?;
+            crate::process::register_child(&child)?;
             let wall_prefix_ns = if gate_path.is_some() {
                 duration_ns(started.elapsed())
             } else {
@@ -2062,9 +2150,15 @@ impl Driver for PerInvocationDriver {
                 .active
                 .take();
             if let Some(mut invocation) = active.take() {
+                let invocation_pid = invocation.child.id();
                 let mut status = invocation.child.try_wait()?;
                 if status.is_none() && invocation.started.elapsed() >= self.config.timeout {
-                    invocation.child.kill().await?;
+                    if let Some(pid) = invocation.child.id() {
+                        #[cfg(unix)]
+                        signal_managed_process_group(pid, libc::SIGKILL)?;
+                        #[cfg(not(unix))]
+                        invocation.child.start_kill()?;
+                    }
                     status = Some(invocation.child.wait().await?);
                 }
                 let mut persisted = self
@@ -2075,6 +2169,9 @@ impl Driver for PerInvocationDriver {
                     .clone();
                 self.refresh_source(&mut persisted, &invocation, status)?;
                 if status.is_some() {
+                    if let Some(pid) = invocation_pid {
+                        crate::process::retire_process(pid)?;
+                    }
                     let wall_ns = invocation
                         .wall_prefix_ns
                         .saturating_add(duration_ns(invocation.started.elapsed()));
@@ -2143,16 +2240,22 @@ impl Driver for PerInvocationDriver {
                 AhrbError::Validation("per-invocation replay command is empty".to_owned())
             })?;
             let mut command = Command::new(program);
+            #[cfg(unix)]
+            command.process_group(0);
             command
                 .args(arguments)
                 .envs(&self.config.environment)
                 .current_dir(self.session_directory(&id).join("workspace"))
                 .stdin(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
-            let output = tokio::time::timeout(self.config.timeout, command.output())
-                .await
-                .map_err(|_| AhrbError::Timeout("per-invocation durable replay".to_owned()))??;
+            let output = run_owned_output(
+                &mut command,
+                self.config.timeout,
+                "per-invocation durable replay",
+            )
+            .await?;
             if !output.status.success() {
                 return Err(AhrbError::Protocol(format!(
                     "per-invocation durable replay exited with {}",
@@ -2305,8 +2408,7 @@ impl Driver for PerInvocationDriver {
                 .active
                 .take();
             if let Some(mut invocation) = active {
-                invocation.child.kill().await?;
-                let _status = invocation.child.wait().await?;
+                stop_managed_child(&mut invocation.child, Duration::from_millis(100)).await?;
                 let mut persisted = self
                     .sessions
                     .get(&id)
@@ -2657,15 +2759,15 @@ impl Transport for ExecTransport {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let mut child = command.spawn()?;
+            crate::process::register_child(&child)?;
             let mut stdin = child
                 .stdin
                 .take()
                 .ok_or_else(|| AhrbError::Protocol("exec transport has no stdin".to_owned()))?;
             stdin.write_all(&bytes).await?;
             stdin.shutdown().await?;
-            let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-                .await
-                .map_err(|_| AhrbError::Timeout("exec transport request".to_owned()))??;
+            let output =
+                wait_owned_output(&mut child, self.timeout, "exec transport request").await?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(AhrbError::Protocol(format!(
@@ -2733,6 +2835,7 @@ impl Transport for StdinRpcTransport {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
             let mut child = command.spawn()?;
+            crate::process::register_child(&child)?;
             let stdin = child
                 .stdin
                 .take()
@@ -2781,13 +2884,16 @@ impl Transport for StdinRpcTransport {
             self.stdin.take();
             self.stdout.take();
             if let Some(mut child) = self.child.take() {
+                let child_pid = child.id();
                 match tokio::time::timeout(self.timeout, child.wait()).await {
                     Ok(status) => {
                         status?;
+                        if let Some(pid) = child_pid {
+                            crate::process::retire_process(pid)?;
+                        }
                     }
                     Err(_) => {
-                        child.kill().await?;
-                        child.wait().await?;
+                        stop_managed_child(&mut child, Duration::from_millis(100)).await?;
                     }
                 }
             }

@@ -37,8 +37,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -91,6 +91,46 @@ struct RunState {
     per_invocation_resources: Vec<PerInvocationObservation>,
     per_invocation_membership: Vec<MembershipSample>,
     per_invocation_turn_wall_ns: Vec<u64>,
+    row_errors: BTreeMap<u8, String>,
+}
+
+#[derive(Clone, Default)]
+struct RunProgress {
+    inner: Arc<Mutex<RunProgressState>>,
+}
+
+#[derive(Default)]
+struct RunProgressState {
+    launched: BTreeSet<u8>,
+    completed: BTreeSet<u8>,
+    events: BTreeMap<u8, Vec<NormalizedEvent>>,
+    results: BTreeMap<u8, TestResult>,
+    row_errors: BTreeMap<u8, String>,
+}
+
+impl RunProgress {
+    fn update(&self, update: impl FnOnce(&mut RunProgressState)) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| AhrbError::Protocol("run progress ledger lock was poisoned".to_owned()))?;
+        update(&mut state);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<RunProgressState> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| AhrbError::Protocol("run progress ledger lock was poisoned".to_owned()))?;
+        Ok(RunProgressState {
+            launched: state.launched.clone(),
+            completed: state.completed.clone(),
+            events: state.events.clone(),
+            results: state.results.clone(),
+            row_errors: state.row_errors.clone(),
+        })
+    }
 }
 
 struct PerInvocationResourceCollection {
@@ -109,8 +149,70 @@ fn per_invocation_topology(manifest: &Manifest) -> bool {
 }
 
 /// Execute selected workflows and write their complete evidence bundle.
-pub async fn run(options: RunOptions) -> Result<i32> {
+pub async fn run(mut options: RunOptions) -> Result<i32> {
     let manifest = crate::manifest::load(&options.manifest)?;
+    let persistence = crate::results::prepare(&options, &manifest)?;
+    options.output = persistence.output.clone();
+    let selected = selected_definitions(&options)?;
+    let deadline_secs = crate::cli::deadline_secs(&options)?;
+    let started = Instant::now();
+    let progress = RunProgress::default();
+    let outcome = match tokio::time::timeout(
+        Duration::from_secs(deadline_secs),
+        run_inner(
+            options.clone(),
+            manifest.clone(),
+            progress.clone(),
+            persistence.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            ensure_owned_cleanup()?;
+            let detail = format!("deadline after {deadline_secs}s");
+            let error = AhrbError::Timeout(detail.clone());
+            crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
+            write_deadline_report(
+                &options,
+                &manifest,
+                &selected,
+                &progress,
+                &persistence,
+                &detail,
+            )?;
+            eprintln!(
+                "ahrb: run deadline reached after {:.3}s; stopped launching rows and wrote {}",
+                started.elapsed().as_secs_f64(),
+                options.output.join("report.json").display()
+            );
+            Ok(2)
+        }
+    };
+    let cleanup = ensure_owned_cleanup();
+    match (outcome, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(code), Ok(())) => Ok(code),
+    }
+}
+
+fn ensure_owned_cleanup() -> Result<()> {
+    let survivors = crate::process::cleanup_owned_processes(Duration::from_millis(500))?;
+    if survivors.is_empty() {
+        Ok(())
+    } else {
+        Err(AhrbError::Protocol(format!(
+            "owned-process cleanup left {} process(es) alive: {survivors:?}",
+            survivors.len()
+        )))
+    }
+}
+
+fn selected_definitions(
+    options: &RunOptions,
+) -> Result<Vec<&'static crate::scenarios::TestDefinition>> {
     let selected: Vec<_> = crate::scenarios::all()
         .iter()
         .filter(|definition| options.tests.is_empty() || options.tests.contains(&definition.row))
@@ -118,6 +220,139 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     if selected.is_empty() {
         return Err(AhrbError::Validation("no tests selected".to_owned()));
     }
+    Ok(selected)
+}
+
+fn row_timeout<T>(
+    row: u8,
+    result: Result<T>,
+    row_errors: &mut BTreeMap<u8, String>,
+    progress: &RunProgress,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(AhrbError::Timeout(detail)) => {
+            let detail = format!("turn timeout: {detail}");
+            row_errors.insert(row, detail.clone());
+            progress.update(|state| {
+                state.row_errors.insert(row, detail);
+            })?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_deadline_report(
+    options: &RunOptions,
+    manifest: &Manifest,
+    selected: &[&crate::scenarios::TestDefinition],
+    progress: &RunProgress,
+    persistence: &crate::results::RunPersistence,
+    detail: &str,
+) -> Result<()> {
+    let manifest_hash = crate::manifest::hash(manifest)?;
+    let selected_rows: Vec<u8> = selected.iter().map(|definition| definition.row).collect();
+    let progress = progress.snapshot()?;
+    let results = selected
+        .iter()
+        .map(|definition| TestResult {
+            row: definition.row,
+            id: definition.id.to_owned(),
+            pillar: definition.pillar,
+            outcome: if progress.completed.contains(&definition.row) {
+                TestOutcome::Error("deadline interrupted final evaluation".to_owned())
+            } else {
+                TestOutcome::Error("deadline".to_owned())
+            },
+            evidence: if progress.completed.contains(&definition.row) {
+                vec![
+                    "row terminalized before the run deadline".to_owned(),
+                    detail.to_owned(),
+                ]
+            } else if progress.launched.contains(&definition.row) {
+                vec![
+                    "row was active when the run deadline elapsed".to_owned(),
+                    detail.to_owned(),
+                ]
+            } else {
+                vec![
+                    "row was not launched before the run deadline".to_owned(),
+                    detail.to_owned(),
+                ]
+            },
+        })
+        .map(|fallback| {
+            progress
+                .row_errors
+                .get(&fallback.row)
+                .map(|error| TestResult {
+                    row: fallback.row,
+                    id: fallback.id.clone(),
+                    pillar: fallback.pillar,
+                    outcome: TestOutcome::Error(error.clone()),
+                    evidence: vec![error.clone()],
+                })
+                .or_else(|| progress.results.get(&fallback.row).cloned())
+                .unwrap_or(fallback)
+        })
+        .collect();
+    let mut raw_events = Vec::new();
+    for events in progress.events.values() {
+        for event in events {
+            raw_events.push(serde_json::to_value(event)?);
+        }
+    }
+    let report = Report {
+        schema: 2,
+        run_id: deterministic_run_id(&manifest_hash, &selected_rows),
+        fingerprint: Fingerprint {
+            harness: manifest.identity.id.clone(),
+            harness_version: persistence.harness_version.clone(),
+            manifest: manifest_hash,
+            workflows: workflow_hash(),
+            fake_model: env!("CARGO_PKG_VERSION").to_owned(),
+            normalizer: env!("CARGO_PKG_VERSION").to_owned(),
+            ahrb_revision: option_env!("AHRB_REVISION").unwrap_or("unknown").to_owned(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            host_memory_bytes: host_memory_bytes(),
+            profile: format!("{:?}", options.profile).to_lowercase(),
+        },
+        results,
+        events: raw_events,
+        ..Report::default()
+    };
+    crate::results::persist_report(persistence, &report, options.junit, true)
+}
+
+async fn run_inner(
+    options: RunOptions,
+    manifest: Manifest,
+    progress: RunProgress,
+    persistence: crate::results::RunPersistence,
+) -> Result<i32> {
+    let selected = selected_definitions(&options)?;
+    let mut row_errors = BTreeMap::new();
+    progress.update(|state| {
+        for definition in &selected {
+            let capability = crate::matrix_evidence::capability_for_row(&manifest, definition.row);
+            if let crate::matrix_evidence::CapabilityStatus::Unsupported(reason)
+            | crate::matrix_evidence::CapabilityStatus::Absent(reason) = capability
+            {
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(false),
+                    &[],
+                    None,
+                );
+                result.evidence.push(format!("capability: {reason}"));
+                state.completed.insert(definition.row);
+                state.results.insert(definition.row, result);
+            }
+        }
+    })?;
 
     let manifest_hash = crate::manifest::hash(&manifest)?;
     let selected_rows: Vec<u8> = selected.iter().map(|definition| definition.row).collect();
@@ -242,36 +477,91 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         Vec::new()
     };
     let per_invocation_collection = if resource_selected && per_invocation_topology(&manifest) {
-        Some(
-            collect_per_invocation_resource_observations(
-                &manifest,
-                options.profile,
-                &profile_root,
-                &workflow,
-                &model_environment,
-                &credential,
-            )
-            .await
-            .map_err(|error| {
-                AhrbError::Protocol(format!("collect per-invocation resources: {error}"))
-            })?,
+        match collect_per_invocation_resource_observations(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &workflow,
+            &model_environment,
+            &credential,
         )
+        .await
+        {
+            Ok(collection) => {
+                progress.update(|state| {
+                    for row in selected_rows
+                        .iter()
+                        .copied()
+                        .filter(|row| (20..=29).contains(row))
+                    {
+                        state.launched.insert(row);
+                        state.completed.insert(row);
+                    }
+                })?;
+                Some(collection)
+            }
+            Err(AhrbError::Timeout(detail)) => {
+                for row in selected_rows
+                    .iter()
+                    .copied()
+                    .filter(|row| (20..=29).contains(row))
+                {
+                    let result: Result<()> = Err(AhrbError::Timeout(detail.clone()));
+                    let _ = row_timeout(row, result, &mut row_errors, &progress)?;
+                }
+                None
+            }
+            Err(error) => {
+                return Err(AhrbError::Protocol(format!(
+                    "collect per-invocation resources: {error}"
+                )));
+            }
+        }
     } else {
         None
     };
-    let resource_evidence = if resource_selected && per_invocation_collection.is_none() {
-        Some(
-            collect_resource_evidence(
-                &manifest,
-                options.profile,
-                &profile_root,
-                &workflow,
-                &model_environment,
-                &credential,
-            )
-            .await
-            .map_err(|error| AhrbError::Protocol(format!("collect resources: {error}")))?,
+    let resource_evidence = if resource_selected
+        && per_invocation_collection.is_none()
+        && !per_invocation_topology(&manifest)
+    {
+        match collect_resource_evidence(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &workflow,
+            &model_environment,
+            &credential,
         )
+        .await
+        {
+            Ok(evidence) => {
+                progress.update(|state| {
+                    for row in selected_rows
+                        .iter()
+                        .copied()
+                        .filter(|row| (20..=29).contains(row))
+                    {
+                        state.launched.insert(row);
+                        state.completed.insert(row);
+                    }
+                })?;
+                Some(evidence)
+            }
+            Err(AhrbError::Timeout(detail)) => {
+                for row in selected_rows
+                    .iter()
+                    .copied()
+                    .filter(|row| (20..=29).contains(row))
+                {
+                    let result: Result<()> = Err(AhrbError::Timeout(detail.clone()));
+                    let _ = row_timeout(row, result, &mut row_errors, &progress)?;
+                }
+                None
+            }
+            Err(error) => {
+                return Err(AhrbError::Protocol(format!("collect resources: {error}")));
+            }
+        }
     } else {
         None
     };
@@ -296,21 +586,32 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         ) {
             continue;
         }
-        for (index, actor_name) in actor_names.iter().enumerate() {
-            let actor = workflow.actors.get(actor_name).ok_or_else(|| {
-                AhrbError::Protocol(format!("workflow actor {actor_name:?} disappeared"))
-            })?;
-            let session = driver
-                .create_session(&format!("{}:{actor_name}", workflow.scenario))
-                .await?;
-            driver
-                .submit(
-                    &session,
-                    &actor.prompt,
-                    &format!("row-{row}-turn-{}", index + 1),
-                )
-                .await?;
-            sessions.entry(*row).or_default().push(session);
+        progress.update(|state| {
+            state.launched.insert(*row);
+        })?;
+        let launched = async {
+            let mut launched = Vec::new();
+            for (index, actor_name) in actor_names.iter().enumerate() {
+                let actor = workflow.actors.get(actor_name).ok_or_else(|| {
+                    AhrbError::Protocol(format!("workflow actor {actor_name:?} disappeared"))
+                })?;
+                let session = driver
+                    .create_session(&format!("{}:{actor_name}", workflow.scenario))
+                    .await?;
+                driver
+                    .submit(
+                        &session,
+                        &actor.prompt,
+                        &format!("row-{row}-turn-{}", index + 1),
+                    )
+                    .await?;
+                launched.push(session);
+            }
+            Ok(launched)
+        }
+        .await;
+        if let Some(launched) = row_timeout(*row, launched, &mut row_errors, &progress)? {
+            sessions.insert(*row, launched);
         }
     }
 
@@ -322,248 +623,287 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     let mut resume_idempotency_valid = None;
     let mut resume_idempotency_detail = None;
     if let Some(session) = sessions.get(&36).and_then(|items| items.first()) {
-        wait_for_session_event(
-            &mut driver,
-            session,
-            EventVocab::TurnAccepted,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
-        let roots = driver.session_pids(session);
-        driver.cancel(session).await?;
-        if per_invocation_topology(&manifest) {
-            let process_cleared = !roots.is_empty()
-                && await_owned_tree_empty(
-                    platform_sampler.as_mut(),
-                    &roots,
-                    Duration::from_millis(manifest.daemon.grace_ms.max(100)),
-                )
-                .await?;
-            let workspace_cleared = per_invocation_workspaces_clean(&profile_root, session)?;
-            cancel_cleanup_valid = Some(process_cleared && workspace_cleared);
-            cancel_cleanup_detail = Some(format!(
-                "terminated {} one-shot process root(s): cleared={process_cleared}; driver and harness workspaces clean={workspace_cleared}",
-                roots.len()
-            ));
-        } else {
-            cancel_cleanup_valid = Some(true);
-            cancel_cleanup_detail = Some(
-                "shared controller acknowledged session cancellation; terminal evidence verifies cleanup"
-                    .to_owned(),
-            );
+        let row_result: Result<()> = async {
+            wait_for_session_event(
+                &mut driver,
+                session,
+                EventVocab::TurnAccepted,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await?;
+            let roots = driver.session_pids(session);
+            driver.cancel(session).await?;
+            if per_invocation_topology(&manifest) {
+                let process_cleared = !roots.is_empty()
+                    && await_owned_tree_empty(
+                        platform_sampler.as_mut(),
+                        &roots,
+                        Duration::from_millis(manifest.daemon.grace_ms.max(100)),
+                    )
+                    .await?;
+                let workspace_cleared = per_invocation_workspaces_clean(&profile_root, session)?;
+                cancel_cleanup_valid = Some(process_cleared && workspace_cleared);
+                cancel_cleanup_detail = Some(format!(
+                    "terminated {} one-shot process root(s): cleared={process_cleared}; driver and harness workspaces clean={workspace_cleared}",
+                    roots.len()
+                ));
+            } else {
+                cancel_cleanup_valid = Some(true);
+                cancel_cleanup_detail = Some(
+                    "shared controller acknowledged session cancellation; terminal evidence verifies cleanup"
+                        .to_owned(),
+                );
+            }
+            Ok(())
         }
+        .await;
+        let _ = row_timeout(36, row_result, &mut row_errors, &progress)?;
     }
     if let Some(session) = sessions.get(&16).and_then(|items| items.first()) {
-        let mut after = None;
-        let mut transcript = Vec::new();
-        let first = collect_session_terminal(
-            &mut driver,
-            session,
-            after,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
-        after = first.iter().map(|event| Cursor(event.cursor)).max();
-        transcript.extend(first);
-        for (turn, actor) in [(2_u8, "r16t2"), (3_u8, "r16t3")] {
-            let prompt = format!(
-                "AHRB matrix row 16 turn {turn} {}",
-                route_marker(&workflow.scenario, actor, "start")
-            );
-            driver
-                .submit(session, &prompt, &format!("row-16-turn-{turn}"))
-                .await?;
-            let suffix = collect_session_terminal(
+        let row_result: Result<Vec<NormalizedEvent>> = async {
+            let mut after = None;
+            let mut transcript = Vec::new();
+            let first = collect_session_terminal(
                 &mut driver,
                 session,
                 after,
                 Duration::from_millis(manifest.resources.turn_timeout_ms),
             )
             .await?;
-            after = suffix
-                .iter()
-                .map(|event| Cursor(event.cursor))
-                .max()
-                .or(after);
-            transcript.extend(suffix);
+            after = first.iter().map(|event| Cursor(event.cursor)).max();
+            transcript.extend(first);
+            for (turn, actor) in [(2_u8, "r16t2"), (3_u8, "r16t3")] {
+                let prompt = format!(
+                    "AHRB matrix row 16 turn {turn} {}",
+                    route_marker(&workflow.scenario, actor, "start")
+                );
+                driver
+                    .submit(session, &prompt, &format!("row-16-turn-{turn}"))
+                    .await?;
+                let suffix = collect_session_terminal(
+                    &mut driver,
+                    session,
+                    after,
+                    Duration::from_millis(manifest.resources.turn_timeout_ms),
+                )
+                .await?;
+                after = suffix
+                    .iter()
+                    .map(|event| Cursor(event.cursor))
+                    .max()
+                    .or(after);
+                transcript.extend(suffix);
+            }
+            Ok(transcript)
         }
-        precollected_events.insert(16_u8, transcript);
+        .await;
+        if let Some(transcript) = row_timeout(16, row_result, &mut row_errors, &progress)? {
+            progress.update(|state| {
+                state.completed.insert(16);
+                state.events.insert(16, transcript.clone());
+            })?;
+            precollected_events.insert(16_u8, transcript);
+        }
     }
 
     if let Some(session) = sessions.get(&30).and_then(|items| items.first()) {
-        let original = collect_session_terminal(
-            &mut driver,
-            session,
-            None,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
-        let after = original
-            .first()
-            .map(|event| Cursor(event.cursor))
-            .ok_or_else(|| AhrbError::Protocol("row-30 replay source was empty".to_owned()))?;
-        driver.resume(session).await?;
-        let suffix = driver.attach(session, Some(after)).await?;
-        let suffix_validation = validate_recovered_suffix(&original, Some(after), &suffix);
-        let last_a = original
-            .last()
-            .map(|event| Cursor(event.cursor))
-            .ok_or_else(|| AhrbError::Protocol("row-30 replay source was empty".to_owned()))?;
-        let turn_b_prompt = format!(
-            "AHRB matrix row 30 continued turn B {}",
-            route_marker(&workflow.scenario, "r30b", "start")
-        );
-        driver
-            .submit(session, &turn_b_prompt, "row-30-turn-2")
+        let row_result: Result<Vec<NormalizedEvent>> = async {
+            let original = collect_session_terminal(
+                &mut driver,
+                session,
+                None,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
             .await?;
-        let turn_b = collect_session_terminal(
-            &mut driver,
-            session,
-            Some(last_a),
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
-        let mut transcript = original;
-        transcript.extend(turn_b);
-        let accepted = transcript
-            .iter()
-            .filter(|event| event.event == EventVocab::TurnAccepted)
-            .count();
-        let terminals = transcript
-            .iter()
-            .filter(|event| is_terminal(&event.event))
-            .count();
-        let continued_b = accepted == 2 && terminals == 2;
-        match suffix_validation {
-            Ok(()) if continued_b => {
-                session_replay_valid = Some(true);
-                session_replay_detail = Some(format!(
-                    "reopened the persisted session journal, replayed {} exact events strictly after cursor {}, then continued turn B in the same session",
-                    suffix.len(),
-                    after.0
-                ));
+            let after = original
+                .first()
+                .map(|event| Cursor(event.cursor))
+                .ok_or_else(|| AhrbError::Protocol("row-30 replay source was empty".to_owned()))?;
+            driver.resume(session).await?;
+            let suffix = driver.attach(session, Some(after)).await?;
+            let suffix_validation = validate_recovered_suffix(&original, Some(after), &suffix);
+            let last_a = original
+                .last()
+                .map(|event| Cursor(event.cursor))
+                .ok_or_else(|| AhrbError::Protocol("row-30 replay source was empty".to_owned()))?;
+            let turn_b_prompt = format!(
+                "AHRB matrix row 30 continued turn B {}",
+                route_marker(&workflow.scenario, "r30b", "start")
+            );
+            driver
+                .submit(session, &turn_b_prompt, "row-30-turn-2")
+                .await?;
+            let turn_b = collect_session_terminal(
+                &mut driver,
+                session,
+                Some(last_a),
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await?;
+            let mut transcript = original;
+            transcript.extend(turn_b);
+            let accepted = transcript
+                .iter()
+                .filter(|event| event.event == EventVocab::TurnAccepted)
+                .count();
+            let terminals = transcript
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .count();
+            let continued_b = accepted == 2 && terminals == 2;
+            match suffix_validation {
+                Ok(()) if continued_b => {
+                    session_replay_valid = Some(true);
+                    session_replay_detail = Some(format!(
+                        "reopened the persisted session journal, replayed {} exact events strictly after cursor {}, then continued turn B in the same session",
+                        suffix.len(),
+                        after.0
+                    ));
+                }
+                Ok(()) => {
+                    session_replay_valid = Some(false);
+                    session_replay_detail = Some(format!(
+                        "replay suffix was exact, but turn B did not complete distinctly: accepted={accepted}, terminals={terminals}"
+                    ));
+                }
+                Err(detail) => {
+                    session_replay_valid = Some(false);
+                    session_replay_detail = Some(detail);
+                }
             }
-            Ok(()) => {
-                session_replay_valid = Some(false);
-                session_replay_detail = Some(format!(
-                    "replay suffix was exact, but turn B did not complete distinctly: accepted={accepted}, terminals={terminals}"
-                ));
-            }
-            Err(detail) => {
-                session_replay_valid = Some(false);
-                session_replay_detail = Some(detail);
-            }
+            Ok(transcript)
         }
-        precollected_events.insert(30_u8, transcript);
+        .await;
+        if let Some(transcript) = row_timeout(30, row_result, &mut row_errors, &progress)? {
+            progress.update(|state| {
+                state.completed.insert(30);
+                state.events.insert(30, transcript.clone());
+            })?;
+            precollected_events.insert(30_u8, transcript);
+        }
     }
 
     if let Some(session) = sessions.get(&37).and_then(|items| items.first()) {
-        let original = collect_session_terminal(
-            &mut driver,
-            session,
-            None,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
-        driver.resume(session).await?;
-        let actor = workflow
-            .actors
-            .get("r37")
-            .ok_or_else(|| AhrbError::Protocol("row-37 workflow actor is absent".to_owned()))?;
-        driver
-            .submit(session, &actor.prompt, "row-37-turn-1")
+        let row_result: Result<Vec<NormalizedEvent>> = async {
+            let original = collect_session_terminal(
+                &mut driver,
+                session,
+                None,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
             .await?;
-        let replayed = collect_session_terminal(
-            &mut driver,
-            session,
-            None,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
-        let accepted = replayed
-            .iter()
-            .filter(|event| event.event == EventVocab::TurnAccepted)
-            .count();
-        let effects = replayed
-            .iter()
-            .filter(|event| event.event == EventVocab::ToolResult)
-            .count();
-        let terminals = replayed
-            .iter()
-            .filter(|event| is_terminal(&event.event))
-            .count();
-        let unchanged = replayed == original;
-        let valid = unchanged && accepted == 1 && effects == 1 && terminals == 1;
-        resume_idempotency_valid = Some(valid);
-        resume_idempotency_detail = Some(format!(
-            "disk reopen plus duplicate submit preserved the exact journal: unchanged={unchanged}, accepted={accepted}, committed_effects={effects}, terminals={terminals}"
-        ));
-        precollected_events.insert(37_u8, replayed);
+            driver.resume(session).await?;
+            let actor = workflow
+                .actors
+                .get("r37")
+                .ok_or_else(|| AhrbError::Protocol("row-37 workflow actor is absent".to_owned()))?;
+            driver
+                .submit(session, &actor.prompt, "row-37-turn-1")
+                .await?;
+            let replayed = collect_session_terminal(
+                &mut driver,
+                session,
+                None,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await?;
+            let accepted = replayed
+                .iter()
+                .filter(|event| event.event == EventVocab::TurnAccepted)
+                .count();
+            let effects = replayed
+                .iter()
+                .filter(|event| event.event == EventVocab::ToolResult)
+                .count();
+            let terminals = replayed
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .count();
+            let unchanged = replayed == original;
+            let valid = unchanged && accepted == 1 && effects == 1 && terminals == 1;
+            resume_idempotency_valid = Some(valid);
+            resume_idempotency_detail = Some(format!(
+                "disk reopen plus duplicate submit preserved the exact journal: unchanged={unchanged}, accepted={accepted}, committed_effects={effects}, terminals={terminals}"
+            ));
+            Ok(replayed)
+        }
+        .await;
+        if let Some(replayed) = row_timeout(37, row_result, &mut row_errors, &progress)? {
+            progress.update(|state| {
+                state.completed.insert(37);
+                state.events.insert(37, replayed.clone());
+            })?;
+            precollected_events.insert(37_u8, replayed);
+        }
     }
 
     if let Some(parent) = sessions.get(&18).and_then(|items| items.first()) {
-        let _child = driver
+        let result = driver
             .spawn_agent(parent, "ahrb-matrix-v1:r18-child", None)
-            .await?;
+            .await;
+        let _ = row_timeout(18, result, &mut row_errors, &progress)?;
     }
     if let Some(session) = sessions.get(&31).and_then(|items| items.first()) {
-        driver.steer(session, "row-31 safe-boundary steer").await?;
+        let result = driver.steer(session, "row-31 safe-boundary steer").await;
+        let _ = row_timeout(31, result, &mut row_errors, &progress)?;
     }
     if let Some(session) = sessions.get(&32).and_then(|items| items.first()) {
-        driver
+        let result = driver
             .subturn(session, "row-32 pre-tool intervention")
-            .await?;
+            .await;
+        let _ = row_timeout(32, result, &mut row_errors, &progress)?;
     }
     if let Some(session) = sessions.get(&33).and_then(|items| items.first()) {
         let actor = workflow
             .actors
             .get("r33")
             .ok_or_else(|| AhrbError::Protocol("row-33 workflow actor is absent".to_owned()))?;
-        driver
+        let result = driver
             .queue(session, &actor.prompt, "row-33-queued-turn")
-            .await?;
+            .await;
+        let _ = row_timeout(33, result, &mut row_errors, &progress)?;
     }
-    let needs_recovery = [35_u8, 40].iter().any(|row| {
+    let recovery_requested = [35_u8, 40].iter().any(|row| {
         selected_rows.contains(row)
             && matches!(
                 crate::matrix_evidence::capability_for_row(&manifest, *row),
                 crate::matrix_evidence::CapabilityStatus::Supported
             )
     });
-    let crash_pre_events = if needs_recovery {
+    let crash_pre_events = if recovery_requested {
         if let Some(session) = sessions.get(&35).and_then(|items| items.first()) {
-            Some(
-                collect_session_checkpoint(
-                    &mut driver,
-                    session,
-                    "row-35-post-commit",
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
-                )
-                .await?,
+            let result = collect_session_checkpoint(
+                &mut driver,
+                session,
+                "row-35-post-commit",
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
             )
+            .await;
+            row_timeout(35, result, &mut row_errors, &progress)?
         } else {
             None
         }
     } else {
         None
     };
-    let journal_pre_events = if needs_recovery {
+    let journal_pre_events = if recovery_requested {
         if let Some(session) = sessions.get(&40).and_then(|items| items.first()) {
-            Some(
-                collect_session_checkpoint(
-                    &mut driver,
-                    session,
-                    "row-40-post-commit",
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
-                )
-                .await?,
+            let result = collect_session_checkpoint(
+                &mut driver,
+                session,
+                "row-40-post-commit",
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
             )
+            .await;
+            row_timeout(40, result, &mut row_errors, &progress)?
         } else {
             None
         }
     } else {
         None
     };
+    let needs_recovery =
+        (crash_pre_events.is_some() || journal_pre_events.is_some()) && recovery_requested;
 
     let parallel_agents = per_invocation_collection
         .as_ref()
@@ -588,12 +928,14 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         })
         .map(|(row, sessions)| (*row, sessions.clone()))
         .collect();
-    let mut events = collect_terminals(
+    let (mut events, terminal_errors) = collect_terminals(
         &mut driver,
         &sessions_to_collect,
         Duration::from_millis(manifest.resources.turn_timeout_ms),
+        &progress,
     )
     .await?;
+    row_errors.extend(terminal_errors);
     events.extend(precollected_events);
     if let Some(pre_crash) = &crash_pre_events {
         events.insert(35, pre_crash.clone());
@@ -601,6 +943,14 @@ pub async fn run(options: RunOptions) -> Result<i32> {
     if let Some(pre_crash) = &journal_pre_events {
         events.insert(40, pre_crash.clone());
     }
+    progress.update(|state| {
+        for (row, row_events) in &events {
+            state.events.insert(*row, row_events.clone());
+            if !row_errors.contains_key(row) && !matches!(*row, 35 | 40) {
+                state.completed.insert(*row);
+            }
+        }
+    })?;
 
     // A complete resource collection is one coherent sampler timeline. Do not
     // append a one-off sample from the main driver's independent CPU tracker:
@@ -671,39 +1021,50 @@ pub async fn run(options: RunOptions) -> Result<i32> {
                     })
                 });
                 if let Some(release_token) = release_token {
-                    recovered.resume(session).await?;
-                    let actor = workflow.actors.get("r35").ok_or_else(|| {
-                        AhrbError::Protocol("row-35 workflow actor is absent".to_owned())
-                    })?;
-                    recovered
-                        .submit(session, &actor.prompt, "row-35-turn-1")
-                        .await?;
-                    recovered.release_checkpoint(session, release_token).await?;
-                    let recovered_events = collect_session_terminal(
-                        &mut recovered,
-                        session,
-                        None,
-                        Duration::from_millis(manifest.resources.turn_timeout_ms),
-                    )
-                    .await?;
-                    let accepted = recovered_events
-                        .iter()
-                        .filter(|event| event.event == EventVocab::TurnAccepted)
-                        .count();
-                    let effects = recovered_events
-                        .iter()
-                        .filter(|event| event.event == EventVocab::ToolResult)
-                        .count();
-                    let terminals = recovered_events
-                        .iter()
-                        .filter(|event| is_terminal(&event.event))
-                        .count();
-                    let valid = accepted == 1 && effects == 1 && terminals == 1;
-                    crash_recovery_valid = Some(valid);
-                    crash_recovery_detail = Some(format!(
-                        "post-commit restart+attach+resume+duplicate-submit observed accepted={accepted}, committed_effects={effects}, terminals={terminals}"
-                    ));
-                    events.insert(35, recovered_events);
+                    let recovered_result: Result<Vec<NormalizedEvent>> = async {
+                        recovered.resume(session).await?;
+                        let actor = workflow.actors.get("r35").ok_or_else(|| {
+                            AhrbError::Protocol("row-35 workflow actor is absent".to_owned())
+                        })?;
+                        recovered
+                            .submit(session, &actor.prompt, "row-35-turn-1")
+                            .await?;
+                        recovered.release_checkpoint(session, release_token).await?;
+                        collect_session_terminal(
+                            &mut recovered,
+                            session,
+                            None,
+                            Duration::from_millis(manifest.resources.turn_timeout_ms),
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Some(recovered_events) =
+                        row_timeout(35, recovered_result, &mut row_errors, &progress)?
+                    {
+                        let accepted = recovered_events
+                            .iter()
+                            .filter(|event| event.event == EventVocab::TurnAccepted)
+                            .count();
+                        let effects = recovered_events
+                            .iter()
+                            .filter(|event| event.event == EventVocab::ToolResult)
+                            .count();
+                        let terminals = recovered_events
+                            .iter()
+                            .filter(|event| is_terminal(&event.event))
+                            .count();
+                        let valid = accepted == 1 && effects == 1 && terminals == 1;
+                        crash_recovery_valid = Some(valid);
+                        crash_recovery_detail = Some(format!(
+                            "post-commit restart+attach+resume+duplicate-submit observed accepted={accepted}, committed_effects={effects}, terminals={terminals}"
+                        ));
+                        progress.update(|state| {
+                            state.completed.insert(35);
+                            state.events.insert(35, recovered_events.clone());
+                        })?;
+                        events.insert(35, recovered_events);
+                    }
                 } else {
                     crash_recovery_valid = Some(false);
                     crash_recovery_detail = Some(
@@ -723,6 +1084,9 @@ pub async fn run(options: RunOptions) -> Result<i32> {
                             Ok(()) => {
                                 if journal_torn_tail_injected == Some(true) {
                                     journal_recovery_valid = Some(true);
+                                    progress.update(|state| {
+                                        state.completed.insert(40);
+                                    })?;
                                     journal_recovery_detail = Some(format!(
                                         "replayed {} exact, contiguous, duplicate-free events and cleanly ignored the induced torn tail",
                                         suffix.len()
@@ -734,6 +1098,10 @@ pub async fn run(options: RunOptions) -> Result<i32> {
                                 journal_recovery_detail = Some(detail);
                             }
                         }
+                    }
+                    Err(AhrbError::Timeout(detail)) => {
+                        let result: Result<()> = Err(AhrbError::Timeout(detail));
+                        let _ = row_timeout(40, result, &mut row_errors, &progress)?;
                     }
                     Err(error) => {
                         journal_recovery_valid = Some(false);
@@ -789,6 +1157,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         per_invocation_resources: per_invocation_collection
             .map(|collection| collection.observations)
             .unwrap_or_default(),
+        row_errors,
     };
     let request_records = engine.request_records().await;
     server.shutdown().await?;
@@ -877,6 +1246,12 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         &profile_root,
     );
     results.sort_by_key(|result| result.row);
+    progress.update(|state| {
+        for result in &results {
+            state.completed.insert(result.row);
+            state.results.insert(result.row, result.clone());
+        }
+    })?;
     let mut resource_metric_values = resource_certification.metrics.clone();
     if let Some(beta) = resource_metric_values
         .get("parallel_beta_bytes_per_agent")
@@ -981,7 +1356,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         run_id,
         fingerprint: Fingerprint {
             harness: manifest.identity.id.clone(),
-            harness_version: manifest.identity.revision.clone(),
+            harness_version: persistence.harness_version.clone(),
             manifest: manifest_hash,
             workflows: workflow_hash(),
             fake_model: env!("CARGO_PKG_VERSION").to_owned(),
@@ -1005,7 +1380,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         events: raw_events,
         model_requests,
     };
-    crate::report::write_bundle(&report, &options.output, options.junit)?;
+    crate::results::persist_report(&persistence, &report, options.junit, false)?;
     println!("{}", render_resource_summary(&report.resource_summary));
     match &report.badge {
         Some(badge) => println!("badge {}", badge_label(badge)),
@@ -1974,33 +2349,99 @@ async fn collect_terminals(
     driver: &mut HarnessDriver,
     sessions: &BTreeMap<u8, Vec<crate::driver::SessionId>>,
     deadline: Duration,
-) -> Result<BTreeMap<u8, Vec<NormalizedEvent>>> {
+    progress: &RunProgress,
+) -> Result<(BTreeMap<u8, Vec<NormalizedEvent>>, BTreeMap<u8, String>)> {
     let started = Instant::now();
     let mut complete: BTreeSet<(u8, String)> = BTreeSet::new();
     let mut evidence = BTreeMap::new();
+    let mut errors = BTreeMap::new();
     loop {
         for (row, row_sessions) in sessions {
+            if errors.contains_key(row) {
+                continue;
+            }
             for session in row_sessions {
                 if complete.contains(&(*row, session.0.clone())) {
                     continue;
                 }
-                let events = driver.attach(session, None).await?;
+                let events = match driver.attach(session, None).await {
+                    Ok(events) => events,
+                    Err(AhrbError::Timeout(detail)) => {
+                        let detail = format!("turn timeout: {detail}");
+                        errors.insert(*row, detail.clone());
+                        progress.update(|state| {
+                            state.row_errors.insert(*row, detail);
+                        })?;
+                        for row_session in row_sessions {
+                            let _ = driver.cancel(row_session).await;
+                        }
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if events.iter().any(|event| is_terminal(&event.event)) {
                     complete.insert((*row, session.0.clone()));
                     evidence.entry(*row).or_insert_with(Vec::new).extend(events);
+                    let row_complete = row_sessions
+                        .iter()
+                        .all(|item| complete.contains(&(*row, item.0.clone())));
+                    if row_complete && let Some(row_events) = evidence.get(row) {
+                        progress.update(|state| {
+                            state.completed.insert(*row);
+                            state.events.insert(*row, row_events.clone());
+                        })?;
+                    }
                 }
             }
         }
         let expected: usize = sessions.values().map(Vec::len).sum();
-        if complete.len() == expected {
-            return Ok(evidence);
+        let errored_sessions: usize = errors
+            .keys()
+            .filter_map(|row| sessions.get(row))
+            .map(Vec::len)
+            .sum();
+        if complete.len().saturating_add(errored_sessions) == expected {
+            progress.update(|state| {
+                for (row, events) in &evidence {
+                    state.completed.insert(*row);
+                    state.events.insert(*row, events.clone());
+                }
+            })?;
+            return Ok((evidence, errors));
         }
         if started.elapsed() >= deadline {
-            return Err(AhrbError::Timeout(format!(
-                "only {}/{} sessions terminalized",
+            let detail = format!(
+                "only {}/{} sessions terminalized within {} ms",
                 complete.len(),
-                expected
-            )));
+                expected,
+                deadline.as_millis()
+            );
+            for (row, row_sessions) in sessions {
+                if errors.contains_key(row) {
+                    continue;
+                }
+                let row_complete = row_sessions
+                    .iter()
+                    .all(|session| complete.contains(&(*row, session.0.clone())));
+                if row_complete {
+                    if let Some(events) = evidence.get(row) {
+                        progress.update(|state| {
+                            state.completed.insert(*row);
+                            state.events.insert(*row, events.clone());
+                        })?;
+                    }
+                } else {
+                    let row_detail = format!("turn timeout: {detail}");
+                    errors.insert(*row, row_detail.clone());
+                    progress.update(|state| {
+                        state.row_errors.insert(*row, row_detail);
+                    })?;
+                    for session in row_sessions {
+                        let _ = driver.cancel(session).await;
+                    }
+                }
+            }
+            return Ok((evidence, errors));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -2139,6 +2580,15 @@ fn evaluate_rows(
     selected
         .iter()
         .map(|definition| {
+            if let Some(error) = state.row_errors.get(&definition.row) {
+                return TestResult {
+                    row: definition.row,
+                    id: definition.id.to_owned(),
+                    pillar: definition.pillar,
+                    outcome: TestOutcome::Error(error.clone()),
+                    evidence: vec![error.clone()],
+                };
+            }
             let capability =
                 crate::matrix_evidence::capability_for_row(manifest, definition.row);
             if !matches!(
@@ -4713,9 +5163,9 @@ fn host_memory_bytes() -> u64 {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output();
+        let output = crate::process::owned_command_output(
+            std::process::Command::new("sysctl").args(["-n", "hw.memsize"]),
+        );
         match output {
             Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
                 .trim()
@@ -4729,6 +5179,90 @@ fn host_memory_bytes() -> u64 {
 #[cfg(test)]
 mod resource_sampler_tests {
     use super::*;
+
+    #[test]
+    fn deadline_report_preserves_completed_rows_and_marks_only_pending_rows_deadline() {
+        let output = std::env::temp_dir().join(format!(
+            "ahrb-partial-deadline-report-{}",
+            std::process::id()
+        ));
+        if output.exists() {
+            std::fs::remove_dir_all(&output).expect("remove stale partial deadline output");
+        }
+        let options = RunOptions {
+            manifest: PathBuf::from("adapters/mock/manifest.toml"),
+            output: output.clone(),
+            profile: Profile::Quick,
+            tests: vec![1, 2, 3],
+            junit: false,
+            deadline_secs: Some(1),
+            no_save: true,
+            harness_version: Some("mock-harness 0.1.0".to_owned()),
+        };
+        let manifest = crate::manifest::load(&options.manifest).expect("load mock manifest");
+        let persistence =
+            crate::results::prepare(&options, &manifest).expect("prepare test persistence");
+        let selected = selected_definitions(&options).expect("select partial deadline rows");
+        let progress = RunProgress::default();
+        progress
+            .update(|state| {
+                state.launched.extend([1, 2]);
+                state.completed.insert(1);
+                state.results.insert(
+                    1,
+                    TestResult {
+                        row: 1,
+                        id: selected[0].id.to_owned(),
+                        pillar: selected[0].pillar,
+                        outcome: TestOutcome::Pass,
+                        evidence: vec!["completed evidence".to_owned()],
+                    },
+                );
+            })
+            .expect("record partial progress");
+        write_deadline_report(
+            &options,
+            &manifest,
+            &selected,
+            &progress,
+            &persistence,
+            "deadline after 1s",
+        )
+        .expect("write partial deadline report");
+        let report: Report = serde_json::from_slice(
+            &std::fs::read(output.join("report.json")).expect("read partial deadline report"),
+        )
+        .expect("parse partial deadline report");
+        assert!(matches!(report.results[0].outcome, TestOutcome::Pass));
+        assert!(matches!(
+            &report.results[1].outcome,
+            TestOutcome::Error(detail) if detail == "deadline"
+        ));
+        assert!(matches!(
+            &report.results[2].outcome,
+            TestOutcome::Error(detail) if detail == "deadline"
+        ));
+        assert!(report.results[1].evidence[0].contains("active"));
+        assert!(report.results[2].evidence[0].contains("not launched"));
+        std::fs::remove_dir_all(output).expect("remove partial deadline output");
+    }
+
+    #[test]
+    fn row_timeout_is_recorded_without_becoming_a_run_error() -> Result<()> {
+        let mut errors = BTreeMap::new();
+        let result: Result<()> = Err(AhrbError::Timeout("one turn".to_owned()));
+        let progress = RunProgress::default();
+        assert!(row_timeout(7, result, &mut errors, &progress)?.is_none());
+        assert_eq!(
+            errors.get(&7).map(String::as_str),
+            Some("turn timeout: one turn")
+        );
+        assert_eq!(
+            progress.snapshot()?.row_errors.get(&7).map(String::as_str),
+            Some("turn timeout: one turn")
+        );
+        Ok(())
+    }
 
     fn generated_file_variables(profile: &Path) -> BTreeMap<String, String> {
         BTreeMap::from([

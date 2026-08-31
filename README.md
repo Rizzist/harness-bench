@@ -15,11 +15,12 @@ Requirements: stable Rust on macOS or Linux.
 cargo build --locked
 cargo run --locked --bin ahrb -- doctor --manifest adapters/mock/manifest.toml
 cargo run --locked --bin ahrb -- list-tests
-cargo run --locked --bin ahrb -- run --manifest adapters/mock/manifest.toml --output ./ahrb-results --profile quick
+cargo run --locked --bin ahrb -- run --manifest adapters/mock/manifest.toml --profile quick
 ```
 
 The run produces `report.md`, `report.json`, `samples.jsonl`, `processes.jsonl`,
-`events.jsonl`, and `model-requests.jsonl`. Add `--junit` for `junit.xml`.
+`membership.jsonl`, `events.jsonl`, and `model-requests.jsonl`. Add `--junit` for
+`junit.xml`.
 
 For a selected quick smoke run:
 
@@ -27,7 +28,47 @@ For a selected quick smoke run:
 cargo run --locked --bin ahrb -- run \
   --manifest adapters/mock/manifest.toml \
   --output ./ahrb-smoke \
-  --tests 1,2,3,9,10,12,20,26,30,35,40
+  --tests 1-3,9,10,12,20,26,30,35,40
+```
+
+The `hbench` shorthand accepts the same row selection, for example
+`hbench codex --tests 1-19,30-41`. Run the resource pillar (rows 20-29) on a
+quiet host: its wall-clock and process measurements are intentionally sensitive
+to machine contention.
+
+## Deadlines and saved results
+
+Every run has an internal run-level deadline: 15 minutes for `quick` and 30
+minutes for `cert`. Override it with `--deadline SECS` or `AHRB_DEADLINE`.
+When it expires, AHRB stops launching rows, cleans up its complete owned process
+tree, writes a nonzero-exit `report.json`, and marks pending rows
+`ERROR: deadline`. A row's manifest `turn_timeout_ms` remains a row-local error
+and does not stop later rows.
+
+By default each run is saved under:
+
+```text
+results/<harness_id>/<UTC-ISO-timestamp>-<short-run-id>/
+```
+
+The directory contains the full report and JSONL evidence bundle (plus
+`junit.xml` when requested and `run-error.txt` on an aborted/deadline run).
+`--output DIR` writes the primary bundle there and also mirrors it into
+`results/`. Use `--no-save` or `AHRB_NO_SAVE=1` to opt out of that durable copy.
+
+`results/index.jsonl` receives one append-only JSON object per saved run. Its
+schema is `harness_id`, `harness_version`, `manifest_hash`, `ahrb_revision`,
+`platform`, `profile`, `rows_run`, `timestamp`, `counts` (`PASS`, `FAIL`,
+`UNSUPPORTED`, `ERROR`; `ABSENT` is counted as `ERROR`), `badge`,
+`resource_summary` (`peak_rss_mib`, `cpu_per_turn_ms`, `wall_per_turn_ms`,
+`sampler_overhead_pct`), `results_dir`, and `load_avg_1m`.
+
+Show the latest saved run per harness, or history, with:
+
+```console
+hbench results
+hbench results codex --all
+ahrb results --all
 ```
 
 ## Adapter manifests

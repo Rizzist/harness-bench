@@ -963,7 +963,9 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
                     diagnostics,
                 });
             };
-            let output = std::process::Command::new(program).args(rest).output()?;
+            let output = crate::process::owned_command_output(
+                std::process::Command::new(program).args(rest),
+            )?;
             let mut text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if text.is_empty() {
                 text = String::from_utf8_lossy(&output.stderr).trim().to_owned();

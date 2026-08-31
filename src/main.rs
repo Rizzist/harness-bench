@@ -2,6 +2,7 @@
 
 #[tokio::main]
 async fn main() {
+    ahrb::process::install_cleanup_handlers();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match ahrb::cli::parse(&args) {
         Ok(command) => {
@@ -13,7 +14,16 @@ async fn main() {
                 Ok(code) => code,
                 Err(error) => {
                     if let Some(options) = run_options {
-                        let output = &options.output;
+                        let output = if options.output.as_os_str().is_empty() {
+                            ahrb::manifest::load(&options.manifest)
+                                .and_then(|manifest| ahrb::results::prepare(&options, &manifest))
+                                .map(|persistence| persistence.output)
+                                .unwrap_or_else(|_| {
+                                    std::path::PathBuf::from("ahrb-output/run-error")
+                                })
+                        } else {
+                            options.output.clone()
+                        };
                         eprintln!(
                             "ahrb: run aborted for manifest {}: {error}",
                             options.manifest.display()
@@ -22,7 +32,7 @@ async fn main() {
                             eprintln!("ahrb: report.json was not written");
                         }
                         match ahrb::report::write_failure_diagnostic(
-                            output,
+                            &output,
                             &options.manifest,
                             &error,
                         ) {
@@ -44,6 +54,17 @@ async fn main() {
         }
         Err(error) => {
             eprintln!("ahrb: {error}");
+            2
+        }
+    };
+    let code = match ahrb::process::cleanup_owned_processes(std::time::Duration::from_millis(500)) {
+        Ok(survivors) if survivors.is_empty() => code,
+        Ok(survivors) => {
+            eprintln!("ahrb: final cleanup left owned processes alive: {survivors:?}");
+            2
+        }
+        Err(error) => {
+            eprintln!("ahrb: final owned-process cleanup failed: {error}");
             2
         }
     };

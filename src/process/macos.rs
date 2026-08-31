@@ -394,7 +394,9 @@ impl Sampler for MacOsSampler {
         }
         let result = self.discover_from_table(roots, &by_pid);
         self.discovery_ns = duration_ns(discovery_started.elapsed());
-        result
+        let tree = result?;
+        crate::process::track_process_tree(&tree)?;
+        Ok(tree)
     }
 
     fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
@@ -647,18 +649,50 @@ pub(crate) fn matching_processes(
     Ok(matches)
 }
 
+pub(crate) fn matching_processes_fast(
+    executable_name: &str,
+    expected_environment: &BTreeMap<String, String>,
+) -> Result<Vec<u32>> {
+    let mut matches = Vec::new();
+    for pid in list_pids_for(PROC_ALL_PIDS, 0)? {
+        let Some(info) = bsd_info(pid)? else {
+            continue;
+        };
+        if process_info(&info, ProcOwnership::DeclaredRoot).command != executable_name {
+            continue;
+        }
+        if process_environment(pid)?.is_some_and(|environment| {
+            expected_environment
+                .iter()
+                .all(|(name, value)| environment.get(name) == Some(value))
+        }) {
+            matches.push(pid);
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
+
 fn lsof_matching_processes(executable_name: &str, roots: &[PathBuf]) -> Result<BTreeSet<u32>> {
     let roots = roots
         .iter()
         .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
         .collect::<Vec<_>>();
-    let output = match std::process::Command::new("/usr/sbin/lsof")
-        .args(["-n", "-P", "-c", executable_name, "-Fpcn"])
-        .output()
-    {
+    let output = match crate::process::owned_command_output(
+        std::process::Command::new("/usr/sbin/lsof").args([
+            "-n",
+            "-P",
+            "-c",
+            executable_name,
+            "-Fpcn",
+        ]),
+    ) {
         Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => return Err(error.into()),
+        Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => return Err(error),
     };
     if !output.status.success() && output.stdout.is_empty() {
         return Ok(BTreeSet::new());
@@ -830,6 +864,28 @@ fn bsd_info(pid: u32) -> Result<Option<ProcBsdInfo>> {
     Err(AhrbError::Protocol(format!(
         "proc_pidinfo returned a short proc_bsdinfo for PID {pid}: {read}/{size} bytes"
     )))
+}
+
+pub(crate) fn process_identity_and_group(pid: u32) -> Result<Option<(ProcIdentity, u32)>> {
+    Ok(bsd_info(pid)?.map(|info| (identity_of(&info), info.pbi_pgid)))
+}
+
+pub(crate) fn process_group_members(
+    process_group: u32,
+    minimum_start: u64,
+) -> Result<Vec<ProcIdentity>> {
+    let mut members = Vec::new();
+    for pid in list_pids_for(PROC_PGRP_ONLY, process_group)? {
+        if let Some(info) = bsd_info(pid)? {
+            let identity = identity_of(&info);
+            if info.pbi_pgid == process_group && identity.start_time >= minimum_start {
+                members.push(identity);
+            }
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
+    Ok(members)
 }
 
 fn task_details(pid: u32) -> Result<Option<ProcTaskInfo>> {
