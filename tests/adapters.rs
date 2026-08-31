@@ -72,11 +72,32 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
     assert_eq!(haider.transport.kind, TransportKind::Exec);
     assert_eq!(haider.availability.exec_paths, ["haider"]);
     assert_eq!(haider.availability.required_exec_paths, ["haiderd"]);
-    assert_eq!(haider.daemon.start, ["haiderd"]);
-    assert_eq!(haider.daemon.readiness.kind, "command");
+    assert_eq!(haider.daemon.start, ["haider", "status", "--json"]);
+    assert!(haider.daemon.launcher_exits);
+    assert_eq!(haider.daemon.process_match.executable_name, "haiderd");
+    assert_eq!(
+        haider
+            .daemon
+            .process_match
+            .environment
+            .get("TMPDIR")
+            .map(String::as_str),
+        Some("{{profile}}/tmp")
+    );
+    assert_eq!(haider.daemon.readiness.kind, "command-json");
     assert_eq!(
         haider.daemon.readiness.command,
-        ["haider", "status", "--json", "--no-spawn"]
+        ["haider", "status", "--json"]
+    );
+    assert_eq!(haider.daemon.readiness.timeout_ms, 30_000);
+    assert_eq!(
+        haider
+            .daemon
+            .readiness
+            .json_pointer_roots
+            .get("/runtime_dir")
+            .map(String::as_str),
+        Some("TMPDIR")
     );
     assert!(
         haider
@@ -378,12 +399,22 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
     assert_eq!(opencode.isolation.generated_files.len(), 1);
     let config = &opencode.isolation.generated_files[0];
     assert!(config.path.ends_with("/config/opencode/opencode.json"));
+    assert!(!opencode.isolation.roots.contains_key("OPENCODE_CONFIG"));
+    assert_eq!(
+        opencode
+            .isolation
+            .environment
+            .get("OPENCODE_CONFIG")
+            .map(String::as_str),
+        Some("{{profile}}/config/opencode/opencode.json")
+    );
     assert!(config.content.contains("@ai-sdk/openai-compatible"));
     assert!(config.content.contains("{{base_url}}/v1"));
     assert!(config.content.contains("\"{{model}}\""));
     for command in [&opencode.transport.command, &opencode.sessions.resume] {
         assert!(command.windows(2).any(|pair| pair == ["--format", "json"]));
         assert!(command.iter().any(|argument| argument == "--auto"));
+        assert!(command.iter().all(|argument| argument != "--json"));
         assert!(command.iter().all(|argument| argument != "--pure"));
     }
     assert_eq!(opencode.tools.aliases["write"].primary(), Some("bash"));

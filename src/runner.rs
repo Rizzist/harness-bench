@@ -975,7 +975,12 @@ fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
     )]);
     for value in manifest.isolation.roots.values() {
         let rendered = crate::manifest::render_template(value, &variables)?;
-        std::fs::create_dir_all(rendered)?;
+        std::fs::create_dir_all(&rendered).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "create isolation root {}: {error}",
+                Path::new(&rendered).display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1003,10 +1008,18 @@ fn write_generated_files(
             )));
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "create generated-file parent {} for {}: {error}",
+                    parent.display(),
+                    path.display()
+                ))
+            })?;
         }
         let content = crate::manifest::render_template(&specification.content, variables)?;
-        std::fs::write(&path, content.as_bytes())?;
+        std::fs::write(&path, content.as_bytes()).map_err(|error| {
+            AhrbError::Protocol(format!("write generated file {}: {error}", path.display()))
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1018,10 +1031,27 @@ fn write_generated_files(
                     ))
                 },
             )?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(
+                |error| {
+                    AhrbError::Protocol(format!(
+                        "set permissions on generated file {}: {error}",
+                        path.display()
+                    ))
+                },
+            )?;
         }
-        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
-        file.sync_all()?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "open generated file {} for sync: {error}",
+                    path.display()
+                ))
+            })?;
+        file.sync_all().map_err(|error| {
+            AhrbError::Protocol(format!("sync generated file {}: {error}", path.display()))
+        })?;
     }
     Ok(())
 }
@@ -1032,6 +1062,12 @@ fn isolated_environment(
 ) -> Result<BTreeMap<String, String>> {
     let mut environment = BTreeMap::new();
     for (name, template) in &manifest.isolation.roots {
+        environment.insert(
+            name.clone(),
+            crate::manifest::render_template(template, variables)?,
+        );
+    }
+    for (name, template) in &manifest.isolation.environment {
         environment.insert(
             name.clone(),
             crate::manifest::render_template(template, variables)?,
@@ -1221,8 +1257,14 @@ fn rendered_managed_daemon_config(
     let mut readiness = manifest.daemon.readiness.clone();
     readiness.target = crate::manifest::render_template(&readiness.target, variables)?;
     readiness.command = resolve_local_program(&render_argv(&readiness.command, variables)?)?;
+    let mut process_match = manifest.daemon.process_match.clone();
+    for value in process_match.environment.values_mut() {
+        *value = crate::manifest::render_template(value, variables)?;
+    }
     Ok(ManagedDaemonConfig {
         command: resolve_local_program(&render_argv(&manifest.daemon.start, variables)?)?,
+        launcher_exits: manifest.daemon.launcher_exits,
+        process_match,
         initialize_command: resolve_local_program(&render_argv(
             &manifest.daemon.initialize,
             variables,
@@ -2379,6 +2421,39 @@ async fn await_owned_pid(
     manifest: &Manifest,
     variables: &BTreeMap<String, String>,
 ) -> Result<Option<u32>> {
+    if !manifest.daemon.process_match.executable_name.is_empty() {
+        let mut expected_environment = manifest.daemon.process_match.environment.clone();
+        for value in expected_environment.values_mut() {
+            *value = crate::manifest::render_template(value, variables)?;
+        }
+        let timeout = Duration::from_millis(manifest.daemon.readiness.timeout_ms.max(1));
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(2);
+        let maximum_backoff = Duration::from_millis(25);
+        while started.elapsed() < timeout {
+            let matches = crate::process::matching_processes(
+                &manifest.daemon.process_match.executable_name,
+                &expected_environment,
+            )?;
+            match matches.as_slice() {
+                [pid] => return Ok(Some(*pid)),
+                [] => {}
+                _ => {
+                    return Err(AhrbError::Protocol(format!(
+                        "detached PID locator for {:?} and isolated environment was ambiguous: {matches:?}",
+                        manifest.daemon.process_match.executable_name
+                    )));
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(maximum_backoff);
+        }
+        return Err(AhrbError::Timeout(format!(
+            "detached PID locator for {:?} and isolated environment did not appear within {} ms",
+            manifest.daemon.process_match.executable_name,
+            timeout.as_millis()
+        )));
+    }
     let template = manifest
         .process
         .pid_files
@@ -2393,7 +2468,7 @@ async fn await_owned_pid(
     };
     let path = PathBuf::from(crate::manifest::render_template(template, variables)?);
     let started = Instant::now();
-    let timeout = Duration::from_secs(2);
+    let timeout = Duration::from_millis(manifest.daemon.readiness.timeout_ms.max(1));
     let maximum_backoff = Duration::from_millis(25);
     let mut backoff = Duration::from_millis(2);
     let mut last_invalid = None;
@@ -4508,6 +4583,72 @@ fn host_memory_bytes() -> u64 {
 #[cfg(test)]
 mod resource_sampler_tests {
     use super::*;
+
+    fn generated_file_variables(profile: &Path) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("profile".to_owned(), profile.to_string_lossy().into_owned()),
+            ("base_url".to_owned(), "http://127.0.0.1:12345".to_owned()),
+            ("credential".to_owned(), "test-credential".to_owned()),
+            ("model".to_owned(), "ahrb-fake-v1".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn opencode_file_valued_environment_does_not_create_config_as_directory() {
+        let manifest = crate::manifest::load(Path::new("adapters/opencode/manifest.toml"))
+            .expect("load OpenCode manifest");
+        let profile =
+            std::env::temp_dir().join(format!("ahrb-opencode-config-fixed-{}", std::process::id()));
+        if profile.exists() {
+            std::fs::remove_dir_all(&profile).expect("remove stale OpenCode profile");
+        }
+        prepare_profile(&manifest, &profile).expect("prepare OpenCode profile");
+        let variables = generated_file_variables(&profile);
+        let config_path = profile.join("config/opencode/opencode.json");
+        assert!(!config_path.exists());
+        write_generated_files(&manifest, &variables, &profile)
+            .expect("write OpenCode generated configuration");
+        assert!(config_path.is_file());
+        let environment = isolated_environment(&manifest, &variables)
+            .expect("render OpenCode isolated environment");
+        assert_eq!(
+            environment.get("OPENCODE_CONFIG").map(String::as_str),
+            config_path.to_str()
+        );
+        std::fs::remove_dir_all(profile).expect("remove OpenCode profile");
+    }
+
+    #[test]
+    fn generated_file_io_error_names_the_colliding_path() {
+        let mut manifest = crate::manifest::load(Path::new("adapters/opencode/manifest.toml"))
+            .expect("load OpenCode manifest");
+        let binding = manifest
+            .isolation
+            .environment
+            .remove("OPENCODE_CONFIG")
+            .expect("OpenCode config environment binding");
+        manifest
+            .isolation
+            .roots
+            .insert("OPENCODE_CONFIG".to_owned(), binding);
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-opencode-config-collision-{}",
+            std::process::id()
+        ));
+        if profile.exists() {
+            std::fs::remove_dir_all(&profile).expect("remove stale collision profile");
+        }
+        prepare_profile(&manifest, &profile).expect("reproduce directory collision");
+        let config_path = profile.join("config/opencode/opencode.json");
+        assert!(config_path.is_dir());
+        let error = write_generated_files(&manifest, &generated_file_variables(&profile), &profile)
+            .expect_err("directory collision must fail as a generated-file write");
+        let message = error.to_string();
+        assert!(message.contains("write generated file"));
+        assert!(message.contains(config_path.to_string_lossy().as_ref()));
+        assert!(message.contains("Is a directory"));
+        std::fs::remove_dir_all(profile).expect("remove collision profile");
+    }
 
     fn recovery_event(cursor: u64) -> NormalizedEvent {
         NormalizedEvent {

@@ -2,7 +2,7 @@
 schema = 1
 id = "opencode"
 name = "OpenCode"
-revision = "1.17-run-json-native-tools-v2"
+revision = "1.17-run-format-json-native-tools-v3"
 
 [availability]
 exec_paths = ["opencode"]
@@ -52,6 +52,8 @@ XDG_DATA_HOME = "{{profile}}/data"
 XDG_STATE_HOME = "{{profile}}/state"
 XDG_RUNTIME_DIR = "{{profile}}/runtime"
 TMPDIR = "{{profile}}/tmp"
+
+[isolation.environment]
 OPENCODE_CONFIG = "{{profile}}/config/opencode/opencode.json"
 
 [isolation]
@@ -212,7 +214,7 @@ redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
 
 [capabilities.required]
-headless = "opencode run --format json is noninteractive"
+headless = "opencode run --format json emits raw JSON events noninteractively"
 sessions = "OpenCode persists sessions under isolated XDG roots"
 resume = "opencode run --session continues the prior session in a fresh process"
 

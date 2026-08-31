@@ -93,7 +93,9 @@ never PID alone.
   double-counts shared pages; PSS is the preferred comparison metric).
 - macOS: `proc_listpids`/`proc_pidinfo` (PPID+start-time); `proc_pid_rusage(RUSAGE_INFO_V4)`
   for resident + physical footprint + cumulative CPU; `task_info(TASK_VM_INFO)` cross-check;
-  root = launcher PID + verified daemon-PID locator + recursive descendants.
+  root = launcher PID + verified daemon-PID locator + recursive descendants. A detached
+  daemon may be located only by an exact executable plus isolated-root evidence: inherited
+  environment where inspectable, otherwise an open file/socket beneath that unique root.
 - Terminal rusage: also `wait4` direct children, normalize ru_maxrss (bytes on macOS, KiB×1024
   on Linux) — supplemental cross-check ONLY, never a substitute for the sampled tree metric.
 Sampling cadence: membership 10ms; Linux cgroup counters 10ms; smaps_rollup 50ms + at
@@ -115,9 +117,11 @@ CPU <5% of one core; CPU ≤250 ms/scripted turn.
 Groups: schema+identity; availability (exec paths, version probe/pattern); fake-model
 (protocol dialect, base-URL + credential binding, model ID, allowed paths, provider config
 templates); model roles (primary/planner/title/compaction/reviewer/child); isolation
-(HOME/XDG/config/data/state/session/runtime/tmp, generated config files+modes, forbidden
-historical state roots); daemon lifecycle (embedded/persistent, start, readiness probe,
-PID locator, shutdown, grace); automation transport; session ops (create/submit/attach/
+(directory-valued HOME/XDG/config/data/state/session/runtime/tmp roots, non-directory
+environment bindings, generated config files+modes, forbidden historical state roots);
+daemon lifecycle (embedded/persistent, resident or finite detached start, readiness probe,
+PID file or executable+isolated-root locator, shutdown, grace); automation transport;
+session ops (create/submit/attach/
 resume/close-delete/list/id-extraction); next-input ops (steer/subturn/queue + capability
 flags); agent ops (create/native-spawn/child-id/status/cancel/collect); concurrency
 (topology, max N, fanout mode, barrier evidence); tool semantics (aliases, schema bindings

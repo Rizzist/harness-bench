@@ -132,12 +132,16 @@ pub struct ModelRole {
     pub required: bool,
 }
 
-/// Per-run environment roots and generated configuration files.
+/// Per-run environment roots, non-directory bindings, and generated files.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Isolation {
-    /// Environment roots rendered relative to the run profile.
+    /// Environment variables whose rendered values are directories AHRB creates.
     #[serde(default)]
     pub roots: BTreeMap<String, String>,
+    /// Additional environment variables whose values AHRB must not create as
+    /// directories (for example, a configuration-file path).
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     /// Files generated inside isolated roots.
     #[serde(default)]
     pub generated_files: Vec<GeneratedFile>,
@@ -170,6 +174,10 @@ pub struct DaemonLifecycle {
     /// Start command argv.
     #[serde(default)]
     pub start: Vec<String>,
+    /// Whether `start` is a finite launcher that leaves the actual daemon
+    /// detached from AHRB's child process group.
+    #[serde(default)]
+    pub launcher_exits: bool,
     /// One-time initialization argv run after readiness. The driver records a
     /// profile-local marker only after this command succeeds.
     #[serde(default)]
@@ -180,12 +188,27 @@ pub struct DaemonLifecycle {
     /// PID locator description or path.
     #[serde(default)]
     pub pid_locator: String,
+    /// Declarative lookup for a detached daemon that inherited isolated
+    /// environment bindings from its finite launcher.
+    #[serde(default)]
+    pub process_match: ProcessMatch,
     /// Graceful shutdown command argv.
     #[serde(default)]
     pub shutdown: Vec<String>,
     /// Shutdown grace period.
     #[serde(default = "default_grace_ms")]
     pub grace_ms: u64,
+}
+
+/// Identity evidence used to locate one detached, profile-owned daemon.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ProcessMatch {
+    /// Exact executable basename.
+    #[serde(default)]
+    pub executable_name: String,
+    /// Exact inherited environment values, rendered before launch.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 fn default_grace_ms() -> u64 {
@@ -204,6 +227,10 @@ pub struct Probe {
     /// Direct argv used by a command readiness probe.
     #[serde(default)]
     pub command: Vec<String>,
+    /// For `command-json`, map required JSON pointers containing paths to the
+    /// isolated environment root that must contain each returned path.
+    #[serde(default)]
+    pub json_pointer_roots: BTreeMap<String, String>,
     /// Maximum wait.
     #[serde(default = "default_ready_ms")]
     pub timeout_ms: u64,
@@ -607,9 +634,46 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "persistent transports require daemon.start for a cold owned run".to_owned(),
         ));
     }
-    if manifest.daemon.readiness.kind == "command" && manifest.daemon.readiness.command.is_empty() {
+    if matches!(
+        manifest.daemon.readiness.kind.as_str(),
+        "command" | "command-json"
+    ) && manifest.daemon.readiness.command.is_empty()
+    {
         return Err(AhrbError::Validation(
             "command daemon readiness requires daemon.readiness.command".to_owned(),
+        ));
+    }
+    if manifest.daemon.launcher_exits {
+        if manifest
+            .daemon
+            .process_match
+            .executable_name
+            .trim()
+            .is_empty()
+            || manifest.daemon.process_match.environment.is_empty()
+        {
+            return Err(AhrbError::Validation(
+                "a detached daemon launcher requires daemon.process_match executable_name and environment evidence"
+                    .to_owned(),
+            ));
+        }
+        if !manifest.daemon.pid_locator.trim().is_empty() {
+            return Err(AhrbError::Validation(
+                "a detached daemon process match conflicts with daemon.pid_locator".to_owned(),
+            ));
+        }
+    }
+    if !manifest.daemon.process_match.executable_name.is_empty() && !manifest.daemon.launcher_exits
+    {
+        return Err(AhrbError::Validation(
+            "daemon.process_match is only valid when daemon.launcher_exits is true".to_owned(),
+        ));
+    }
+    if !manifest.daemon.readiness.json_pointer_roots.is_empty()
+        && manifest.daemon.readiness.kind != "command-json"
+    {
+        return Err(AhrbError::Validation(
+            "daemon.readiness.json_pointer_roots requires kind = command-json".to_owned(),
         ));
     }
     if manifest.transport.timeout_ms == 0
@@ -672,6 +736,37 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         if !profile_scoped_template(template) {
             return Err(AhrbError::Validation(format!(
                 "isolation.roots.{name} must be lexically contained under {{{{profile}}}}"
+            )));
+        }
+    }
+    for (name, template) in &manifest.isolation.environment {
+        if template.contains("{{profile}}") && !profile_scoped_template(template) {
+            return Err(AhrbError::Validation(format!(
+                "isolation.environment.{name} must be lexically contained under {{{{profile}}}}"
+            )));
+        }
+        if manifest.isolation.roots.contains_key(name) {
+            return Err(AhrbError::Validation(format!(
+                "isolation environment variable {name:?} is declared as both a directory root and a non-directory binding"
+            )));
+        }
+    }
+    for (name, template) in &manifest.daemon.process_match.environment {
+        if !profile_scoped_template(template) {
+            return Err(AhrbError::Validation(format!(
+                "daemon.process_match.environment.{name} must be lexically contained under {{{{profile}}}}"
+            )));
+        }
+    }
+    for (pointer, root_name) in &manifest.daemon.readiness.json_pointer_roots {
+        if !pointer.starts_with('/') || pointer == "/" {
+            return Err(AhrbError::Validation(format!(
+                "daemon readiness JSON pointer {pointer:?} is invalid"
+            )));
+        }
+        if !manifest.isolation.roots.contains_key(root_name) {
+            return Err(AhrbError::Validation(format!(
+                "daemon readiness JSON pointer {pointer:?} refers to undeclared isolation root {root_name:?}"
             )));
         }
     }

@@ -8,16 +8,20 @@ use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::mem::{size_of, zeroed};
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 const PROC_PPID_ONLY: u32 = 6;
 const PROC_PGRP_ONLY: u32 = 2;
+const PROC_ALL_PIDS: u32 = 1;
 const PROC_PIDTBSDINFO: c_int = 3;
 const PROC_PIDTASKINFO: c_int = 4;
 const RUSAGE_INFO_V4: c_int = 4;
 const TASK_VM_INFO: c_int = 22;
 const KERN_SUCCESS: c_int = 0;
 const MAXCOMLEN: usize = 16;
+const CTL_KERN: c_int = 1;
+const KERN_PROCARGS2: c_int = 49;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -567,9 +571,13 @@ fn list_pids_for(kind: u32, type_info: u32) -> Result<Vec<u32>> {
     // Direct-child sets are normally tiny. Starting with a useful buffer avoids
     // libproc's separate sizing syscall on every 10 ms membership refresh; a
     // saturated buffer is still retried geometrically below.
-    let mut capacity = 64_usize;
+    let mut capacity = if kind == PROC_ALL_PIDS {
+        2_048_usize
+    } else {
+        64_usize
+    };
 
-    for _ in 0..3 {
+    for _ in 0..6 {
         let mut pids = vec![0_u32; capacity];
         let buffer_bytes = capacity
             .checked_mul(size_of::<u32>())
@@ -604,6 +612,196 @@ fn list_pids_for(kind: u32, type_info: u32) -> Result<Vec<u32>> {
     Err(AhrbError::Protocol(
         "process list changed too quickly to capture safely".to_owned(),
     ))
+}
+
+pub(crate) fn matching_processes(
+    executable_name: &str,
+    expected_environment: &BTreeMap<String, String>,
+) -> Result<Vec<u32>> {
+    let open_path_matches = lsof_matching_processes(
+        executable_name,
+        &expected_environment
+            .values()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    )?;
+    let mut matches = Vec::new();
+    for pid in list_pids_for(PROC_ALL_PIDS, 0)? {
+        let Some(info) = bsd_info(pid)? else {
+            continue;
+        };
+        if process_info(&info, ProcOwnership::DeclaredRoot).command != executable_name {
+            continue;
+        }
+        let environment_matches = process_environment(pid)?.is_some_and(|environment| {
+            expected_environment
+                .iter()
+                .all(|(name, value)| environment.get(name) == Some(value))
+        });
+        if environment_matches || open_path_matches.contains(&pid) {
+            matches.push(pid);
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn lsof_matching_processes(executable_name: &str, roots: &[PathBuf]) -> Result<BTreeSet<u32>> {
+    let roots = roots
+        .iter()
+        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
+    let output = match std::process::Command::new("/usr/sbin/lsof")
+        .args(["-n", "-P", "-c", executable_name, "-Fpcn"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !output.status.success() && output.stdout.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut matches = BTreeSet::new();
+    let mut pid = None;
+    let mut command_matches = false;
+    let mut path_matches = false;
+    let finish = |pid: Option<u32>,
+                  command_matches: bool,
+                  path_matches: bool,
+                  matches: &mut BTreeSet<u32>| {
+        if command_matches
+            && path_matches
+            && let Some(pid) = pid
+        {
+            matches.insert(pid);
+        }
+    };
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (tag, value) = line.split_at(1);
+        match tag {
+            "p" => {
+                finish(pid, command_matches, path_matches, &mut matches);
+                pid = value.parse().ok();
+                command_matches = false;
+                path_matches = false;
+            }
+            "c" => command_matches = value == executable_name,
+            "n" => {
+                path_matches |= roots.iter().any(|root| Path::new(value).starts_with(root));
+            }
+            _ => {}
+        }
+    }
+    finish(pid, command_matches, path_matches, &mut matches);
+    Ok(matches)
+}
+
+fn process_environment(pid: u32) -> Result<Option<BTreeMap<String, String>>> {
+    let pid = c_int::try_from(pid)
+        .map_err(|_| AhrbError::Validation("PID exceeds Darwin pid_t range".to_owned()))?;
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
+    let mut size = 0_usize;
+    // SAFETY: the MIB has three initialized elements and `size` is a writable
+    // output. A null old-value pointer requests only the required buffer size.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+        ) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    if size < size_of::<c_int>() || size > 16 * 1024 * 1024 {
+        return Ok(None);
+    }
+    let mut buffer = vec![0_u8; size];
+    // SAFETY: `buffer` owns `size` writable bytes and the MIB/output-size
+    // pointers remain valid for the duration of the call.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+        ) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    buffer.truncate(size);
+    Ok(parse_procargs_environment(&buffer))
+}
+
+fn parse_procargs_environment(buffer: &[u8]) -> Option<BTreeMap<String, String>> {
+    let argc_bytes: [u8; size_of::<c_int>()] = buffer.get(..size_of::<c_int>())?.try_into().ok()?;
+    let argc = c_int::from_ne_bytes(argc_bytes);
+    let argc = usize::try_from(argc).ok()?;
+    let mut offset = size_of::<c_int>();
+
+    skip_c_string(buffer, &mut offset)?;
+    skip_nuls(buffer, &mut offset);
+    for _ in 0..argc {
+        skip_c_string(buffer, &mut offset)?;
+        skip_nuls(buffer, &mut offset);
+    }
+
+    let mut environment = BTreeMap::new();
+    while offset < buffer.len() {
+        let end = buffer[offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|relative| offset + relative)
+            .unwrap_or(buffer.len());
+        if end == offset {
+            offset = offset.saturating_add(1);
+            continue;
+        }
+        let item = std::str::from_utf8(&buffer[offset..end]).ok()?;
+        if let Some((name, value)) = item.split_once('=') {
+            environment.insert(name.to_owned(), value.to_owned());
+        }
+        offset = end.saturating_add(1);
+    }
+    Some(environment)
+}
+
+fn skip_c_string(buffer: &[u8], offset: &mut usize) -> Option<()> {
+    let relative = buffer.get(*offset..)?.iter().position(|byte| *byte == 0)?;
+    *offset = offset.checked_add(relative)?.checked_add(1)?;
+    Some(())
+}
+
+fn skip_nuls(buffer: &[u8], offset: &mut usize) {
+    while buffer.get(*offset) == Some(&0) {
+        *offset = offset.saturating_add(1);
+    }
 }
 
 fn bsd_info(pid: u32) -> Result<Option<ProcBsdInfo>> {
@@ -776,6 +974,24 @@ mod tests {
             .into_iter()
             .map(|process| (process.pbi_pid, process))
             .collect()
+    }
+
+    #[test]
+    fn parses_procargs_environment_after_argv() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&2_i32.to_ne_bytes());
+        buffer.extend_from_slice(b"/usr/local/bin/haiderd\0\0");
+        buffer.extend_from_slice(b"haiderd\0--foreground\0");
+        buffer.extend_from_slice(b"HOME=/tmp/profile/home\0TMPDIR=/tmp/profile/tmp\0\0");
+        let environment = parse_procargs_environment(&buffer).expect("parse process arguments");
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/tmp/profile/home")
+        );
+        assert_eq!(
+            environment.get("TMPDIR").map(String::as_str),
+            Some("/tmp/profile/tmp")
+        );
     }
 
     #[test]

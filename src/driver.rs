@@ -7,7 +7,7 @@
 use crate::events::{
     EventNormalizer, EventVocab, NATIVE_FIXTURE_METADATA_PREFIX, NormalizedEvent, rule_matches,
 };
-use crate::manifest::{EventMapping, ExitContract, Probe};
+use crate::manifest::{EventMapping, ExitContract, Probe, ProcessMatch};
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -99,6 +99,10 @@ static DAEMON_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct ManagedDaemonConfig {
     /// Fully rendered cold-start argv.
     pub command: Vec<String>,
+    /// The start command is a finite launcher for a double-forked daemon.
+    pub launcher_exits: bool,
+    /// Exact executable/environment evidence for the detached daemon.
+    pub process_match: ProcessMatch,
     /// Fully rendered one-time setup argv run after readiness.
     pub initialize_command: Vec<String>,
     /// Profile-local success marker for the initialization command.
@@ -116,17 +120,17 @@ pub struct ManagedDaemonConfig {
 async fn managed_daemon_readiness_satisfied(
     probe: &Probe,
     environment: &BTreeMap<String, String>,
-) -> Result<bool> {
+) -> Result<Option<Value>> {
     match probe.kind.as_str() {
-        "" | "process" => Ok(true),
-        "file" => Ok(Path::new(&probe.target).is_file()),
+        "" | "process" => Ok(Some(Value::Null)),
+        "file" => Ok(Path::new(&probe.target).is_file().then_some(Value::Null)),
         "socket" => {
             #[cfg(unix)]
             {
                 match tokio::net::UnixStream::connect(&probe.target).await {
                     Ok(stream) => {
                         drop(stream);
-                        Ok(true)
+                        Ok(Some(Value::Null))
                     }
                     Err(error)
                         if matches!(
@@ -136,7 +140,7 @@ async fn managed_daemon_readiness_satisfied(
                                 | std::io::ErrorKind::ConnectionReset
                         ) =>
                     {
-                        Ok(false)
+                        Ok(None)
                     }
                     Err(error) => Err(error.into()),
                 }
@@ -153,7 +157,7 @@ async fn managed_daemon_readiness_satisfied(
             match tokio::net::TcpStream::connect((parsed.host.as_str(), parsed.port)).await {
                 Ok(stream) => {
                     drop(stream);
-                    Ok(true)
+                    Ok(Some(Value::Null))
                 }
                 Err(error)
                     if matches!(
@@ -163,7 +167,7 @@ async fn managed_daemon_readiness_satisfied(
                             | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    Ok(false)
+                    Ok(None)
                 }
                 Err(error) => Err(error.into()),
             }
@@ -177,11 +181,55 @@ async fn managed_daemon_readiness_satisfied(
                 .stderr(Stdio::null());
             let attempt_timeout = Duration::from_millis(probe.timeout_ms.clamp(1, 1_000));
             match tokio::time::timeout(attempt_timeout, command.status()).await {
-                Ok(Ok(status)) => Ok(status.success()),
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Ok(Ok(status)) => Ok(status.success().then_some(Value::Null)),
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Ok(Err(error)) => Err(error.into()),
-                Err(_) => Ok(false),
+                Err(_) => Ok(None),
             }
+        }
+        "command-json" => {
+            let mut command = command_from_argv(&probe.command)?;
+            command
+                .envs(environment)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let attempt_timeout = Duration::from_millis(probe.timeout_ms.clamp(1, 5_000));
+            let output = match tokio::time::timeout(attempt_timeout, command.output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => return Ok(None),
+            };
+            if !output.status.success() {
+                return Ok(None);
+            }
+            let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "daemon readiness command returned invalid JSON: {error}"
+                ))
+            })?;
+            for (pointer, root_name) in &probe.json_pointer_roots {
+                let returned = value
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(format!(
+                            "daemon readiness JSON omitted string path at {pointer}"
+                        ))
+                    })?;
+                let root = environment.get(root_name).ok_or_else(|| {
+                    AhrbError::Validation(format!(
+                        "daemon readiness root environment {root_name:?} is absent"
+                    ))
+                })?;
+                if !Path::new(returned).starts_with(root) {
+                    return Err(AhrbError::Protocol(format!(
+                        "daemon readiness JSON path {pointer}={returned:?} is outside isolated {root_name}={root:?}"
+                    )));
+                }
+            }
+            Ok(Some(value))
         }
         other => Err(AhrbError::Validation(format!(
             "unsupported daemon readiness probe {other:?}"
@@ -235,7 +283,144 @@ async fn stop_managed_child(child: &mut Child, grace: Duration) -> Result<()> {
     Ok(())
 }
 
-async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<Child> {
+#[derive(Debug)]
+struct ManagedDaemonProcess {
+    child: Option<Child>,
+    detached_pid: Option<u32>,
+}
+
+impl ManagedDaemonProcess {
+    fn pid(&self) -> Option<u32> {
+        self.detached_pid
+            .or_else(|| self.child.as_ref().and_then(Child::id))
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> Result<bool> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| AhrbError::Protocol(format!("daemon PID {pid} does not fit pid_t")))?;
+    // SAFETY: signal zero does not mutate the target process.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn signal_detached_process(pid: u32, signal: i32) -> Result<()> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| AhrbError::Protocol(format!("daemon PID {pid} does not fit pid_t")))?;
+    // SAFETY: the PID was revalidated against exact executable and isolated
+    // environment evidence immediately before this call.
+    if unsafe { libc::kill(pid, signal) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn matching_detached_pids(process_match: &ProcessMatch) -> Result<Vec<u32>> {
+    crate::process::matching_processes(&process_match.executable_name, &process_match.environment)
+}
+
+async fn await_detached_pid(
+    process_match: &ProcessMatch,
+    deadline: std::time::Instant,
+) -> Result<u32> {
+    loop {
+        let matches = matching_detached_pids(process_match)?;
+        match matches.as_slice() {
+            [pid] => return Ok(*pid),
+            [] => {}
+            _ => {
+                return Err(AhrbError::Protocol(format!(
+                    "detached daemon match for {:?} and isolated environment was ambiguous: {matches:?}",
+                    process_match.executable_name
+                )));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "detached daemon {:?} with isolated environment did not appear before readiness deadline",
+                process_match.executable_name
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn stop_managed_daemon(
+    process: &mut ManagedDaemonProcess,
+    config: &ManagedDaemonConfig,
+) -> Result<()> {
+    if let Some(child) = process.child.as_mut() {
+        stop_managed_child(child, config.grace).await?;
+        process.child = None;
+    }
+    let Some(pid) = process.detached_pid.take() else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        if !process_exists(pid)? {
+            return Ok(());
+        }
+        if !matching_detached_pids(&config.process_match)?.contains(&pid) {
+            return Err(AhrbError::Protocol(format!(
+                "refusing to signal detached daemon PID {pid}: executable/environment ownership evidence no longer matches"
+            )));
+        }
+        signal_detached_process(pid, libc::SIGTERM)?;
+        let deadline = std::time::Instant::now() + config.grace;
+        while process_exists(pid)? && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if process_exists(pid)? {
+            if !matching_detached_pids(&config.process_match)?.contains(&pid) {
+                return Err(AhrbError::Protocol(format!(
+                    "refusing to SIGKILL detached daemon PID {pid}: ownership evidence changed after SIGTERM"
+                )));
+            }
+            signal_detached_process(pid, libc::SIGKILL)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, config);
+        Err(AhrbError::Unsupported(
+            "detached daemon termination requires Unix".to_owned(),
+        ))
+    }
+}
+
+async fn stop_matching_detached_daemon(config: &ManagedDaemonConfig) -> Result<()> {
+    let matches = matching_detached_pids(&config.process_match)?;
+    match matches.as_slice() {
+        [] => Ok(()),
+        [pid] => {
+            let mut process = ManagedDaemonProcess {
+                child: None,
+                detached_pid: Some(*pid),
+            };
+            stop_managed_daemon(&mut process, config).await
+        }
+        _ => Err(AhrbError::Protocol(format!(
+            "refusing failed-launch cleanup for ambiguous detached daemon match {:?}: {matches:?}",
+            config.process_match.executable_name
+        ))),
+    }
+}
+
+async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<ManagedDaemonProcess> {
     std::fs::create_dir_all(&config.log_directory)?;
     let sequence = DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stdout = std::fs::OpenOptions::new()
@@ -264,40 +449,115 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<Child> {
 
     let readiness_timeout = Duration::from_millis(config.readiness.timeout_ms.max(1));
     let started = std::time::Instant::now();
-    loop {
-        let daemon_pid = child.id();
-        let status = match child.try_wait() {
-            Ok(status) => status,
-            Err(error) => {
+    let readiness_deadline = started + readiness_timeout;
+    if config.launcher_exits {
+        let launcher_pid = child.id();
+        let status = match tokio::time::timeout(readiness_timeout, child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
                 stop_managed_child(&mut child, config.grace).await?;
-                return Err(error.into());
+                stop_matching_detached_daemon(config).await?;
+                return Err(AhrbError::Timeout("detached daemon launcher".to_owned()));
             }
         };
-        if let Some(status) = status {
+        if !status.success() {
             #[cfg(unix)]
-            if let Some(pid) = daemon_pid {
+            if let Some(pid) = launcher_pid {
                 signal_managed_process_group(pid, libc::SIGKILL)?;
             }
+            stop_matching_detached_daemon(config).await?;
             return Err(AhrbError::Protocol(format!(
-                "managed daemon exited before readiness with {status}"
+                "detached daemon launcher exited with {status}"
             )));
         }
+    }
+    let mut process = ManagedDaemonProcess {
+        child: (!config.launcher_exits).then_some(child),
+        detached_pid: None,
+    };
+    let readiness_metadata = loop {
+        if let Some(child) = process.child.as_mut() {
+            let daemon_pid = child.id();
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    stop_managed_daemon(&mut process, config).await?;
+                    return Err(error.into());
+                }
+            };
+            if let Some(status) = status {
+                #[cfg(unix)]
+                if let Some(pid) = daemon_pid {
+                    signal_managed_process_group(pid, libc::SIGKILL)?;
+                }
+                return Err(AhrbError::Protocol(format!(
+                    "managed daemon exited before readiness with {status}"
+                )));
+            }
+        }
         match managed_daemon_readiness_satisfied(&config.readiness, &config.environment).await {
-            Ok(true) => break,
-            Ok(false) => {}
+            Ok(Some(metadata)) => break metadata,
+            Ok(None) => {}
             Err(error) => {
-                stop_managed_child(&mut child, config.grace).await?;
+                if config.launcher_exits
+                    && let Ok(matches) = matching_detached_pids(&config.process_match)
+                    && let [pid] = matches.as_slice()
+                {
+                    process.detached_pid = Some(*pid);
+                }
+                stop_managed_daemon(&mut process, config).await?;
                 return Err(error);
             }
         }
-        if started.elapsed() >= readiness_timeout {
-            stop_managed_child(&mut child, config.grace).await?;
+        if std::time::Instant::now() >= readiness_deadline {
+            if config.launcher_exits
+                && let Ok(matches) = matching_detached_pids(&config.process_match)
+                && let [pid] = matches.as_slice()
+            {
+                process.detached_pid = Some(*pid);
+            }
+            stop_managed_daemon(&mut process, config).await?;
             return Err(AhrbError::Timeout(format!(
                 "daemon readiness {:?} at {:?}",
                 config.readiness.kind, config.readiness.target
             )));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    if config.launcher_exits {
+        match await_detached_pid(&config.process_match, readiness_deadline).await {
+            Ok(pid) => process.detached_pid = Some(pid),
+            Err(error) => {
+                if let Ok(matches) = matching_detached_pids(&config.process_match)
+                    && let [pid] = matches.as_slice()
+                {
+                    process.detached_pid = Some(*pid);
+                    stop_managed_daemon(&mut process, config).await?;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    if readiness_metadata != Value::Null {
+        let status_path = config
+            .log_directory
+            .join(format!("daemon-{sequence:04}.readiness.json"));
+        let metadata = match serde_json::to_vec_pretty(&readiness_metadata) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                stop_managed_daemon(&mut process, config).await?;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = std::fs::write(&status_path, metadata) {
+            stop_managed_daemon(&mut process, config).await?;
+            return Err(AhrbError::Protocol(format!(
+                "write parsed daemon readiness metadata {}: {error}",
+                status_path.display()
+            )));
+        }
     }
 
     if !config.initialize_command.is_empty() && !config.initialize_marker.is_file() {
@@ -326,18 +586,18 @@ async fn start_managed_daemon(config: &ManagedDaemonConfig) -> Result<Child> {
         }
         .await;
         if let Err(error) = initialize_result {
-            stop_managed_child(&mut child, config.grace).await?;
+            stop_managed_daemon(&mut process, config).await?;
             return Err(error);
         }
     }
-    Ok(child)
+    Ok(process)
 }
 
 /// A lifecycle wrapper for daemons reached through a separate client transport.
 pub struct ManagedDaemonTransport<T: Transport> {
     inner: T,
     config: ManagedDaemonConfig,
-    child: Option<Child>,
+    daemon: Option<ManagedDaemonProcess>,
 }
 
 impl<T: Transport> ManagedDaemonTransport<T> {
@@ -346,7 +606,7 @@ impl<T: Transport> ManagedDaemonTransport<T> {
         Self {
             inner,
             config,
-            child: None,
+            daemon: None,
         }
     }
 }
@@ -354,13 +614,13 @@ impl<T: Transport> ManagedDaemonTransport<T> {
 impl<T: Transport> Transport for ManagedDaemonTransport<T> {
     fn start(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
-            if self.child.is_some() {
+            if self.daemon.is_some() {
                 return Ok(());
             }
-            self.child = Some(start_managed_daemon(&self.config).await?);
+            self.daemon = Some(start_managed_daemon(&self.config).await?);
             if let Err(error) = self.inner.start().await {
-                if let Some(mut child) = self.child.take() {
-                    stop_managed_child(&mut child, self.config.grace).await?;
+                if let Some(mut daemon) = self.daemon.take() {
+                    stop_managed_daemon(&mut daemon, &self.config).await?;
                 }
                 return Err(error);
             }
@@ -375,8 +635,8 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
     fn stop(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
             let inner_result = self.inner.stop().await;
-            let daemon_result = if let Some(mut child) = self.child.take() {
-                stop_managed_child(&mut child, self.config.grace).await
+            let daemon_result = if let Some(mut daemon) = self.daemon.take() {
+                stop_managed_daemon(&mut daemon, &self.config).await
             } else {
                 Ok(())
             };
@@ -386,7 +646,7 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
 
     fn owned_pids(&self) -> Vec<u32> {
         let mut pids = self.inner.owned_pids();
-        if let Some(pid) = self.child.as_ref().and_then(Child::id) {
+        if let Some(pid) = self.daemon.as_ref().and_then(ManagedDaemonProcess::pid) {
             pids.push(pid);
         }
         pids.sort_unstable();
@@ -398,14 +658,26 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
 impl<T: Transport> Drop for ManagedDaemonTransport<T> {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = self.child.as_ref().and_then(Child::id) {
+        if let Some(pid) = self.daemon.as_ref().and_then(ManagedDaemonProcess::pid) {
             // Drop cannot wait asynchronously, but it must prevent an error path
             // from leaving daemon workers resident. Tokio's kill-on-drop handles
             // the leader; this signal covers every descendant in the owned group.
-            let _ = signal_managed_process_group(pid, libc::SIGKILL);
+            if self.config.launcher_exits {
+                if matching_detached_pids(&self.config.process_match)
+                    .is_ok_and(|matches| matches.contains(&pid))
+                {
+                    let _ = signal_detached_process(pid, libc::SIGKILL);
+                }
+            } else {
+                let _ = signal_managed_process_group(pid, libc::SIGKILL);
+            }
         }
         #[cfg(not(unix))]
-        if let Some(child) = self.child.as_mut() {
+        if let Some(child) = self
+            .daemon
+            .as_mut()
+            .and_then(|daemon| daemon.child.as_mut())
+        {
             let _ = child.start_kill();
         }
     }
@@ -1052,7 +1324,7 @@ pub struct PerInvocationDriver {
     config: PerInvocationConfig,
     state_root: PathBuf,
     sessions: BTreeMap<String, ExecSession>,
-    daemon_child: Option<Child>,
+    daemon_process: Option<ManagedDaemonProcess>,
 }
 
 impl PerInvocationDriver {
@@ -1063,7 +1335,7 @@ impl PerInvocationDriver {
             config,
             state_root,
             sessions: BTreeMap::new(),
-            daemon_child: None,
+            daemon_process: None,
         }
     }
 
@@ -1600,16 +1872,16 @@ impl PerInvocationDriver {
 impl Driver for PerInvocationDriver {
     fn start(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
-            if self.daemon_child.is_none()
+            if self.daemon_process.is_none()
                 && let Some(config) = self.config.daemon.clone()
             {
-                self.daemon_child = Some(start_managed_daemon(&config).await?);
+                self.daemon_process = Some(start_managed_daemon(&config).await?);
             }
             if let Err(error) = self.load_sessions() {
-                if let (Some(mut child), Some(config)) =
-                    (self.daemon_child.take(), self.config.daemon.as_ref())
+                if let (Some(mut daemon), Some(config)) =
+                    (self.daemon_process.take(), self.config.daemon.as_ref())
                 {
-                    stop_managed_child(&mut child, config.grace).await?;
+                    stop_managed_daemon(&mut daemon, config).await?;
                 }
                 return Err(error);
             }
@@ -2080,10 +2352,10 @@ impl Driver for PerInvocationDriver {
                     break;
                 }
             }
-            let daemon_result = if let (Some(mut child), Some(config)) =
-                (self.daemon_child.take(), self.config.daemon.as_ref())
+            let daemon_result = if let (Some(mut daemon), Some(config)) =
+                (self.daemon_process.take(), self.config.daemon.as_ref())
             {
-                stop_managed_child(&mut child, config.grace).await
+                stop_managed_daemon(&mut daemon, config).await
             } else {
                 Ok(())
             };
@@ -2118,7 +2390,11 @@ impl Driver for PerInvocationDriver {
             .filter_map(|session| session.active.as_ref())
             .filter_map(|active| active.child.id())
             .collect::<Vec<_>>();
-        if let Some(pid) = self.daemon_child.as_ref().and_then(Child::id) {
+        if let Some(pid) = self
+            .daemon_process
+            .as_ref()
+            .and_then(ManagedDaemonProcess::pid)
+        {
             pids.push(pid);
         }
         pids.sort_unstable();
@@ -2139,11 +2415,33 @@ impl Driver for PerInvocationDriver {
 impl Drop for PerInvocationDriver {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(pid) = self.daemon_child.as_ref().and_then(Child::id) {
-            let _ = signal_managed_process_group(pid, libc::SIGKILL);
+        if let Some(pid) = self
+            .daemon_process
+            .as_ref()
+            .and_then(ManagedDaemonProcess::pid)
+        {
+            if self
+                .config
+                .daemon
+                .as_ref()
+                .is_some_and(|config| config.launcher_exits)
+            {
+                if self.config.daemon.as_ref().is_some_and(|config| {
+                    matching_detached_pids(&config.process_match)
+                        .is_ok_and(|matches| matches.contains(&pid))
+                }) {
+                    let _ = signal_detached_process(pid, libc::SIGKILL);
+                }
+            } else {
+                let _ = signal_managed_process_group(pid, libc::SIGKILL);
+            }
         }
         #[cfg(not(unix))]
-        if let Some(child) = self.daemon_child.as_mut() {
+        if let Some(child) = self
+            .daemon_process
+            .as_mut()
+            .and_then(|daemon| daemon.child.as_mut())
+        {
             let _ = child.start_kill();
         }
     }
@@ -3431,6 +3729,8 @@ mod tests {
             NoopTransport,
             ManagedDaemonConfig {
                 command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+                launcher_exits: false,
+                process_match: ProcessMatch::default(),
                 initialize_command: Vec::new(),
                 initialize_marker: logs.join("initialized"),
                 environment: BTreeMap::new(),
@@ -3438,6 +3738,7 @@ mod tests {
                     kind: "process".to_owned(),
                     target: String::new(),
                     command: Vec::new(),
+                    json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
                 },
                 grace: Duration::from_millis(100),
@@ -3479,6 +3780,8 @@ mod tests {
             NoopTransport,
             ManagedDaemonConfig {
                 command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+                launcher_exits: false,
+                process_match: ProcessMatch::default(),
                 initialize_command: vec!["/usr/bin/true".to_owned()],
                 initialize_marker: marker.clone(),
                 environment: BTreeMap::new(),
@@ -3486,6 +3789,7 @@ mod tests {
                     kind: "command".to_owned(),
                     target: String::new(),
                     command: vec!["/usr/bin/true".to_owned()],
+                    json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
                 },
                 grace: Duration::from_millis(100),
@@ -3519,6 +3823,8 @@ mod tests {
             .expect("load exec reference manifest");
         let daemon = ManagedDaemonConfig {
             command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+            launcher_exits: false,
+            process_match: ProcessMatch::default(),
             initialize_command: Vec::new(),
             initialize_marker: profile.join("initialized"),
             environment: BTreeMap::new(),
@@ -3526,6 +3832,7 @@ mod tests {
                 kind: "process".to_owned(),
                 target: String::new(),
                 command: Vec::new(),
+                json_pointer_roots: BTreeMap::new(),
                 timeout_ms: 1_000,
             },
             grace: Duration::from_millis(100),
@@ -3553,6 +3860,105 @@ mod tests {
         driver.shutdown().await.expect("stop thin-client driver");
         assert!(driver.owned_pids().is_empty());
         std::fs::remove_dir_all(profile).expect("remove thin-client profile");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_launcher_is_located_by_isolated_environment_and_reaped() {
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-detached-daemon-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.load(Ordering::Relaxed)
+        ));
+        if profile.exists() {
+            std::fs::remove_dir_all(&profile).expect("remove stale detached-daemon profile");
+        }
+        let home = profile.join("home").to_string_lossy().into_owned();
+        let temporary = profile.join("tmp").to_string_lossy().into_owned();
+        let status = json!({
+            "profile_path": format!("{home}/.haider/dev-profile"),
+            "runtime_dir": format!("{temporary}/haider/abc123"),
+            "daemon": {"pipe_dir": format!("{home}/.haider/dev-profile/pipe")}
+        })
+        .to_string();
+        let environment = BTreeMap::from([
+            ("HOME".to_owned(), home),
+            ("TMPDIR".to_owned(), temporary),
+            (
+                "AHRB_PROFILE".to_owned(),
+                profile.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let process_match = ProcessMatch {
+            executable_name: "sleep".to_owned(),
+            environment: environment.clone(),
+        };
+        let mut transport = ManagedDaemonTransport::new(
+            NoopTransport,
+            ManagedDaemonConfig {
+                command: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "/bin/sleep 30 &".to_owned(),
+                ],
+                launcher_exits: true,
+                process_match,
+                initialize_command: Vec::new(),
+                initialize_marker: profile.join("initialized"),
+                environment,
+                readiness: Probe {
+                    kind: "command-json".to_owned(),
+                    target: String::new(),
+                    command: vec!["/usr/bin/printf".to_owned(), status],
+                    json_pointer_roots: BTreeMap::from([
+                        ("/profile_path".to_owned(), "HOME".to_owned()),
+                        ("/runtime_dir".to_owned(), "TMPDIR".to_owned()),
+                        ("/daemon/pipe_dir".to_owned(), "HOME".to_owned()),
+                    ]),
+                    timeout_ms: 2_000,
+                },
+                grace: Duration::from_millis(500),
+                log_directory: profile.join("logs"),
+            },
+        );
+        transport.start().await.expect("start detached daemon");
+        let pids = transport.owned_pids();
+        assert_eq!(pids.len(), 1);
+        let pid = pids[0];
+        assert!(
+            profile
+                .join("logs")
+                .read_dir()
+                .expect("read daemon logs")
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".readiness.json"))
+        );
+        transport.stop().await.expect("stop detached daemon");
+        assert!(wait_until_pid_is_dead(pid).await);
+        std::fs::remove_dir_all(profile).expect("remove detached daemon profile");
+    }
+
+    #[tokio::test]
+    async fn command_json_readiness_rejects_paths_outside_isolation() {
+        let probe = Probe {
+            kind: "command-json".to_owned(),
+            target: String::new(),
+            command: vec![
+                "/usr/bin/printf".to_owned(),
+                r#"{"runtime_dir":"/tmp/ambient/haider"}"#.to_owned(),
+            ],
+            json_pointer_roots: BTreeMap::from([("/runtime_dir".to_owned(), "TMPDIR".to_owned())]),
+            timeout_ms: 1_000,
+        };
+        let environment =
+            BTreeMap::from([("TMPDIR".to_owned(), "/tmp/isolated-profile/tmp".to_owned())]);
+        let error = managed_daemon_readiness_satisfied(&probe, &environment)
+            .await
+            .expect_err("ambient runtime path must be rejected");
+        assert!(error.to_string().contains("outside isolated TMPDIR"));
     }
 
     #[cfg(unix)]
@@ -3602,6 +4008,8 @@ mod tests {
                     "ahrb-managed-daemon".to_owned(),
                     worker_file.to_string_lossy().into_owned(),
                 ],
+                launcher_exits: false,
+                process_match: ProcessMatch::default(),
                 initialize_command: Vec::new(),
                 initialize_marker: logs.join("initialized"),
                 environment: BTreeMap::new(),
@@ -3609,6 +4017,7 @@ mod tests {
                     kind: "file".to_owned(),
                     target: logs.join("never-ready").to_string_lossy().into_owned(),
                     command: Vec::new(),
+                    json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
                 },
                 grace: Duration::from_millis(100),
@@ -3644,6 +4053,8 @@ mod tests {
                     "ahrb-managed-daemon".to_owned(),
                     worker_file.to_string_lossy().into_owned(),
                 ],
+                launcher_exits: false,
+                process_match: ProcessMatch::default(),
                 initialize_command: Vec::new(),
                 initialize_marker: logs.join("initialized"),
                 environment: BTreeMap::new(),
@@ -3651,6 +4062,7 @@ mod tests {
                     kind: "file".to_owned(),
                     target: worker_file.to_string_lossy().into_owned(),
                     command: Vec::new(),
+                    json_pointer_roots: BTreeMap::new(),
                     timeout_ms: 1_000,
                 },
                 grace: Duration::from_millis(100),

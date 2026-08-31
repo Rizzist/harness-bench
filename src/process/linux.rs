@@ -61,6 +61,69 @@ impl LinuxSampler {
     }
 }
 
+pub(crate) fn matching_processes(
+    executable_name: &str,
+    expected_environment: &BTreeMap<String, String>,
+) -> Result<Vec<u32>> {
+    let mut matches = Vec::new();
+    let mut entries = fs::read_dir("/proc")?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let directory = entry.path();
+        let command = match fs::read_to_string(directory.join("comm")) {
+            Ok(command) => command.trim_end().to_owned(),
+            Err(error) if transient_process_error(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if command != executable_name {
+            continue;
+        }
+        let bytes = match fs::read(directory.join("environ")) {
+            Ok(bytes) => bytes,
+            Err(error) if transient_process_error(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let environment = parse_environ(&bytes);
+        if expected_environment
+            .iter()
+            .all(|(name, value)| environment.get(name) == Some(value))
+        {
+            matches.push(pid);
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn transient_process_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+    )
+}
+
+fn parse_environ(bytes: &[u8]) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    for item in bytes
+        .split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+    {
+        let text = String::from_utf8_lossy(item);
+        if let Some((name, value)) = text.split_once('=') {
+            environment.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    environment
+}
+
 impl Sampler for LinuxSampler {
     fn discover(&mut self, roots: &[u32]) -> Result<ProcessTree> {
         let by_pid = read_process_table(&self.proc_root)?;

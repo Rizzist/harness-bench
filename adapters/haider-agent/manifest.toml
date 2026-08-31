@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.966-thin-client-daemon-native-tools-v2"
+revision = "0.0.966-detached-daemon-native-tools-v3"
 
 [availability]
 exec_paths = ["haider"]
@@ -32,34 +32,45 @@ XDG_DATA_HOME = "{{profile}}/data"
 XDG_STATE_HOME = "{{profile}}/state"
 XDG_RUNTIME_DIR = "{{profile}}/runtime"
 TMPDIR = "{{profile}}/tmp"
-HAIDER_PROFILE_DIR = "{{profile}}/haider/store"
-HAIDER_RUNTIME_DIR = "{{profile}}/haider/runtime"
-HAIDER_DISCOVERY_DISABLED = "{{profile}}/discovery-disabled"
 
 [isolation]
 generated_files = []
 forbidden_roots = ["~/.config/haider", "~/.local/share/haider"]
 
-# AHRB owns the resident daemon process group, waits through the public status
-# CLI, then registers the fake provider exactly once in this isolated profile.
+# Haider's public status command auto-spawns a double-forked daemon. AHRB parses
+# status JSON, verifies every reported state/runtime path remains in the cold
+# HOME/TMPDIR, and locates the detached daemon by exact executable plus inherited
+# isolation environment before registering the fake provider once per profile.
 # Every benchmark turn remains a `haider run` thin-client invocation; AHRB does
 # not speak or decode Haider's private socket protocol.
 [daemon]
 persistent = true
-start = ["haiderd"]
+start = ["haider", "status", "--json"]
+launcher_exits = true
 initialize = [
   "haider", "account", "add", "ahrb",
   "--base-url", "{{base_url}}", "--no-auth", "--api-family", "openai",
   "--response-open-timeout", "2s", "--chunk-idle-timeout", "2s",
   "--semantic-progress-timeout", "2s", "--json"
 ]
-pid_locator = "owned haiderd child process group"
-grace_ms = 2000
+grace_ms = 5000
+
+[daemon.process_match]
+executable_name = "haiderd"
+
+[daemon.process_match.environment]
+HOME = "{{profile}}/home"
+TMPDIR = "{{profile}}/tmp"
 
 [daemon.readiness]
-kind = "command"
-command = ["haider", "status", "--json", "--no-spawn"]
-timeout_ms = 10000
+kind = "command-json"
+command = ["haider", "status", "--json"]
+timeout_ms = 30000
+
+[daemon.readiness.json_pointer_roots]
+"/profile_path" = "HOME"
+"/runtime_dir" = "TMPDIR"
+"/daemon/pipe_dir" = "HOME"
 
 [transport]
 kind = "exec"
@@ -192,3 +203,6 @@ durable_journal = "the daemon owns a transactional journal, but 0.0.966 exposes 
 # session; `haider session <id> --watch --no-spawn` is scoped but follows.
 # Wire row 40 only when Haider exposes a finite raw per-session replay command
 # with cursor semantics and a safe native torn-tail fault-injection surface.
+# TODO(orchestrator): confirm the installed 0.0.966 status JSON keeps
+# `/profile_path`, `/runtime_dir`, and `/daemon/pipe_dir` stable and that SIGTERM
+# of the matched `haiderd` performs a clean shutdown after the final thin client.

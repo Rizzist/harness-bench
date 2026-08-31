@@ -209,6 +209,29 @@ pub trait Sampler: Send {
     fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample>;
 }
 
+/// Locate processes by exact executable basename and isolated-root evidence.
+///
+/// This is intentionally stricter than a name-only lookup. Linux reads the
+/// inherited environment directly. macOS uses that evidence when permitted and
+/// otherwise requires an open file beneath one of the same isolated roots.
+pub fn matching_processes(
+    executable_name: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    {
+        return macos::matching_processes(executable_name, environment);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux::matching_processes(executable_name, environment);
+    }
+    #[allow(unreachable_code)]
+    Err(AhrbError::Unsupported(
+        "detached process matching is implemented only on macOS and Linux".to_owned(),
+    ))
+}
+
 /// Reap a direct child with `wait4` and return supplemental terminal usage.
 ///
 /// `no_hang` maps to `WNOHANG`; a return of `Ok(None)` means the child has not
