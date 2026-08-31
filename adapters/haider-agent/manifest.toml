@@ -80,7 +80,7 @@ timeout_ms = 30000
 [transport]
 kind = "exec"
 command = [
-  "haider", "run", "-p", "{{prompt}}", "--account", "ahrb",
+  "haider", "run", "-p", "{{prompt}}", "--model", "ahrb/{{model}}",
   "--output", "jsonl", "--allow-writes", "--allow-exec",
   "--timeout", "30s"
 ]
