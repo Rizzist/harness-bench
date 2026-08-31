@@ -31,6 +31,7 @@ XDG_CACHE_HOME = "{{profile}}/cache"
 XDG_DATA_HOME = "{{profile}}/data"
 XDG_STATE_HOME = "{{profile}}/state"
 XDG_RUNTIME_DIR = "{{profile}}/run"
+HAIDER_RUNTIME_DIR = "{{profile}}/run"
 TMPDIR = "{{profile}}/tmp"
 
 [isolation]
@@ -62,6 +63,7 @@ executable_name = "haiderd"
 HOME = "{{profile}}/home"
 TMPDIR = "{{profile}}/tmp"
 XDG_RUNTIME_DIR = "{{profile}}/run"
+HAIDER_RUNTIME_DIR = "{{profile}}/run"
 
 [daemon.readiness]
 kind = "command-json"
@@ -70,7 +72,7 @@ timeout_ms = 30000
 
 [daemon.readiness.json_pointer_roots]
 "/profile_path" = "HOME"
-"/runtime_dir" = "XDG_RUNTIME_DIR"
+"/runtime_dir" = "HAIDER_RUNTIME_DIR"
 "/daemon/pipe_dir" = "HOME"
 
 [transport]
