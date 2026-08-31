@@ -737,6 +737,7 @@ mod tests {
             collection_wall_ns: 1,
             processes,
             process_samples: Vec::new(),
+            cpu_accounting_warnings: Vec::new(),
         }
     }
 

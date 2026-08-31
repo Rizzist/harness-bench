@@ -835,6 +835,12 @@ pub trait Driver: Send {
     fn close(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
     /// Shut down and clean up the harness.
     fn shutdown(&mut self) -> DriverFuture<'_, ()>;
+    /// Reap launcher handles after AHRB has externally killed the owned tree.
+    ///
+    /// This must not send a graceful control request or mutate harness state.
+    fn reap_after_external_kill(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Release benchmark launch gates after resource membership is armed.
     fn release_invocations(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
@@ -851,6 +857,19 @@ pub trait Driver: Send {
     fn completed_turn_wall_ns(&self) -> Vec<u64> {
         Vec::new()
     }
+    /// Completed one-shot launch/exit boundaries on the shared monotonic clock.
+    fn completed_turn_boundaries(&self) -> Vec<CompletedTurnBoundary> {
+        Vec::new()
+    }
+}
+
+/// Exact external lifecycle boundaries for one completed per-invocation turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedTurnBoundary {
+    /// Boundary immediately before spawning the one-shot child.
+    pub launch_ns: u64,
+    /// Boundary immediately after observing child exit.
+    pub exit_ns: u64,
 }
 
 /// Generic data-driven driver backed by one transport.
@@ -1224,6 +1243,7 @@ struct ActiveInvocation {
     stdout_path: PathBuf,
     gate_path: Option<PathBuf>,
     started: std::time::Instant,
+    launch_ns: u64,
     wall_prefix_ns: u64,
     turn: u64,
 }
@@ -1418,6 +1438,7 @@ pub struct PerInvocationDriver {
     sessions: BTreeMap<String, ExecSession>,
     daemon_process: Option<ManagedDaemonProcess>,
     completed_turn_wall_ns: Vec<u64>,
+    completed_turn_boundaries: Vec<CompletedTurnBoundary>,
 }
 
 impl PerInvocationDriver {
@@ -1430,6 +1451,7 @@ impl PerInvocationDriver {
             sessions: BTreeMap::new(),
             daemon_process: None,
             completed_turn_wall_ns: Vec::new(),
+            completed_turn_boundaries: Vec::new(),
         }
     }
 
@@ -2113,6 +2135,7 @@ impl Driver for PerInvocationDriver {
             // Gated resource trials retain only actual spawn plus post-release
             // execution time, excluding the observer-arming wait.
             let started = std::time::Instant::now();
+            let launch_ns = crate::fake_model::monotonic_timestamp_ns();
             let child = command.spawn()?;
             crate::process::register_child(&child)?;
             let wall_prefix_ns = if gate_path.is_some() {
@@ -2129,6 +2152,7 @@ impl Driver for PerInvocationDriver {
                 stdout_path,
                 gate_path,
                 started,
+                launch_ns,
                 wall_prefix_ns,
                 turn,
             });
@@ -2169,6 +2193,7 @@ impl Driver for PerInvocationDriver {
                     .clone();
                 self.refresh_source(&mut persisted, &invocation, status)?;
                 if status.is_some() {
+                    let exit_ns = crate::fake_model::monotonic_timestamp_ns();
                     if let Some(pid) = invocation_pid {
                         crate::process::retire_process(pid)?;
                     }
@@ -2176,6 +2201,10 @@ impl Driver for PerInvocationDriver {
                         .wall_prefix_ns
                         .saturating_add(duration_ns(invocation.started.elapsed()));
                     self.completed_turn_wall_ns.push(wall_ns);
+                    self.completed_turn_boundaries.push(CompletedTurnBoundary {
+                        launch_ns: invocation.launch_ns,
+                        exit_ns,
+                    });
                     persisted.turns = persisted.turns.saturating_add(1);
                     Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
                     let item = self.sessions.get_mut(&id).ok_or_else(|| {
@@ -2492,6 +2521,21 @@ impl Driver for PerInvocationDriver {
         })
     }
 
+    fn reap_after_external_kill(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            for session in self.sessions.values_mut() {
+                if let Some(invocation) = session.active.as_mut() {
+                    let pid = invocation.child.id();
+                    invocation.child.wait().await?;
+                    if let Some(pid) = pid {
+                        crate::process::retire_process(pid)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn release_invocations(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
             use std::io::Write as _;
@@ -2544,6 +2588,10 @@ impl Driver for PerInvocationDriver {
 
     fn completed_turn_wall_ns(&self) -> Vec<u64> {
         self.completed_turn_wall_ns.clone()
+    }
+
+    fn completed_turn_boundaries(&self) -> Vec<CompletedTurnBoundary> {
+        self.completed_turn_boundaries.clone()
     }
 }
 
@@ -4003,6 +4051,69 @@ mod tests {
         driver.shutdown().await.expect("stop thin-client driver");
         assert!(driver.owned_pids().is_empty());
         std::fs::remove_dir_all(profile).expect("remove thin-client profile");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn per_invocation_driver_reaps_externally_killed_launchers() {
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-external-kill-reap-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest = crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+            .expect("load exec reference manifest");
+        let mut driver = PerInvocationDriver::new(PerInvocationConfig {
+            daemon: None,
+            command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+            resume_command: Vec::new(),
+            release_command: Vec::new(),
+            cancel_command: Vec::new(),
+            replay_command: Vec::new(),
+            environment: BTreeMap::new(),
+            base_variables: BTreeMap::new(),
+            profile_root: profile.clone(),
+            events: manifest.events,
+            exit: manifest.exit,
+            session_id_pointer: String::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4_096,
+            gate_launch: false,
+        });
+        driver.start().await.expect("start per-invocation driver");
+        let session = driver
+            .create_session("external-kill")
+            .await
+            .expect("session");
+        driver
+            .submit(&session, "ignored", "turn-1")
+            .await
+            .expect("launch child");
+        let pid = driver
+            .session_pids(&session)
+            .into_iter()
+            .next()
+            .expect("active launcher PID");
+        let platform_pid = i32::try_from(pid).expect("PID fits platform range");
+        // SAFETY: the PID belongs to the child just spawned by this test.
+        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGKILL) }, 0);
+
+        driver
+            .reap_after_external_kill()
+            .await
+            .expect("reap externally killed launcher");
+        let status = driver
+            .sessions
+            .get_mut(&session.0)
+            .and_then(|session| session.active.as_mut())
+            .expect("active invocation handle")
+            .child
+            .try_wait()
+            .expect("query reaped launcher");
+        assert!(status.is_some());
+
+        drop(driver);
+        std::fs::remove_dir_all(profile).expect("remove external-kill profile");
     }
 
     #[cfg(unix)]

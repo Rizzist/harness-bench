@@ -213,11 +213,25 @@ impl MacOsSampler {
         current_self_cpu: &BTreeMap<ProcIdentity, u64>,
         current_parents: &BTreeMap<ProcIdentity, ProcIdentity>,
         current_child_rollup: &BTreeMap<ProcIdentity, u64>,
+        newly_missing: &[ProcIdentity],
+        readmitted_after_miss: &[(ProcIdentity, u64)],
     ) -> Result<u64> {
-        for (identity, cpu_ns) in &self.last_self_cpu {
-            if current_self_cpu.contains_key(identity) {
+        for (identity, previous_cpu_ns) in readmitted_after_miss {
+            let Some(parent) = self.parent_by_child.get(identity) else {
                 continue;
+            };
+            let Some(pending) = self.pending_sampled_child_cpu.get_mut(parent) else {
+                continue;
+            };
+            *pending = pending.saturating_sub(*previous_cpu_ns);
+            if *pending == 0 {
+                self.pending_sampled_child_cpu.remove(parent);
             }
+        }
+        for identity in newly_missing {
+            let Some(cpu_ns) = self.last_self_cpu.get(identity) else {
+                continue;
+            };
             if let Some(parent) = self.parent_by_child.get(identity) {
                 self.pending_sampled_child_cpu
                     .entry(*parent)
@@ -252,9 +266,21 @@ impl MacOsSampler {
                 .unsampled_child_cpu_ns
                 .saturating_add(delta.saturating_sub(already_sampled));
         }
-        self.last_self_cpu = current_self_cpu.clone();
-        self.parent_by_child = current_parents.clone();
-        self.child_rollup_cpu = current_child_rollup.clone();
+        self.last_self_cpu.extend(
+            current_self_cpu
+                .iter()
+                .map(|(identity, cpu)| (*identity, *cpu)),
+        );
+        self.parent_by_child.extend(
+            current_parents
+                .iter()
+                .map(|(identity, parent)| (*identity, *parent)),
+        );
+        self.child_rollup_cpu.extend(
+            current_child_rollup
+                .iter()
+                .map(|(identity, cpu)| (*identity, *cpu)),
+        );
         Ok(self.unsampled_child_cpu_ns)
     }
 
@@ -483,11 +509,16 @@ impl Sampler for MacOsSampler {
             });
         }
 
-        let unsampled_child_cpu_ns =
-            self.reconcile_child_cpu(&live_cpu, &current_parents, &child_rollup_cpu)?;
-        let cpu_ns = self
-            .cpu
-            .update(&live_cpu)?
+        let cpu_update = self.cpu.update(&live_cpu)?;
+        let unsampled_child_cpu_ns = self.reconcile_child_cpu(
+            &live_cpu,
+            &current_parents,
+            &child_rollup_cpu,
+            &cpu_update.newly_missing,
+            &cpu_update.readmitted_after_miss,
+        )?;
+        let cpu_ns = cpu_update
+            .cumulative_ns
             .saturating_add(unsampled_child_cpu_ns);
         let elapsed_ns = duration_ns(self.started.elapsed());
         let wall_time = SystemTime::now();
@@ -536,6 +567,7 @@ impl Sampler for MacOsSampler {
                 .saturating_add(duration_ns(collection_started.elapsed())),
             processes,
             process_samples,
+            cpu_accounting_warnings: cpu_update.warnings,
         })
     }
 }
@@ -1161,6 +1193,8 @@ mod tests {
                 &BTreeMap::from([(parent, 50), (child, 10)]),
                 &BTreeMap::from([(child, parent)]),
                 &BTreeMap::from([(parent, 0), (child, 0)]),
+                &[],
+                &[],
             )?,
             0
         );
@@ -1169,6 +1203,8 @@ mod tests {
                 &BTreeMap::from([(parent, 55)]),
                 &BTreeMap::new(),
                 &BTreeMap::from([(parent, 12)]),
+                &[child],
+                &[],
             )?,
             2
         );
@@ -1179,6 +1215,8 @@ mod tests {
                 &BTreeMap::from([(parent, 50)]),
                 &BTreeMap::new(),
                 &BTreeMap::from([(parent, 0)]),
+                &[],
+                &[],
             )?,
             0
         );
@@ -1187,9 +1225,58 @@ mod tests {
                 &BTreeMap::from([(parent, 55)]),
                 &BTreeMap::new(),
                 &BTreeMap::from([(parent, 7)]),
+                &[],
+                &[],
             )?,
             7
         );
+        Ok(())
+    }
+
+    #[test]
+    fn child_rollup_suppression_starts_on_first_miss_before_retirement() -> Result<()> {
+        let parent = ProcIdentity {
+            pid: 300,
+            start_time: 3,
+        };
+        let child = ProcIdentity {
+            pid: 400,
+            start_time: 4,
+        };
+        let mut tracker = TreeCpuTracker::default();
+        let mut sampler = MacOsSampler::default();
+        let initial_cpu = BTreeMap::from([(parent, 50), (child, 10)]);
+        let initial = tracker.update(&initial_cpu)?;
+        assert_eq!(
+            sampler.reconcile_child_cpu(
+                &initial_cpu,
+                &BTreeMap::from([(child, parent)]),
+                &BTreeMap::from([(parent, 0), (child, 0)]),
+                &initial.newly_missing,
+                &initial.readmitted_after_miss,
+            )?,
+            0
+        );
+
+        for (parent_cpu, expected_missing) in [(55, true), (56, false), (57, false)] {
+            let current_cpu = BTreeMap::from([(parent, parent_cpu)]);
+            let update = tracker.update(&current_cpu)?;
+            assert_eq!(update.newly_missing.contains(&child), expected_missing);
+            assert_eq!(
+                sampler.reconcile_child_cpu(
+                    &current_cpu,
+                    &BTreeMap::new(),
+                    &BTreeMap::from([(parent, 12)]),
+                    &update.newly_missing,
+                    &update.readmitted_after_miss,
+                )?,
+                2
+            );
+            assert_eq!(
+                update.cumulative_ns.saturating_add(2),
+                parent_cpu.saturating_add(12)
+            );
+        }
         Ok(())
     }
 }

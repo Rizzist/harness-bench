@@ -2,15 +2,36 @@ use ahrb::evaluate::{TestOutcome, classify};
 use ahrb::scenarios::{PRIORITIZED_ROWS, RequirementKind, all};
 
 #[test]
-fn matrix_has_exactly_41_ordered_unique_rows() {
+fn matrix_has_exactly_44_ordered_unique_rows() {
     let tests = all();
-    assert_eq!(tests.len(), 41);
+    assert_eq!(tests.len(), 44);
     let rows: Vec<u8> = tests.iter().map(|test| test.row).collect();
-    assert_eq!(rows, (1_u8..=41).collect::<Vec<_>>());
+    assert_eq!(rows, (1_u8..=44).collect::<Vec<_>>());
     let mut ids: Vec<&str> = tests.iter().map(|test| test.id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 41);
+    assert_eq!(ids.len(), 44);
+}
+
+#[test]
+fn row_42_is_informational_resource_evidence() {
+    let definition = all().iter().find(|test| test.row == 42).expect("row 42");
+    assert_eq!(definition.id, "model-request-efficiency");
+    assert_eq!(definition.requirement(), RequirementKind::Informational);
+}
+
+#[test]
+fn row_43_is_informational_resource_evidence() {
+    let definition = all().iter().find(|test| test.row == 43).expect("row 43");
+    assert_eq!(definition.id, "turn-latency-distribution");
+    assert_eq!(definition.requirement(), RequirementKind::Informational);
+}
+
+#[test]
+fn row_44_is_core_resource_evidence() {
+    let definition = all().iter().find(|test| test.row == 44).expect("row 44");
+    assert_eq!(definition.id, "process-hygiene");
+    assert_eq!(definition.requirement(), RequirementKind::Core);
 }
 
 #[test]

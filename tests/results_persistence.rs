@@ -44,6 +44,9 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
     assert_eq!(entry.counts.fail, 0);
     assert_eq!(entry.counts.unsupported, 0);
     assert_eq!(entry.counts.error, 0);
+    assert_ne!(entry.ahrb_revision, "unknown");
+    assert!(!entry.harness_version.contains(['\n', '\r']));
+    assert!(entry.harness_version.chars().count() <= 80);
     assert!(entry.load_avg_1m.is_some());
     let saved = root.join(&entry.results_dir);
     for file in [
@@ -55,6 +58,7 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
         "membership.jsonl",
         "events.jsonl",
         "model-requests.jsonl",
+        "turns.jsonl",
     ] {
         assert!(primary.join(file).is_file(), "primary missing {file}");
         assert!(saved.join(file).is_file(), "saved bundle missing {file}");

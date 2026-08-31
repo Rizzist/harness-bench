@@ -61,6 +61,15 @@ fn run_profile(output: &Path) -> PathBuf {
     profiles.remove(0)
 }
 
+fn derived_row43_journal(profile: &Path) -> String {
+    std::fs::read_dir(profile.join("derived-row43/state/sessions"))
+        .expect("read derived row-43 sessions")
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("journal.jsonl")).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn provider_value(provider: &str, key: &str) -> String {
     let prefix = format!("{key} = '");
     provider
@@ -112,12 +121,24 @@ fn assert_exec_template_propagation(output: &Path, report: &Report) {
     let rendered = report
         .events
         .iter()
+        .filter(|event| {
+            event
+                .get("actor")
+                .and_then(Value::as_str)
+                .is_some_and(|actor| actor.starts_with("ahrb-matrix-v1:"))
+        })
         .filter_map(exec_template_evidence)
         .collect::<Vec<_>>();
     let accepted_turns = report
         .events
         .iter()
-        .filter(|event| event.get("event").and_then(Value::as_str) == Some("turn-accepted"))
+        .filter(|event| {
+            event.get("event").and_then(Value::as_str) == Some("turn-accepted")
+                && event
+                    .get("actor")
+                    .and_then(Value::as_str)
+                    .is_some_and(|actor| actor.starts_with("ahrb-matrix-v1:"))
+        })
         .count();
     assert!(
         !rendered.is_empty(),
@@ -131,6 +152,56 @@ fn assert_exec_template_propagation(output: &Path, report: &Report) {
     for evidence in &rendered {
         assert_rendered_bindings(evidence, &base_url, &credential_fingerprint);
     }
+
+    let derived_profiles = BTreeMap::from([
+        ("ahrb-row42-r1:row42", "derived-row42-r1"),
+        ("ahrb-row42-r2:row42", "derived-row42-r2"),
+        ("ahrb-row43:row43", "derived-row43"),
+    ]);
+    let mut derived_credentials = Vec::new();
+    let mut derived_accepted_turns = 0_usize;
+    for (actor, directory) in derived_profiles {
+        let provider =
+            std::fs::read_to_string(profile.join(directory).join("config/provider.toml"))
+                .unwrap_or_else(|error| panic!("read {directory} provider config: {error}"));
+        let derived_base_url = provider_value(&provider, "base_url");
+        let derived_credential = provider_value(&provider, "credential");
+        let derived_fingerprint = format!("{:x}", Sha256::digest(derived_credential.as_bytes()));
+        let actor_events = report
+            .events
+            .iter()
+            .filter(|event| event.get("actor").and_then(Value::as_str) == Some(actor))
+            .filter_map(exec_template_evidence)
+            .collect::<Vec<_>>();
+        assert!(!actor_events.is_empty(), "no derived events for {actor}");
+        for evidence in actor_events {
+            assert_rendered_bindings(evidence, &derived_base_url, &derived_fingerprint);
+            derived_accepted_turns = derived_accepted_turns.saturating_add(1);
+        }
+        derived_credentials.push(derived_credential);
+    }
+    assert_eq!(derived_accepted_turns, 140);
+    let row43_primary_requests = report
+        .model_requests
+        .iter()
+        .filter(|request| {
+            request.pointer("/request/scenario").and_then(Value::as_str) == Some("ahrb-row43")
+                && request.get("accepted").and_then(Value::as_bool) == Some(true)
+                && request.get("role").and_then(Value::as_str) == Some("primary")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row43_primary_requests.len(), 100);
+    assert!(row43_primary_requests.iter().all(|request| {
+        request
+            .pointer("/request/checkpoint")
+            .and_then(Value::as_str)
+            != Some("warmup")
+    }));
+    let row43_journal = derived_row43_journal(&profile);
+    assert_eq!(
+        row43_journal.matches("\"key\":\"row-43-warmup\"").count(),
+        1
+    );
 
     let mut turns_by_session = BTreeMap::<&str, usize>::new();
     for event in report
@@ -198,6 +269,12 @@ fn assert_exec_template_propagation(output: &Path, report: &Report) {
         !serialized_report.contains(&credential),
         "raw rendered credential leaked into report evidence"
     );
+    assert!(
+        derived_credentials
+            .iter()
+            .all(|credential| { !serialized_report.contains(credential) }),
+        "raw derived-row credential leaked into report evidence"
+    );
 }
 
 #[test]
@@ -212,7 +289,7 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
         Some(0),
         "reference per-invocation certification must exit zero"
     );
-    assert_eq!(report.results.len(), 41);
+    assert_eq!(report.results.len(), 44);
     let pass_count = report
         .results
         .iter()
@@ -225,7 +302,7 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
             matches!(result.outcome, TestOutcome::Unsupported(_)).then_some(result.row)
         })
         .collect::<Vec<_>>();
-    assert_eq!(pass_count, 35);
+    assert_eq!(pass_count, 38);
     assert_eq!(unsupported_rows, vec![4, 18, 31, 32, 33, 39]);
     assert!(
         report.results.iter().all(|result| {
@@ -235,6 +312,11 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
     let badge = report.badge.as_ref().expect("reduced-facet badge");
     assert_eq!(badge.topology, "client-process-fanout");
     assert_eq!(badge.parallel_width, 4);
+    assert_eq!(badge.spec_version, 2);
+    assert!(matches!(
+        badge.latency_class.as_str(),
+        "L100" | "L250" | "L500" | "L1000"
+    ));
     assert_eq!(badge.facets, vec!["replay", "crash", "resume"]);
     assert_eq!(badge.comparison_scope, "within-topology-only");
     assert!(report.resource_summary.peak_rss_mib > 0.0);
@@ -249,6 +331,20 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
     );
     assert!(report.resource_summary.scaling_alpha.is_some());
     assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
+    assert_eq!(report.turns.len(), 100);
+    assert!(report.turns.iter().all(|turn| {
+        turn.launch_ns
+            .zip(turn.exit_ns)
+            .zip(turn.turn_wall_ns)
+            .is_some_and(|((launch, exit), wall)| exit.checked_sub(launch) == Some(wall))
+    }));
+    assert_eq!(report.resource_summary.topology, "client-process-fanout");
+    assert_eq!(
+        report.resource_summary.comparison_scope,
+        "within-topology-only"
+    );
+    assert!(report.resource_summary.wall_per_turn_p95_ms <= 1_000.0);
+    assert!(report.resource_summary.wall_per_turn_jitter_ratio <= 0.25);
     let sampled_peak = report
         .samples
         .iter()

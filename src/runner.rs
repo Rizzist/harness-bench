@@ -7,17 +7,21 @@ use crate::driver::{
     StdinRpcTransport, Transport,
 };
 use crate::evaluate::{
-    Assertion, TestOutcome, TestResult, badge_label, certify, classify, suite_exit_code,
+    Assertion, TestOutcome, TestResult, TestResultMetadata, badge_label, certify, classify,
+    suite_exit_code,
 };
 use crate::events::{EventVocab, NormalizedEvent};
 use crate::fake_model::{
-    FakeModelEngine, FakeModelServer, FakeModelUnixServer, is_transient_bind_error,
+    FakeModelEngine, FakeModelMailboxServer, FakeModelServer, FakeModelUnixServer,
+    is_transient_bind_error, monotonic_timestamp_ns,
 };
 use crate::manifest::{Manifest, TransportKind};
 use crate::process::{ProcessSample, ProcessTree, Sample, Sampler};
 use crate::report::{
-    Fingerprint, MembershipSample, Report, TopologyMetric, render_resource_summary,
-    summarize_resources,
+    Fingerprint, MembershipSample, ProcessHygieneAudit, ProcessHygieneCadenceSample,
+    ProcessHygieneCheckpoint, ProcessHygieneEvaluation, ProcessHygieneEvidence,
+    ProcessHygieneProcess, Report, TopologyMetric, TurnLatencyEvaluation, TurnObservation,
+    evaluate_process_hygiene, evaluate_turn_latency, render_resource_summary, summarize_resources,
 };
 use crate::resource_certification::{
     CleanupObservation, ColdStartObservation, IdleObservation, IdlePhaseRepetition,
@@ -38,7 +42,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -51,6 +55,7 @@ enum ModelServer {
         server: FakeModelUnixServer,
         directory: PathBuf,
     },
+    Mailbox(FakeModelMailboxServer),
     Embedded,
 }
 
@@ -63,6 +68,7 @@ impl ModelServer {
                 std::fs::remove_dir(directory)?;
                 Ok(())
             }
+            Self::Mailbox(server) => server.shutdown().await,
             Self::Embedded => Ok(()),
         }
     }
@@ -140,6 +146,67 @@ struct PerInvocationResourceCollection {
     turn_wall_ns: Vec<u64>,
 }
 
+struct ModelRequestEfficiencyTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    process_hygiene: Option<ProcessHygieneEvidence>,
+}
+
+struct TurnLatencyTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    turns: Vec<TurnObservation>,
+}
+
+struct DerivedRowEvaluations<'a> {
+    model_request_efficiency: &'a crate::fake_model::ModelRequestEfficiencyEvaluation,
+    turn_latency: &'a TurnLatencyEvaluation,
+    process_hygiene: &'a ProcessHygieneEvaluation,
+}
+
+fn apply_turn_latency_summary(
+    summary: &mut crate::report::ResourceSummary,
+    evaluation: &TurnLatencyEvaluation,
+) {
+    summary.wall_per_turn_p50_ms = evaluation.wall_per_turn_p50_ms;
+    summary.wall_per_turn_p95_ms = evaluation.wall_per_turn_p95_ms;
+    summary.wall_per_turn_max_ms = evaluation.wall_per_turn_max_ms;
+    summary.wall_per_turn_mad_ms = evaluation.wall_per_turn_mad_ms;
+    summary.wall_per_turn_jitter_ratio = evaluation.wall_per_turn_jitter_ratio;
+    summary.latency_class.clone_from(&evaluation.latency_class);
+}
+
+fn turn_latency_resource_metrics(evaluation: &TurnLatencyEvaluation) -> BTreeMap<String, f64> {
+    BTreeMap::from([
+        (
+            "wall_per_turn_p50_ms".to_owned(),
+            evaluation.wall_per_turn_p50_ms,
+        ),
+        (
+            "wall_per_turn_p95_ms".to_owned(),
+            evaluation.wall_per_turn_p95_ms,
+        ),
+        (
+            "wall_per_turn_max_ms".to_owned(),
+            evaluation.wall_per_turn_max_ms,
+        ),
+        (
+            "wall_per_turn_mad_ms".to_owned(),
+            evaluation.wall_per_turn_mad_ms,
+        ),
+        (
+            "wall_per_turn_jitter_ratio".to_owned(),
+            evaluation.wall_per_turn_jitter_ratio,
+        ),
+    ])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunInterruption {
+    Deadline,
+    Abort,
+}
+
 fn per_invocation_topology(manifest: &Manifest) -> bool {
     !manifest.daemon.persistent
         && matches!(
@@ -157,7 +224,7 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
     let deadline_secs = crate::cli::deadline_secs(&options)?;
     let started = Instant::now();
     let progress = RunProgress::default();
-    let outcome = match tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         Duration::from_secs(deadline_secs),
         run_inner(
             options.clone(),
@@ -166,9 +233,32 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
             persistence.clone(),
         ),
     )
-    .await
-    {
-        Ok(result) => result,
+    .await;
+    let outcome = match outcome {
+        Ok(Ok(code)) => Ok(code),
+        Ok(Err(error)) => {
+            let error = match ensure_owned_cleanup() {
+                Ok(()) => error,
+                Err(cleanup_error) => AhrbError::Protocol(format!(
+                    "{error}; abort cleanup also failed: {cleanup_error}"
+                )),
+            };
+            crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
+            write_abort_report(
+                &options,
+                &manifest,
+                &selected,
+                &progress,
+                &persistence,
+                &error.to_string(),
+            )?;
+            eprintln!(
+                "ahrb: run aborted for manifest {}: {error}; wrote {}",
+                options.manifest.display(),
+                options.output.join("report.json").display()
+            );
+            return Ok(2);
+        }
         Err(_) => {
             ensure_owned_cleanup()?;
             let detail = format!("deadline after {deadline_secs}s");
@@ -251,6 +341,46 @@ fn write_deadline_report(
     persistence: &crate::results::RunPersistence,
     detail: &str,
 ) -> Result<()> {
+    write_interrupted_report(
+        options,
+        manifest,
+        selected,
+        progress,
+        persistence,
+        detail,
+        RunInterruption::Deadline,
+    )
+}
+
+fn write_abort_report(
+    options: &RunOptions,
+    manifest: &Manifest,
+    selected: &[&crate::scenarios::TestDefinition],
+    progress: &RunProgress,
+    persistence: &crate::results::RunPersistence,
+    detail: &str,
+) -> Result<()> {
+    write_interrupted_report(
+        options,
+        manifest,
+        selected,
+        progress,
+        persistence,
+        detail,
+        RunInterruption::Abort,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_interrupted_report(
+    options: &RunOptions,
+    manifest: &Manifest,
+    selected: &[&crate::scenarios::TestDefinition],
+    progress: &RunProgress,
+    persistence: &crate::results::RunPersistence,
+    detail: &str,
+    interruption: RunInterruption,
+) -> Result<()> {
     let manifest_hash = crate::manifest::hash(manifest)?;
     let selected_rows: Vec<u8> = selected.iter().map(|definition| definition.row).collect();
     let progress = progress.snapshot()?;
@@ -260,12 +390,19 @@ fn write_deadline_report(
             row: definition.row,
             id: definition.id.to_owned(),
             pillar: definition.pillar,
-            outcome: if progress.completed.contains(&definition.row) {
-                TestOutcome::Error("deadline interrupted final evaluation".to_owned())
-            } else {
-                TestOutcome::Error("deadline".to_owned())
+            outcome: match interruption {
+                RunInterruption::Deadline if progress.completed.contains(&definition.row) => {
+                    TestOutcome::Error("deadline interrupted final evaluation".to_owned())
+                }
+                RunInterruption::Deadline => TestOutcome::Error("deadline".to_owned()),
+                RunInterruption::Abort => TestOutcome::Error("run aborted".to_owned()),
             },
-            evidence: if progress.completed.contains(&definition.row) {
+            evidence: if interruption == RunInterruption::Abort {
+                vec![
+                    "run aborted before a trustworthy final report".to_owned(),
+                    detail.to_owned(),
+                ]
+            } else if progress.completed.contains(&definition.row) {
                 vec![
                     "row terminalized before the run deadline".to_owned(),
                     detail.to_owned(),
@@ -281,8 +418,15 @@ fn write_deadline_report(
                     detail.to_owned(),
                 ]
             },
+            metadata: TestResultMetadata::for_row(
+                definition.row,
+                &TestOutcome::Error("run interrupted".to_owned()),
+            ),
         })
         .map(|fallback| {
+            if interruption == RunInterruption::Abort {
+                return fallback;
+            }
             progress
                 .row_errors
                 .get(&fallback.row)
@@ -292,6 +436,10 @@ fn write_deadline_report(
                     pillar: fallback.pillar,
                     outcome: TestOutcome::Error(error.clone()),
                     evidence: vec![error.clone()],
+                    metadata: TestResultMetadata::for_row(
+                        fallback.row,
+                        &TestOutcome::Error(error.clone()),
+                    ),
                 })
                 .or_else(|| progress.results.get(&fallback.row).cloned())
                 .unwrap_or(fallback)
@@ -304,7 +452,8 @@ fn write_deadline_report(
         }
     }
     let report = Report {
-        schema: 2,
+        schema: 3,
+        spec_version: 2,
         run_id: deterministic_run_id(&manifest_hash, &selected_rows),
         fingerprint: Fingerprint {
             harness: manifest.identity.id.clone(),
@@ -313,7 +462,7 @@ fn write_deadline_report(
             workflows: workflow_hash(),
             fake_model: env!("CARGO_PKG_VERSION").to_owned(),
             normalizer: env!("CARGO_PKG_VERSION").to_owned(),
-            ahrb_revision: option_env!("AHRB_REVISION").unwrap_or("unknown").to_owned(),
+            ahrb_revision: crate::results::ahrb_revision(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             host_memory_bytes: host_memory_bytes(),
             profile: format!("{:?}", options.profile).to_lowercase(),
@@ -370,7 +519,9 @@ async fn run_inner(
         ("endpoint".to_owned(), String::new()),
     ]);
 
-    let embedded_model = std::env::var("CODEX_SANDBOX_NETWORK_DISABLED").as_deref() == Ok("1");
+    // Provider evidence must remain outside the harness process. When TCP loopback is
+    // unavailable, `start_model` falls back to its Unix-domain HTTP transport.
+    let embedded_model = false;
     let (workflow, actors_by_row) = build_workflow(
         &selected_rows,
         &profile_root,
@@ -378,9 +529,10 @@ async fn run_inner(
         options.profile,
         &manifest,
     )?;
-    let engine = Arc::new(FakeModelEngine::with_model_roles(
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
         &workflow,
         &manifest.model_roles,
+        &manifest.request_role_rules,
     )?);
     let (server, model_environment) = start_model(
         Arc::clone(&engine),
@@ -577,7 +729,7 @@ async fn run_inner(
     let mut sessions: BTreeMap<u8, Vec<crate::driver::SessionId>> = BTreeMap::new();
 
     for (row, actor_names) in &actors_by_row {
-        if (20..=29).contains(row) {
+        if (20..=29).contains(row) || matches!(*row, 42..=44) {
             continue;
         }
         if !matches!(
@@ -979,14 +1131,20 @@ async fn run_inner(
         let owned_tree = platform_sampler.discover(&recovery_roots)?;
         let had_owned_process = !owned_tree.members.is_empty();
         signal_owned_tree(&owned_tree)?;
+        let recovery_grace = Duration::from_millis(manifest.daemon.grace_ms.max(100));
+        if let Ok(reap_result) =
+            tokio::time::timeout(recovery_grace, driver.reap_after_external_kill()).await
+        {
+            reap_result.map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "reap externally killed recovery launchers: {error}"
+                ))
+            })?;
+        }
         drop(driver);
         let tree_cleared = had_owned_process
-            && await_owned_tree_empty(
-                platform_sampler.as_mut(),
-                &recovery_roots,
-                Duration::from_millis(manifest.daemon.grace_ms.max(100)),
-            )
-            .await?;
+            && await_owned_tree_empty(platform_sampler.as_mut(), &recovery_roots, recovery_grace)
+                .await?;
         crash_recovery_tree_cleared = Some(tree_cleared);
         if tree_cleared {
             if let Some(session) = sessions.get(&40).and_then(|items| items.first()) {
@@ -1126,6 +1284,65 @@ async fn run_inner(
         driver.shutdown().await?;
     }
 
+    // Derived-row workloads own independent drivers and provider ledgers. Run
+    // them only after the v1 driver has completed its terminal or recovery
+    // lifecycle so their duration cannot change any v1 observation.
+    let row42_trials = if selected_rows.contains(&42) || selected_rows.contains(&44) {
+        match collect_model_request_efficiency_trials(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &manifest_hash,
+            selected_rows.contains(&44),
+        )
+        .await
+        {
+            Ok(trials) => {
+                let evidence_row = if selected_rows.contains(&42) { 42 } else { 44 };
+                events.insert(evidence_row, trials.events.clone());
+                Some(trials)
+            }
+            Err(AhrbError::Timeout(detail)) => {
+                for row in [42_u8, 44_u8] {
+                    if selected_rows.contains(&row) {
+                        let result: Result<()> = Err(AhrbError::Timeout(detail.clone()));
+                        let _ = row_timeout(row, result, &mut row_errors, &progress)?;
+                    }
+                }
+                None
+            }
+            Err(error) => {
+                return Err(AhrbError::Protocol(format!(
+                    "collect shared model-request-efficiency/process-hygiene sequence: {error}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    let row43_trials = if selected_rows.contains(&43) {
+        match collect_turn_latency_trials(&manifest, options.profile, &profile_root, &manifest_hash)
+            .await
+        {
+            Ok(trials) => {
+                events.insert(43_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(AhrbError::Timeout(detail)) => {
+                let result: Result<()> = Err(AhrbError::Timeout(detail));
+                let _ = row_timeout(43, result, &mut row_errors, &progress)?;
+                None
+            }
+            Err(error) => {
+                return Err(AhrbError::Protocol(format!(
+                    "collect turn-latency-distribution: {error}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
     let state = RunState {
         events,
         sessions,
@@ -1159,8 +1376,35 @@ async fn run_inner(
             .unwrap_or_default(),
         row_errors,
     };
-    let request_records = engine.request_records().await;
+    let mut request_records = engine.request_records().await;
+    if let Some(trials) = &row42_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row43_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if row42_trials.is_some() || row43_trials.is_some() {
+        request_records.sort_by(|left, right| {
+            (
+                &left.request.scenario,
+                &left.request.actor,
+                &left.request.checkpoint,
+                left.semantic_ordinal,
+                left.attempt,
+            )
+                .cmp(&(
+                    &right.request.scenario,
+                    &right.request.actor,
+                    &right.request.checkpoint,
+                    right.semantic_ordinal,
+                    right.attempt,
+                ))
+        });
+    }
     server.shutdown().await?;
+    // Final cleanup is part of the run outcome, not a post-report afterthought:
+    // a protocol-level residue failure must be persisted as an aborted run.
+    ensure_owned_cleanup()?;
 
     let resource_evidence = state
         .resource_evidence
@@ -1218,7 +1462,7 @@ async fn run_inner(
             .unwrap_or(0.0)
             / (1024.0 * 1024.0)
     });
-    let resource_summary = summarize_resources(
+    let mut resource_summary = summarize_resources(
         summary_samples,
         &membership,
         workflow_turns,
@@ -1233,9 +1477,63 @@ async fn run_inner(
             .get("parallel_scaling_exponent")
             .copied(),
     );
+    resource_summary.topology = manifest.concurrency.topology.clone();
+    resource_summary.comparison_scope = "within-topology-only".to_owned();
     enforce_sampler_overhead(
         &mut resource_certification.rows,
         resource_summary.sampler_overhead_pct,
+    );
+    let row42_records = request_records
+        .iter()
+        .filter(|record| record.request.actor.starts_with("r42"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let row42_completed_turns = state
+        .events
+        .get(&42)
+        .into_iter()
+        .flatten()
+        .filter(|event| is_terminal(&event.event))
+        .count() as u64;
+    let row42_expected_turns = match options.profile {
+        Profile::Quick => 40,
+        Profile::Cert => 200,
+    };
+    let row42_evaluation = crate::fake_model::evaluate_model_request_efficiency(
+        &row42_records,
+        row42_completed_turns,
+        row42_expected_turns,
+    );
+    let row43_expected_turns = match options.profile {
+        Profile::Quick => 100,
+        Profile::Cert => 1_000,
+    };
+    let row43_observations = row43_trials
+        .as_ref()
+        .map_or(&[][..], |trials| trials.turns.as_slice());
+    let row43_evaluation = evaluate_turn_latency(
+        row43_observations,
+        row43_expected_turns,
+        per_invocation_topology(&manifest),
+        manifest.resources.turn_timeout_ms,
+    );
+    if selected_rows.contains(&43) {
+        apply_turn_latency_summary(&mut resource_summary, &row43_evaluation);
+    }
+    let row44_evidence = row42_trials
+        .as_ref()
+        .and_then(|trials| trials.process_hygiene.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let row44_turns = match options.profile {
+        Profile::Quick => 20,
+        Profile::Cert => 100,
+    };
+    let row44_evaluation = evaluate_process_hygiene(
+        &row44_evidence,
+        2,
+        row44_turns,
+        per_invocation_topology(&manifest),
     );
     let mut results = evaluate_rows(
         &selected,
@@ -1244,6 +1542,11 @@ async fn run_inner(
         &manifest,
         &resource_certification,
         &profile_root,
+        &DerivedRowEvaluations {
+            model_request_efficiency: &row42_evaluation,
+            turn_latency: &row43_evaluation,
+            process_hygiene: &row44_evaluation,
+        },
     );
     results.sort_by_key(|result| result.row);
     progress.update(|state| {
@@ -1271,6 +1574,9 @@ async fn run_inner(
                 as f64
         },
     );
+    if selected_rows.contains(&43) {
+        resource_metric_values.extend(turn_latency_resource_metrics(&row43_evaluation));
+    }
     let marginal_bytes = resource_metric_values
         .get("parallel_beta_bytes_per_agent")
         .copied()
@@ -1319,12 +1625,32 @@ async fn run_inner(
             if value { 1.0 } else { 0.0 },
         );
     }
+    if selected_rows.contains(&42) {
+        metrics.extend(row42_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&44) {
+        metrics.extend(row44_evaluation.metrics.clone());
+    }
+    let mut details = BTreeMap::new();
+    if selected_rows.contains(&42) {
+        details.insert(
+            "model-request-efficiency".to_owned(),
+            row42_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&44) {
+        details.insert(
+            "process-hygiene".to_owned(),
+            row44_evaluation.details.clone(),
+        );
+    }
     let badge = certify(
         &results,
         &manifest,
         std::env::consts::OS,
         state.parallel_agents,
         marginal_bytes,
+        &resource_summary.latency_class,
     );
     let mut raw_events = Vec::new();
     for row_events in state.events.values() {
@@ -1341,18 +1667,23 @@ async fn run_inner(
         for row_events in state.events.values() {
             for event in row_events {
                 if event.event == EventVocab::ModelRequest {
-                    model_requests.push(json!({
-                        "event": event,
-                        "model": event.payload.get("model").cloned().unwrap_or(Value::Null),
-                        "endpoint": event.payload.get("endpoint").cloned().unwrap_or(Value::Null),
-                        "credential_fingerprint": "embedded-redacted"
-                    }));
+                    if event.payload.get("request").is_some() {
+                        model_requests.push(event.payload.clone());
+                    } else {
+                        model_requests.push(json!({
+                            "event": event,
+                            "model": event.payload.get("model").cloned().unwrap_or(Value::Null),
+                            "endpoint": event.payload.get("endpoint").cloned().unwrap_or(Value::Null),
+                            "credential_fingerprint": "embedded-redacted"
+                        }));
+                    }
                 }
             }
         }
     }
     let report = Report {
-        schema: 2,
+        schema: 3,
+        spec_version: 2,
         run_id,
         fingerprint: Fingerprint {
             harness: manifest.identity.id.clone(),
@@ -1361,10 +1692,7 @@ async fn run_inner(
             workflows: workflow_hash(),
             fake_model: env!("CARGO_PKG_VERSION").to_owned(),
             normalizer: env!("CARGO_PKG_VERSION").to_owned(),
-            ahrb_revision: match option_env!("AHRB_REVISION") {
-                Some(revision) => revision.to_owned(),
-                None => "unknown".to_owned(),
-            },
+            ahrb_revision: crate::results::ahrb_revision(),
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             host_memory_bytes: host_memory_bytes(),
             profile: format!("{:?}", options.profile).to_lowercase(),
@@ -1372,6 +1700,7 @@ async fn run_inner(
         results,
         badge,
         metrics,
+        details,
         resource_metrics,
         resource_summary,
         samples: state.samples,
@@ -1379,6 +1708,9 @@ async fn run_inner(
         membership,
         events: raw_events,
         model_requests,
+        turns: row43_trials
+            .as_ref()
+            .map_or_else(Vec::new, |trials| trials.turns.clone()),
     };
     crate::results::persist_report(&persistence, &report, options.junit, false)?;
     println!("{}", render_resource_summary(&report.resource_summary));
@@ -1549,14 +1881,34 @@ async fn start_model(
                 || is_transient_bind_error(&error) =>
         {
             let tcp_error = error.to_string();
-            start_unix_model(engine).await.map_err(|unix_error| {
-                AhrbError::Protocol(format!(
-                    "TCP fake-model bind failed after bounded retries ({tcp_error}); Unix-socket fallback failed: {unix_error}"
-                ))
-            })
+            match start_unix_model(Arc::clone(&engine)).await {
+                Ok(started) => Ok(started),
+                Err(unix_error) => start_mailbox_model(engine).await.map_err(|mailbox_error| {
+                    AhrbError::Protocol(format!(
+                        "TCP fake-model bind failed after bounded retries ({tcp_error}); Unix-socket fallback failed ({unix_error}); provider mailbox fallback failed: {mailbox_error}"
+                    ))
+                }),
+            }
         }
         Err(error) => Err(error),
     }
+}
+
+async fn start_mailbox_model(
+    engine: Arc<FakeModelEngine>,
+) -> Result<(ModelServer, BTreeMap<String, String>)> {
+    #[cfg(target_os = "macos")]
+    let root = PathBuf::from("/private/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let root = PathBuf::from("/tmp");
+    let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = root.join(format!("ahrb-fmb-{}-{sequence}", std::process::id()));
+    let server = FakeModelMailboxServer::bind(directory.clone(), engine).await?;
+    let environment = BTreeMap::from([(
+        "AHRB_MOCK_PROVIDER_MAILBOX".to_owned(),
+        directory.to_string_lossy().into_owned(),
+    )]);
+    Ok((ModelServer::Mailbox(server), environment))
 }
 
 async fn start_unix_model(
@@ -1807,6 +2159,40 @@ fn build_workflow(
                 },
             );
             let mut row_responses = scripted_row(*row, scenario, &actor, manifest)?;
+            if *row == 42 {
+                let turns = match profile {
+                    Profile::Quick => 20,
+                    Profile::Cert => 100,
+                };
+                for turn in 2..=turns {
+                    let turn_actor = format!("{actor}-turn-{turn}");
+                    actors.insert(
+                        turn_actor.clone(),
+                        Actor {
+                            id: turn_actor.clone(),
+                            parent: None,
+                            prompt: format!(
+                                "AHRB model request efficiency turn {turn} {}",
+                                route_marker(scenario, &turn_actor, "start")
+                            ),
+                            workspace: profile_root
+                                .join("workspaces")
+                                .join(&turn_actor)
+                                .to_string_lossy()
+                                .into_owned(),
+                        },
+                    );
+                    row_responses.push(ScriptedResponse {
+                        scenario: scenario.to_owned(),
+                        actor: turn_actor,
+                        checkpoint: "start".to_owned(),
+                        request_hash: String::new(),
+                        response: success_value(),
+                        fault: None,
+                        barrier: None,
+                    });
+                }
+            }
             if *row == 26 && state_barrier {
                 if let Some(first) = row_responses.first_mut() {
                     first.barrier = Some("row26-steady".to_owned());
@@ -1899,6 +2285,949 @@ fn build_workflow(
         },
         actors_by_row,
     ))
+}
+
+fn model_efficiency_workflow(profile_root: &Path, repetition: u32, turns: u32) -> Workflow {
+    let scenario = format!("ahrb-row42-r{repetition}");
+    let actor = format!("r42-r{repetition}");
+    let actors = BTreeMap::from([(
+        actor.clone(),
+        Actor {
+            id: actor.clone(),
+            parent: None,
+            prompt: format!(
+                "AHRB model request efficiency direct terminal turn 1 {}",
+                route_marker(&scenario, &actor, "turn-001")
+            ),
+            workspace: profile_root
+                .join("workspace")
+                .to_string_lossy()
+                .into_owned(),
+        },
+    )]);
+    let mut responses = Vec::new();
+    for turn in 1..=turns {
+        responses.push(ScriptedResponse {
+            scenario: scenario.clone(),
+            actor: actor.clone(),
+            checkpoint: format!("turn-{turn:03}"),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: None,
+            barrier: None,
+        });
+    }
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario,
+        actors,
+        barriers: BTreeMap::new(),
+        responses,
+    }
+}
+
+fn sample_process_hygiene(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    phase: &str,
+    elapsed_ns: u64,
+) -> Result<(ProcessHygieneCadenceSample, Vec<String>)> {
+    let wall_started = Instant::now();
+    let cpu_started = sampler_thread_cpu_ns()?;
+    let tree = sampler.discover(roots)?;
+    let sample = sampler.sample(&tree, phase)?;
+    let collection_cpu_ns = sampler_thread_cpu_ns()?.saturating_sub(cpu_started);
+    let collection_wall_ns = duration_ns(wall_started.elapsed());
+    let mut warnings = Vec::new();
+    for warning in sample.cpu_accounting_warnings {
+        warnings.push(serde_json::to_string(&warning)?);
+    }
+    let mut processes = sample
+        .process_samples
+        .into_iter()
+        .map(|process| ProcessHygieneProcess {
+            identity: process.process.identity,
+            command: process.process.command,
+            ownership: process.process.ownership,
+            thread_count: process.thread_count,
+            open_fds: process.open_fds,
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by_key(|process| process.identity);
+    Ok((
+        ProcessHygieneCadenceSample {
+            elapsed_ns,
+            collection_cpu_ns,
+            collection_wall_ns,
+            processes,
+        },
+        warnings,
+    ))
+}
+
+fn collect_process_hygiene_snapshot(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    phase: &str,
+    evidence: &mut ProcessHygieneEvidence,
+) -> Result<Vec<ProcessHygieneProcess>> {
+    let (sample, warnings) = sample_process_hygiene(sampler, roots, phase, 0)?;
+    evidence.sampler_collection_cpu_ns = evidence
+        .sampler_collection_cpu_ns
+        .saturating_add(sample.collection_cpu_ns);
+    evidence.sampler_collection_wall_ns = evidence
+        .sampler_collection_wall_ns
+        .saturating_add(sample.collection_wall_ns);
+    evidence.sampler_warnings.extend(warnings);
+    Ok(sample.processes)
+}
+
+struct ProcessHygieneTurnCollection {
+    sampler: Box<dyn Sampler>,
+    samples: Vec<ProcessHygieneCadenceSample>,
+    warnings: Vec<String>,
+    sampled_wall_ns: u64,
+}
+
+struct ProcessHygieneTurnSampler {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    started: Instant,
+    join: std::thread::JoinHandle<Result<ProcessHygieneTurnCollection>>,
+}
+
+impl ProcessHygieneTurnSampler {
+    fn finish(self) -> Result<ProcessHygieneTurnCollection> {
+        let sampled_wall_ns = duration_ns(self.started.elapsed()).max(1);
+        {
+            let (lock, wake) = &*self.stop;
+            let mut stopping = lock.lock().map_err(|_| {
+                AhrbError::Protocol("row-44 sampler stop lock was poisoned".to_owned())
+            })?;
+            *stopping = true;
+            wake.notify_one();
+        }
+        let mut collection = self
+            .join
+            .join()
+            .map_err(|_| AhrbError::Protocol("row-44 sampler thread panicked".to_owned()))??;
+        collection.sampled_wall_ns = sampled_wall_ns;
+        Ok(collection)
+    }
+}
+
+fn start_process_hygiene_turn_sampler(
+    mut sampler: Box<dyn Sampler>,
+    roots: Vec<u32>,
+    phase: String,
+    cadence: Duration,
+) -> Result<ProcessHygieneTurnSampler> {
+    let sample_interval = cadence
+        .checked_div(2)
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(cadence);
+    let started = Instant::now();
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_stop = Arc::clone(&stop);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+    let join = std::thread::Builder::new()
+        .name("ahrb-row44-sampler".to_owned())
+        .spawn(move || {
+            prioritize_counter_thread();
+            let mut samples = Vec::new();
+            let mut warnings = Vec::new();
+            let first = sample_process_hygiene(
+                sampler.as_mut(),
+                &roots,
+                &phase,
+                duration_ns(started.elapsed()),
+            );
+            let ready_result = first.as_ref().map(|_| ()).map_err(ToString::to_string);
+            let _ = ready_tx.send(ready_result);
+            let (sample, first_warnings) = first?;
+            samples.push(sample);
+            warnings.extend(first_warnings);
+            let mut deadline = Instant::now() + sample_interval;
+            loop {
+                let (lock, wake) = &*thread_stop;
+                let stopping = lock.lock().map_err(|_| {
+                    AhrbError::Protocol("row-44 sampler stop lock was poisoned".to_owned())
+                })?;
+                let now = Instant::now();
+                let stopping = if *stopping || now >= deadline {
+                    *stopping
+                } else {
+                    let (guard, _) = wake
+                        .wait_timeout(stopping, deadline.duration_since(now))
+                        .map_err(|_| {
+                            AhrbError::Protocol("row-44 sampler stop lock was poisoned".to_owned())
+                        })?;
+                    *guard
+                };
+                let previous_elapsed = samples.last().map_or(0, |sample| sample.elapsed_ns);
+                let mut elapsed_ns = duration_ns(started.elapsed());
+                while elapsed_ns <= previous_elapsed {
+                    std::thread::yield_now();
+                    elapsed_ns = duration_ns(started.elapsed());
+                }
+                let (sample, sample_warnings) =
+                    sample_process_hygiene(sampler.as_mut(), &roots, &phase, elapsed_ns)?;
+                samples.push(sample);
+                warnings.extend(sample_warnings);
+                if stopping {
+                    break;
+                }
+                let due = Instant::now();
+                while deadline <= due {
+                    deadline += sample_interval;
+                }
+            }
+            Ok(ProcessHygieneTurnCollection {
+                sampler,
+                samples,
+                warnings,
+                sampled_wall_ns: 0,
+            })
+        })?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(ProcessHygieneTurnSampler {
+            stop,
+            started,
+            join,
+        }),
+        Ok(Err(detail)) => {
+            let _ = join.join();
+            Err(AhrbError::Protocol(format!(
+                "row-44 initial cadence sample failed: {detail}"
+            )))
+        }
+        Err(_) => {
+            let _ = join.join();
+            Err(AhrbError::Protocol(
+                "row-44 sampler exited before publishing its initial sample".to_owned(),
+            ))
+        }
+    }
+}
+
+fn record_process_hygiene_turn(
+    evidence: &mut ProcessHygieneEvidence,
+    repetition: u32,
+    turn_index: u32,
+    required_cadence_ns: u64,
+    collection: &ProcessHygieneTurnCollection,
+) {
+    let mut processes = BTreeMap::new();
+    let mut active_cpu_ns = 0_u64;
+    let mut active_wall_ns = 0_u64;
+    for sample in &collection.samples {
+        active_cpu_ns = active_cpu_ns.saturating_add(sample.collection_cpu_ns);
+        active_wall_ns = active_wall_ns.saturating_add(sample.collection_wall_ns);
+        for process in &sample.processes {
+            processes.insert(process.identity, process.clone());
+        }
+    }
+    evidence.active_sampler_collection_cpu_ns = evidence
+        .active_sampler_collection_cpu_ns
+        .saturating_add(active_cpu_ns);
+    evidence.sampled_turn_wall_ns = evidence
+        .sampled_turn_wall_ns
+        .saturating_add(collection.sampled_wall_ns);
+    evidence.sampler_collection_cpu_ns = evidence
+        .sampler_collection_cpu_ns
+        .saturating_add(active_cpu_ns);
+    evidence.sampler_collection_wall_ns = evidence
+        .sampler_collection_wall_ns
+        .saturating_add(active_wall_ns);
+    evidence
+        .sampler_warnings
+        .extend(collection.warnings.iter().cloned());
+    evidence.checkpoints.push(ProcessHygieneCheckpoint {
+        repetition,
+        turn_index,
+        processes: processes.into_values().collect(),
+        cadence_samples: collection.samples.clone(),
+        sampled_wall_ns: collection.sampled_wall_ns,
+        required_cadence_ns,
+    });
+}
+
+async fn collect_process_hygiene_audit(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    phase: &str,
+    evidence: &mut ProcessHygieneEvidence,
+) -> Result<(u64, Vec<ProcessHygieneProcess>)> {
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let processes = collect_process_hygiene_snapshot(sampler, roots, phase, evidence)?;
+    let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok((waited_ms, processes))
+}
+
+async fn collect_model_request_efficiency_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+    collect_process_hygiene: bool,
+) -> Result<ModelRequestEfficiencyTrials> {
+    let turns = match profile {
+        Profile::Quick => 20_u32,
+        Profile::Cert => 100_u32,
+    };
+    let mut all_events = Vec::new();
+    let mut all_requests = Vec::new();
+    let mut process_hygiene = collect_process_hygiene.then(ProcessHygieneEvidence::default);
+    for repetition in 1..=2_u32 {
+        let per_invocation = per_invocation_topology(manifest);
+        let profile_root = run_profile_root.join(format!("derived-row42-r{repetition}"));
+        prepare_profile(manifest, &profile_root).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "prepare row-42 repetition {repetition} fresh profile: {error}"
+            ))
+        })?;
+        let mut workflow = model_efficiency_workflow(&profile_root, repetition, turns);
+        let hygiene_warmup_actor = format!("r44-warmup-r{repetition}");
+        if collect_process_hygiene && !per_invocation {
+            workflow.actors.insert(
+                hygiene_warmup_actor.clone(),
+                Actor {
+                    id: hygiene_warmup_actor.clone(),
+                    parent: None,
+                    prompt: format!(
+                        "AHRB process hygiene daemon warm-up {}",
+                        route_marker(&workflow.scenario, &hygiene_warmup_actor, "warmup")
+                    ),
+                    workspace: profile_root
+                        .join("workspace")
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+            );
+            workflow.responses.push(ScriptedResponse {
+                scenario: workflow.scenario.clone(),
+                actor: hygiene_warmup_actor.clone(),
+                checkpoint: "warmup".to_owned(),
+                request_hash: String::new(),
+                response: success_value(),
+                fault: None,
+                barrier: None,
+            });
+        }
+        let engine = Arc::new(FakeModelEngine::with_request_roles(
+            &workflow,
+            &manifest.model_roles,
+            &manifest.request_role_rules,
+        )?);
+        let (server, model_environment) = start_model(
+            Arc::clone(&engine),
+            &workflow,
+            &profile_root,
+            false,
+            &manifest.fake_model.base_url_env,
+        )
+        .await?;
+        let mut variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("endpoint".to_owned(), String::new()),
+        ]);
+        let credential = format!(
+            "ahrb-{}-row42-r{repetition}-{}",
+            &manifest_hash[..16],
+            std::process::id()
+        );
+        let mut environment = isolated_environment(manifest, &variables)?;
+        environment.extend(model_environment);
+        environment.insert(
+            manifest.fake_model.credential_env.clone(),
+            credential.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_MODEL".to_owned(),
+            manifest.fake_model.model.clone(),
+        );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential);
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &profile_root)?;
+        let command = if manifest.transport.kind == TransportKind::Exec {
+            manifest.transport.command.clone()
+        } else {
+            render_argv(&manifest.transport.command, &variables)?
+        };
+        let mut driver = make_driver(
+            manifest,
+            &command,
+            &environment,
+            &variables,
+            &profile_root,
+            collect_process_hygiene && per_invocation,
+        )?;
+        driver.start().await?;
+        let mut hygiene_sampler = collect_process_hygiene.then(platform_sampler);
+        let daemon_roots = if collect_process_hygiene && !per_invocation {
+            let roots = driver.owned_pids();
+            if roots.is_empty() {
+                return Err(AhrbError::Protocol(format!(
+                    "row-44 repetition {repetition} daemon exposed no owned root PID"
+                )));
+            }
+            roots
+        } else {
+            Vec::new()
+        };
+        let session = driver
+            .create_session(&format!("{}:row42", workflow.scenario))
+            .await?;
+        let mut after = None;
+        if collect_process_hygiene && !per_invocation {
+            let warmup = workflow.actors.get(&hygiene_warmup_actor).ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "row-44 repetition {repetition} daemon warm-up actor disappeared"
+                ))
+            })?;
+            driver
+                .submit(
+                    &session,
+                    &warmup.prompt,
+                    &format!("row-44-r{repetition}-warmup"),
+                )
+                .await?;
+            let suffix = collect_session_terminal(
+                &mut driver,
+                &session,
+                after,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await?;
+            after = suffix
+                .iter()
+                .map(|event| Cursor(event.cursor))
+                .max()
+                .or(after);
+            let (Some(sampler), Some(evidence)) =
+                (hygiene_sampler.as_deref_mut(), process_hygiene.as_mut())
+            else {
+                return Err(AhrbError::Protocol(
+                    "row-44 daemon warm-up lost its sampler".to_owned(),
+                ));
+            };
+            let processes = collect_process_hygiene_snapshot(
+                sampler,
+                &daemon_roots,
+                &format!("row44-r{repetition}-warm-baseline"),
+                evidence,
+            )?;
+            evidence.warm_baselines.push(ProcessHygieneCheckpoint {
+                repetition,
+                turn_index: 0,
+                processes,
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            });
+        }
+        let hygiene_cadence = Duration::from_millis(
+            ResourceTimingPlan::for_profile(ResourceProfile::from(profile)).membership_cadence_ms,
+        );
+        let hygiene_cadence_ns = duration_ns(hygiene_cadence);
+        for turn in 1..=turns {
+            let actor_name = format!("r42-r{repetition}");
+            let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "row-42 repetition {repetition} actor {actor_name:?} disappeared"
+                ))
+            })?;
+            let prompt = if turn == 1 {
+                actor.prompt.clone()
+            } else {
+                format!(
+                    "AHRB model request efficiency direct terminal turn {turn} {}",
+                    route_marker(&workflow.scenario, &actor_name, &format!("turn-{turn:03}"))
+                )
+            };
+            let mut turn_sampler = if collect_process_hygiene && !per_invocation {
+                let sampler = hygiene_sampler.take().ok_or_else(|| {
+                    AhrbError::Protocol("row-44 daemon cadence sampler disappeared".to_owned())
+                })?;
+                Some(start_process_hygiene_turn_sampler(
+                    sampler,
+                    daemon_roots.clone(),
+                    format!("row44-r{repetition}-turn-{turn:03}"),
+                    hygiene_cadence,
+                )?)
+            } else {
+                None
+            };
+            if let Err(error) = driver
+                .submit(
+                    &session,
+                    &prompt,
+                    &format!("row-42-r{repetition}-t{turn:03}"),
+                )
+                .await
+            {
+                if let Some(sampler) = turn_sampler.take() {
+                    let _ = sampler.finish();
+                }
+                return Err(error);
+            }
+            let turn_roots = if per_invocation {
+                driver.session_pids(&session)
+            } else {
+                daemon_roots.clone()
+            };
+            if collect_process_hygiene && turn_roots.is_empty() {
+                if let Some(sampler) = turn_sampler.take() {
+                    let _ = sampler.finish();
+                }
+                return Err(AhrbError::Protocol(format!(
+                    "row-44 repetition {repetition} turn {turn} exposed no owned root PID"
+                )));
+            }
+            if collect_process_hygiene && per_invocation {
+                let sampler = hygiene_sampler.take().ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "row-44 per-invocation cadence sampler disappeared".to_owned(),
+                    )
+                })?;
+                turn_sampler = Some(start_process_hygiene_turn_sampler(
+                    sampler,
+                    turn_roots.clone(),
+                    format!("row44-r{repetition}-turn-{turn:03}"),
+                    hygiene_cadence,
+                )?);
+                if let Err(error) = driver.release_invocations().await {
+                    if let Some(sampler) = turn_sampler.take() {
+                        let _ = sampler.finish();
+                    }
+                    return Err(error);
+                }
+            }
+            let terminal_result = collect_session_terminal(
+                &mut driver,
+                &session,
+                after,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await;
+            let turn_collection = turn_sampler
+                .take()
+                .map(ProcessHygieneTurnSampler::finish)
+                .transpose()?;
+            let suffix = terminal_result?;
+            after = suffix
+                .iter()
+                .map(|event| Cursor(event.cursor))
+                .max()
+                .or(after);
+            all_events.extend(suffix);
+            if let (Some(collection), Some(evidence)) = (turn_collection, process_hygiene.as_mut())
+            {
+                record_process_hygiene_turn(
+                    evidence,
+                    repetition,
+                    turn,
+                    hygiene_cadence_ns,
+                    &collection,
+                );
+                hygiene_sampler = Some(collection.sampler);
+            }
+            if let (Some(sampler), Some(evidence)) =
+                (hygiene_sampler.as_deref_mut(), process_hygiene.as_mut())
+                && per_invocation
+            {
+                let (waited_ms, processes) = collect_process_hygiene_audit(
+                    sampler,
+                    &turn_roots,
+                    &format!("row44-r{repetition}-turn-{turn:03}-post-exit"),
+                    evidence,
+                )
+                .await?;
+                evidence.per_turn_audits.push(ProcessHygieneAudit {
+                    repetition,
+                    turn_index: Some(turn),
+                    waited_ms,
+                    processes,
+                });
+            }
+        }
+        if collect_process_hygiene
+            || manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty()
+        {
+            driver.close(&session).await?;
+        }
+        if let (Some(sampler), Some(evidence)) =
+            (hygiene_sampler.as_deref_mut(), process_hygiene.as_mut())
+            && !per_invocation
+        {
+            let (waited_ms, processes) = collect_process_hygiene_audit(
+                sampler,
+                &daemon_roots,
+                &format!("row44-r{repetition}-post-close"),
+                evidence,
+            )
+            .await?;
+            evidence.post_close_audits.push(ProcessHygieneAudit {
+                repetition,
+                turn_index: None,
+                waited_ms,
+                processes,
+            });
+        }
+        driver.shutdown().await?;
+        if let (Some(sampler), Some(evidence)) =
+            (hygiene_sampler.as_deref_mut(), process_hygiene.as_mut())
+            && !per_invocation
+        {
+            let (waited_ms, processes) = collect_process_hygiene_audit(
+                sampler,
+                &daemon_roots,
+                &format!("row44-r{repetition}-shutdown"),
+                evidence,
+            )
+            .await?;
+            evidence.shutdown_audits.push(ProcessHygieneAudit {
+                repetition,
+                turn_index: None,
+                waited_ms,
+                processes,
+            });
+        }
+        server.shutdown().await?;
+        all_requests.extend(engine.request_records().await);
+    }
+    all_requests.sort_by(|left, right| {
+        (
+            &left.request.scenario,
+            &left.request.actor,
+            &left.request.checkpoint,
+            left.semantic_ordinal,
+            left.attempt,
+        )
+            .cmp(&(
+                &right.request.scenario,
+                &right.request.actor,
+                &right.request.checkpoint,
+                right.semantic_ordinal,
+                right.attempt,
+            ))
+    });
+    Ok(ModelRequestEfficiencyTrials {
+        events: all_events,
+        requests: all_requests,
+        process_hygiene,
+    })
+}
+
+fn turn_latency_workflow(profile_root: &Path, turns: u32) -> Workflow {
+    let scenario = "ahrb-row43".to_owned();
+    let actor = "r43-latency".to_owned();
+    let actors = BTreeMap::from([(
+        actor.clone(),
+        Actor {
+            id: actor.clone(),
+            parent: None,
+            prompt: format!(
+                "AHRB turn latency unmeasured direct terminal warm-up {}",
+                route_marker(&scenario, &actor, "warmup")
+            ),
+            workspace: profile_root
+                .join("workspace")
+                .to_string_lossy()
+                .into_owned(),
+        },
+    )]);
+    let mut responses = vec![ScriptedResponse {
+        scenario: scenario.clone(),
+        actor: actor.clone(),
+        checkpoint: "warmup".to_owned(),
+        request_hash: String::new(),
+        response: success_value(),
+        fault: None,
+        barrier: None,
+    }];
+    responses.extend((1..=turns).map(|turn| ScriptedResponse {
+        scenario: scenario.clone(),
+        actor: actor.clone(),
+        checkpoint: format!("turn-{turn:04}"),
+        request_hash: String::new(),
+        response: success_value(),
+        fault: None,
+        barrier: None,
+    }));
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario,
+        actors,
+        barriers: BTreeMap::new(),
+        responses,
+    }
+}
+
+async fn await_completed_turn_boundary(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    after: Option<Cursor>,
+    previous_count: usize,
+    timeout: Duration,
+) -> Result<crate::driver::CompletedTurnBoundary> {
+    let started = Instant::now();
+    loop {
+        if let Some(boundary) = driver
+            .completed_turn_boundaries()
+            .get(previous_count)
+            .copied()
+        {
+            return Ok(boundary);
+        }
+        if started.elapsed() >= timeout {
+            return Err(AhrbError::Timeout(
+                "per-invocation row-43 child did not reach its exit boundary".to_owned(),
+            ));
+        }
+        let _events = driver.attach(session, after).await?;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+async fn collect_turn_latency_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<TurnLatencyTrials> {
+    let turns = match profile {
+        Profile::Quick => 100_u32,
+        Profile::Cert => 1_000_u32,
+    };
+    let profile_root = run_profile_root.join("derived-row43");
+    prepare_profile(manifest, &profile_root)
+        .map_err(|error| AhrbError::Protocol(format!("prepare row-43 fresh profile: {error}")))?;
+    let workflow = turn_latency_workflow(&profile_root, turns);
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let (server, model_environment) = start_model(
+        Arc::clone(&engine),
+        &workflow,
+        &profile_root,
+        false,
+        &manifest.fake_model.base_url_env,
+    )
+    .await?;
+    let mut variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+    ]);
+    let credential = format!("ahrb-{}-row43-{}", &manifest_hash[..16], std::process::id());
+    let mut environment = isolated_environment(manifest, &variables)?;
+    environment.extend(model_environment);
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        credential.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    variables.insert("credential".to_owned(), credential);
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(manifest, &variables, &profile_root)?;
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let mut driver = make_driver(
+        manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+    )?;
+    driver.start().await?;
+    let session = driver
+        .create_session(&format!("{}:row43", workflow.scenario))
+        .await?;
+    let session_id_hash = stable_evidence_hash(&session.0);
+    let actor = "r43-latency";
+    let mut events = Vec::new();
+    let mut observations = Vec::with_capacity(turns as usize);
+    let warmup_prompt = workflow
+        .actors
+        .get(actor)
+        .map(|actor| actor.prompt.as_str())
+        .ok_or_else(|| AhrbError::Protocol("row-43 actor disappeared".to_owned()))?;
+    let warmup_boundary_count = driver.completed_turn_boundaries().len();
+    driver
+        .submit(&session, warmup_prompt, "row-43-warmup")
+        .await?;
+    let warmup_events = collect_session_terminal(
+        &mut driver,
+        &session,
+        None,
+        Duration::from_millis(manifest.resources.turn_timeout_ms),
+    )
+    .await?;
+    let mut after = warmup_events.iter().map(|event| Cursor(event.cursor)).max();
+    let warmup_terminals = warmup_events
+        .iter()
+        .filter(|event| is_terminal(&event.event))
+        .count();
+    let warmup_tool_events = warmup_events
+        .iter()
+        .filter(|event| matches!(event.event, EventVocab::ToolCall | EventVocab::ToolResult))
+        .count();
+    if warmup_terminals != 1 || warmup_tool_events != 0 {
+        return Err(AhrbError::Protocol(format!(
+            "row-43 warm-up was not one direct-terminal semantic turn: terminals={warmup_terminals}, tool_events={warmup_tool_events}"
+        )));
+    }
+    if per_invocation_topology(manifest) {
+        let _warmup_boundary = await_completed_turn_boundary(
+            &mut driver,
+            &session,
+            after,
+            warmup_boundary_count,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+        )
+        .await?;
+    }
+    for turn in 1..=turns {
+        let prompt = format!(
+            "AHRB turn latency direct terminal turn {turn} {}",
+            route_marker(&workflow.scenario, actor, &format!("turn-{turn:04}"))
+        );
+        let previous_boundary_count = driver.completed_turn_boundaries().len();
+        let submit_ns = monotonic_timestamp_ns();
+        driver
+            .submit(&session, &prompt, &format!("row-43-turn-{turn:04}"))
+            .await?;
+        let suffix = collect_session_terminal_with_poll(
+            &mut driver,
+            &session,
+            after,
+            Duration::from_millis(manifest.resources.turn_timeout_ms),
+            Duration::from_millis(1),
+        )
+        .await?;
+        let terminal_ns = monotonic_timestamp_ns();
+        after = suffix
+            .iter()
+            .map(|event| Cursor(event.cursor))
+            .max()
+            .or(after);
+        events.extend(suffix);
+        let (launch_ns, exit_ns, turn_wall_ns) = if per_invocation_topology(manifest) {
+            let boundary = await_completed_turn_boundary(
+                &mut driver,
+                &session,
+                after,
+                previous_boundary_count,
+                Duration::from_millis(manifest.resources.turn_timeout_ms),
+            )
+            .await?;
+            let wall_ns = boundary
+                .exit_ns
+                .checked_sub(boundary.launch_ns)
+                .ok_or_else(|| {
+                    AhrbError::Protocol("row-43 launch/exit boundaries are reversed".to_owned())
+                })?;
+            (Some(boundary.launch_ns), Some(boundary.exit_ns), wall_ns)
+        } else {
+            let wall_ns = terminal_ns.checked_sub(submit_ns).ok_or_else(|| {
+                AhrbError::Protocol("row-43 submit/terminal boundaries are reversed".to_owned())
+            })?;
+            (None, None, wall_ns)
+        };
+        observations.push(TurnObservation {
+            repetition: 1,
+            turn_index: turn,
+            actor: actor.to_owned(),
+            session_id_hash: session_id_hash.clone(),
+            phase: "turn-latency".to_owned(),
+            launch_ns,
+            submit_ns: Some(submit_ns),
+            first_model_request_ns: None,
+            terminal_ns: Some(terminal_ns),
+            exit_ns,
+            turn_wall_ns: Some(turn_wall_ns),
+        });
+    }
+    if manifest.transport.kind == TransportKind::Exec || !manifest.sessions.close_delete.is_empty()
+    {
+        driver.close(&session).await?;
+    }
+    driver.shutdown().await?;
+    server.shutdown().await?;
+    let all_requests = engine.request_records().await;
+    let scripted_primary_checkpoints = all_requests
+        .iter()
+        .filter(|request| request.accepted && request.role == "primary")
+        .map(|request| request.request.checkpoint.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_primary_checkpoints = std::iter::once("warmup".to_owned())
+        .chain((1..=turns).map(|turn| format!("turn-{turn:04}")))
+        .collect::<BTreeSet<_>>();
+    if scripted_primary_checkpoints
+        != expected_primary_checkpoints
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    {
+        return Err(AhrbError::Protocol(format!(
+            "row-43 provider scripts did not cover exactly one warm-up plus {turns} measured checkpoints"
+        )));
+    }
+    let requests = all_requests
+        .into_iter()
+        .filter(|request| request.request.checkpoint != "warmup")
+        .collect::<Vec<_>>();
+    let first_requests = requests
+        .iter()
+        .fold(BTreeMap::new(), |mut values, request| {
+            values
+                .entry(request.request.checkpoint.as_str())
+                .and_modify(|timestamp: &mut u64| {
+                    *timestamp = (*timestamp).min(request.received_ns)
+                })
+                .or_insert(request.received_ns);
+            values
+        });
+    for observation in &mut observations {
+        observation.first_model_request_ns = first_requests
+            .get(format!("turn-{:04}", observation.turn_index).as_str())
+            .copied();
+    }
+    Ok(TurnLatencyTrials {
+        events,
+        requests,
+        turns: observations,
+    })
 }
 
 fn add_resource_workflow(
@@ -2453,6 +3782,17 @@ async fn collect_session_terminal(
     after: Option<Cursor>,
     deadline: Duration,
 ) -> Result<Vec<NormalizedEvent>> {
+    collect_session_terminal_with_poll(driver, session, after, deadline, Duration::from_millis(10))
+        .await
+}
+
+async fn collect_session_terminal_with_poll(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    after: Option<Cursor>,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> Result<Vec<NormalizedEvent>> {
     let started = Instant::now();
     loop {
         let events = driver.attach(session, after).await?;
@@ -2465,7 +3805,7 @@ async fn collect_session_terminal(
                 session.0
             )));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -2576,7 +3916,11 @@ fn evaluate_rows(
     manifest: &Manifest,
     resources: &ResourceCertification,
     profile_root: &Path,
+    derived: &DerivedRowEvaluations<'_>,
 ) -> Vec<TestResult> {
+    let row42 = derived.model_request_efficiency;
+    let row43 = derived.turn_latency;
+    let row44 = derived.process_hygiene;
     selected
         .iter()
         .map(|definition| {
@@ -2587,6 +3931,10 @@ fn evaluate_rows(
                     pillar: definition.pillar,
                     outcome: TestOutcome::Error(error.clone()),
                     evidence: vec![error.clone()],
+                    metadata: TestResultMetadata::for_row(
+                        definition.row,
+                        &TestOutcome::Error(error.clone()),
+                    ),
                 };
             }
             let capability =
@@ -2627,6 +3975,131 @@ fn evaluate_rows(
                             Some("resource certification omitted this matrix row".to_owned()),
                         )
                     });
+            }
+            if definition.row == 42 {
+                if !row42.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some("model-request-efficiency evidence is incomplete".to_owned()),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row42.reference_envelope_pass,
+                        detail: format!(
+                            "requests/turn={:.3}, primary/turn={:.3}, side-channel/turn={:.3}, retries/turn={:.3}, context p95={:.0} bytes, slope={:.3} bytes/turn",
+                            row42.metrics["model_request_efficiency.requests_per_semantic_turn"],
+                            row42.metrics["model_request_efficiency.primary_requests_per_turn"],
+                            row42.metrics["model_request_efficiency.side_channel_requests_per_turn"],
+                            row42.metrics["model_request_efficiency.retry_attempts_per_turn"],
+                            row42.metrics["model_request_efficiency.context_tax_bytes_p95"],
+                            row42.metrics["model_request_efficiency.context_tax_slope_bytes_per_turn"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 43 {
+                if !row43.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row43.measurement_error.clone().unwrap_or_else(|| {
+                            "turn-latency-distribution evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row43.reference_envelope_pass,
+                        detail: format!(
+                            "p50={:.3}ms, p95={:.3}ms, max={:.3}ms, MAD={:.3}ms, jitter={:.3}, class={}",
+                            row43.wall_per_turn_p50_ms,
+                            row43.wall_per_turn_p95_ms,
+                            row43.wall_per_turn_max_ms,
+                            row43.wall_per_turn_mad_ms,
+                            row43.wall_per_turn_jitter_ratio,
+                            row43.latency_class,
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 44 {
+                if !row44.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row44.measurement_error.clone().unwrap_or_else(|| {
+                            "process-hygiene evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                let sampler_detail = if row44.sampler_warnings.is_empty() {
+                    format!(
+                        "out-of-band sampler CPU={}ns, wall={}ns, active overhead={:.3}%, warnings=0",
+                        row44.sampler_collection_cpu_ns,
+                        row44.sampler_collection_wall_ns,
+                        row44.sampler_overhead_pct,
+                    )
+                } else {
+                    format!(
+                        "out-of-band sampler CPU={}ns, wall={}ns, active overhead={:.3}%, warnings={}",
+                        row44.sampler_collection_cpu_ns,
+                        row44.sampler_collection_wall_ns,
+                        row44.sampler_overhead_pct,
+                        row44.sampler_warnings.join(" | ")
+                    )
+                };
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[
+                        Assertion {
+                            name: definition.metric.to_owned(),
+                            passed: row44.passed,
+                            detail: row44.failure_detail.clone().unwrap_or_else(|| {
+                                format!(
+                                    "residue processes={:.0}, thread delta={:.0}, FD delta={:.0}; peak live={:.0}, threads={:.0}, FDs={:.0}",
+                                    row44.metrics["process_hygiene.residue_processes"],
+                                    row44.metrics["process_hygiene.residue_threads_delta"],
+                                    row44.metrics["process_hygiene.residue_fds_delta"],
+                                    row44.metrics["process_hygiene.peak_live_processes"],
+                                    row44.metrics["process_hygiene.peak_threads"],
+                                    row44.metrics["process_hygiene.peak_fds"],
+                                )
+                            }),
+                        },
+                        Assertion {
+                            name: "out-of-band sampler evidence".to_owned(),
+                            passed: true,
+                            detail: sampler_detail,
+                        },
+                    ],
+                    None,
+                );
             }
             let events = state.events.get(&definition.row).map_or(&[][..], Vec::as_slice);
             let success_count = events
@@ -5146,6 +6619,12 @@ fn workflow_hash() -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn stable_evidence_hash(value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(value.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
 fn host_memory_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -5179,6 +6658,222 @@ fn host_memory_bytes() -> u64 {
 #[cfg(test)]
 mod resource_sampler_tests {
     use super::*;
+
+    struct LateChurnSampler {
+        refreshes: u32,
+        started: Instant,
+    }
+
+    impl Default for LateChurnSampler {
+        fn default() -> Self {
+            Self {
+                refreshes: 0,
+                started: Instant::now(),
+            }
+        }
+    }
+
+    impl Sampler for LateChurnSampler {
+        fn discover(&mut self, _roots: &[u32]) -> Result<ProcessTree> {
+            self.refreshes = self.refreshes.saturating_add(1);
+            let root = crate::process::ProcIdentity {
+                pid: 100,
+                start_time: 1,
+            };
+            let mut tree = ProcessTree::default();
+            tree.roots.insert(root);
+            tree.members.insert(
+                root,
+                crate::process::ProcessInfo {
+                    identity: root,
+                    ppid: 0,
+                    command: "late-root".to_owned(),
+                    ownership: crate::process::ProcOwnership::DeclaredRoot,
+                },
+            );
+            if self.refreshes >= 2 {
+                let child = crate::process::ProcIdentity {
+                    pid: 101,
+                    start_time: 2,
+                };
+                tree.members.insert(
+                    child,
+                    crate::process::ProcessInfo {
+                        identity: child,
+                        ppid: 100,
+                        command: "late-child".to_owned(),
+                        ownership: crate::process::ProcOwnership::Descendant,
+                    },
+                );
+            }
+            Ok(tree)
+        }
+
+        fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
+            let elapsed_ns = duration_ns(self.started.elapsed());
+            let wall_time = std::time::SystemTime::now();
+            let process_samples = tree
+                .members
+                .values()
+                .cloned()
+                .map(|process| {
+                    let late_child = process.identity.pid == 101;
+                    ProcessSample {
+                        elapsed_ns,
+                        wall_time,
+                        phase: phase.to_owned(),
+                        process,
+                        rss_bytes: 0,
+                        pss_bytes: None,
+                        private_bytes: None,
+                        footprint_bytes: None,
+                        rss_crosscheck_bytes: None,
+                        cpu_ns: 0,
+                        open_fds: Some(if late_child { 5 } else { 3 }),
+                        thread_count: Some(if late_child { 2 } else { 1 }),
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(Sample {
+                elapsed_ns,
+                wall_time,
+                phase: phase.to_owned(),
+                rss_bytes: 0,
+                pss_bytes: None,
+                private_bytes: None,
+                footprint_bytes: None,
+                rss_crosscheck_bytes: None,
+                cgroup_memory_bytes: None,
+                cgroup_peak_bytes: None,
+                cpu_ns: 0,
+                open_fds: Some(
+                    process_samples
+                        .iter()
+                        .filter_map(|sample| sample.open_fds)
+                        .sum(),
+                ),
+                thread_count: Some(
+                    process_samples
+                        .iter()
+                        .filter_map(|sample| sample.thread_count)
+                        .sum(),
+                ),
+                collection_ns: 1,
+                collection_wall_ns: 1,
+                processes: tree.members.values().cloned().collect(),
+                process_samples,
+                cpu_accounting_warnings: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn process_hygiene_cadence_collector_captures_late_child_thread_and_fd_churn() {
+        let sampler = start_process_hygiene_turn_sampler(
+            Box::new(LateChurnSampler::default()),
+            vec![100],
+            "row44-late-churn".to_owned(),
+            Duration::from_millis(10),
+        )
+        .expect("start deterministic cadence collector");
+        std::thread::sleep(Duration::from_millis(12));
+        let collection = sampler.finish().expect("finish cadence collector");
+        assert_eq!(collection.samples[0].processes.len(), 1);
+        assert!(
+            collection
+                .samples
+                .iter()
+                .skip(1)
+                .any(|sample| sample.processes.len() == 2)
+        );
+        let mut evidence = ProcessHygieneEvidence::default();
+        record_process_hygiene_turn(&mut evidence, 1, 1, 10_000_000, &collection);
+        evidence.per_turn_audits.push(ProcessHygieneAudit {
+            repetition: 1,
+            turn_index: Some(1),
+            waited_ms: 2_000,
+            processes: Vec::new(),
+        });
+        let evaluation = evaluate_process_hygiene(&evidence, 1, 1, true);
+        assert!(
+            evaluation.measurement_complete,
+            "late-churn measurement error: {:?}",
+            evaluation.measurement_error
+        );
+        assert_eq!(
+            evaluation.metrics["process_hygiene.observed_processes_spawned_per_turn_max"],
+            2.0
+        );
+        assert_eq!(
+            evaluation.metrics["process_hygiene.observed_threads_created_per_turn_max"],
+            3.0
+        );
+        assert_eq!(
+            evaluation.metrics["process_hygiene.observed_fds_opened_per_turn_max"],
+            8.0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_hygiene_actual_residual_child_fixture_fails() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 5 & sleep 0.2"]);
+        command.process_group(0);
+        let mut leader = command
+            .spawn()
+            .expect("spawn isolated residual-child fixture");
+        let root_pid = leader.id();
+        let sampler = platform_sampler();
+        let mut evidence = ProcessHygieneEvidence::default();
+        let turn_sampler = start_process_hygiene_turn_sampler(
+            sampler,
+            vec![root_pid],
+            "row44-residual-fixture-active".to_owned(),
+            Duration::from_millis(10),
+        )
+        .expect("start residual fixture cadence sampler");
+        leader.wait().expect("reap fixture group leader");
+        let mut collection = turn_sampler
+            .finish()
+            .expect("finish residual fixture cadence sampler");
+        record_process_hygiene_turn(&mut evidence, 1, 1, 10_000_000, &collection);
+        let (waited_ms, residue) = collect_process_hygiene_audit(
+            collection.sampler.as_mut(),
+            &[root_pid],
+            "row44-residual-fixture-audit",
+            &mut evidence,
+        )
+        .await
+        .expect("audit detached fixture child");
+        evidence.per_turn_audits.push(ProcessHygieneAudit {
+            repetition: 1,
+            turn_index: Some(1),
+            waited_ms,
+            processes: residue,
+        });
+
+        let group = i32::try_from(root_pid).expect("fixture PID fits pid_t");
+        // SAFETY: `process_group(0)` above made the just-spawned leader's PID the
+        // fixture-only process group; the negative target cannot address AHRB.
+        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+
+        let evaluation = evaluate_process_hygiene(&evidence, 1, 1, true);
+        assert!(
+            evaluation.measurement_complete,
+            "residual fixture measurement error: {:?}",
+            evaluation.measurement_error
+        );
+        assert!(!evaluation.passed);
+        assert!(evaluation.metrics["process_hygiene.residue_processes"] >= 1.0);
+        assert!(
+            evaluation.details["residue_identities"]
+                .as_array()
+                .is_some_and(|identities| !identities.is_empty())
+        );
+    }
 
     #[test]
     fn deadline_report_preserves_completed_rows_and_marks_only_pending_rows_deadline() {
@@ -5216,6 +6911,7 @@ mod resource_sampler_tests {
                         pillar: selected[0].pillar,
                         outcome: TestOutcome::Pass,
                         evidence: vec!["completed evidence".to_owned()],
+                        metadata: TestResultMetadata::for_row(1, &TestOutcome::Pass),
                     },
                 );
             })

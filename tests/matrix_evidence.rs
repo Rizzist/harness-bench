@@ -172,9 +172,13 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
                 TestOutcome::Pass
             },
             evidence: vec!["capability: explicit".to_owned()],
+            metadata: ahrb::evaluate::TestResultMetadata::for_row(
+                definition.row,
+                &TestOutcome::Pass,
+            ),
         })
         .collect::<Vec<_>>();
-    let badge = certify(&results, &reduced_manifest, "macos", 8, 1.0)
+    let badge = certify(&results, &reduced_manifest, "macos", 8, 1.0, "L100")
         .expect("unsupported facet does not suppress badge");
     assert_eq!(
         suite_exit_code(&results, Some(&badge), &reduced_manifest),
@@ -202,7 +206,17 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
         suite_exit_code(&core_unsupported, None, &reduced_manifest),
         0
     );
-    assert!(certify(&core_unsupported, &reduced_manifest, "macos", 8, 1.0).is_none());
+    assert!(
+        certify(
+            &core_unsupported,
+            &reduced_manifest,
+            "macos",
+            8,
+            1.0,
+            "L100"
+        )
+        .is_none()
+    );
 }
 
 #[test]

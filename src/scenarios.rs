@@ -1,4 +1,4 @@
-//! Versioned declarative definitions for the 41 benchmark rows.
+//! Versioned declarative definitions for implemented benchmark rows.
 
 use crate::evaluate::Pillar;
 
@@ -29,6 +29,8 @@ pub enum RequirementKind {
         /// Manifest capability declaration associated with this facet.
         capability: &'static str,
     },
+    /// A reference-envelope measurement that does not gate the badge.
+    Informational,
 }
 
 /// One deterministic suffix component shown when its matrix row passes.
@@ -56,6 +58,9 @@ pub enum BadgeFacetScope {
 impl TestDefinition {
     /// Return this row's certification role from authoritative matrix metadata.
     pub fn requirement(self) -> RequirementKind {
+        if (42..=43).contains(&self.row) {
+            return RequirementKind::Informational;
+        }
         OPTIONAL_FACETS
             .iter()
             .find(|facet| facet.row == self.row)
@@ -165,7 +170,7 @@ const AR: Pillar = Pillar::AutomationReadiness;
 /// Matrix rows that must pass early in the implementation and verification loop.
 pub const PRIORITIZED_ROWS: &[u8] = &[1, 2, 3, 9, 10, 12, 20, 26, 30, 35, 40];
 
-const TESTS: [TestDefinition; 41] = [
+const TESTS: [TestDefinition; 44] = [
     test(
         1,
         "routing",
@@ -493,6 +498,30 @@ const TESTS: [TestDefinition; 41] = [
         AR,
         "outside access and secret scans",
         "all roles use isolated roots and only fake endpoint egress",
+    ),
+    test(
+        42,
+        "model-request-efficiency",
+        "Model request efficiency",
+        RS,
+        "physical model requests per completed semantic turn",
+        "all requests classified; primary <=1/turn; side channels <=0.05/turn; no retries; bounded context tax and growth",
+    ),
+    test(
+        43,
+        "turn-latency-distribution",
+        "Turn latency distribution",
+        RS,
+        "external turn latency distribution",
+        "all external boundaries present; max below turn timeout; p95 <=1000ms and jitter <=0.25",
+    ),
+    test(
+        44,
+        "process-hygiene",
+        "Process hygiene",
+        RS,
+        "observed process, thread, and FD churn plus post-exit residue",
+        "no topology-specific residue and no sustained increase in live process, thread, or FD counts",
     ),
 ];
 

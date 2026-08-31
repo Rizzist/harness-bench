@@ -276,9 +276,9 @@ fn parse_test_row(part: &str) -> Result<u8> {
     let row: u8 = part
         .parse()
         .map_err(|_| AhrbError::Usage(format!("invalid test row {part:?}")))?;
-    if !(1..=41).contains(&row) {
+    if !(1..=44).contains(&row) {
         return Err(AhrbError::Usage(format!(
-            "test row {row} is outside 1..=41"
+            "test row {row} is outside 1..=44"
         )));
     }
     Ok(row)
@@ -343,7 +343,8 @@ mod tests {
         );
         assert!(parse_test_rows("4-2").is_err());
         assert!(parse_test_rows("1,").is_err());
-        assert!(parse_test_rows("40-42").is_err());
+        assert_eq!(parse_test_rows("40-44")?, vec![40, 41, 42, 43, 44]);
+        assert!(parse_test_rows("43-45").is_err());
         Ok(())
     }
 

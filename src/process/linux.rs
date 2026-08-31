@@ -281,7 +281,7 @@ impl Sampler for LinuxSampler {
             });
         }
 
-        let tracked_cpu_ns = self.cpu.update(&live_cpu)?;
+        let cpu_update = self.cpu.update(&live_cpu)?;
 
         let cgroup_memory_bytes = self
             .cgroup
@@ -309,7 +309,7 @@ impl Sampler for LinuxSampler {
         if let Some(current) = cgroup_cpu_ns {
             self.last_cgroup_cpu_ns = Some(current);
         }
-        let cpu_ns = cgroup_cpu_ns.unwrap_or(tracked_cpu_ns);
+        let cpu_ns = cgroup_cpu_ns.unwrap_or(cpu_update.cumulative_ns);
         let elapsed_ns = duration_ns(self.started.elapsed());
         let wall_time = SystemTime::now();
         let phase = phase.to_owned();
@@ -353,6 +353,7 @@ impl Sampler for LinuxSampler {
             collection_wall_ns: duration_ns(collection_started.elapsed()),
             processes,
             process_samples,
+            cpu_accounting_warnings: cpu_update.warnings,
         })
     }
 }

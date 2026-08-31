@@ -419,6 +419,10 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
             pillar: crate::evaluate::Pillar::Functionality,
             outcome: TestOutcome::Error(format!("matrix row {row} is outside 1..=41")),
             evidence: Vec::new(),
+            metadata: crate::evaluate::TestResultMetadata::for_row(
+                row,
+                &TestOutcome::Error("unknown matrix row".to_owned()),
+            ),
         };
     };
     let capability = capability_for_row(manifest, row);

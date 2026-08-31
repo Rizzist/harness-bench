@@ -154,8 +154,15 @@ fn per_invocation_badge_uses_process_marginal_and_labels_topology() {
             }
         })
         .collect::<Vec<_>>();
-    let badge = certify(&results, &manifest, "macos", 4, 20.0 * 1024.0 * 1024.0)
-        .expect("complete per-invocation result earns a badge");
+    let badge = certify(
+        &results,
+        &manifest,
+        "macos",
+        4,
+        20.0 * 1024.0 * 1024.0,
+        "L250",
+    )
+    .expect("complete per-invocation result earns a badge");
     assert_eq!(badge.topology, "client-process-fanout");
     assert_eq!(badge.resource_class, "R32");
     assert_eq!(badge.comparison_scope, "within-topology-only");

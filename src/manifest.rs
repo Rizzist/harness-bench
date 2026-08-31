@@ -18,6 +18,9 @@ pub struct Manifest {
     /// Logical model roles.
     #[serde(default)]
     pub model_roles: BTreeMap<String, ModelRole>,
+    /// Ordered predicates used to classify non-primary model requests.
+    #[serde(default)]
+    pub request_role_rules: Vec<RequestRoleRule>,
     /// Per-run profile isolation.
     pub isolation: Isolation,
     /// Daemon lifecycle operations.
@@ -130,6 +133,53 @@ pub struct ModelRole {
     /// Whether the role must reach the fake server.
     #[serde(default)]
     pub required: bool,
+}
+
+/// Allowed auxiliary request classifications for model-efficiency evidence.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SideChannelKind {
+    /// Thread/title generation.
+    Title,
+    /// Conversation summary generation.
+    Summary,
+    /// Context compaction.
+    Compaction,
+    /// Reviewer or critic pass.
+    Reviewer,
+    /// Child-agent request.
+    Child,
+}
+
+impl SideChannelKind {
+    /// Stable report spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Summary => "summary",
+            Self::Compaction => "compaction",
+            Self::Reviewer => "reviewer",
+            Self::Child => "child",
+        }
+    }
+}
+
+/// One ordered request-role classifier. All specified predicates are ANDed.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RequestRoleRule {
+    /// Assigned auxiliary kind.
+    pub kind: SideChannelKind,
+    /// Unique ascending match priority.
+    pub priority: u32,
+    /// Optional exact provider model-ID allow-list.
+    #[serde(default)]
+    pub model_ids: Vec<String>,
+    /// Optional JSON Pointer whose scalar/canonical value is matched by `regex`.
+    #[serde(default)]
+    pub json_pointer: String,
+    /// Rust regular expression applied to the pointed value.
+    #[serde(default)]
+    pub regex: String,
 }
 
 /// Per-run environment roots, non-directory bindings, and generated files.
@@ -616,6 +666,49 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "fake_model.allowed_paths must not be empty".to_owned(),
         ));
     }
+    let mut role_rule_priorities = std::collections::BTreeSet::new();
+    for rule in &manifest.request_role_rules {
+        if !role_rule_priorities.insert(rule.priority) {
+            return Err(AhrbError::Validation(format!(
+                "request_role_rules priority {} is duplicated",
+                rule.priority
+            )));
+        }
+        if rule.model_ids.iter().any(|model| model.trim().is_empty()) {
+            return Err(AhrbError::Validation(format!(
+                "request_role_rules priority {} contains an empty model ID",
+                rule.priority
+            )));
+        }
+        let has_pointer = !rule.json_pointer.is_empty();
+        let has_regex = !rule.regex.is_empty();
+        if has_pointer != has_regex {
+            return Err(AhrbError::Validation(format!(
+                "request_role_rules priority {} requires json_pointer and regex together",
+                rule.priority
+            )));
+        }
+        if has_pointer && (!rule.json_pointer.starts_with('/') || rule.json_pointer == "/") {
+            return Err(AhrbError::Validation(format!(
+                "request_role_rules priority {} has invalid JSON Pointer {:?}",
+                rule.priority, rule.json_pointer
+            )));
+        }
+        if has_regex {
+            regex::Regex::new(&rule.regex).map_err(|error| {
+                AhrbError::Validation(format!(
+                    "request_role_rules priority {} has invalid regex: {error}",
+                    rule.priority
+                ))
+            })?;
+        }
+        if rule.model_ids.is_empty() && !has_pointer {
+            return Err(AhrbError::Validation(format!(
+                "request_role_rules priority {} must declare at least one predicate",
+                rule.priority
+            )));
+        }
+    }
     if manifest.transport.command.is_empty()
         && matches!(
             manifest.transport.kind,
@@ -977,7 +1070,10 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
             {
                 diagnostics.push("version output does not match the required pattern".to_owned());
             }
-            Some(text)
+            Some(concise_version(
+                &text,
+                &manifest.availability.version_pattern,
+            ))
         }
         [] => None,
     };
@@ -992,6 +1088,31 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
     })
 }
 
+fn concise_version(output: &str, version_pattern: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut nonempty = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = nonempty.next().unwrap_or_default();
+    let selected = if version_pattern.is_empty() {
+        first
+    } else {
+        output
+            .lines()
+            .map(str::trim)
+            .find(|line| line.contains(version_pattern))
+            .unwrap_or(first)
+    };
+    let mut characters = selected.chars();
+    let prefix = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        prefix.chars().take(MAX_CHARS - 1).collect::<String>() + "…"
+    } else {
+        prefix
+    }
+}
+
 fn resolve_executable(candidate: &str) -> Option<PathBuf> {
     let path = PathBuf::from(candidate);
     if path.components().count() > 1 {
@@ -1002,4 +1123,54 @@ fn resolve_executable(candidate: &str) -> Option<PathBuf> {
             .map(|directory| directory.join(candidate))
             .find(|possible| possible.is_file())
     })
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{RequestRoleRule, SideChannelKind, concise_version, validate};
+
+    #[test]
+    fn version_probe_keeps_only_matching_line_or_first_line_and_caps_it() {
+        let help = "usage: mock [OPTIONS]\nahrb-mock-harness 0.1.0\nmore help";
+        assert_eq!(
+            concise_version(help, "ahrb-mock-harness"),
+            "ahrb-mock-harness 0.1.0"
+        );
+        assert_eq!(concise_version(help, ""), "usage: mock [OPTIONS]");
+        let long = format!("version {}", "x".repeat(100));
+        let value = concise_version(&long, "version");
+        assert_eq!(value.chars().count(), 80);
+        assert!(value.ends_with('…'));
+    }
+
+    #[test]
+    fn request_role_rules_require_unique_priorities_and_complete_predicates() {
+        let mut manifest = super::load(std::path::Path::new("adapters/mock/manifest.toml"))
+            .expect("load mock manifest");
+        manifest.request_role_rules = vec![
+            RequestRoleRule {
+                kind: SideChannelKind::Title,
+                priority: 10,
+                model_ids: vec!["title-model".to_owned()],
+                json_pointer: String::new(),
+                regex: String::new(),
+            },
+            RequestRoleRule {
+                kind: SideChannelKind::Summary,
+                priority: 20,
+                model_ids: Vec::new(),
+                json_pointer: "/messages/0/content".to_owned(),
+                regex: "(?i)summary".to_owned(),
+            },
+        ];
+        validate(&manifest).expect("valid ordered role rules");
+
+        manifest.request_role_rules[1].priority = 10;
+        assert!(validate(&manifest).is_err());
+        manifest.request_role_rules[1].priority = 20;
+        manifest.request_role_rules[1].regex.clear();
+        assert!(validate(&manifest).is_err());
+        manifest.request_role_rules[1].json_pointer.clear();
+        assert!(validate(&manifest).is_err());
+    }
 }

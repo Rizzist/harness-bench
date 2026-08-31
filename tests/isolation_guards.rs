@@ -29,12 +29,23 @@ fn topology_and_persistence_must_describe_the_same_architecture() {
 
 #[test]
 fn credential_argv_requires_an_explicit_capture_policy_opt_in() {
+    // The reference manifests no longer place the credential in argv (it moved
+    // to a generated config file per the "credentials never in argv" rule), so
+    // inject an argv credential here to prove the default policy rejects it.
     let mut manifest = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
-        .expect("load opted-in exec manifest");
+        .expect("load exec manifest");
+    manifest
+        .transport
+        .command
+        .push("--api-key={{credential}}".to_owned());
     manifest.capture.allow_credential_argv = false;
     let error = ahrb::manifest::validate(&manifest)
         .expect_err("credential argv must remain rejected by default");
     assert!(error.to_string().contains("credential value in argv"));
+
+    // With the explicit opt-in, the same manifest must validate.
+    manifest.capture.allow_credential_argv = true;
+    ahrb::manifest::validate(&manifest).expect("opt-in permits credential argv");
 }
 
 #[test]

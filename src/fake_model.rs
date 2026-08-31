@@ -1,7 +1,9 @@
 //! Marker-routed deterministic fake-model engine and local HTTP protocol frontends.
 
-use crate::manifest::ModelRole;
-use crate::workflow::{BarrierCoordinator, Fault, RouteMarker, Workflow, WorkflowMachine};
+use crate::manifest::{ModelRole, RequestRoleRule, SideChannelKind};
+use crate::workflow::{
+    BarrierCoordinator, Fault, RouteMarker, TransitionRecognition, Workflow, WorkflowMachine,
+};
 use crate::{AhrbError, Result};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
@@ -33,8 +35,9 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 const BIND_MAX_ATTEMPTS: usize = 8;
 const BIND_BACKOFF_MS: u64 = 10;
-const TITLE_SYSTEM_PROMPT: &str = "You are a title generator. You output ONLY a thread title.";
 const DETERMINISTIC_THREAD_TITLE: &str = "AHRB benchmark thread";
+#[cfg(test)]
+const TITLE_SYSTEM_PROMPT: &str = "You are a title generator. You output ONLY a thread title.";
 
 // The managed source-build sandbox permits local listeners but may reject concurrent
 // binds. Serialize listener-owning unit tests; production servers are unaffected.
@@ -113,23 +116,13 @@ impl ModelRequest {
     pub fn canonical_hash(&self) -> Result<String> {
         canonical_request_hash(&retry_identity_canonical(&self.dialect, &self.canonical))
     }
-
-    fn same_retry_identity(&self, other: &Self) -> bool {
-        self.dialect == other.dialect
-            && self.endpoint == other.endpoint
-            && self.model == other.model
-            && self.scenario == other.scenario
-            && self.actor == other.actor
-            && self.checkpoint == other.checkpoint
-            && self.credential_fingerprint == other.credential_fingerprint
-            && retry_identity_canonical(&self.dialect, &self.canonical)
-                == retry_identity_canonical(&other.dialect, &other.canonical)
-    }
 }
 
 /// A protocol-independent response selected by the workflow engine.
 #[derive(Clone, Debug)]
 pub struct ModelResponse {
+    /// Protocol dialect used to locate physical-attempt evidence.
+    pub dialect: String,
     /// Model ID supplied by the request.
     pub model: String,
     /// Scenario route marker.
@@ -140,6 +133,8 @@ pub struct ModelResponse {
     pub checkpoint: String,
     /// Canonical retry-identity hash.
     pub request_hash: String,
+    /// Physical request attempt correlated to response evidence.
+    pub attempt: u64,
     /// Deterministic semantic response.
     pub value: Value,
     /// Optional transport fault.
@@ -178,7 +173,7 @@ pub trait ProtocolFrontend: Send + Sync {
     fn render(&self, response: &ModelResponse) -> Result<RenderedResponse>;
 }
 
-/// One stable request evidence record. Records are returned in route/hash order.
+/// One physical model-request attempt. Records are returned in semantic-key/attempt order.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelRequestRecord {
     /// Parsed canonical request.
@@ -189,23 +184,300 @@ pub struct ModelRequestRecord {
     pub attempts: u64,
     /// Whether the workflow state machine accepted the request.
     pub accepted: bool,
+    /// Stable ordinal within the scripted scenario/actor/checkpoint route.
+    pub semantic_ordinal: u64,
+    /// One-based physical attempt number for this semantic request.
+    pub attempt: u64,
+    /// Monotonic timestamp after the fake provider finished reading the request body.
+    pub received_ns: u64,
+    /// Exact raw HTTP request body length before JSON parsing.
+    pub body_bytes: u64,
+    /// `primary`, `side-channel`, or `unclassified`.
+    pub role: String,
+    /// Classified auxiliary kind; null for a primary request.
+    pub side_channel_kind: Option<String>,
+    /// HTTP response status when known at the provider boundary.
+    pub response_status: Option<u16>,
+    /// Monotonic first response-frame yield boundary when observed.
+    pub response_first_frame_yield_ns: Option<u64>,
+    /// Monotonic last response-frame yield boundary when observed.
+    pub response_last_frame_yield_ns: Option<u64>,
+    /// Final physical-attempt total, repeated on every attempt record.
+    pub semantic_attempts_total: u64,
+}
+
+/// Complete row-42 aggregation and reference-envelope decision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelRequestEfficiencyEvaluation {
+    /// Exact numeric `metrics` entries required by the v2 schema.
+    pub metrics: BTreeMap<String, f64>,
+    /// Exact structured `details.model-request-efficiency` value.
+    pub details: Value,
+    /// Whether all mandatory observations were present.
+    pub measurement_complete: bool,
+    /// Reference-envelope decision when measurement is complete.
+    pub reference_envelope_pass: bool,
+}
+
+/// Aggregate physical request attempts for row 42 without instrumenting the harness path.
+pub fn evaluate_model_request_efficiency(
+    records: &[ModelRequestRecord],
+    completed_semantic_turns: u64,
+    expected_semantic_turns: u64,
+) -> ModelRequestEfficiencyEvaluation {
+    let physical_requests = records.len() as u64;
+    let primary_requests = records
+        .iter()
+        .filter(|record| record.role == "primary")
+        .count() as u64;
+    let side_channel_requests = records
+        .iter()
+        .filter(|record| record.role == "side-channel")
+        .count() as u64;
+    let unclassified = records
+        .iter()
+        .filter(|record| {
+            record.role == "unclassified"
+                || record.side_channel_kind.as_deref() == Some("unknown-side-channel")
+        })
+        .collect::<Vec<_>>();
+    let mut semantic_attempts = BTreeMap::new();
+    for record in records {
+        semantic_attempts
+            .entry((
+                record.request.scenario.as_str(),
+                record.request.actor.as_str(),
+                record.request.checkpoint.as_str(),
+                record.semantic_ordinal,
+            ))
+            .and_modify(|total: &mut u64| {
+                *total = (*total).max(record.semantic_attempts_total);
+            })
+            .or_insert(record.semantic_attempts_total);
+    }
+    let retry_attempts = semantic_attempts.values().fold(0_u64, |total, attempts| {
+        total.saturating_add(attempts.saturating_sub(1))
+    });
+    let body_sizes = records
+        .iter()
+        .map(|record| record.body_bytes)
+        .collect::<Vec<_>>();
+    let context_sizes = records
+        .iter()
+        .map(|record| canonical_context_tax_bytes(&record.request.canonical))
+        .collect::<Vec<_>>();
+    let mut primary_semantics = BTreeMap::<(&str, &str), BTreeMap<(u64, &str), u64>>::new();
+    for record in records.iter().filter(|record| record.role == "primary") {
+        primary_semantics
+            .entry((
+                record.request.scenario.as_str(),
+                record.request.actor.as_str(),
+            ))
+            .or_default()
+            .entry((record.semantic_ordinal, record.request.checkpoint.as_str()))
+            .or_insert_with(|| canonical_context_tax_bytes(&record.request.canonical));
+    }
+    let mut context_slopes = primary_semantics
+        .values()
+        .map(|turns| theil_sen_by_index(&turns.values().copied().collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+    context_slopes.sort_by(f64::total_cmp);
+    let denominator = completed_semantic_turns as f64;
+    let rate = |count: u64| {
+        if completed_semantic_turns == 0 {
+            0.0
+        } else {
+            count as f64 / denominator
+        }
+    };
+    let context_slope = median_f64(&context_slopes);
+    let mut metrics = BTreeMap::from([
+        (
+            "model_request_efficiency.requests_per_semantic_turn".to_owned(),
+            rate(physical_requests),
+        ),
+        (
+            "model_request_efficiency.primary_requests_per_turn".to_owned(),
+            rate(primary_requests),
+        ),
+        (
+            "model_request_efficiency.side_channel_requests_per_turn".to_owned(),
+            rate(side_channel_requests),
+        ),
+        (
+            "model_request_efficiency.retry_attempts_per_turn".to_owned(),
+            rate(retry_attempts),
+        ),
+        (
+            "model_request_efficiency.request_body_bytes_p50".to_owned(),
+            nearest_rank(&body_sizes, 50) as f64,
+        ),
+        (
+            "model_request_efficiency.request_body_bytes_p95".to_owned(),
+            nearest_rank(&body_sizes, 95) as f64,
+        ),
+        (
+            "model_request_efficiency.request_body_bytes_max".to_owned(),
+            body_sizes.iter().copied().max().unwrap_or(0) as f64,
+        ),
+        (
+            "model_request_efficiency.context_tax_bytes_p50".to_owned(),
+            nearest_rank(&context_sizes, 50) as f64,
+        ),
+        (
+            "model_request_efficiency.context_tax_bytes_p95".to_owned(),
+            nearest_rank(&context_sizes, 95) as f64,
+        ),
+        (
+            "model_request_efficiency.context_tax_bytes_max".to_owned(),
+            context_sizes.iter().copied().max().unwrap_or(0) as f64,
+        ),
+        (
+            "model_request_efficiency.context_tax_slope_bytes_per_turn".to_owned(),
+            context_slope,
+        ),
+    ]);
+    // Normalize negative zero so serialized reports stay byte-stable.
+    if metrics.get("model_request_efficiency.context_tax_slope_bytes_per_turn") == Some(&-0.0) {
+        metrics.insert(
+            "model_request_efficiency.context_tax_slope_bytes_per_turn".to_owned(),
+            0.0,
+        );
+    }
+    let mut side_channel_requests_by_role = BTreeMap::new();
+    for kind in ["title", "summary", "compaction", "reviewer", "child"] {
+        let count = records
+            .iter()
+            .filter(|record| record.side_channel_kind.as_deref() == Some(kind))
+            .count() as u64;
+        side_channel_requests_by_role.insert(kind, count);
+    }
+    let unclassified_requests = unclassified
+        .iter()
+        .map(|record| {
+            json!({
+                "scenario": record.request.scenario,
+                "actor": record.request.actor,
+                "checkpoint": record.request.checkpoint,
+                "semantic_ordinal": record.semantic_ordinal,
+                "attempt": record.attempt
+            })
+        })
+        .collect::<Vec<_>>();
+    let measurement_complete = completed_semantic_turns > 0
+        && completed_semantic_turns == expected_semantic_turns
+        && !records.is_empty()
+        && records.iter().all(|record| record.body_bytes > 0);
+    let reference_envelope_pass = measurement_complete
+        && unclassified.is_empty()
+        && metrics["model_request_efficiency.primary_requests_per_turn"] <= 1.0
+        && metrics["model_request_efficiency.side_channel_requests_per_turn"] <= 0.05
+        && metrics["model_request_efficiency.retry_attempts_per_turn"] == 0.0
+        && metrics["model_request_efficiency.context_tax_bytes_p95"] <= 1_048_576.0
+        && context_slope.abs() <= 1_024.0;
+    ModelRequestEfficiencyEvaluation {
+        metrics,
+        details: json!({
+            "side_channel_requests_by_role": side_channel_requests_by_role,
+            "unclassified_requests": unclassified_requests
+        }),
+        measurement_complete,
+        reference_envelope_pass,
+    }
+}
+
+/// Canonical encoded system/developer instructions plus tool definitions.
+pub fn canonical_context_tax_bytes(canonical: &Value) -> u64 {
+    let mut bytes = 0_u64;
+    let mut add = |value: &Value| {
+        if let Ok(encoded) = serde_json::to_vec(value) {
+            bytes = bytes.saturating_add(encoded.len() as u64);
+        }
+    };
+    if let Some(value) = canonical.get("system") {
+        add(value);
+    }
+    if let Some(value) = canonical.get("instructions") {
+        add(value);
+    }
+    for field in ["messages", "input"] {
+        if let Some(items) = canonical.get(field).and_then(Value::as_array) {
+            for item in items {
+                if matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                ) {
+                    add(item);
+                }
+            }
+        }
+    }
+    if let Some(tools) = canonical.get("tools") {
+        add(tools);
+    }
+    bytes
+}
+
+fn nearest_rank(values: &[u64], percentile: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let rank = percentile.saturating_mul(sorted.len()).saturating_add(99) / 100;
+    sorted[rank.max(1).min(sorted.len()) - 1]
+}
+
+fn theil_sen_by_index(values: &[u64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mut slopes = Vec::new();
+    for left in 0..values.len() - 1 {
+        for right in left + 1..values.len() {
+            let delta = values[right] as f64 - values[left] as f64;
+            slopes.push(delta / (right - left) as f64);
+        }
+    }
+    slopes.sort_by(f64::total_cmp);
+    let middle = slopes.len() / 2;
+    if slopes.len() % 2 == 0 {
+        (slopes[middle - 1] + slopes[middle]) / 2.0
+    } else {
+        slopes[middle]
+    }
+}
+
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
 }
 
 type RequestRecordKey = (String, String, String, String, String);
+type SemanticRequestKey = (String, String, String, u64);
 
 /// State for deterministic transition validation, barriers, and idempotent retries.
 #[derive(Debug)]
 pub struct FakeModelEngine {
     machine: WorkflowMachine,
     barriers: BarrierCoordinator,
-    requests: Mutex<BTreeMap<RequestRecordKey, ModelRequestRecord>>,
-    title_model: Option<String>,
+    requests: Mutex<BTreeMap<RequestRecordKey, Vec<ModelRequestRecord>>>,
+    attempt_sequences: Mutex<BTreeMap<SemanticRequestKey, u64>>,
+    request_role_rules: Vec<RequestRoleRule>,
+    semantic_ordinals: BTreeMap<(String, String, String), u64>,
 }
 
 impl FakeModelEngine {
     /// Build an engine from one validated declarative workflow.
     pub fn new(workflow: &Workflow) -> Result<Self> {
-        Self::with_model_roles(workflow, &BTreeMap::new())
+        Self::with_request_roles(workflow, &BTreeMap::new(), &[])
     }
 
     /// Build an engine with manifest-declared auxiliary model roles.
@@ -213,16 +485,54 @@ impl FakeModelEngine {
         workflow: &Workflow,
         model_roles: &BTreeMap<String, ModelRole>,
     ) -> Result<Self> {
+        Self::with_request_roles(workflow, model_roles, &[])
+    }
+
+    /// Build an engine with model IDs and ordered non-primary request classifiers.
+    pub fn with_request_roles(
+        workflow: &Workflow,
+        _model_roles: &BTreeMap<String, ModelRole>,
+        request_role_rules: &[RequestRoleRule],
+    ) -> Result<Self> {
+        let mut request_role_rules = request_role_rules.to_vec();
+        request_role_rules.sort_by_key(|rule| rule.priority);
+        let mut next_by_actor = BTreeMap::<String, u64>::new();
+        let mut semantic_ordinals = BTreeMap::new();
+        for response in &workflow.responses {
+            let next = next_by_actor.entry(response.actor.clone()).or_default();
+            *next = next.saturating_add(1);
+            semantic_ordinals.insert(
+                (
+                    response.scenario.clone(),
+                    response.actor.clone(),
+                    response.checkpoint.clone(),
+                ),
+                *next,
+            );
+        }
         Ok(Self {
             machine: WorkflowMachine::new(workflow)?,
             barriers: BarrierCoordinator::new(workflow)?,
             requests: Mutex::new(BTreeMap::new()),
-            title_model: model_roles.get("title").map(|role| role.model.clone()),
+            attempt_sequences: Mutex::new(BTreeMap::new()),
+            request_role_rules,
+            semantic_ordinals,
         })
     }
 
     /// Validate, route, and await any named barrier for a canonical request.
     pub async fn handle(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let body_bytes = serde_json::to_vec(&request.canonical)?.len() as u64;
+        self.handle_observed(request, body_bytes, monotonic_timestamp_ns())
+            .await
+    }
+
+    async fn handle_observed(
+        &self,
+        request: ModelRequest,
+        body_bytes: u64,
+        received_ns: u64,
+    ) -> Result<ModelResponse> {
         let marker = request.marker()?;
         let request_hash = request.canonical_hash()?;
         let record_key = (
@@ -232,61 +542,110 @@ impl FakeModelEngine {
             request_hash.clone(),
             request.dialect.clone(),
         );
+        let semantic_ordinal = self
+            .semantic_ordinals
+            .get(&(
+                request.scenario.clone(),
+                request.actor.clone(),
+                request.checkpoint.clone(),
+            ))
+            .copied()
+            .unwrap_or(1);
+        let semantic_key = (
+            request.scenario.clone(),
+            request.actor.clone(),
+            request.checkpoint.clone(),
+            semantic_ordinal,
+        );
         let attempt = {
-            let mut records = self.requests.lock().await;
-            let record = records
-                .entry(record_key.clone())
-                .or_insert_with(|| ModelRequestRecord {
-                    request: request.clone(),
-                    canonical_hash: request_hash.clone(),
-                    attempts: 0,
-                    accepted: false,
-                });
-            if !record.request.same_retry_identity(&request) {
-                return Err(AhrbError::Protocol(
-                    "request evidence key collision with different request".to_owned(),
-                ));
-            }
-            record.attempts = record.attempts.checked_add(1).ok_or_else(|| {
+            let mut sequences = self.attempt_sequences.lock().await;
+            let attempt = sequences.entry(semantic_key).or_default();
+            *attempt = attempt.checked_add(1).ok_or_else(|| {
                 AhrbError::Protocol("request attempt counter overflow".to_owned())
             })?;
-            record.attempts
+            *attempt
         };
-
-        if self.title_model.as_deref() == Some(request.model.as_str())
-            && is_title_generation_request(&request)
         {
-            self.mark_request_accepted(&record_key).await?;
+            let mut records = self.requests.lock().await;
+            let attempts = records.entry(record_key.clone()).or_default();
+            attempts.push(ModelRequestRecord {
+                request: request.clone(),
+                canonical_hash: request_hash.clone(),
+                attempts: attempt,
+                accepted: false,
+                semantic_ordinal,
+                attempt,
+                received_ns,
+                body_bytes,
+                role: "unclassified".to_owned(),
+                side_channel_kind: Some("unknown-side-channel".to_owned()),
+                response_status: None,
+                response_first_frame_yield_ns: None,
+                response_last_frame_yield_ns: None,
+                semantic_attempts_total: attempt,
+            });
+        }
+
+        if matches!(
+            self.machine.recognize(&marker).await,
+            TransitionRecognition::Current | TransitionRecognition::Retry
+        ) {
+            let accepted = self.machine.accept(&marker, &request_hash).await?;
+            self.mark_request_accepted(&record_key, "primary", None)
+                .await?;
+            if let Some(barrier) = &accepted.response.barrier {
+                self.barriers.arrive(barrier, &marker).await?;
+                self.barriers.wait_for_release(barrier).await?;
+            }
+            let value = adapt_scripted_tool_calls(&accepted.response.response, &request.canonical)?;
+
             return Ok(ModelResponse {
+                dialect: request.dialect,
                 model: request.model,
                 scenario: marker.scenario,
                 actor: marker.actor,
                 checkpoint: marker.checkpoint,
                 request_hash,
-                value: json!({"text": DETERMINISTIC_THREAD_TITLE}),
+                attempt,
+                value,
+                fault: accepted.response.fault,
+                retry: accepted.retry,
+                stream: request.stream,
+            });
+        }
+
+        let classified_side_channel = self.classify_side_channel(&request)?;
+        if let Some(kind) = classified_side_channel {
+            self.mark_request_accepted(&record_key, "side-channel", Some(kind.as_str()))
+                .await?;
+            return Ok(ModelResponse {
+                dialect: request.dialect,
+                model: request.model,
+                scenario: marker.scenario,
+                actor: marker.actor,
+                checkpoint: marker.checkpoint,
+                request_hash,
+                attempt,
+                value: json!({"text": if kind == SideChannelKind::Title { DETERMINISTIC_THREAD_TITLE } else { "AHRB deterministic auxiliary response" }}),
                 fault: None,
                 retry: attempt > 1,
                 stream: request.stream,
             });
         }
 
-        let accepted = self.machine.accept(&marker, &request_hash).await?;
-        self.mark_request_accepted(&record_key).await?;
-        if let Some(barrier) = &accepted.response.barrier {
-            self.barriers.arrive(barrier, &marker).await?;
-            self.barriers.wait_for_release(barrier).await?;
-        }
-        let value = adapt_scripted_tool_calls(&accepted.response.response, &request.canonical)?;
-
+        self.mark_request_accepted(&record_key, "side-channel", Some("unknown-side-channel"))
+            .await?;
         Ok(ModelResponse {
+            dialect: request.dialect,
             model: request.model,
             scenario: marker.scenario,
             actor: marker.actor,
             checkpoint: marker.checkpoint,
             request_hash,
-            value,
-            fault: accepted.response.fault,
-            retry: accepted.retry,
+            attempt,
+            value: json!({"text": "AHRB deterministic unclassified auxiliary response"}),
+            fault: None,
+            retry: attempt > 1,
             stream: request.stream,
         })
     }
@@ -298,55 +657,176 @@ impl FakeModelEngine {
 
     /// Return deterministic request evidence sorted independently of arrival order.
     pub async fn request_records(&self) -> Vec<ModelRequestRecord> {
-        self.requests.lock().await.values().cloned().collect()
+        let records = self.requests.lock().await;
+        let mut output = Vec::new();
+        for attempts in records.values() {
+            for record in attempts {
+                output.push(record.clone());
+            }
+        }
+        output.sort_by(|left, right| {
+            (
+                &left.request.scenario,
+                &left.request.actor,
+                &left.request.checkpoint,
+                left.semantic_ordinal,
+                left.attempt,
+            )
+                .cmp(&(
+                    &right.request.scenario,
+                    &right.request.actor,
+                    &right.request.checkpoint,
+                    right.semantic_ordinal,
+                    right.attempt,
+                ))
+        });
+        let totals = output.iter().fold(
+            BTreeMap::<SemanticRequestKey, u64>::new(),
+            |mut totals, record| {
+                let key = (
+                    record.request.scenario.clone(),
+                    record.request.actor.clone(),
+                    record.request.checkpoint.clone(),
+                    record.semantic_ordinal,
+                );
+                totals
+                    .entry(key)
+                    .and_modify(|total| *total = (*total).max(record.attempt))
+                    .or_insert(record.attempt);
+                totals
+            },
+        );
+        for record in &mut output {
+            let key = (
+                record.request.scenario.clone(),
+                record.request.actor.clone(),
+                record.request.checkpoint.clone(),
+                record.semantic_ordinal,
+            );
+            let total = totals.get(&key).copied().unwrap_or(record.attempt);
+            record.attempts = total;
+            record.semantic_attempts_total = total;
+        }
+        output
     }
 
-    async fn mark_request_accepted(&self, record_key: &RequestRecordKey) -> Result<()> {
+    async fn mark_request_accepted(
+        &self,
+        record_key: &RequestRecordKey,
+        role: &str,
+        side_channel_kind: Option<&str>,
+    ) -> Result<()> {
         let mut records = self.requests.lock().await;
-        let Some(record) = records.get_mut(record_key) else {
+        let Some(record) = records
+            .get_mut(record_key)
+            .and_then(|records| records.last_mut())
+        else {
             return Err(AhrbError::Protocol(
                 "request evidence disappeared during transition".to_owned(),
             ));
         };
         record.accepted = true;
+        record.role = role.to_owned();
+        record.side_channel_kind = side_channel_kind.map(str::to_owned);
+        Ok(())
+    }
+
+    fn classify_side_channel(&self, request: &ModelRequest) -> Result<Option<SideChannelKind>> {
+        for rule in &self.request_role_rules {
+            if !rule.model_ids.is_empty()
+                && !rule.model_ids.iter().any(|model| model == &request.model)
+            {
+                continue;
+            }
+            if !rule.json_pointer.is_empty() {
+                let Some(value) = request.canonical.pointer(&rule.json_pointer) else {
+                    continue;
+                };
+                let candidate = match value {
+                    Value::String(value) => value.clone(),
+                    _ => serde_json::to_string(value)?,
+                };
+                let expression = regex::Regex::new(&rule.regex).map_err(|error| {
+                    AhrbError::Validation(format!(
+                        "invalid request-role regex after manifest validation: {error}"
+                    ))
+                })?;
+                if !expression.is_match(&candidate) {
+                    continue;
+                }
+            }
+            return Ok(Some(rule.kind));
+        }
+        Ok(None)
+    }
+
+    async fn mark_response_status(&self, response: &ModelResponse, status: u16) -> Result<()> {
+        let key = (
+            response.scenario.clone(),
+            response.actor.clone(),
+            response.checkpoint.clone(),
+            response.request_hash.clone(),
+            response.dialect.clone(),
+        );
+        let mut records = self.requests.lock().await;
+        let Some(record) = records.get_mut(&key).and_then(|records| {
+            records
+                .iter_mut()
+                .find(|record| record.attempt == response.attempt)
+        }) else {
+            return Err(AhrbError::Protocol(
+                "request evidence disappeared before response status recording".to_owned(),
+            ));
+        };
+        record.response_status = Some(status);
+        Ok(())
+    }
+
+    async fn mark_response_frame_yield(
+        &self,
+        response: &ModelResponse,
+        yielded_ns: u64,
+    ) -> Result<()> {
+        let key = (
+            response.scenario.clone(),
+            response.actor.clone(),
+            response.checkpoint.clone(),
+            response.request_hash.clone(),
+            response.dialect.clone(),
+        );
+        let mut records = self.requests.lock().await;
+        let Some(record) = records.get_mut(&key).and_then(|records| {
+            records
+                .iter_mut()
+                .find(|record| record.attempt == response.attempt)
+        }) else {
+            return Err(AhrbError::Protocol(
+                "request evidence disappeared before response frame recording".to_owned(),
+            ));
+        };
+        record
+            .response_first_frame_yield_ns
+            .get_or_insert(yielded_ns);
+        record.response_last_frame_yield_ns = Some(yielded_ns);
         Ok(())
     }
 }
 
-fn is_title_generation_request(request: &ModelRequest) -> bool {
-    if request.dialect != "openai-chat-completions" {
-        return false;
-    }
-    let Some(object) = request.canonical.as_object() else {
-        return false;
+/// System-wide monotonic nanoseconds suitable for cross-process evidence correlation.
+pub fn monotonic_timestamp_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    let no_tools = object
-        .get("tools")
-        .is_none_or(|tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty));
-    let no_tool_choice = object.get("tool_choice").is_none_or(Value::is_null);
-    let title_prompt = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message.get("role").and_then(Value::as_str) == Some("system")
-                    && message
-                        .get("content")
-                        .is_some_and(is_exact_title_system_prompt)
-            })
-        });
-    no_tools && no_tool_choice && title_prompt
-}
-
-fn is_exact_title_system_prompt(content: &Value) -> bool {
-    match content {
-        Value::String(text) => text == TITLE_SYSTEM_PROMPT,
-        Value::Array(parts) => {
-            parts.len() == 1 && parts.first().is_some_and(is_exact_title_system_prompt)
-        }
-        Value::Object(part) => part.get("text").is_some_and(is_exact_title_system_prompt),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    // SAFETY: `time` is a valid writable timespec and CLOCK_MONOTONIC is system-wide.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
     }
+    let seconds = u64::try_from(time.tv_sec).unwrap_or(0);
+    let nanoseconds = u64::try_from(time.tv_nsec).unwrap_or(0);
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds)
 }
 
 #[derive(Clone, Debug)]
@@ -847,6 +1327,198 @@ pub struct FakeModelUnixServer {
     engine: Arc<FakeModelEngine>,
 }
 
+/// Atomic raw HTTP envelope used when the host denies socket creation.
+///
+/// This is an actual provider transport, not telemetry: the harness receives no model
+/// response until the runner-owned provider sidecar consumes this envelope.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderMailboxRequest {
+    /// Transport correlation ID; never used for semantic workflow routing.
+    pub id: String,
+    /// Exact HTTP method.
+    pub method: String,
+    /// Exact HTTP request path.
+    pub path: String,
+    /// Exact request headers.
+    pub headers: BTreeMap<String, String>,
+    /// Exact raw body bytes before parsing.
+    pub body: Vec<u8>,
+}
+
+/// Atomic provider response paired 1:1 with a mailbox request.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderMailboxResponse {
+    /// Correlation ID copied from the request envelope.
+    pub id: String,
+    /// HTTP response status when a response was produced.
+    pub status: u16,
+    /// Exact rendered response body.
+    pub body: Vec<u8>,
+    /// Transport/protocol failure when no HTTP response can be represented.
+    pub error: Option<String>,
+}
+
+/// Runner-owned fake-provider sidecar for restricted hosts without sockets.
+#[derive(Debug)]
+pub struct FakeModelMailboxServer {
+    directory: PathBuf,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl FakeModelMailboxServer {
+    /// Create a fresh atomic-envelope provider transport.
+    pub async fn bind(directory: PathBuf, engine: Arc<FakeModelEngine>) -> Result<Self> {
+        tokio::fs::create_dir(&directory).await?;
+        let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
+        let task_directory = directory.clone();
+        let task = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_receiver => {
+                        requests.abort_all();
+                        while requests.join_next().await.is_some() {}
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(2)) => {
+                        let mut entries = tokio::fs::read_dir(&task_directory).await?;
+                        let mut paths = Vec::new();
+                        while let Some(entry) = entries.next_entry().await? {
+                            let path = entry.path();
+                            if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.ends_with(".request.json")) {
+                                paths.push(path);
+                            }
+                        }
+                        paths.sort();
+                        for path in paths {
+                            let claimed = path.with_extension("claimed");
+                            match tokio::fs::rename(&path, &claimed).await {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                                Err(error) => return Err(error.into()),
+                            }
+                            let bytes = tokio::fs::read(&claimed).await?;
+                            let received_ns = monotonic_timestamp_ns();
+                            tokio::fs::remove_file(&claimed).await?;
+                            let envelope: ProviderMailboxRequest = serde_json::from_slice(&bytes)?;
+                            let response_directory = task_directory.clone();
+                            let response_engine = Arc::clone(&engine);
+                            requests.spawn(async move {
+                                let response = handle_provider_mailbox_request(
+                                    &envelope,
+                                    received_ns,
+                                    response_engine,
+                                )
+                                .await;
+                                let response = match response {
+                                    Ok(response) => response,
+                                    Err(error) => ProviderMailboxResponse {
+                                        id: envelope.id.clone(),
+                                        status: 0,
+                                        body: Vec::new(),
+                                        error: Some(error.to_string()),
+                                    },
+                                };
+                                write_provider_mailbox_response(&response_directory, &response).await
+                            });
+                        }
+                        while requests.try_join_next().is_some() {}
+                    }
+                }
+            }
+            Ok(())
+        });
+        Ok(Self {
+            directory,
+            shutdown: Some(shutdown_sender),
+            task,
+        })
+    }
+
+    /// Provider transport directory passed to the reference harness.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Stop the sidecar and remove its fresh transport directory.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(sender) = self.shutdown.take() {
+            let _sent = sender.send(());
+        }
+        self.task
+            .await
+            .map_err(|error| AhrbError::Protocol(format!("provider mailbox task: {error}")))??;
+        tokio::fs::remove_dir_all(&self.directory).await?;
+        Ok(())
+    }
+}
+
+async fn handle_provider_mailbox_request(
+    envelope: &ProviderMailboxRequest,
+    received_ns: u64,
+    engine: Arc<FakeModelEngine>,
+) -> Result<ProviderMailboxResponse> {
+    if envelope.method != "POST" {
+        return Err(AhrbError::Protocol(format!(
+            "provider mailbox only accepts POST, not {:?}",
+            envelope.method
+        )));
+    }
+    let frontend: &dyn ProtocolFrontend = match envelope.path.as_str() {
+        "/v1/chat/completions" => &OpenAiChatFrontend,
+        "/v1/responses" => &OpenAiResponsesFrontend,
+        "/v1/messages" => &AnthropicMessagesFrontend,
+        other => {
+            return Err(AhrbError::Protocol(format!(
+                "unexpected provider mailbox path {other:?}"
+            )));
+        }
+    };
+    let body_bytes = u64::try_from(envelope.body.len()).map_err(|_| {
+        AhrbError::Protocol("provider mailbox body length does not fit u64".to_owned())
+    })?;
+    let headers = canonicalize_provider_headers(&envelope.headers)?;
+    let parsed = frontend.parse(&envelope.path, &headers, &envelope.body)?;
+    let selected = engine
+        .handle_observed(parsed, body_bytes, received_ns)
+        .await?;
+    let (status, body) = match &selected.fault {
+        Some(Fault::HttpStatus { status, body }) => (*status, body.as_bytes().to_vec()),
+        Some(Fault::Stall) => std::future::pending::<(u16, Vec<u8>)>().await,
+        Some(Fault::MidStreamDisconnect { .. }) => {
+            return Err(AhrbError::Protocol(
+                "provider mailbox injected a mid-stream disconnect".to_owned(),
+            ));
+        }
+        None | Some(Fault::Fragment { .. }) | Some(Fault::RepeatFrame { .. }) => {
+            let rendered = frontend.render(&selected)?;
+            (rendered.status, rendered.body)
+        }
+    };
+    engine.mark_response_status(&selected, status).await?;
+    engine
+        .mark_response_frame_yield(&selected, monotonic_timestamp_ns())
+        .await?;
+    Ok(ProviderMailboxResponse {
+        id: envelope.id.clone(),
+        status,
+        body,
+        error: None,
+    })
+}
+
+async fn write_provider_mailbox_response(
+    directory: &Path,
+    response: &ProviderMailboxResponse,
+) -> Result<()> {
+    let final_path = directory.join(format!("{}.response.json", response.id));
+    let temporary = directory.join(format!("{}.response.tmp", response.id));
+    tokio::fs::write(&temporary, serde_json::to_vec(response)?).await?;
+    tokio::fs::rename(temporary, final_path).await?;
+    Ok(())
+}
+
 #[cfg(unix)]
 impl FakeModelUnixServer {
     /// Bind a new Unix socket and serve all built-in HTTP protocol frontends.
@@ -1019,9 +1691,16 @@ async fn handle_http(
     };
     let headers = canonical_headers(request.headers())?;
     let body = collect_bounded(request.into_body()).await?;
+    let received_ns = monotonic_timestamp_ns();
+    let body_bytes = u64::try_from(body.len()).map_err(|_| {
+        AhrbError::Protocol("fake-model request body length does not fit u64".to_owned())
+    })?;
     let parsed = frontend.parse(&path, &headers, &body)?;
-    let selected = engine.handle(parsed).await?;
+    let selected = engine
+        .handle_observed(parsed, body_bytes, received_ns)
+        .await?;
     if let Some(Fault::HttpStatus { status, body }) = &selected.fault {
+        engine.mark_response_status(&selected, *status).await?;
         return response_from_parts(
             *status,
             &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
@@ -1030,6 +1709,9 @@ async fn handle_http(
     }
 
     let rendered = frontend.render(&selected)?;
+    engine
+        .mark_response_status(&selected, rendered.status)
+        .await?;
     let response_body = DeterministicBody::from_fault(rendered.body, selected.fault.as_ref())?;
     response_from_parts(rendered.status, &rendered.headers, response_body)
 }
@@ -1197,6 +1879,21 @@ fn canonical_headers(headers: &hyper::HeaderMap) -> Result<BTreeMap<String, Stri
             AhrbError::Protocol(format!("header {:?} is not visible ASCII", name.as_str()))
         })?;
         canonical.insert(name.as_str().to_ascii_lowercase(), value.to_owned());
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_provider_headers(
+    headers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut canonical = BTreeMap::new();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if canonical.insert(lower.clone(), value.clone()).is_some() {
+            return Err(AhrbError::Protocol(format!(
+                "provider mailbox repeats header {lower:?} case-insensitively"
+            )));
+        }
     }
     Ok(canonical)
 }
@@ -2233,11 +2930,13 @@ mod tests {
 
     fn streamed_tool_response() -> ModelResponse {
         ModelResponse {
+            dialect: "openai-chat-completions".to_owned(),
             model: "ahrb-fake-v1".to_owned(),
             scenario: "routing".to_owned(),
             actor: "root".to_owned(),
             checkpoint: "start".to_owned(),
             request_hash: "request-hash".to_owned(),
+            attempt: 1,
             value: json!({
                 "tool_calls": [{
                     "id": "call_fixture",
@@ -2291,31 +2990,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn title_role_requests_do_not_consume_main_checkpoint_identity() -> Result<()> {
-        let mut workflow = simple_workflow();
-        workflow.responses[0].response = json!({
-            "tool_calls": [{
-                "id": "call-opencode",
-                "name": "write_fixture",
-                "arguments": {"path": "opencode.txt", "content": "ok"},
-                "_ahrb_native": {
-                    "semantic": "write",
-                    "aliases": ["bash"],
-                    "bindings": {"bash.command": "command"},
-                    "argv": ["/bin/sh", "-c", "printf ok > opencode.txt"]
-                }
-            }]
-        });
-        let roles = BTreeMap::from([(
-            "title".to_owned(),
-            ModelRole {
-                model: "ahrb-title-v1".to_owned(),
-                required: false,
-            },
-        )]);
-        let engine = FakeModelEngine::with_model_roles(&workflow, &roles)?;
+    async fn current_checkpoint_precedes_ordered_side_channel_rules_and_unknown_is_retained()
+    -> Result<()> {
+        let workflow = simple_workflow();
+        let rules = vec![RequestRoleRule {
+            kind: SideChannelKind::Title,
+            priority: 10,
+            model_ids: vec!["ahrb-title-v1".to_owned()],
+            json_pointer: String::new(),
+            regex: String::new(),
+        }];
+        let engine = FakeModelEngine::with_request_roles(&workflow, &BTreeMap::new(), &rules)?;
         let frontend = OpenAiChatFrontend;
-        let title_body = json!({
+        let current_body = json!({
             "model": "ahrb-title-v1",
             "messages": [
                 {"role": "system", "content": TITLE_SYSTEM_PROMPT},
@@ -2324,96 +3011,165 @@ mod tests {
             "tool_choice": null,
             "stream": false
         });
-        let title_bytes = serde_json::to_vec(&title_body)?;
-        let title = frontend.parse(frontend.path(), &BTreeMap::new(), &title_bytes)?;
+        let current = frontend.parse(
+            frontend.path(),
+            &BTreeMap::new(),
+            &serde_json::to_vec(&current_body)?,
+        )?;
+        let selected = engine.handle(current).await?;
+        assert_eq!(selected.value, json!({"text":"SUCCESS"}));
 
-        let first_title = engine.handle(title.clone()).await?;
-        assert_eq!(
-            first_title.value.get("text").and_then(Value::as_str),
-            Some(DETERMINISTIC_THREAD_TITLE)
-        );
-        assert!(!first_title.retry);
-
-        let main_body = json!({
-            "model": "ahrb-fake-v1",
-            "messages": [
-                {"role": "system", "content": "You are opencode, an interactive CLI tool."},
-                {"role": "user", "content": "go [[AHRB:scenario=routing;actor=root;checkpoint=start]]"}
-            ],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"command": {"type": "string"}},
-                        "required": ["command"],
-                        "additionalProperties": false
-                    }
-                }
-            }],
-            "tool_choice": "auto",
-            "stream": true
-        });
-        let main_bytes = serde_json::to_vec(&main_body)?;
-        let main = frontend.parse(frontend.path(), &BTreeMap::new(), &main_bytes)?;
-        let selected = engine.handle(main.clone()).await?;
-        assert_eq!(
-            selected
-                .value
-                .pointer("/tool_calls/0/name")
-                .and_then(Value::as_str),
-            Some("bash")
-        );
-        assert!(
-            selected
-                .value
-                .pointer("/tool_calls/0/arguments/command")
-                .and_then(Value::as_str)
-                .is_some_and(|command| command.contains("printf ok > opencode.txt"))
-        );
-
-        let mut next_title_body = title_body.clone();
-        next_title_body["messages"][1]["content"] =
-            json!("another turn [[AHRB:scenario=routing;actor=root;checkpoint=start]]");
-        let next_title_bytes = serde_json::to_vec(&next_title_body)?;
-        let next_title = frontend.parse(frontend.path(), &BTreeMap::new(), &next_title_bytes)?;
+        let mut auxiliary_body = current_body.clone();
+        auxiliary_body["messages"][1]["content"] =
+            json!("title [[AHRB:scenario=routing;actor=root;checkpoint=aux]]");
+        let auxiliary = frontend.parse(
+            frontend.path(),
+            &BTreeMap::new(),
+            &serde_json::to_vec(&auxiliary_body)?,
+        )?;
         assert_eq!(
             engine
-                .handle(next_title)
+                .handle(auxiliary)
                 .await?
                 .value
                 .get("text")
                 .and_then(Value::as_str),
             Some(DETERMINISTIC_THREAD_TITLE)
         );
-        assert!(engine.handle(title).await?.retry);
-        assert!(engine.handle(main).await?.retry);
 
-        let mut invalid_title_body = title_body;
-        invalid_title_body["tools"] = main_body["tools"].clone();
-        let invalid_title_bytes = serde_json::to_vec(&invalid_title_body)?;
-        let invalid_title =
-            frontend.parse(frontend.path(), &BTreeMap::new(), &invalid_title_bytes)?;
+        let mut unknown_body = auxiliary_body;
+        unknown_body["model"] = json!("unmatched-model");
+        unknown_body["messages"][1]["content"] =
+            json!("other [[AHRB:scenario=routing;actor=root;checkpoint=other]]");
+        let unknown = frontend.parse(
+            frontend.path(),
+            &BTreeMap::new(),
+            &serde_json::to_vec(&unknown_body)?,
+        )?;
+        engine.handle(unknown).await?;
+
+        let records = engine.request_records().await;
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().any(|record| record.role == "primary"));
+        assert!(
+            records
+                .iter()
+                .any(|record| { record.side_channel_kind.as_deref() == Some("title") })
+        );
+        assert!(
+            records.iter().any(|record| {
+                record.side_channel_kind.as_deref() == Some("unknown-side-channel")
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_checkpoint_protocol_errors_never_fall_through_to_role_rules() -> Result<()> {
+        let mut workflow = simple_workflow();
+        workflow.responses[0].request_hash = "0".repeat(64);
+        let rules = vec![RequestRoleRule {
+            kind: SideChannelKind::Title,
+            priority: 1,
+            model_ids: vec!["ahrb-fake".to_owned()],
+            json_pointer: String::new(),
+            regex: String::new(),
+        }];
+        let engine = FakeModelEngine::with_request_roles(&workflow, &BTreeMap::new(), &rules)?;
+        let frontend = OpenAiChatFrontend;
+        let request = frontend.parse(frontend.path(), &BTreeMap::new(), &request_body())?;
         let error = engine
-            .handle(invalid_title)
+            .handle(request)
             .await
-            .expect_err("tool-bearing traffic must follow the normal workflow path");
+            .expect_err("a current-checkpoint hash mismatch must remain a protocol error");
         assert!(
             error
                 .to_string()
-                .contains("retried with different canonical request")
+                .contains("canonical request hash mismatch")
         );
-
         let records = engine.request_records().await;
-        assert_eq!(records.len(), 4);
-        assert_eq!(records.iter().filter(|record| record.accepted).count(), 3);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].role, "unclassified");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mailbox_normalizes_headers_and_captures_raw_body_before_provider_parsing() -> Result<()>
+    {
+        let body = request_body();
+        let engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);
+        let response = handle_provider_mailbox_request(
+            &ProviderMailboxRequest {
+                id: "mailbox-test".to_owned(),
+                method: "POST".to_owned(),
+                path: "/v1/chat/completions".to_owned(),
+                headers: BTreeMap::from([(
+                    "Authorization".to_owned(),
+                    "Bearer mailbox-secret".to_owned(),
+                )]),
+                body: body.clone(),
+            },
+            42,
+            Arc::clone(&engine),
+        )
+        .await?;
+        assert_eq!(response.status, 200);
+        let records = engine.request_records().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].received_ns, 42);
+        assert_eq!(records[0].body_bytes, body.len() as u64);
+        assert_eq!(
+            records[0].request.credential_fingerprint,
+            sha256_hex(b"Bearer mailbox-secret")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_sort_by_semantic_key_and_attempt_not_canonical_hash() -> Result<()> {
+        let rules = vec![RequestRoleRule {
+            kind: SideChannelKind::Title,
+            priority: 1,
+            model_ids: vec!["ahrb-aux".to_owned()],
+            json_pointer: String::new(),
+            regex: String::new(),
+        }];
+        let engine =
+            FakeModelEngine::with_request_roles(&simple_workflow(), &BTreeMap::new(), &rules)?;
+        let frontend = OpenAiChatFrontend;
+        for content in ["z-body", "a-body"] {
+            let body = serde_json::to_vec(&json!({
+                "model": "ahrb-aux",
+                "messages": [{
+                    "role": "user",
+                    "content": format!(
+                        "{content} [[AHRB:scenario=routing;actor=root;checkpoint=aux]]"
+                    )
+                }]
+            }))?;
+            let request = frontend.parse(frontend.path(), &BTreeMap::new(), &body)?;
+            engine.handle(request).await?;
+        }
+        let records = engine.request_records().await;
         assert_eq!(
             records
                 .iter()
-                .find(|record| record.request.model == "ahrb-fake-v1")
-                .map(|record| record.attempts),
-            Some(2)
+                .map(|record| record.attempt)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.semantic_attempts_total == 2)
+        );
+        assert_eq!(
+            records[0]
+                .request
+                .canonical
+                .pointer("/messages/0/content")
+                .and_then(Value::as_str),
+            Some("z-body [[AHRB:scenario=routing;actor=root;checkpoint=aux]]")
         );
         Ok(())
     }
@@ -2475,7 +3231,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_chat_retry_identity_ignores_rick_probe_delivery_controls() -> Result<()> {
+    async fn openai_chat_retry_identity_ignores_delivery_controls_but_rejects_changed_retry()
+    -> Result<()> {
         let frontend = OpenAiChatFrontend;
         let common = json!({
             "model": "ahrb-fake",
@@ -2513,8 +3270,10 @@ mod tests {
         assert!(!engine.handle(probe).await?.retry);
         assert!(engine.handle(streamed.clone()).await?.retry);
         let records = engine.request_records().await;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].attempts, 2);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.attempts == 2));
+        assert_eq!(records[0].attempt, 1);
+        assert_eq!(records[1].attempt, 2);
 
         let mut changed_body = streamed_body;
         changed_body["messages"][0]["content"] =
@@ -2522,7 +3281,21 @@ mod tests {
         let changed_bytes = serde_json::to_vec(&changed_body)?;
         let changed = frontend.parse(frontend.path(), &BTreeMap::new(), &changed_bytes)?;
         assert_ne!(streamed.canonical_hash()?, changed.canonical_hash()?);
-        assert!(engine.handle(changed).await.is_err());
+        let error = engine
+            .handle(changed)
+            .await
+            .expect_err("a changed request at an accepted checkpoint is a protocol error");
+        assert!(
+            error
+                .to_string()
+                .contains("retried with different canonical request")
+        );
+        let records = engine.request_records().await;
+        assert!(
+            records.iter().any(|record| {
+                record.side_channel_kind.as_deref() == Some("unknown-side-channel")
+            })
+        );
         Ok(())
     }
 
@@ -2583,11 +3356,13 @@ mod tests {
         assert!(adapted.pointer("/tool_calls/0/_ahrb_native").is_none());
         assert!(adapted.pointer("/tool_calls/0/arguments/path").is_none());
         let rendered = OpenAiResponsesFrontend.render(&ModelResponse {
+            dialect: "openai-responses".to_owned(),
             model: "ahrb-fake-v1".to_owned(),
             scenario: "native".to_owned(),
             actor: "root".to_owned(),
             checkpoint: "next".to_owned(),
             request_hash: "request-hash".to_owned(),
+            attempt: 1,
             value: adapted.clone(),
             fault: None,
             retry: false,
@@ -2768,11 +3543,13 @@ mod tests {
             );
             if adapter == "claude-code" {
                 let rendered = AnthropicMessagesFrontend.render(&ModelResponse {
+                    dialect: "anthropic-messages".to_owned(),
                     model: manifest.fake_model.model.clone(),
                     scenario: "native".to_owned(),
                     actor: "claude".to_owned(),
                     checkpoint: "start".to_owned(),
                     request_hash: "claude-request-hash".to_owned(),
+                    attempt: 1,
                     value: adapted.clone(),
                     fault: None,
                     retry: false,
@@ -3063,5 +3840,126 @@ mod tests {
         assert!(!socket_path.exists());
         std::fs::remove_dir(&directory)?;
         Ok(())
+    }
+
+    fn efficiency_record(turn: usize, role: &str, side_kind: Option<&str>) -> ModelRequestRecord {
+        let canonical = json!({
+            "model": "ahrb-fake-v1",
+            "messages": [
+                {"role":"system", "content":"fixed instructions"},
+                {"role":"user", "content":format!("turn {turn}")}
+            ],
+            "tools": []
+        });
+        ModelRequestRecord {
+            request: ModelRequest {
+                dialect: "openai-chat-completions".to_owned(),
+                endpoint: "/v1/chat/completions".to_owned(),
+                model: "ahrb-fake-v1".to_owned(),
+                scenario: "efficiency".to_owned(),
+                actor: format!("r42t{turn}"),
+                checkpoint: "start".to_owned(),
+                canonical,
+                credential_fingerprint: "redacted".to_owned(),
+                stream: false,
+            },
+            canonical_hash: format!("hash-{turn}"),
+            attempts: 1,
+            accepted: true,
+            semantic_ordinal: 1,
+            attempt: 1,
+            received_ns: turn as u64,
+            body_bytes: 256,
+            role: role.to_owned(),
+            side_channel_kind: side_kind.map(str::to_owned),
+            response_status: Some(200),
+            response_first_frame_yield_ns: None,
+            response_last_frame_yield_ns: None,
+            semantic_attempts_total: 1,
+        }
+    }
+
+    #[test]
+    fn model_request_efficiency_oracle_honors_side_channel_boundary_and_exact_keys() {
+        let mut records = (1..=20)
+            .map(|turn| efficiency_record(turn, "primary", None))
+            .collect::<Vec<_>>();
+        records.push(efficiency_record(21, "side-channel", Some("title")));
+        let at_boundary = evaluate_model_request_efficiency(&records, 20, 20);
+        assert!(at_boundary.measurement_complete);
+        assert!(at_boundary.reference_envelope_pass);
+        assert_eq!(at_boundary.metrics.len(), 11);
+        assert_eq!(
+            at_boundary.metrics["model_request_efficiency.side_channel_requests_per_turn"],
+            0.05
+        );
+        assert_eq!(
+            at_boundary.details["side_channel_requests_by_role"]["title"],
+            1
+        );
+
+        records.push(efficiency_record(22, "side-channel", Some("summary")));
+        let above_boundary = evaluate_model_request_efficiency(&records, 20, 20);
+        assert!(!above_boundary.reference_envelope_pass);
+        assert_eq!(
+            above_boundary.metrics["model_request_efficiency.side_channel_requests_per_turn"],
+            0.10
+        );
+    }
+
+    #[test]
+    fn model_request_efficiency_counts_retry_subset_once_and_rejects_unclassified() {
+        let mut records = (1..=20)
+            .map(|turn| efficiency_record(turn, "primary", None))
+            .collect::<Vec<_>>();
+        records[0].attempts = 2;
+        records[0].semantic_attempts_total = 2;
+        let mut retry = records[0].clone();
+        retry.attempt = 2;
+        records.push(retry);
+        let retried = evaluate_model_request_efficiency(&records, 20, 20);
+        assert_eq!(
+            retried.metrics["model_request_efficiency.retry_attempts_per_turn"],
+            0.05
+        );
+        assert!(!retried.reference_envelope_pass);
+
+        let mut unclassified_records = (1..=20)
+            .map(|turn| efficiency_record(turn, "primary", None))
+            .collect::<Vec<_>>();
+        unclassified_records.push(efficiency_record(
+            21,
+            "unclassified",
+            Some("unknown-side-channel"),
+        ));
+        let unclassified = evaluate_model_request_efficiency(&unclassified_records, 20, 20);
+        assert!(!unclassified.reference_envelope_pass);
+        assert_eq!(
+            unclassified.details["unclassified_requests"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn canonical_context_tax_includes_only_instructions_and_tools() {
+        let base = json!({
+            "messages": [
+                {"role":"system", "content":"system"},
+                {"role":"developer", "content":"developer"},
+                {"role":"user", "content":"user-a"}
+            ],
+            "tools": [{"type":"function","function":{"name":"x"}}]
+        });
+        let mut changed_user = base.clone();
+        changed_user["messages"][2]["content"] = json!("a much longer user message");
+        assert_eq!(
+            canonical_context_tax_bytes(&base),
+            canonical_context_tax_bytes(&changed_user)
+        );
+        let mut changed_system = base.clone();
+        changed_system["messages"][0]["content"] = json!("a much longer system instruction");
+        assert!(canonical_context_tax_bytes(&changed_system) > canonical_context_tax_bytes(&base));
     }
 }

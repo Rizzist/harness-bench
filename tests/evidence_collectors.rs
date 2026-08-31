@@ -41,6 +41,16 @@ fn model_record(actor: &str) -> ModelRequestRecord {
         canonical_hash: format!("hash-{actor}"),
         attempts: 1,
         accepted: true,
+        semantic_ordinal: 1,
+        attempt: 1,
+        received_ns: 1,
+        body_bytes: 32,
+        role: "primary".to_owned(),
+        side_channel_kind: None,
+        response_status: Some(200),
+        response_first_frame_yield_ns: None,
+        response_last_frame_yield_ns: None,
+        semantic_attempts_total: 1,
     }
 }
 

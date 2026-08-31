@@ -388,6 +388,21 @@ pub struct AcceptedTransition {
     pub retry: bool,
 }
 
+/// State-only classification used before accepting a model request.
+///
+/// This lets the fake provider distinguish a scripted primary request (including an
+/// already accepted checkpoint retry) from an auxiliary request without suppressing
+/// protocol or canonical-hash errors raised while accepting a primary request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionRecognition {
+    /// The marker names the actor's exact next scripted checkpoint.
+    Current,
+    /// The marker names a checkpoint already accepted for this actor.
+    Retry,
+    /// The marker does not name the current or an accepted scripted checkpoint.
+    NonPrimary,
+}
+
 #[derive(Debug, Default)]
 struct MachineState {
     next_by_actor: BTreeMap<String, usize>,
@@ -425,6 +440,32 @@ impl WorkflowMachine {
             scripts_by_actor,
             state: Mutex::new(MachineState::default()),
         })
+    }
+
+    /// Recognize whether a marker is current, a retry, or non-primary without mutating state.
+    pub async fn recognize(&self, marker: &RouteMarker) -> TransitionRecognition {
+        if marker.scenario != self.scenario {
+            return TransitionRecognition::NonPrimary;
+        }
+        let Some(scripts) = self.scripts_by_actor.get(&marker.actor) else {
+            return TransitionRecognition::NonPrimary;
+        };
+        let state = self.state.lock().await;
+        if state
+            .seen
+            .contains_key(&(marker.actor.clone(), marker.checkpoint.clone()))
+        {
+            return TransitionRecognition::Retry;
+        }
+        let next_index = state.next_by_actor.get(&marker.actor).copied().unwrap_or(0);
+        if scripts
+            .get(next_index)
+            .is_some_and(|response| response.checkpoint == marker.checkpoint)
+        {
+            TransitionRecognition::Current
+        } else {
+            TransitionRecognition::NonPrimary
+        }
     }
 
     /// Validate and accept one request transition.
@@ -700,9 +741,23 @@ mod tests {
     async fn identical_retry_does_not_advance() -> Result<()> {
         let machine = WorkflowMachine::new(&workflow())?;
         let marker = RouteMarker::new("scenario", "a", "one")?;
+        assert_eq!(
+            machine.recognize(&marker).await,
+            TransitionRecognition::Current
+        );
         assert!(!machine.accept(&marker, "hash").await?.retry);
+        assert_eq!(
+            machine.recognize(&marker).await,
+            TransitionRecognition::Retry
+        );
         assert!(machine.accept(&marker, "hash").await?.retry);
         assert!(machine.accept(&marker, "different").await.is_err());
+        assert_eq!(
+            machine
+                .recognize(&RouteMarker::new("scenario", "a", "aux")?)
+                .await,
+            TransitionRecognition::NonPrimary
+        );
         Ok(())
     }
 

@@ -9,7 +9,10 @@ use crate::driver::http_post;
 #[cfg(unix)]
 use crate::driver::unix_http_post;
 use crate::events::{EventVocab, NormalizedEvent};
-use crate::fake_model::{FakeModelEngine, OpenAiChatFrontend, ProtocolFrontend};
+use crate::fake_model::{
+    FakeModelEngine, OpenAiChatFrontend, ProtocolFrontend, ProviderMailboxRequest,
+    ProviderMailboxResponse,
+};
 use crate::workflow::{Fault, Workflow};
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
@@ -41,6 +44,7 @@ const MIB: u64 = 1024 * 1024;
 static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEW_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static REPLACE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static PROVIDER_MAILBOX_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Durable append-only event storage for one session.
 #[derive(Clone, Debug)]
@@ -122,6 +126,7 @@ struct MockConfig {
     state_dir: PathBuf,
     base_url: Option<String>,
     unix_socket: Option<PathBuf>,
+    provider_mailbox: Option<PathBuf>,
     embedded_model: Option<Arc<FakeModelEngine>>,
     api_key: Option<String>,
     model: String,
@@ -572,11 +577,12 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  [--session-memory-mib N]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
                  --session-id ID --prompt PROMPT --key KEY \
-                 [--base-url URL --credential TOKEN]\n\
+                 [--base-url URL]\n\
                  ahrb-mock-harness release-checkpoint --state-dir PATH \
                  --session-id ID --release-token TOKEN\n\
                  ahrb-mock-harness cancel-session --state-dir PATH --session-id ID\n\
-                 model endpoint comes from AHRB_MOCK_BASE_URL or AHRB_MOCK_UNIX_SOCKET; \
+                 model endpoint comes from AHRB_MOCK_BASE_URL, AHRB_MOCK_UNIX_SOCKET, \
+                 or AHRB_MOCK_PROVIDER_MAILBOX; \
                  key/model come from AHRB_MOCK_API_KEY and AHRB_MOCK_MODEL"
             );
             Ok(0)
@@ -593,7 +599,6 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     let mut prompt = None;
     let mut key = None;
     let mut rendered_base_url = None;
-    let mut rendered_credential = None;
     let mut event_journal = None;
     let mut post_output_delay_ms = 0_u64;
     let mut config_args = Vec::new();
@@ -609,7 +614,6 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             "--prompt" => prompt = Some(value.clone()),
             "--key" => key = Some(value.clone()),
             "--base-url" => rendered_base_url = Some(value.clone()),
-            "--credential" => rendered_credential = Some(value.clone()),
             "--event-journal" => event_journal = Some(PathBuf::from(value)),
             "--post-output-delay-ms" => {
                 post_output_delay_ms = value
@@ -633,23 +637,21 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         .ok_or_else(|| AhrbError::Usage("--session-id is required".to_owned()))?;
     let prompt = prompt.ok_or_else(|| AhrbError::Usage("--prompt is required".to_owned()))?;
     let key = key.ok_or_else(|| AhrbError::Usage("--key is required".to_owned()))?;
-    let exec_template_evidence = match (rendered_base_url, rendered_credential) {
-        (Some(base_url), Some(credential)) => {
+    let exec_template_evidence = match rendered_base_url {
+        Some(base_url) => {
             let environment_base_url = std::env::var("AHRB_MOCK_BASE_URL").unwrap_or_default();
             let environment_credential = std::env::var("AHRB_MOCK_API_KEY").unwrap_or_default();
             Some(ExecTemplateEvidence {
                 base_url_matches_environment: base_url == environment_base_url,
-                credential_fingerprint: format!("{:x}", Sha256::digest(credential.as_bytes())),
-                credential_matches_environment: credential == environment_credential,
+                credential_fingerprint: format!(
+                    "{:x}",
+                    Sha256::digest(environment_credential.as_bytes())
+                ),
+                credential_matches_environment: !environment_credential.is_empty(),
                 base_url,
             })
         }
-        (None, None) => None,
-        _ => {
-            return Err(AhrbError::Usage(
-                "--base-url and --credential must be provided together".to_owned(),
-            ));
-        }
+        None => None,
     };
     let mut config = parse_config(&config_args)?;
     config.declare_native_shell = true;
@@ -863,6 +865,7 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         state_dir,
         base_url,
         unix_socket: std::env::var_os("AHRB_MOCK_UNIX_SOCKET").map(PathBuf::from),
+        provider_mailbox: std::env::var_os("AHRB_MOCK_PROVIDER_MAILBOX").map(PathBuf::from),
         embedded_model,
         api_key: std::env::var("AHRB_MOCK_API_KEY").ok(),
         model: std::env::var("AHRB_MOCK_MODEL").unwrap_or_else(|_| "ahrb-fake-v1".to_owned()),
@@ -1212,7 +1215,10 @@ async fn execute_turn(
     turn: &PendingTurn,
 ) -> Result<()> {
     let config = harness.lock().await.config.clone();
-    if config.base_url.is_none() && config.unix_socket.is_none() && config.embedded_model.is_none()
+    if config.base_url.is_none()
+        && config.unix_socket.is_none()
+        && config.provider_mailbox.is_none()
+        && config.embedded_model.is_none()
     {
         let mut guard = harness.lock().await;
         if session_should_stop(guard.session_mut(id)?)? {
@@ -1236,11 +1242,6 @@ async fn execute_turn(
             for prompt in std::mem::take(&mut session.injected) {
                 messages.push(json!({ "role": "user", "content": prompt }));
             }
-            guard.append(
-                id,
-                EventVocab::ModelRequest,
-                json!({ "model": config.model, "endpoint": "/v1/chat/completions", "checkpoint": checkpoint }),
-            )?;
         }
         let request = json!({
             "model": config.model,
@@ -1253,6 +1254,14 @@ async fn execute_turn(
             headers.insert("Authorization".to_owned(), format!("Bearer {key}"));
         }
         let body = serde_json::to_vec(&request)?;
+        {
+            let mut guard = harness.lock().await;
+            guard.append(
+                id,
+                EventVocab::ModelRequest,
+                json!({ "model": config.model, "endpoint": "/v1/chat/completions", "checkpoint": checkpoint }),
+            )?;
+        }
         let response_result = model_http_post(&config, &headers, &body).await;
         let response = match response_result {
             Ok(response) => response,
@@ -1847,6 +1856,9 @@ async fn model_http_post(
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> Result<crate::driver::HttpResponse> {
+    if let Some(directory) = &config.provider_mailbox {
+        return provider_mailbox_post(directory, headers, body, config.idle_timeout).await;
+    }
     if let Some(engine) = &config.embedded_model {
         let frontend = OpenAiChatFrontend;
         let future = async {
@@ -1893,6 +1905,55 @@ async fn model_http_post(
         .ok_or_else(|| AhrbError::Validation("mock model endpoint is not configured".to_owned()))?;
     let endpoint = format!("{base_url}/v1/chat/completions");
     http_post(&endpoint, headers, body, config.idle_timeout).await
+}
+
+async fn provider_mailbox_post(
+    directory: &Path,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<crate::driver::HttpResponse> {
+    let sequence = PROVIDER_MAILBOX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{}-{sequence}", std::process::id());
+    let envelope = ProviderMailboxRequest {
+        id: id.clone(),
+        method: "POST".to_owned(),
+        path: "/v1/chat/completions".to_owned(),
+        headers: headers.clone(),
+        body: body.to_vec(),
+    };
+    let temporary = directory.join(format!("{id}.request.tmp"));
+    let request_path = directory.join(format!("{id}.request.json"));
+    tokio::fs::write(&temporary, serde_json::to_vec(&envelope)?).await?;
+    tokio::fs::rename(&temporary, &request_path).await?;
+    let response_path = directory.join(format!("{id}.response.json"));
+    let response = tokio::time::timeout(timeout, async {
+        loop {
+            match tokio::fs::read(&response_path).await {
+                Ok(bytes) => break Ok::<Vec<u8>, AhrbError>(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Err(error) => break Err(error.into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| AhrbError::Timeout("provider mailbox idle deadline".to_owned()))??;
+    tokio::fs::remove_file(response_path).await?;
+    let response: ProviderMailboxResponse = serde_json::from_slice(&response)?;
+    if response.id != id {
+        return Err(AhrbError::Protocol(
+            "provider mailbox response correlation mismatch".to_owned(),
+        ));
+    }
+    if let Some(error) = response.error {
+        return Err(AhrbError::Protocol(error));
+    }
+    Ok(crate::driver::HttpResponse {
+        status: response.status,
+        body: response.body,
+    })
 }
 
 fn fixture_tools(declare_native_shell: bool) -> Value {
@@ -2408,6 +2469,7 @@ mod tests {
             state_dir,
             base_url: None,
             unix_socket: None,
+            provider_mailbox: None,
             embedded_model: None,
             api_key: None,
             model: "ahrb-fake-v1".to_owned(),
@@ -3395,6 +3457,7 @@ mod tests {
             state_dir: directory.join("state"),
             base_url: None,
             unix_socket: Some(server.socket_path().to_path_buf()),
+            provider_mailbox: None,
             embedded_model: None,
             api_key: Some("unix-secret".to_owned()),
             model: "ahrb-fake-v1".to_owned(),

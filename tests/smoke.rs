@@ -78,6 +78,7 @@ async fn mock_harness_exercises_the_non_resource_report_pipeline() -> Result<()>
         "processes.jsonl",
         "events.jsonl",
         "model-requests.jsonl",
+        "turns.jsonl",
         "junit.xml",
     ] {
         assert!(

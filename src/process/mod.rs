@@ -701,49 +701,117 @@ pub struct Sample {
     /// Timestamped, per-process resource observations in deterministic identity order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_samples: Vec<ProcessSample>,
+    /// Recoverable CPU-accounting anomalies observed by the out-of-band sampler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_accounting_warnings: Vec<CpuAccountingWarning>,
 }
 
 /// Monotonic cumulative CPU accounting across owned-process lifecycles.
 ///
-/// A process that disappears contributes its last observed cumulative counter to
-/// `retired_ns`; this prevents whole-tree CPU from dropping when workers exit.
+/// A process must be absent for at least three consecutive counter refreshes
+/// before it is retired. Its last cumulative counter remains accounted forever,
+/// which prevents whole-tree CPU from dropping when workers exit or flicker.
 #[derive(Debug, Default)]
 pub(crate) struct TreeCpuTracker {
-    live: BTreeMap<ProcIdentity, u64>,
-    retired: BTreeSet<ProcIdentity>,
-    retired_ns: u64,
+    identities: BTreeMap<ProcIdentity, CpuIdentityState>,
+}
+
+const CPU_RETIREMENT_MISSES: u32 = 3;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CpuIdentityState {
+    accounted_ns: u64,
+    consecutive_misses: u32,
+    retired: bool,
+}
+
+/// A recoverable whole-tree CPU accounting anomaly retained in raw evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CpuAccountingWarning {
+    /// Stable warning category.
+    pub kind: String,
+    /// Process identity that was re-admitted.
+    pub identity: ProcIdentity,
+    /// Consecutive absent refreshes observed before retirement.
+    pub consecutive_misses: u32,
+    /// Last cumulative CPU value retained while the identity was absent.
+    pub previous_cpu_ns: u64,
+    /// Cumulative CPU value observed when the identity reappeared.
+    pub observed_cpu_ns: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TreeCpuUpdate {
+    pub(crate) cumulative_ns: u64,
+    pub(crate) newly_missing: Vec<ProcIdentity>,
+    pub(crate) readmitted_after_miss: Vec<(ProcIdentity, u64)>,
+    pub(crate) warnings: Vec<CpuAccountingWarning>,
 }
 
 impl TreeCpuTracker {
-    pub(crate) fn update(&mut self, current: &BTreeMap<ProcIdentity, u64>) -> Result<u64> {
+    pub(crate) fn update(
+        &mut self,
+        current: &BTreeMap<ProcIdentity, u64>,
+    ) -> Result<TreeCpuUpdate> {
+        let mut warnings = Vec::new();
+        let mut readmitted_after_miss = Vec::new();
         for (identity, cpu_ns) in current {
-            if self.retired.contains(identity) {
-                return Err(AhrbError::Protocol(format!(
-                    "retired process identity ({},{}) reappeared in CPU accounting",
-                    identity.pid, identity.start_time
-                )));
-            }
-            if let Some(previous) = self.live.get(identity) {
-                if cpu_ns < previous {
+            if let Some(state) = self.identities.get_mut(identity) {
+                if *cpu_ns < state.accounted_ns {
                     return Err(AhrbError::Protocol(format!(
-                        "process ({},{}) cumulative CPU regressed from {previous} to {cpu_ns}",
-                        identity.pid, identity.start_time
+                        "process ({},{}) cumulative CPU regressed from {} to {cpu_ns}",
+                        identity.pid, identity.start_time, state.accounted_ns
                     )));
                 }
+                if state.retired {
+                    warnings.push(CpuAccountingWarning {
+                        kind: "retired-identity-readmitted".to_owned(),
+                        identity: *identity,
+                        consecutive_misses: state.consecutive_misses,
+                        previous_cpu_ns: state.accounted_ns,
+                        observed_cpu_ns: *cpu_ns,
+                    });
+                }
+                if state.consecutive_misses > 0 {
+                    readmitted_after_miss.push((*identity, state.accounted_ns));
+                }
+                state.accounted_ns = *cpu_ns;
+                state.consecutive_misses = 0;
+                state.retired = false;
+            } else {
+                self.identities.insert(
+                    *identity,
+                    CpuIdentityState {
+                        accounted_ns: *cpu_ns,
+                        consecutive_misses: 0,
+                        retired: false,
+                    },
+                );
             }
         }
 
-        for (identity, cpu_ns) in &self.live {
-            if !current.contains_key(identity) {
-                self.retired_ns = self.retired_ns.saturating_add(*cpu_ns);
-                self.retired.insert(*identity);
+        let mut newly_missing = Vec::new();
+        for (identity, state) in &mut self.identities {
+            if current.contains_key(identity) || state.retired {
+                continue;
+            }
+            state.consecutive_misses = state.consecutive_misses.saturating_add(1);
+            if state.consecutive_misses == 1 {
+                newly_missing.push(*identity);
+            }
+            if state.consecutive_misses >= CPU_RETIREMENT_MISSES {
+                state.retired = true;
             }
         }
-        self.live = current.clone();
-        Ok(self
-            .live
-            .values()
-            .fold(self.retired_ns, |total, value| total.saturating_add(*value)))
+
+        Ok(TreeCpuUpdate {
+            cumulative_ns: self.identities.values().fold(0_u64, |total, state| {
+                total.saturating_add(state.accounted_ns)
+            }),
+            newly_missing,
+            readmitted_after_miss,
+            warnings,
+        })
     }
 }
 
@@ -863,16 +931,53 @@ mod tests {
         let worker = identity(20);
         let mut tracker = TreeCpuTracker::default();
         assert_eq!(
-            tracker.update(&BTreeMap::from([(root, 100), (worker, 50)]))?,
+            tracker
+                .update(&BTreeMap::from([(root, 100), (worker, 50)]))?
+                .cumulative_ns,
             150
         );
-        assert_eq!(tracker.update(&BTreeMap::from([(root, 120)]))?, 170);
-        assert_eq!(tracker.update(&BTreeMap::from([(root, 130)]))?, 180);
+        assert_eq!(
+            tracker
+                .update(&BTreeMap::from([(root, 120)]))?
+                .cumulative_ns,
+            170
+        );
+        assert_eq!(
+            tracker
+                .update(&BTreeMap::from([(root, 130)]))?
+                .cumulative_ns,
+            180
+        );
         Ok(())
     }
 
     #[test]
-    fn tree_cpu_rejects_counter_regression_and_retired_reappearance() -> Result<()> {
+    fn tree_cpu_tolerates_flicker_and_readmits_a_retired_identity() -> Result<()> {
+        let root = identity(10);
+        let worker = identity(20);
+        let mut tracker = TreeCpuTracker::default();
+        tracker.update(&BTreeMap::from([(root, 100), (worker, 50)]))?;
+        let missed_once = tracker.update(&BTreeMap::from([(root, 120)]))?;
+        assert_eq!(missed_once.cumulative_ns, 170);
+        assert_eq!(missed_once.newly_missing, vec![worker]);
+        let returned = tracker.update(&BTreeMap::from([(root, 130), (worker, 60)]))?;
+        assert_eq!(returned.cumulative_ns, 190);
+        assert!(returned.warnings.is_empty());
+        assert_eq!(returned.readmitted_after_miss, vec![(worker, 50)]);
+
+        for root_cpu in [140, 150, 160] {
+            tracker.update(&BTreeMap::from([(root, root_cpu)]))?;
+        }
+        let readmitted = tracker.update(&BTreeMap::from([(root, 170), (worker, 70)]))?;
+        assert_eq!(readmitted.cumulative_ns, 240);
+        assert_eq!(readmitted.warnings.len(), 1);
+        assert_eq!(readmitted.warnings[0].identity, worker);
+        assert_eq!(readmitted.warnings[0].kind, "retired-identity-readmitted");
+        Ok(())
+    }
+
+    #[test]
+    fn tree_cpu_still_rejects_a_same_identity_counter_regression() -> Result<()> {
         let root = identity(10);
         let worker = identity(20);
         let mut tracker = TreeCpuTracker::default();
@@ -881,12 +986,6 @@ mod tests {
             .update(&BTreeMap::from([(root, 99), (worker, 50)]))
             .expect_err("same-identity CPU regression must be rejected");
         assert!(regression.to_string().contains("CPU regressed"));
-
-        tracker.update(&BTreeMap::from([(root, 120)]))?;
-        let reappearance = tracker
-            .update(&BTreeMap::from([(root, 130), (worker, 60)]))
-            .expect_err("retired identity must not reappear");
-        assert!(reappearance.to_string().contains("reappeared"));
         Ok(())
     }
 }

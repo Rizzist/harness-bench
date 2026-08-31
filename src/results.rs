@@ -95,7 +95,7 @@ pub struct IndexEntry {
 
 /// Resolve default output and capture run-start metadata.
 pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersistence> {
-    let repository = repository_root();
+    let repository = absolute_path(&repository_root())?;
     let timestamp = utc_timestamp(SystemTime::now())?;
     let short_id = short_run_id(&manifest.identity.id, &timestamp);
     let relative_results = PathBuf::from("results")
@@ -108,7 +108,7 @@ pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersisten
             .clone()
             .unwrap_or_else(|| repository.join("ahrb-output").join(&manifest.identity.id))
     } else {
-        options.output.clone()
+        absolute_path(&options.output)?
     };
     let harness_version = options
         .harness_version
@@ -132,6 +132,21 @@ pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersisten
         load_avg_1m: load_average_1m(),
         results_dir_field: (!no_save).then(|| path_string(&relative_results)),
     })
+}
+
+/// Resolve a path against the CLI's current directory without requiring the
+/// destination to exist. This must happen before profile paths are rendered
+/// into harness environment/config templates.
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).map_err(Into::into)
+}
+
+/// Source revision embedded by `build.rs`, preferring the build checkout's
+/// Git HEAD and falling back there to `AHRB_REVISION` when Git is unavailable.
+pub fn ahrb_revision() -> String {
+    option_env!("AHRB_BUILD_REVISION")
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn no_save_from_environment() -> Result<bool> {
@@ -422,6 +437,19 @@ fn load_average_1m() -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn mock_options(output: PathBuf) -> RunOptions {
+        RunOptions {
+            manifest: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("adapters/mock/manifest.toml"),
+            output,
+            profile: crate::cli::Profile::Quick,
+            tests: vec![1],
+            junit: false,
+            deadline_secs: Some(120),
+            no_save: true,
+            harness_version: Some("mock 1".to_owned()),
+        }
+    }
+
     #[test]
     fn unix_epoch_formats_as_utc_iso() -> Result<()> {
         assert_eq!(utc_timestamp(UNIX_EPOCH)?, "1970-01-01T00:00:00Z");
@@ -435,5 +463,27 @@ mod tests {
     #[test]
     fn row_ranges_are_compact() {
         assert_eq!(compact_rows(&[3, 1, 2, 30, 31, 41]), "1-3,30-31,41");
+    }
+
+    #[test]
+    fn persistence_resolves_relative_output_before_profile_rendering() -> Result<()> {
+        let manifest = crate::manifest::load(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("adapters/mock/manifest.toml"),
+        )?;
+        let persistence = prepare(&mock_options(PathBuf::from("relative-output")), &manifest)?;
+        assert!(persistence.output.is_absolute());
+        let mut saved_options = mock_options(PathBuf::new());
+        saved_options.no_save = false;
+        let saved = prepare(&saved_options, &manifest)?;
+        assert!(saved.output.is_absolute());
+        assert!(saved.results_dir.is_some_and(|path| path.is_absolute()));
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_build_embeds_a_real_source_revision() {
+        let revision = ahrb_revision();
+        assert_ne!(revision, "unknown");
+        assert!(!revision.trim().is_empty());
     }
 }

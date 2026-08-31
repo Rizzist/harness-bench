@@ -48,11 +48,87 @@ pub struct TestResult {
     pub outcome: TestOutcome,
     /// Deterministically ordered evidence references.
     pub evidence: Vec<String>,
+    /// Additive v2 result metadata serialized as exact top-level fields.
+    #[serde(flatten)]
+    pub metadata: TestResultMetadata,
+}
+
+/// Additive v2 metadata shared by every matrix result.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TestResultMetadata {
+    /// `core`, `optional-facet`, or `informational`.
+    #[serde(default = "default_core_requirement")]
+    pub requirement: String,
+    /// Optional capability key associated with the row.
+    #[serde(default)]
+    pub capability: Option<String>,
+    /// Whether the row produced all required observations.
+    #[serde(default)]
+    pub measurement_complete: bool,
+    /// Optional normalized grade in [0,1].
+    #[serde(default)]
+    pub score: Option<f64>,
+    /// Reference-envelope result for informational rows only.
+    #[serde(default)]
+    pub reference_envelope_pass: Option<bool>,
+}
+
+fn default_core_requirement() -> String {
+    "core".to_owned()
+}
+
+impl Default for TestResultMetadata {
+    fn default() -> Self {
+        Self {
+            requirement: default_core_requirement(),
+            capability: None,
+            measurement_complete: false,
+            score: None,
+            reference_envelope_pass: None,
+        }
+    }
+}
+
+impl TestResultMetadata {
+    /// Derive exact row metadata from authoritative scenario declarations.
+    pub fn for_row(row: u8, outcome: &TestOutcome) -> Self {
+        let requirement = crate::scenarios::all()
+            .iter()
+            .find(|definition| definition.row == row)
+            .map(|definition| definition.requirement());
+        let (requirement, capability) = match requirement {
+            Some(RequirementKind::Core) | None => ("core", None),
+            Some(RequirementKind::OptionalFacet { capability }) => {
+                ("optional-facet", Some(capability.to_owned()))
+            }
+            Some(RequirementKind::Informational) => ("informational", None),
+        };
+        let measurement_complete = !matches!(outcome, TestOutcome::Error(_));
+        let informational = matches!(
+            crate::scenarios::all()
+                .iter()
+                .find(|definition| definition.row == row)
+                .map(|definition| definition.requirement()),
+            Some(RequirementKind::Informational)
+        );
+        let reference_envelope_pass =
+            (informational && measurement_complete).then_some(matches!(outcome, TestOutcome::Pass));
+        Self {
+            requirement: requirement.to_owned(),
+            capability,
+            measurement_complete,
+            score: None,
+            reference_envelope_pass,
+        }
+    }
 }
 
 /// A certified automation-readiness badge.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Badge {
+    /// Authoritative benchmark specification version for this badge.
+    #[serde(default = "default_badge_spec_version")]
+    pub spec_version: u32,
     /// Operating-system label.
     pub os: String,
     /// Process topology label.
@@ -61,11 +137,18 @@ pub struct Badge {
     pub parallel_width: usize,
     /// Resource class such as R32 or R256+.
     pub resource_class: String,
+    /// Turn-latency class such as L100 or L1000+.
+    #[serde(default)]
+    pub latency_class: String,
     /// Certified readiness facets.
     pub facets: Vec<String>,
     /// Explicit guard against cross-topology resource ranking.
     #[serde(default)]
     pub comparison_scope: String,
+}
+
+fn default_badge_spec_version() -> u32 {
+    1
 }
 
 /// A deterministic assertion emitted by a scenario runner.
@@ -106,12 +189,14 @@ pub fn classify(
     } else {
         TestOutcome::Pass
     };
+    let metadata = TestResultMetadata::for_row(row, &outcome);
     TestResult {
         row,
         id: id.to_owned(),
         pillar,
         outcome,
         evidence,
+        metadata,
     }
 }
 
@@ -167,14 +252,23 @@ fn badge_compatible_results(results: &[TestResult], manifest: &Manifest) -> bool
                 .iter()
                 .find(|definition| definition.row == result.row)
                 .map(|definition| definition.requirement());
-            return matches!(requirement, Some(RequirementKind::Core))
-                || (matches!(requirement, Some(RequirementKind::OptionalFacet { .. }))
-                    && matches!(
-                        crate::matrix_evidence::capability_for_row(manifest, result.row),
-                        crate::matrix_evidence::CapabilityStatus::Supported
-                    ));
+            return matches!(
+                requirement,
+                Some(RequirementKind::Core | RequirementKind::Informational)
+            ) || (matches!(requirement, Some(RequirementKind::OptionalFacet { .. }))
+                && matches!(
+                    crate::matrix_evidence::capability_for_row(manifest, result.row),
+                    crate::matrix_evidence::CapabilityStatus::Supported
+                ));
         }
-        optional_unsupported_is_honest(manifest, result)
+        let informational = crate::scenarios::all()
+            .iter()
+            .find(|definition| definition.row == result.row)
+            .is_some_and(|definition| {
+                matches!(definition.requirement(), RequirementKind::Informational)
+            });
+        (informational && matches!(result.outcome, TestOutcome::Fail(_)))
+            || optional_unsupported_is_honest(manifest, result)
     })
 }
 
@@ -186,10 +280,12 @@ pub fn certify(
     os: &str,
     parallel_width: usize,
     marginal_bytes: f64,
+    latency_class: &str,
 ) -> Option<Badge> {
     // Quick certification uses the required N=1,2,4 sweep; the full certification
     // profile reports N=8. The width remains explicit in every badge label.
     if parallel_width < 4
+        || !matches!(latency_class, "L100" | "L250" | "L500" | "L1000" | "L1000+")
         || !mandatory_passes(results, manifest)
         || !badge_compatible_results(results, manifest)
     {
@@ -238,10 +334,12 @@ pub fn certify(
         .map(|facet| facet.label.to_owned())
         .collect();
     Some(Badge {
+        spec_version: 2,
         os: os.to_owned(),
         topology: manifest.concurrency.topology.clone(),
         parallel_width,
         resource_class: resource_class.to_owned(),
+        latency_class: latency_class.to_owned(),
         facets,
         comparison_scope: "within-topology-only".to_owned(),
     })
@@ -254,20 +352,38 @@ pub fn suite_exit_code(
     _badge: Option<&Badge>,
     _manifest: &Manifest,
 ) -> i32 {
-    let has_failure_or_error = results
-        .iter()
-        .any(|result| matches!(result.outcome, TestOutcome::Fail(_) | TestOutcome::Error(_)));
+    let has_failure_or_error = results.iter().any(|result| match result.outcome {
+        TestOutcome::Error(_) => true,
+        TestOutcome::Fail(_) => crate::scenarios::all()
+            .iter()
+            .find(|definition| definition.row == result.row)
+            .is_none_or(|definition| {
+                !matches!(definition.requirement(), RequirementKind::Informational)
+            }),
+        _ => false,
+    });
     if has_failure_or_error { 1 } else { 0 }
 }
 
 /// Render the normative badge label.
 pub fn badge_label(badge: &Badge) -> String {
-    format!(
-        "Automation Ready v1 · {} · {} · N{} · {} · {}",
-        badge.os,
-        badge.topology,
-        badge.parallel_width,
-        badge.resource_class,
-        badge.facets.join("+")
-    )
+    if badge.spec_version == 1 {
+        return format!(
+            "Automation Ready v1 · {} · {} · N{} · {} · {}",
+            badge.os,
+            badge.topology,
+            badge.parallel_width,
+            badge.resource_class,
+            badge.facets.join("+")
+        );
+    }
+    let mut label = format!(
+        "Automation Ready v2 · {} · {} · N{} · {} · {}",
+        badge.os, badge.topology, badge.parallel_width, badge.resource_class, badge.latency_class,
+    );
+    if !badge.facets.is_empty() {
+        label.push_str(" · ");
+        label.push_str(&badge.facets.join("+"));
+    }
+    label
 }
