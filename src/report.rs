@@ -61,6 +61,39 @@ pub struct TopologyMetric {
     pub comparison_scope: String,
 }
 
+/// Topology-agnostic resource and performance headline values.
+///
+/// Every value here is derived after workload execution from AHRB's external
+/// whole-tree samples, membership-discovery accounting, and the external turn
+/// wall clocks that already enforce turn deadlines. Summary construction never
+/// executes synchronously in the harness turn path.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ResourceSummary {
+    /// Maximum effective owned-tree memory over the sampled run.
+    pub peak_rss_mib: f64,
+    /// Arithmetic mean effective owned-tree memory over all samples.
+    pub mean_rss_mib: f64,
+    /// Median effective owned-tree memory over all samples.
+    pub median_rss_mib: f64,
+    /// Cumulative owned-tree CPU delta over the sampled run.
+    pub cpu_total_s: f64,
+    /// Cumulative owned-tree CPU divided by executed workflow turns.
+    pub cpu_per_turn_ms: f64,
+    /// Mean external AHRB turn wall clock.
+    pub wall_per_turn_ms: f64,
+    /// Resident daemon baseline; absent for zero-process-between-turns topologies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_rss_mib: Option<f64>,
+    /// Parallel marginal memory where a complete sweep supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_beta_mib_per_agent: Option<f64>,
+    /// Parallel scaling exponent where a complete sweep supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling_alpha: Option<f64>,
+    /// Membership sampler CPU as a percentage of one core.
+    pub sampler_overhead_pct: f64,
+}
+
 /// Complete benchmark report and embedded evidence.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Report {
@@ -80,6 +113,9 @@ pub struct Report {
     /// Resource metrics with topology labels and within-topology comparison scope.
     #[serde(default)]
     pub resource_metrics: BTreeMap<String, TopologyMetric>,
+    /// Cross-topology headline summary derived from external observations.
+    #[serde(default)]
+    pub resource_summary: ResourceSummary,
     /// Raw resource samples.
     pub samples: Vec<Sample>,
     /// Raw process observations.
@@ -180,6 +216,12 @@ pub fn render_markdown(report: &Report) -> String {
             outcome_label(&result.outcome)
         );
     }
+    let _ = writeln!(output, "\n## Resource summary\n");
+    let _ = writeln!(
+        output,
+        "`{}`",
+        render_resource_summary(&report.resource_summary)
+    );
     if !report.resource_metrics.is_empty() {
         let topology = report
             .resource_metrics
@@ -218,6 +260,126 @@ pub fn render_markdown(report: &Report) -> String {
     let _ = writeln!(output, "- Platform: `{}`", report.fingerprint.platform);
     let _ = writeln!(output, "- Profile: `{}`", report.fingerprint.profile);
     output
+}
+
+/// Build the concise resource-summary line shared by `ahrb run` and `hbench`.
+pub fn render_resource_summary(summary: &ResourceSummary) -> String {
+    let mut output = format!(
+        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} cpu_total_s={:.3} cpu_per_turn_ms={:.3} wall_per_turn_ms={:.3}",
+        summary.peak_rss_mib,
+        summary.mean_rss_mib,
+        summary.median_rss_mib,
+        summary.cpu_total_s,
+        summary.cpu_per_turn_ms,
+        summary.wall_per_turn_ms,
+    );
+    if let Some(value) = summary.idle_rss_mib {
+        let _ = write!(output, " idle_rss_mib={value:.3}");
+    }
+    if let Some(value) = summary.parallel_beta_mib_per_agent {
+        let _ = write!(output, " parallel_beta_mib_per_agent={value:.3}");
+    }
+    if let Some(value) = summary.scaling_alpha {
+        let _ = write!(output, " scaling_alpha={value:.3}");
+    }
+    let _ = write!(
+        output,
+        " sampler_overhead_pct={:.3}",
+        summary.sampler_overhead_pct
+    );
+    output
+}
+
+/// Derive summary values exclusively from already-collected external evidence.
+///
+/// `turn_wall_ns` contains durations from AHRB's pre-existing external deadline
+/// clocks; this function performs no sampling and does not interact with a
+/// harness. On macOS effective memory is physical footprint, while on Linux it
+/// is PSS when available and RSS otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn summarize_resources(
+    samples: &[Sample],
+    membership: &[MembershipSample],
+    workflow_turns: u64,
+    turn_wall_ns: &[u64],
+    idle_rss_mib: Option<f64>,
+    parallel_beta_mib_per_agent: Option<f64>,
+    scaling_alpha: Option<f64>,
+) -> ResourceSummary {
+    const MIB: f64 = 1_048_576.0;
+    let mut memory = samples
+        .iter()
+        .map(effective_memory_bytes)
+        .collect::<Vec<_>>();
+    let peak_bytes = memory.iter().copied().max().unwrap_or(0);
+    let mean_bytes = if memory.is_empty() {
+        0.0
+    } else {
+        memory.iter().map(|value| *value as f64).sum::<f64>() / memory.len() as f64
+    };
+    memory.sort_unstable();
+    let median_bytes = match memory.len() {
+        0 => 0.0,
+        length if length % 2 == 1 => memory[length / 2] as f64,
+        length => {
+            let upper = memory[length / 2] as f64;
+            let lower = memory[length / 2 - 1] as f64;
+            (lower + upper) / 2.0
+        }
+    };
+    let cpu_ns = samples
+        .first()
+        .zip(samples.last())
+        .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns));
+    let cpu_per_turn_ms = if workflow_turns == 0 {
+        0.0
+    } else {
+        cpu_ns as f64 / workflow_turns as f64 / 1_000_000.0
+    };
+    let wall_per_turn_ms = if turn_wall_ns.is_empty() {
+        0.0
+    } else {
+        turn_wall_ns.iter().map(|value| *value as f64).sum::<f64>()
+            / turn_wall_ns.len() as f64
+            / 1_000_000.0
+    };
+    let sampling_wall_span = membership
+        .iter()
+        .map(|sample| sample.elapsed_ns)
+        .min()
+        .zip(membership.iter().map(|sample| sample.elapsed_ns).max())
+        .map_or(0, |(first, last)| last.saturating_sub(first));
+    let discovery_cpu_ns = membership.iter().fold(0_u64, |total, sample| {
+        total.saturating_add(sample.discovery_cpu_ns)
+    });
+    let sampler_overhead_pct = if sampling_wall_span == 0 {
+        0.0
+    } else {
+        100.0 * discovery_cpu_ns as f64 / sampling_wall_span as f64
+    };
+    ResourceSummary {
+        peak_rss_mib: peak_bytes as f64 / MIB,
+        mean_rss_mib: mean_bytes / MIB,
+        median_rss_mib: median_bytes / MIB,
+        cpu_total_s: cpu_ns as f64 / 1_000_000_000.0,
+        cpu_per_turn_ms,
+        wall_per_turn_ms,
+        idle_rss_mib,
+        parallel_beta_mib_per_agent,
+        scaling_alpha,
+        sampler_overhead_pct,
+    }
+}
+
+fn effective_memory_bytes(sample: &Sample) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        sample.footprint_bytes.unwrap_or(sample.rss_bytes)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        sample.pss_bytes.unwrap_or(sample.rss_bytes)
+    }
 }
 
 fn outcome_label(outcome: &TestOutcome) -> &'static str {

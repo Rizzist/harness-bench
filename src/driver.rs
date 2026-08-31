@@ -766,6 +766,10 @@ pub trait Driver: Send {
     fn session_pids(&self, _session: &SessionId) -> Vec<u32> {
         Vec::new()
     }
+    /// Completed external process-lifetime clocks for one-process-per-turn drivers.
+    fn completed_turn_wall_ns(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Generic data-driven driver backed by one transport.
@@ -1139,6 +1143,7 @@ struct ActiveInvocation {
     stdout_path: PathBuf,
     gate_path: Option<PathBuf>,
     started: std::time::Instant,
+    wall_prefix_ns: u64,
     turn: u64,
 }
 
@@ -1331,6 +1336,7 @@ pub struct PerInvocationDriver {
     state_root: PathBuf,
     sessions: BTreeMap<String, ExecSession>,
     daemon_process: Option<ManagedDaemonProcess>,
+    completed_turn_wall_ns: Vec<u64>,
 }
 
 impl PerInvocationDriver {
@@ -1342,6 +1348,7 @@ impl PerInvocationDriver {
             state_root,
             sessions: BTreeMap::new(),
             daemon_process: None,
+            completed_turn_wall_ns: Vec::new(),
         }
     }
 
@@ -2015,7 +2022,16 @@ impl Driver for PerInvocationDriver {
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
                 .kill_on_drop(true);
+            // Reuse the invocation deadline clock as the external wall clock.
+            // Gated resource trials retain only actual spawn plus post-release
+            // execution time, excluding the observer-arming wait.
+            let started = std::time::Instant::now();
             let child = command.spawn()?;
+            let wall_prefix_ns = if gate_path.is_some() {
+                duration_ns(started.elapsed())
+            } else {
+                0
+            };
             let item = self
                 .sessions
                 .get_mut(&id)
@@ -2024,7 +2040,8 @@ impl Driver for PerInvocationDriver {
                 child,
                 stdout_path,
                 gate_path,
-                started: std::time::Instant::now(),
+                started,
+                wall_prefix_ns,
                 turn,
             });
             Ok(())
@@ -2058,6 +2075,10 @@ impl Driver for PerInvocationDriver {
                     .clone();
                 self.refresh_source(&mut persisted, &invocation, status)?;
                 if status.is_some() {
+                    let wall_ns = invocation
+                        .wall_prefix_ns
+                        .saturating_add(duration_ns(invocation.started.elapsed()));
+                    self.completed_turn_wall_ns.push(wall_ns);
                     persisted.turns = persisted.turns.saturating_add(1);
                     Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
                     let item = self.sessions.get_mut(&id).ok_or_else(|| {
@@ -2372,14 +2393,16 @@ impl Driver for PerInvocationDriver {
     fn release_invocations(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
             use std::io::Write as _;
-            for session in self.sessions.values() {
-                let Some(path) = session
-                    .active
-                    .as_ref()
-                    .and_then(|invocation| invocation.gate_path.as_ref())
-                else {
+            for session in self.sessions.values_mut() {
+                let Some(invocation) = session.active.as_mut() else {
                     continue;
                 };
+                let Some(path) = invocation.gate_path.as_ref() else {
+                    continue;
+                };
+                // The same deadline clock is restarted at the release boundary,
+                // excluding only AHRB's deliberate sampler-arming hold.
+                invocation.started = std::time::Instant::now();
                 let mut gate = std::fs::OpenOptions::new().write(true).open(path)?;
                 gate.write_all(b"release\n")?;
                 drop(gate);
@@ -2416,6 +2439,14 @@ impl Driver for PerInvocationDriver {
             .into_iter()
             .collect()
     }
+
+    fn completed_turn_wall_ns(&self) -> Vec<u64> {
+        self.completed_turn_wall_ns.clone()
+    }
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Drop for PerInvocationDriver {

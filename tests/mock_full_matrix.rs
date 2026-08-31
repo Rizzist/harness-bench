@@ -137,6 +137,43 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
             .resource_metrics
             .contains_key("parallel_beta_mib_per_agent")
     );
+    assert!(report.resource_summary.peak_rss_mib > 0.0);
+    assert!(report.resource_summary.mean_rss_mib > 0.0);
+    assert!(report.resource_summary.wall_per_turn_ms > 0.0);
+    assert!(report.resource_summary.idle_rss_mib.is_some());
+    assert!(
+        report
+            .resource_summary
+            .parallel_beta_mib_per_agent
+            .is_some()
+    );
+    assert!(report.resource_summary.scaling_alpha.is_some());
+    assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
+    let sampled_peak = report
+        .samples
+        .iter()
+        .map(|sample| {
+            #[cfg(target_os = "macos")]
+            {
+                sample.footprint_bytes.unwrap_or(sample.rss_bytes)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                sample.pss_bytes.unwrap_or(sample.rss_bytes)
+            }
+        })
+        .max()
+        .unwrap_or(0) as f64
+        / (1024.0 * 1024.0);
+    assert!((report.resource_summary.peak_rss_mib - sampled_peak).abs() < f64::EPSILON);
+    let sampled_cpu_s = report
+        .samples
+        .first()
+        .zip(report.samples.last())
+        .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns))
+        as f64
+        / 1_000_000_000.0;
+    assert!((report.resource_summary.cpu_total_s - sampled_cpu_s).abs() < f64::EPSILON);
     assert!(report.resource_metrics.values().all(|metric| {
         metric.topology == "shared-daemon-sessions"
             && metric.comparison_scope == "within-topology-only"

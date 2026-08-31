@@ -65,6 +65,17 @@ fn per_invocation_resource_rows_measure_process_fanout_without_idle_penalty() {
             .all(|row| matches!(row.outcome, TestOutcome::Pass))
     );
     assert!(!report.resource_metrics.is_empty());
+    assert!(report.resource_summary.peak_rss_mib > 0.0);
+    assert!(report.resource_summary.mean_rss_mib > 0.0);
+    assert!(report.resource_summary.cpu_per_turn_ms >= 0.0);
+    assert!(report.resource_summary.wall_per_turn_ms > 0.0);
+    assert!(report.resource_summary.idle_rss_mib.is_none());
+    assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
+    assert!(!report.membership.is_empty());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("resource_summary peak_rss_mib="));
+    assert!(stdout.contains("sampler_overhead_pct="));
+    assert!(stdout.contains("badge none"));
     assert!(report.resource_metrics.values().all(|metric| {
         metric.topology == "client-process-fanout"
             && metric.comparison_scope == "within-topology-only"

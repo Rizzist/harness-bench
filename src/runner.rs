@@ -6,14 +6,19 @@ use crate::driver::{
     ManagedDaemonTransport, PerInvocationConfig, PerInvocationDriver, SocketJsonRpcTransport,
     StdinRpcTransport, Transport,
 };
-use crate::evaluate::{Assertion, TestResult, certify, classify, suite_exit_code};
+use crate::evaluate::{
+    Assertion, TestOutcome, TestResult, badge_label, certify, classify, suite_exit_code,
+};
 use crate::events::{EventVocab, NormalizedEvent};
 use crate::fake_model::{
     FakeModelEngine, FakeModelServer, FakeModelUnixServer, is_transient_bind_error,
 };
 use crate::manifest::{Manifest, TransportKind};
 use crate::process::{ProcessSample, ProcessTree, Sample, Sampler};
-use crate::report::{Fingerprint, MembershipSample, Report, TopologyMetric};
+use crate::report::{
+    Fingerprint, MembershipSample, Report, TopologyMetric, render_resource_summary,
+    summarize_resources,
+};
 use crate::resource_certification::{
     CleanupObservation, ColdStartObservation, IdleObservation, IdlePhaseRepetition,
     IdleProcessModel, LongHorizonObservation, LongHorizonPoint, LongHorizonToolResult,
@@ -84,11 +89,15 @@ struct RunState {
     parallel_agents: usize,
     resource_evidence: Option<ResourceEvidence>,
     per_invocation_resources: Vec<PerInvocationObservation>,
+    per_invocation_membership: Vec<MembershipSample>,
+    per_invocation_turn_wall_ns: Vec<u64>,
 }
 
 struct PerInvocationResourceCollection {
     observations: Vec<PerInvocationObservation>,
     samples: Vec<Sample>,
+    membership: Vec<MembershipSample>,
+    turn_wall_ns: Vec<u64>,
 }
 
 fn per_invocation_topology(manifest: &Manifest) -> bool {
@@ -593,7 +602,11 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         events.insert(40, pre_crash.clone());
     }
 
-    if !main_roots.is_empty() {
+    // A complete resource collection is one coherent sampler timeline. Do not
+    // append a one-off sample from the main driver's independent CPU tracker:
+    // doing so would make samples.jsonl's last-first CPU and peak disagree with
+    // the reproducible summary. Non-resource runs retain the diagnostic sample.
+    if !main_roots.is_empty() && resource_evidence.is_none() {
         let tree = platform_sampler.discover(&main_roots)?;
         samples.push(platform_sampler.sample(&tree, "post-turn")?);
     }
@@ -765,6 +778,14 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         resume_idempotency_detail,
         parallel_agents,
         resource_evidence,
+        per_invocation_membership: per_invocation_collection
+            .as_ref()
+            .map(|collection| collection.membership.clone())
+            .unwrap_or_default(),
+        per_invocation_turn_wall_ns: per_invocation_collection
+            .as_ref()
+            .map(|collection| collection.turn_wall_ns.clone())
+            .unwrap_or_default(),
         per_invocation_resources: per_invocation_collection
             .map(|collection| collection.observations)
             .unwrap_or_default(),
@@ -776,7 +797,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         .resource_evidence
         .clone()
         .unwrap_or_else(|| incomplete_resource_evidence(&state, &manifest));
-    let resource_certification =
+    let mut resource_certification =
         if per_invocation_topology(&manifest) && !state.per_invocation_resources.is_empty() {
             evaluate_per_invocation_resources(
                 ResourceProfile::from(options.profile),
@@ -790,6 +811,63 @@ pub async fn run(options: RunOptions) -> Result<i32> {
                 &ResourceEnvelope::default(),
             )
         };
+    let membership = if state.per_invocation_resources.is_empty() {
+        resource_evidence
+            .phases
+            .cadence
+            .as_ref()
+            .map(|cadence| membership_report_samples(&cadence.membership_refreshes_by_phase))
+            .unwrap_or_default()
+    } else {
+        state.per_invocation_membership.clone()
+    };
+    let summary_samples = if state.per_invocation_resources.is_empty() {
+        &resource_evidence.series.samples
+    } else {
+        &state.samples
+    };
+    let workflow_turns = if state.per_invocation_resources.is_empty() {
+        resource_evidence_turns(&resource_evidence)
+    } else {
+        state
+            .per_invocation_resources
+            .iter()
+            .fold(0_u64, |total, observation| {
+                total.saturating_add(u64::from(observation.completed_processes))
+            })
+    };
+    let turn_wall_ns = if state.per_invocation_resources.is_empty() {
+        resource_evidence.turn_wall_ns.as_slice()
+    } else {
+        state.per_invocation_turn_wall_ns.as_slice()
+    };
+    let idle_rss_mib = manifest.daemon.persistent.then(|| {
+        resource_certification
+            .metrics
+            .get("idle_median_bytes")
+            .copied()
+            .unwrap_or(0.0)
+            / (1024.0 * 1024.0)
+    });
+    let resource_summary = summarize_resources(
+        summary_samples,
+        &membership,
+        workflow_turns,
+        turn_wall_ns,
+        idle_rss_mib,
+        resource_certification
+            .metrics
+            .get("parallel_beta_mib_per_agent")
+            .copied(),
+        resource_certification
+            .metrics
+            .get("parallel_scaling_exponent")
+            .copied(),
+    );
+    enforce_sampler_overhead(
+        &mut resource_certification.rows,
+        resource_summary.sampler_overhead_pct,
+    );
     let mut results = evaluate_rows(
         &selected,
         &state,
@@ -880,26 +958,6 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         }
     }
     let processes = process_observations(&state.samples);
-    let membership = resource_evidence
-        .phases
-        .cadence
-        .as_ref()
-        .map(|cadence| {
-            cadence
-                .membership_refreshes_by_phase
-                .iter()
-                .flat_map(|(phase, refreshes)| {
-                    refreshes.iter().map(|refresh| MembershipSample {
-                        elapsed_ns: refresh.elapsed_ns,
-                        phase: phase.clone(),
-                        discovery_wall_ns: refresh.discovery_wall_ns,
-                        discovery_cpu_ns: refresh.discovery_cpu_ns,
-                        lane: refresh.lane,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let mut model_requests = request_records
         .into_iter()
         .map(serde_json::to_value)
@@ -919,7 +977,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         }
     }
     let report = Report {
-        schema: 1,
+        schema: 2,
         run_id,
         fingerprint: Fingerprint {
             harness: manifest.identity.id.clone(),
@@ -940,6 +998,7 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         badge,
         metrics,
         resource_metrics,
+        resource_summary,
         samples: state.samples,
         processes,
         membership,
@@ -947,6 +1006,11 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         model_requests,
     };
     crate::report::write_bundle(&report, &options.output, options.junit)?;
+    println!("{}", render_resource_summary(&report.resource_summary));
+    match &report.badge {
+        Some(badge) => println!("badge {}", badge_label(badge)),
+        None => println!("badge none"),
+    }
     Ok(suite_exit_code(
         &report.results,
         report.badge.as_ref(),
@@ -3097,7 +3161,8 @@ async fn collect_per_invocation_resource_observations(
 ) -> Result<PerInvocationResourceCollection> {
     let timing = ResourceTimingPlan::for_profile(ResourceProfile::from(profile));
     let mut observations = Vec::new();
-    let mut collected_samples = Vec::new();
+    let mut collector = ResourceCollector::new(&timing);
+    let mut turn_wall_ns = Vec::new();
 
     for repetition in 0..timing.repetitions {
         let repetition_root =
@@ -3166,7 +3231,6 @@ async fn collect_per_invocation_resource_observations(
                     launcher_pids.len()
                 )));
             }
-            let mut collector = ResourceCollector::new(&timing);
             let sampler = collector.sampler.as_deref_mut().ok_or_else(|| {
                 AhrbError::Protocol("per-invocation sampler is unavailable".to_owned())
             })?;
@@ -3272,10 +3336,9 @@ async fn collect_per_invocation_resource_observations(
                 .max()
                 .unwrap_or(0);
             let cpu_ns = phase_samples
-                .iter()
-                .map(|sample| sample.cpu_ns)
-                .max()
-                .unwrap_or(0);
+                .first()
+                .zip(phase_samples.last())
+                .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns));
             observations.push(PerInvocationObservation {
                 repetition,
                 agents: *agents,
@@ -3285,17 +3348,20 @@ async fn collect_per_invocation_resource_observations(
                 completed_processes,
                 residual_processes,
             });
-            collected_samples.extend(collector.series.samples);
             for session in &sessions {
                 driver.close(session).await?;
             }
         }
+        turn_wall_ns.extend(driver.completed_turn_wall_ns());
         driver.shutdown().await?;
     }
 
+    let membership = membership_report_samples(&collector.membership_refreshes_by_phase);
     Ok(PerInvocationResourceCollection {
         observations,
-        samples: collected_samples,
+        samples: collector.series.samples,
+        membership,
+        turn_wall_ns,
     })
 }
 
@@ -3359,6 +3425,7 @@ async fn collect_resource_evidence(
     let mut single_agents = Vec::new();
     let mut cleanups = Vec::new();
     let mut long_horizons = Vec::new();
+    let mut turn_wall_ns = Vec::new();
     let mut initial_idle_workers = None;
     let mut final_idle_workers = None;
     let mut initial_idle_threads = None;
@@ -3534,18 +3601,18 @@ async fn collect_resource_evidence(
             }
             sweep.push(group.sweep);
         }
-        long_horizons.push(
-            run_long_horizon(
-                &mut collector,
-                &mut driver,
-                &roots,
-                workflow,
-                &identity,
-                &timing,
-                !manifest.hooks.completion.is_empty(),
-            )
-            .await?,
-        );
+        let (long_horizon, long_turn_wall_ns) = run_long_horizon(
+            &mut collector,
+            &mut driver,
+            &roots,
+            workflow,
+            &identity,
+            &timing,
+            !manifest.hooks.completion.is_empty(),
+        )
+        .await?;
+        long_horizons.push(long_horizon);
+        turn_wall_ns.extend(long_turn_wall_ns);
         driver.shutdown().await?;
     }
 
@@ -3565,6 +3632,7 @@ async fn collect_resource_evidence(
     Ok(ResourceEvidence {
         completed_repetitions: timing.repetitions,
         series: collector.series,
+        turn_wall_ns,
         phases: ResourcePhases {
             warm_idle: "resource-idle".to_owned(),
             idle_cpu: "resource-idle".to_owned(),
@@ -3689,7 +3757,11 @@ async fn run_resource_group(
         .sample_phase(
             roots,
             &baseline_phase,
-            Duration::from_millis(timing.idle_baseline_ms),
+            // Collect one complete discardable baseline window before the
+            // required trailing window. macOS may asynchronously reclaim a
+            // just-closed session's allocator pages even after warm idle; the
+            // certified plateau remains the full normative trailing duration.
+            Duration::from_millis(timing.idle_baseline_ms.saturating_mul(2)),
         )
         .await?;
     let baseline_sample = phase_samples(&collector.series, &baseline_phase)
@@ -3996,7 +4068,7 @@ async fn run_long_horizon(
     identity: &RepetitionIdentity,
     timing: &ResourceTimingPlan,
     completion_hook_required: bool,
-) -> Result<LongHorizonObservation> {
+) -> Result<(LongHorizonObservation, Vec<u64>)> {
     if timing.long_horizon_sample_turns == 0 {
         return Err(AhrbError::Validation(
             "long-horizon checkpoint cadence must be nonzero".to_owned(),
@@ -4038,6 +4110,7 @@ async fn run_long_horizon(
     }];
     let mut tool_results_by_turn = BTreeMap::new();
     let mut completed_turns = 0_u32;
+    let mut turn_wall_ns = Vec::new();
     for turn in 1..=timing.long_horizon_turns {
         let checkpoint = resource_long_checkpoint(identity.repetition, turn);
         let prompt = format!(
@@ -4045,16 +4118,21 @@ async fn run_long_horizon(
             route_marker(&workflow.scenario, &actor_name, &checkpoint)
         );
         let turn_key = format!("resource-long-r{}-turn-{turn}", identity.repetition);
+        // Move the existing external deadline clock to the submit boundary so
+        // it covers submit plus daemon handling without adding another timer.
+        let turn_started = Instant::now();
         driver.submit(&session, &prompt, &turn_key).await?;
-        let (terminal_cursor, tool_results) = wait_one_terminal(
+        let (terminal_cursor, tool_results, turn_wall) = wait_one_terminal(
             driver,
             &session,
             after,
             &turn_key,
             completion_hook_required,
             Duration::from_millis(timing.reclaim_deadline_ms),
+            turn_started,
         )
         .await?;
+        turn_wall_ns.push(duration_ns(turn_wall));
         after = Some(terminal_cursor);
         completed_turns = completed_turns.saturating_add(1);
         tool_results_by_turn.insert(turn, tool_results);
@@ -4136,24 +4214,27 @@ async fn run_long_horizon(
         .iter()
         .map(|process| process.identity)
         .collect();
-    Ok(LongHorizonObservation {
-        identity: identity.clone(),
-        baseline_phase,
-        final_post_close_phase,
-        points,
-        completed_turns,
-        tool_results_by_turn,
-        expected_session_id,
-        closed_session_id,
-        baseline_bytes,
-        final_post_close_bytes: final_plateau.median_bytes,
-        baseline_open_fds,
-        final_post_close_open_fds,
-        baseline_threads,
-        final_post_close_threads,
-        baseline_processes,
-        final_post_close_processes,
-    })
+    Ok((
+        LongHorizonObservation {
+            identity: identity.clone(),
+            baseline_phase,
+            final_post_close_phase,
+            points,
+            completed_turns,
+            tool_results_by_turn,
+            expected_session_id,
+            closed_session_id,
+            baseline_bytes,
+            final_post_close_bytes: final_plateau.median_bytes,
+            baseline_open_fds,
+            final_post_close_open_fds,
+            baseline_threads,
+            final_post_close_threads,
+            baseline_processes,
+            final_post_close_processes,
+        },
+        turn_wall_ns,
+    ))
 }
 
 async fn wait_one_terminal(
@@ -4163,8 +4244,8 @@ async fn wait_one_terminal(
     turn_key: &str,
     completion_hook_required: bool,
     deadline: Duration,
-) -> Result<(crate::driver::Cursor, Vec<LongHorizonToolResult>)> {
-    let started = Instant::now();
+    started: Instant,
+) -> Result<(crate::driver::Cursor, Vec<LongHorizonToolResult>, Duration)> {
     let mut observed_tool_results = BTreeMap::new();
     loop {
         let events = driver.attach(session, after).await?;
@@ -4211,6 +4292,7 @@ async fn wait_one_terminal(
             return Ok((
                 crate::driver::Cursor(cursor),
                 observed_tool_results.into_values().collect(),
+                started.elapsed(),
             ));
         }
         if started.elapsed() >= deadline {
@@ -4501,6 +4583,7 @@ fn incomplete_resource_evidence(state: &RunState, manifest: &Manifest) -> Resour
         series: SampleSeries {
             samples: state.samples.clone(),
         },
+        turn_wall_ns: Vec::new(),
         phases: ResourcePhases::default(),
         memory_metric: (!state.samples.is_empty()).then_some(MemoryMetric::Effective),
         sampler_cadence_ns: Some(20_000_000),
@@ -4523,6 +4606,59 @@ fn incomplete_resource_evidence(state: &RunState, manifest: &Manifest) -> Resour
         single_agent: None,
         cleanup: None,
         long_horizon: None,
+    }
+}
+
+fn membership_report_samples(
+    refreshes_by_phase: &BTreeMap<String, Vec<MembershipRefreshEvidence>>,
+) -> Vec<MembershipSample> {
+    let mut membership = refreshes_by_phase
+        .iter()
+        .flat_map(|(phase, refreshes)| {
+            refreshes.iter().map(|refresh| MembershipSample {
+                elapsed_ns: refresh.elapsed_ns,
+                phase: phase.clone(),
+                discovery_wall_ns: refresh.discovery_wall_ns,
+                discovery_cpu_ns: refresh.discovery_cpu_ns,
+                lane: refresh.lane,
+            })
+        })
+        .collect::<Vec<_>>();
+    membership.sort_by_key(|sample| (sample.elapsed_ns, sample.lane, sample.phase.clone()));
+    membership
+}
+
+fn resource_evidence_turns(evidence: &ResourceEvidence) -> u64 {
+    let warmup = evidence
+        .warmup
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .fold(0_u64, |total, observation| {
+            total.saturating_add(u64::from(observation.completed_turns))
+        });
+    let sweep = evidence.sweep.iter().fold(0_u64, |total, observation| {
+        total.saturating_add(u64::from(observation.agents))
+    });
+    let long_horizon = evidence
+        .long_horizon
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .fold(0_u64, |total, observation| {
+            total.saturating_add(u64::from(observation.completed_turns))
+        });
+    warmup.saturating_add(sweep).saturating_add(long_horizon)
+}
+
+fn enforce_sampler_overhead(rows: &mut [TestResult], sampler_overhead_pct: f64) {
+    if sampler_overhead_pct <= 10.0 {
+        return;
+    }
+    let error = format!("sampler overload: {sampler_overhead_pct:.3}% membership discovery CPU");
+    for row in rows {
+        row.outcome = TestOutcome::Error(error.clone());
+        row.evidence.push(error.clone());
     }
 }
 
@@ -4813,6 +4949,27 @@ mod resource_sampler_tests {
         let error = reject_membership_overrun(10_000_001, Duration::from_millis(10))
             .expect_err("membership collection beyond its cadence must fail");
         assert!(error.to_string().contains("sampler overload"));
+    }
+
+    #[test]
+    fn aggregate_membership_cpu_over_ten_percent_errors_resource_rows() {
+        let mut rows = vec![classify(
+            20,
+            "idle-footprint",
+            crate::evaluate::Pillar::Resource,
+            Some(true),
+            &[Assertion {
+                name: "measured".to_owned(),
+                passed: true,
+                detail: "external evidence".to_owned(),
+            }],
+            None,
+        )];
+        enforce_sampler_overhead(&mut rows, 10.001);
+        assert!(matches!(
+            &rows[0].outcome,
+            TestOutcome::Error(detail) if detail.contains("sampler overload")
+        ));
     }
 
     #[test]

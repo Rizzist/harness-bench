@@ -114,7 +114,7 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             .json_pointer_roots
             .get("/runtime_dir")
             .map(String::as_str),
-        Some("XDG_RUNTIME_DIR")
+        Some("HAIDER_RUNTIME_DIR")
     );
     assert!(
         haider

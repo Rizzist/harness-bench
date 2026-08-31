@@ -585,6 +585,9 @@ pub struct ResourceEvidence {
     pub completed_repetitions: u32,
     /// Phase-aware whole-tree samples.
     pub series: SampleSeries,
+    /// Existing external AHRB turn clocks captured for ordinary sampled turns.
+    #[serde(default)]
+    pub turn_wall_ns: Vec<u64>,
     /// Standard idle phase names.
     #[serde(default)]
     pub phases: ResourcePhases,
@@ -1563,7 +1566,8 @@ impl<'a> Analysis<'a> {
                     &observation.returned_phase,
                     self.timing.barrier_steady_ms,
                 )?;
-                let recovery = derive_recovery(&self.evidence.series, observation, metric)?;
+                let recovery =
+                    derive_recovery(&self.evidence.series, observation, metric, &self.timing)?;
                 residuals.push(recovery.residual_bytes as f64);
                 settled.push(observation.settled_after_ms as f64);
                 assertions.extend([
@@ -3098,10 +3102,11 @@ fn derive_sweep_point(
             "barrier discard plus steady window exceeds the hold duration".to_owned(),
         ));
     }
-    let baseline = series.plateau(
+    let baseline = series.trailing_plateau(
         &observation.baseline_phase,
         metric,
         observation.minimum_baseline_processes,
+        timing.idle_baseline_ms.saturating_mul(1_000_000),
     )?;
     let steady = series.trailing_plateau(
         &observation.steady_phase,
@@ -3201,11 +3206,13 @@ fn derive_recovery(
     series: &SampleSeries,
     observation: &ReturnToIdleObservation,
     metric: MemoryMetric,
+    timing: &ResourceTimingPlan,
 ) -> Result<RecoveryMetrics> {
-    let baseline = series.plateau(
+    let baseline = series.trailing_plateau(
         &observation.baseline_phase,
         metric,
         observation.minimum_baseline_processes,
+        timing.idle_baseline_ms.saturating_mul(1_000_000),
     )?;
     let returned = series.plateau(
         &observation.returned_phase,
@@ -3803,6 +3810,7 @@ mod tests {
         Ok(ResourceEvidence {
             completed_repetitions: timing.repetitions,
             series,
+            turn_wall_ns: Vec::new(),
             phases: ResourcePhases {
                 repetitions: idle_repetitions,
                 cadence: Some(cadence),
