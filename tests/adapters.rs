@@ -113,19 +113,23 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             .windows(2)
             .any(|arguments| { arguments == ["--output", "jsonl"] })
     );
+    // Contract-correct selector on 0.0.967: `--account <alias>` names a credential
+    // descriptor, and a no-auth custom provider has none, so runs select the
+    // provider/model pair directly. The `account add` in `initialize` still
+    // registers the provider; `--account` must NOT appear as a run flag.
     assert!(
         haider
             .transport
             .command
             .windows(2)
-            .any(|arguments| { arguments == ["--account", "ahrb"] })
+            .any(|arguments| { arguments == ["--model", "ahrb/{{model}}"] })
     );
     assert!(
         !haider
             .transport
             .command
             .iter()
-            .any(|argument| argument == "--model")
+            .any(|argument| argument == "--account")
     );
     assert!(haider.sessions.create.is_empty());
     assert!(haider.sessions.submit.is_empty());
@@ -501,11 +505,29 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
         Some("command")
     );
     assert_eq!(haider.events.type_pointer, "/payload/type");
-    assert_eq!(haider.events.replay_envelope_pointer, "/envelope");
+    assert_eq!(haider.events.schema_version_pointer, "/schema_version");
+    assert_eq!(haider.events.schema_versions, [1]);
+    assert!(haider.events.warn_unmapped_payload_kinds);
+    assert_eq!(haider.events.replay_mode, "document");
+    assert_eq!(haider.events.replay_records_pointer, "/events");
+    assert!(haider.events.replay_envelope_pointer.is_empty());
+    assert_eq!(
+        haider
+            .events
+            .replay_assertions
+            .get("/provider_requests")
+            .map(String::as_str),
+        Some("0")
+    );
+    assert!(haider.events.replay_compare_live_records);
+    assert_eq!(
+        haider.events.replay_state_pointers,
+        ["/result/head_seq", "/result/terminal_seq"]
+    );
     assert_eq!(haider.events.replay_cursor_start, Some(2));
     assert!(haider.events.rules.iter().any(|rule| {
         rule.matches == "item"
-            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("started")
+            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("completed")
             && rule
                 .match_fields
                 .get("/payload/item/item")
@@ -518,14 +540,20 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
             && rule.event == "tool-result"
             && rule.payload_bindings.get("call_id").map(String::as_str) == Some("/payload/call_id")
     }));
-    for (state, event) in [
-        ("done", "terminal-success"),
-        ("errored", "terminal-failure"),
-        ("cancelled", "terminal-cancelled"),
+    for (terminal_kind, event) in [
+        ("success", "terminal-success"),
+        ("failure", "terminal-failure"),
+        ("provider_error", "terminal-failure"),
+        ("cancellation", "terminal-cancelled"),
+        ("timeout", "terminal-timeout"),
     ] {
         assert!(haider.events.rules.iter().any(|rule| {
             rule.matches == "run_state"
-                && rule.match_fields.get("/payload/state").map(String::as_str) == Some(state)
+                && rule
+                    .match_fields
+                    .get("/payload/terminal_kind")
+                    .map(String::as_str)
+                    == Some(terminal_kind)
                 && rule.event == event
         }));
     }

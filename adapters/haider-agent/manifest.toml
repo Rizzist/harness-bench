@@ -121,12 +121,21 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 [events]
 source = "stdout"
 replay_command = ["haider", "run", "--replay", "{{run_id}}"]
-replay_envelope_pointer = "/envelope"
+replay_mode = "document"
+replay_records_pointer = "/events"
+replay_assertions = { "/schema" = "haider.run.replay.v1", "/mode" = "durable_journal", "/provider_requests" = "0", "/integrity/sequences_strictly_increasing" = "true", "/integrity/run_id_stable" = "true", "/integrity/exactly_one_typed_terminal" = "true", "/integrity/terminal_seq_matches_status" = "true", "/equivalence/equivalent" = "true" }
+replay_state_command = ["haider", "run", "--status", "{{run_id}}", "--output", "json"]
+replay_state_assertions = { "/schema" = "haider.run.status.v1" }
+replay_state_pointers = ["/result/head_seq", "/result/terminal_seq"]
+replay_compare_live_records = true
 replay_cursor_start = 2
 framing = "jsonl"
 type_pointer = "/payload/type"
 id_pointer = "/event_id"
 cursor_pointer = "/seq"
+schema_version_pointer = "/schema_version"
+schema_versions = [1]
+warn_unmapped_payload_kinds = true
 
 [[events.rules]]
 matches = "accepted"
@@ -140,7 +149,7 @@ payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "item"
-match_fields = { "/payload/event" = "started", "/payload/item/item" = "tool_call" }
+match_fields = { "/payload/event" = "completed", "/payload/item/item" = "tool_call" }
 event = "tool-call"
 payload_pointer = "/payload/item"
 payload_bindings = { call_id = "/payload/item/call_id", name = "/payload/item/name", arguments = "/payload/item/args" }
@@ -164,42 +173,38 @@ payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/state" = "done" }
+match_fields = { "/payload/terminal_kind" = "success" }
 event = "terminal-success"
 payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/state" = "errored" }
+match_fields = { "/payload/terminal_kind" = "failure" }
 event = "terminal-failure"
 payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/state" = "cancelled" }
-event = "terminal-cancelled"
-payload_pointer = "/payload"
-
-[[events.rules]]
-matches = "error"
-event = "terminal-failure"
-
-[[events.rules]]
-matches = "terminal"
-match_fields = { "/payload/status" = "success" }
-event = "terminal-success"
-payload_pointer = "/payload"
-
-[[events.rules]]
-matches = "terminal"
-match_fields = { "/payload/status" = "failure" }
+match_fields = { "/payload/terminal_kind" = "provider_error" }
 event = "terminal-failure"
 payload_pointer = "/payload"
 
 [[events.rules]]
-matches = "terminal"
-match_fields = { "/payload/status" = "cancelled" }
+matches = "run_state"
+match_fields = { "/payload/terminal_kind" = "budget" }
+event = "terminal-failure"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/terminal_kind" = "cancellation" }
 event = "terminal-cancelled"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/terminal_kind" = "timeout" }
+event = "terminal-timeout"
 payload_pointer = "/payload"
 
 [exit]

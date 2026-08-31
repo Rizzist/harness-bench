@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use std::collections::BTreeSet;
 
 /// An opaque harness session identifier.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1168,6 +1169,11 @@ pub trait Driver: Send {
     fn lifecycle_notes(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Unique source payload kinds observed at a supported schema version but
+    /// left unmapped by the adapter's normalization table.
+    fn unmapped_payload_kinds(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Explicit process-exit evidence used by daemon-topology resource fencing.
@@ -1826,6 +1832,7 @@ pub struct PerInvocationDriver {
     daemon_launch_pid: Option<u32>,
     completed_turn_wall_ns: Vec<u64>,
     lifecycle_notes: Vec<String>,
+    unmapped_payload_kinds: BTreeSet<String>,
 }
 
 impl PerInvocationDriver {
@@ -1841,6 +1848,7 @@ impl PerInvocationDriver {
             daemon_launch_pid: None,
             completed_turn_wall_ns: Vec::new(),
             lifecycle_notes: Vec::new(),
+            unmapped_payload_kinds: BTreeSet::new(),
         }
     }
 
@@ -2061,6 +2069,31 @@ impl PerInvocationDriver {
         Ok((records, stdout))
     }
 
+    fn raw_live_replay_records(&self, session: &PersistedExecSession) -> Result<Vec<Value>> {
+        let mut records = Vec::new();
+        for turn in 1..=session.invocations {
+            let path = self
+                .session_directory(&session.local_id)
+                .join(format!("turn-{turn:06}.stdout"));
+            let bytes = Self::bounded_read(&path, self.config.max_output_bytes, false)?;
+            for record in parse_event_records(&bytes, &self.config.events.framing)? {
+                let has_cursor = record
+                    .pointer(&self.config.events.cursor_pointer)
+                    .and_then(Value::as_u64)
+                    .is_some();
+                let same_run = self.config.run_id_pointer.is_empty()
+                    || record
+                        .pointer(&self.config.run_id_pointer)
+                        .and_then(Value::as_str)
+                        == Some(session.run_id.as_str());
+                if has_cursor && same_run {
+                    records.push(record);
+                }
+            }
+        }
+        Ok(records)
+    }
+
     fn read_cached_events(path: &Path) -> Result<Vec<NormalizedEvent>> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -2151,7 +2184,10 @@ impl PerInvocationDriver {
                 if !allow_terminal
                     && matches!(
                         rule.event.as_str(),
-                        "terminal-success" | "terminal-failure" | "terminal-cancelled"
+                        "terminal-success"
+                            | "terminal-failure"
+                            | "terminal-cancelled"
+                            | "terminal-timeout"
                     )
                 {
                     continue;
@@ -2259,7 +2295,7 @@ impl PerInvocationDriver {
     }
 
     fn refresh_source(
-        &self,
+        &mut self,
         session: &mut PersistedExecSession,
         active: &ActiveInvocation,
         completed: Option<std::process::ExitStatus>,
@@ -2272,6 +2308,7 @@ impl PerInvocationDriver {
             .map(|event| (event.id.clone(), event))
             .collect();
         let (records, stdout) = self.source_records(session, Some(&active.stdout_path))?;
+        self.record_event_contract(&records)?;
         self.learn_harness_identifiers(session, &records);
         let namespace = if self.config.events.source == "stdout" {
             format!("turn-{}", active.turn)
@@ -2302,7 +2339,9 @@ impl PerInvocationDriver {
             if let Some(mapped) = additions.iter_mut().rev().find(|event| {
                 matches!(
                     event.event,
-                    EventVocab::TerminalSuccess | EventVocab::TerminalFailure
+                    EventVocab::TerminalSuccess
+                        | EventVocab::TerminalFailure
+                        | EventVocab::TerminalTimeout
                 )
             }) && mapped.event == expected
                 && let (Some(mapped_payload), Some(exit_payload)) =
@@ -2320,10 +2359,15 @@ impl PerInvocationDriver {
                     EventVocab::TerminalSuccess
                         | EventVocab::TerminalFailure
                         | EventVocab::TerminalCancelled
+                        | EventVocab::TerminalTimeout
                 )
             });
             if mapped_terminal.is_none_or(|event| {
-                event.event != expected && event.event != EventVocab::TerminalCancelled
+                event.event != expected
+                    && !matches!(
+                        event.event,
+                        EventVocab::TerminalCancelled | EventVocab::TerminalTimeout
+                    )
             }) {
                 additions.push(NormalizedEvent {
                     id: format!("{turn_prefix}:terminal"),
@@ -2339,7 +2383,7 @@ impl PerInvocationDriver {
         Self::append_cached_events(&cache_path, &additions)
     }
 
-    fn refresh_inactive_journal(&self, session: &mut PersistedExecSession) -> Result<()> {
+    fn refresh_inactive_journal(&mut self, session: &mut PersistedExecSession) -> Result<()> {
         if self.config.events.source != "journal-file" {
             return Ok(());
         }
@@ -2351,6 +2395,7 @@ impl PerInvocationDriver {
             .map(|event| (event.id.clone(), event))
             .collect();
         let (records, _) = self.source_records(session, None)?;
+        self.record_event_contract(&records)?;
         self.learn_harness_identifiers(session, &records);
         let additions = Self::normalize_records(
             &self.config.events,
@@ -2361,6 +2406,17 @@ impl PerInvocationDriver {
             true,
         )?;
         Self::append_cached_events(&cache_path, &additions)
+    }
+
+    fn record_event_contract(&mut self, records: &[Value]) -> Result<()> {
+        for kind in inspect_event_contract(&self.config.events, records)? {
+            if self.unmapped_payload_kinds.insert(kind.clone()) {
+                eprintln!(
+                    "warning: supported source schema contained unmapped payload kind {kind:?}"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn run_control_command(
@@ -2413,7 +2469,25 @@ impl PerInvocationDriver {
             "per-invocation control command",
         )
         .await?;
+        // Control commands may print a human-readable preamble line before the
+        // JSON document on the same stream (e.g. haider's recover --probe emits
+        // "no crash window to reconcile" ahead of its haider.session_recovery.v1
+        // document), so extract the LAST parseable JSON line rather than parsing
+        // the whole buffer.
+        let stdout_text = String::from_utf8_lossy(&output.stdout);
+        let last_json = stdout_text
+            .lines()
+            .rev()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .find_map(|line| serde_json::from_str::<Value>(line).ok());
         if !output.status.success() {
+            // A structured JSON control response with a nonzero exit is still
+            // evidence (e.g. a typed "no_recovery" probe answer); let the row
+            // oracle judge it instead of masking it behind a protocol error.
+            if let Some(value) = last_json {
+                return Ok(Some(value));
+            }
             return Err(AhrbError::Protocol(format!(
                 "per-invocation control command exited with {}: {}",
                 output.status,
@@ -2423,10 +2497,10 @@ impl PerInvocationDriver {
         if output.stdout.iter().all(u8::is_ascii_whitespace) {
             return Ok(None);
         }
-        let value = serde_json::from_slice(&output.stdout).map_err(|error| {
-            AhrbError::Protocol(format!(
-                "per-invocation control command returned invalid JSON: {error}"
-            ))
+        let value = last_json.ok_or_else(|| {
+            AhrbError::Protocol(
+                "per-invocation control command returned no parseable JSON line".to_owned(),
+            )
         })?;
         Ok(Some(value))
     }
@@ -2759,13 +2833,36 @@ impl Driver for PerInvocationDriver {
             let (program, arguments) = argv.split_first().ok_or_else(|| {
                 AhrbError::Validation("per-invocation replay command is empty".to_owned())
             })?;
+            let working_directory = self.session_directory(&id).join("workspace");
+            let state_argv = self
+                .config
+                .events
+                .replay_state_command
+                .iter()
+                .map(|argument| crate::manifest::render_template(argument, &variables))
+                .collect::<Result<Vec<_>>>()?;
+            let before_state = if state_argv.is_empty() {
+                None
+            } else {
+                Some(
+                    run_json_output_command(
+                        &state_argv,
+                        &self.config.environment,
+                        &working_directory,
+                        self.config.timeout,
+                        self.config.max_output_bytes,
+                        "pre-replay durable state",
+                    )
+                    .await?,
+                )
+            };
             let mut command = Command::new(program);
             #[cfg(unix)]
             command.process_group(0);
             command
                 .args(arguments)
                 .envs(&self.config.environment)
-                .current_dir(self.session_directory(&id).join("workspace"))
+                .current_dir(&working_directory)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -2776,24 +2873,58 @@ impl Driver for PerInvocationDriver {
                 "per-invocation durable replay",
             )
             .await?;
-            if !output.status.success() {
-                return Err(AhrbError::Protocol(format!(
-                    "per-invocation durable replay exited with {}",
-                    output.status
-                )));
+            validate_replay_output(&output, self.config.max_output_bytes)?;
+            let mut records = extract_replay_records(&self.config.events, &output.stdout)?;
+            self.record_event_contract(&records)?;
+            if self.config.events.replay_compare_live_records {
+                let live = self.raw_live_replay_records(&persisted)?;
+                if records != live {
+                    return Err(AhrbError::Protocol(format!(
+                        "durable replay records differed from raw live run projection: live={}, replay={}",
+                        live.len(),
+                        records.len()
+                    )));
+                }
             }
-            if output.stdout.len() > self.config.max_output_bytes {
-                return Err(AhrbError::Protocol(
-                    "per-invocation durable replay exceeded capture bound".to_owned(),
-                ));
+            if let Some(before) = before_state {
+                let after = run_json_output_command(
+                    &state_argv,
+                    &self.config.environment,
+                    &working_directory,
+                    self.config.timeout,
+                    self.config.max_output_bytes,
+                    "post-replay durable state",
+                )
+                .await?;
+                validate_scalar_assertions(
+                    &before,
+                    &self.config.events.replay_state_assertions,
+                    "pre-replay durable state",
+                )?;
+                validate_scalar_assertions(
+                    &after,
+                    &self.config.events.replay_state_assertions,
+                    "post-replay durable state",
+                )?;
+                for pointer in &self.config.events.replay_state_pointers {
+                    let before_value = before.pointer(pointer).ok_or_else(|| {
+                        AhrbError::Protocol(format!(
+                            "pre-replay durable state omitted comparison field at {pointer}"
+                        ))
+                    })?;
+                    let after_value = after.pointer(pointer).ok_or_else(|| {
+                        AhrbError::Protocol(format!(
+                            "post-replay durable state omitted comparison field at {pointer}"
+                        ))
+                    })?;
+                    if before_value != after_value {
+                        return Err(AhrbError::Protocol(format!(
+                            "durable replay mutated state at {pointer}: before={}, after={}",
+                            before_value, after_value
+                        )));
+                    }
+                }
             }
-            if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
-                return Err(AhrbError::Protocol(
-                    "durable replay output ended with a torn record".to_owned(),
-                ));
-            }
-            let mut records =
-                unwrap_replay_records(&self.config.events, parse_journal_records(&output.stdout)?)?;
             let mut replayed = persisted;
             if self.config.events.source == "stdout" {
                 // Normalize the replay stream into AHRB cursors before applying
@@ -3204,6 +3335,10 @@ impl Driver for PerInvocationDriver {
         self.lifecycle_notes.clone()
     }
 
+    fn unmapped_payload_kinds(&self) -> Vec<String> {
+        self.unmapped_payload_kinds.iter().cloned().collect()
+    }
+
     fn wait_ready(
         &mut self,
         sessions: &[SessionId],
@@ -3438,7 +3573,51 @@ fn parse_journal_records(bytes: &[u8]) -> Result<Vec<Value>> {
     Ok(records)
 }
 
-fn unwrap_replay_records(mapping: &EventMapping, records: Vec<Value>) -> Result<Vec<Value>> {
+fn validate_replay_output(output: &std::process::Output, maximum: usize) -> Result<()> {
+    if !output.status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "per-invocation durable replay exited with {}",
+            output.status
+        )));
+    }
+    if output.stdout.len() > maximum {
+        return Err(AhrbError::Protocol(
+            "per-invocation durable replay exceeded capture bound".to_owned(),
+        ));
+    }
+    if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
+        return Err(AhrbError::Protocol(
+            "durable replay output ended with a torn record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_replay_records(mapping: &EventMapping, bytes: &[u8]) -> Result<Vec<Value>> {
+    let records = parse_journal_records(bytes)?;
+    if mapping.replay_mode == "document" {
+        let [document] = records.as_slice() else {
+            return Err(AhrbError::Protocol(format!(
+                "durable replay document mode expected one JSON document, received {}",
+                records.len()
+            )));
+        };
+        validate_scalar_assertions(
+            document,
+            &mapping.replay_assertions,
+            "durable replay document",
+        )?;
+        return document
+            .pointer(&mapping.replay_records_pointer)
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "durable replay document omitted event array at {}",
+                    mapping.replay_records_pointer
+                ))
+            });
+    }
     if mapping.replay_envelope_pointer.is_empty() {
         return Ok(records);
     }
@@ -3457,6 +3636,117 @@ fn unwrap_replay_records(mapping: &EventMapping, records: Vec<Value>) -> Result<
                 })
         })
         .collect()
+}
+
+fn validate_scalar_assertions(
+    document: &Value,
+    assertions: &BTreeMap<String, String>,
+    label: &str,
+) -> Result<()> {
+    for (pointer, expected) in assertions {
+        let actual = document.pointer(pointer).ok_or_else(|| {
+            AhrbError::Protocol(format!("{label} omitted asserted field at {pointer}"))
+        })?;
+        if !scalar_matches(actual, expected) {
+            return Err(AhrbError::Protocol(format!(
+                "{label} assertion at {pointer} expected {expected:?}, received {actual}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn run_json_output_command(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+    working_directory: &Path,
+    timeout: Duration,
+    maximum: usize,
+    label: &str,
+) -> Result<Value> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| AhrbError::Validation(format!("{label} command is empty")))?;
+    let mut command = Command::new(program);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .args(arguments)
+        .envs(environment)
+        .current_dir(working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = run_owned_output(&mut command, timeout, label).await?;
+    if !output.status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "{label} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if output.stdout.len() > maximum {
+        return Err(AhrbError::Protocol(format!(
+            "{label} exceeded capture bound"
+        )));
+    }
+    parse_last_json_value(&output.stdout)
+        .ok_or_else(|| AhrbError::Protocol(format!("{label} emitted no JSON document")))
+}
+
+fn parse_last_json_value(bytes: &[u8]) -> Option<Value> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice(trim_ascii(line)).ok())
+        .next_back()
+}
+
+fn scalar_matches(actual: &Value, expected: &str) -> bool {
+    match actual {
+        Value::String(value) => value == expected,
+        Value::Bool(value) => value.to_string() == expected,
+        Value::Number(value) => value.to_string() == expected,
+        _ => false,
+    }
+}
+
+fn inspect_event_contract(mapping: &EventMapping, records: &[Value]) -> Result<BTreeSet<String>> {
+    if mapping.schema_version_pointer.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut unmapped = BTreeSet::new();
+    for record in records {
+        let Some(kind) = record
+            .pointer(&mapping.type_pointer)
+            .and_then(Value::as_str)
+        else {
+            // Mixed stdout streams can contain transport announcements which
+            // are not durable envelopes and therefore have no schema version.
+            continue;
+        };
+        let version = record
+            .pointer(&mapping.schema_version_pointer)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "source payload kind {kind:?} omitted u64 schema version at {}",
+                    mapping.schema_version_pointer
+                ))
+            })?;
+        if !mapping.schema_versions.contains(&version) {
+            return Err(AhrbError::Protocol(format!(
+                "unsupported source schema version {version} for payload kind {kind:?}; supported versions are {:?}",
+                mapping.schema_versions
+            )));
+        }
+        if mapping.warn_unmapped_payload_kinds
+            && !mapping.rules.iter().any(|rule| rule.matches == kind)
+        {
+            unmapped.insert(kind.to_owned());
+        }
+    }
+    Ok(unmapped)
 }
 
 /// One-process-per-operation transport using JSON on stdin and stdout.
@@ -4126,7 +4416,17 @@ mod tests {
             type_pointer: String::new(),
             id_pointer: String::new(),
             cursor_pointer: String::new(),
+            schema_version_pointer: String::new(),
+            schema_versions: Vec::new(),
+            warn_unmapped_payload_kinds: false,
             replay_command: Vec::new(),
+            replay_mode: "lines".to_owned(),
+            replay_records_pointer: String::new(),
+            replay_assertions: BTreeMap::new(),
+            replay_state_command: Vec::new(),
+            replay_state_assertions: BTreeMap::new(),
+            replay_state_pointers: Vec::new(),
+            replay_compare_live_records: false,
             replay_envelope_pointer: String::new(),
             replay_cursor_start: None,
             rules: vec![
@@ -4480,7 +4780,7 @@ mod tests {
                         "event_id":"evt-tool-call","seq":2,
                         "session_id":"haider-session","run_id":"run-1",
                         "payload":{
-                            "type":"item","event":"started","item_id":"item-1",
+                            "type":"item","event":"completed","item_id":"item-1",
                             "item":{
                                 "item":"tool_call","call_id":"haider-tool-1",
                                 "name":"process_exec","args":{"command":command},
@@ -4507,7 +4807,7 @@ mod tests {
                     json!({
                         "event_id":"evt-done","seq":5,
                         "session_id":"haider-session","run_id":"run-1",
-                        "payload":{"type":"run_state","state":"done"}
+                        "payload":{"type":"run_state","state":"done","terminal_kind":"success"}
                     }),
                 ],
             ),
@@ -4539,7 +4839,12 @@ mod tests {
             let call = events
                 .iter()
                 .find(|event| event.event == EventVocab::ToolCall)
-                .expect("normalized tool call");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "normalized tool call missing for {adapter}; normalized kinds: {:?}",
+                        events.iter().map(|event| &event.event).collect::<Vec<_>>()
+                    )
+                });
             let result = events
                 .iter()
                 .find(|event| event.event == EventVocab::ToolResult)
@@ -5018,21 +5323,66 @@ mod tests {
     }
 
     #[test]
-    fn haider_replay_envelopes_reuse_live_rules_and_cursor_origin() {
+    fn haider_replay_document_reuses_live_rules_and_cursor_origin() {
         let manifest = crate::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))
             .expect("load Haider manifest");
-        let wrapped = vec![
-            json!({"v":1,"kind":"event","envelope":{
+        let live_records = vec![
+            json!({
+                "schema_version":1,
                 "event_id":"evt-thinking","seq":8,"session_id":"session-1","run_id":"run-1",
                 "payload":{"type":"run_state","state":"thinking"}
-            }}),
-            json!({"v":1,"kind":"event","envelope":{
+            }),
+            json!({
+                "schema_version":1,
+                "event_id":"evt-tool-call","seq":16,"session_id":"session-1","run_id":"run-1",
+                "payload":{"type":"item","event":"completed","item":{
+                    "item":"tool_call","call_id":"provider-call-1","name":"process_exec",
+                    "args":{"command":["true"]}
+                }}
+            }),
+            json!({
+                "schema_version":1,
+                "event_id":"evt-tool-result","seq":17,"session_id":"session-1","run_id":"run-1",
+                "payload":{"type":"tool_result","call_id":"provider-call-1","result":{"ok":true}}
+            }),
+            json!({
+                "schema_version":1,
                 "event_id":"evt-done","seq":23,"session_id":"session-1","run_id":"run-1",
                 "payload":{"type":"run_state","state":"done","terminal_kind":"success"}
-            }}),
+            }),
         ];
-        let records =
-            unwrap_replay_records(&manifest.events, wrapped).expect("unwrap replay envelopes");
+        let document = json!({
+            "schema":"haider.run.replay.v1",
+            "mode":"durable_journal",
+            "provider_requests":0,
+            "events":live_records,
+            "integrity":{
+                "sequences_strictly_increasing":true,
+                "run_id_stable":true,
+                "exactly_one_typed_terminal":true,
+                "terminal_seq_matches_status":true
+            },
+            "equivalence":{"equivalent":true}
+        });
+        let mut bytes = serde_json::to_vec(&document).expect("serialize replay document");
+        bytes.push(b'\n');
+        let records = extract_replay_records(&manifest.events, &bytes)
+            .expect("extract replay document events");
+        assert_eq!(records, live_records);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.get("seq").and_then(Value::as_u64))
+                .collect::<Vec<_>>(),
+            [8, 16, 17, 23]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.pointer("/payload/call_id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["provider-call-1"]
+        );
         let mut session = PersistedExecSession {
             local_id: "local-1".to_owned(),
             marker: "r30".to_owned(),
@@ -5052,11 +5402,21 @@ mod tests {
             true,
         )
         .expect("normalize replayed Haider envelopes");
-        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized.len(), 4);
         assert_eq!(normalized[0].cursor, 2);
         assert_eq!(normalized[0].event, EventVocab::ModelRequest);
-        assert_eq!(normalized[1].cursor, 3);
-        assert_eq!(normalized[1].event, EventVocab::TerminalSuccess);
+        assert_eq!(normalized[1].event, EventVocab::ToolCall);
+        assert_eq!(
+            normalized[1].payload.get("call_id").and_then(Value::as_str),
+            Some("provider-call-1")
+        );
+        assert_eq!(normalized[2].event, EventVocab::ToolResult);
+        assert_eq!(
+            normalized[2].payload.get("call_id").and_then(Value::as_str),
+            Some("provider-call-1")
+        );
+        assert_eq!(normalized[3].cursor, 5);
+        assert_eq!(normalized[3].event, EventVocab::TerminalSuccess);
     }
 
     #[test]

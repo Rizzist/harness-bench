@@ -2328,7 +2328,10 @@ fn session_should_stop(session: &SessionState) -> Result<bool> {
 fn is_terminal(event: &EventVocab) -> bool {
     matches!(
         event,
-        EventVocab::TerminalSuccess | EventVocab::TerminalFailure | EventVocab::TerminalCancelled
+        EventVocab::TerminalSuccess
+            | EventVocab::TerminalFailure
+            | EventVocab::TerminalCancelled
+            | EventVocab::TerminalTimeout
     )
 }
 

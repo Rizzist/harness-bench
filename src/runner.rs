@@ -2806,7 +2806,10 @@ async fn collect_session_checkpoint(
 fn is_terminal(event: &EventVocab) -> bool {
     matches!(
         event,
-        EventVocab::TerminalSuccess | EventVocab::TerminalFailure | EventVocab::TerminalCancelled
+        EventVocab::TerminalSuccess
+            | EventVocab::TerminalFailure
+            | EventVocab::TerminalCancelled
+            | EventVocab::TerminalTimeout
     )
 }
 
@@ -5282,6 +5285,7 @@ fn validate_recovered_suffix(
                 EventVocab::TerminalSuccess
                     | EventVocab::TerminalFailure
                     | EventVocab::TerminalCancelled
+                    | EventVocab::TerminalTimeout
             ) && let Some(payload) = event.payload.as_object_mut()
             {
                 // These fields are added by the observing client at exit and

@@ -858,7 +858,10 @@ fn terminal_count(events: &[&NormalizedEvent]) -> usize {
 fn is_terminal(event: &EventVocab) -> bool {
     matches!(
         event,
-        EventVocab::TerminalSuccess | EventVocab::TerminalFailure | EventVocab::TerminalCancelled
+        EventVocab::TerminalSuccess
+            | EventVocab::TerminalFailure
+            | EventVocab::TerminalCancelled
+            | EventVocab::TerminalTimeout
     )
 }
 

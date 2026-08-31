@@ -462,9 +462,46 @@ pub struct EventMapping {
     /// Resume cursor pointer.
     #[serde(default)]
     pub cursor_pointer: String,
+    /// Envelope schema-version pointer. Records resolved through
+    /// `type_pointer` must carry one of `schema_versions` when configured.
+    #[serde(default)]
+    pub schema_version_pointer: String,
+    /// Envelope schema versions understood by this adapter revision.
+    #[serde(default)]
+    pub schema_versions: Vec<u64>,
+    /// Warn and retain unique evidence for source payload kinds which have no
+    /// normalization rule at an understood schema version.
+    #[serde(default)]
+    pub warn_unmapped_payload_kinds: bool,
     /// Optional argv that reopens the harness journal and emits normalized JSONL.
     #[serde(default)]
     pub replay_command: Vec<String>,
+    /// Replay output shape: `lines` applies replay extraction to each record,
+    /// while `document` extracts an array from one JSON document.
+    #[serde(default = "default_replay_mode")]
+    pub replay_mode: String,
+    /// JSON pointer to the replay event array when `replay_mode = "document"`.
+    #[serde(default)]
+    pub replay_records_pointer: String,
+    /// Scalar JSON-pointer assertions evaluated on a replay document before
+    /// any contained events are normalized.
+    #[serde(default)]
+    pub replay_assertions: BTreeMap<String, String>,
+    /// Optional argv that snapshots durable replay state before and after the
+    /// replay command.
+    #[serde(default)]
+    pub replay_state_command: Vec<String>,
+    /// Scalar assertions evaluated on both durable-state snapshots.
+    #[serde(default)]
+    pub replay_state_assertions: BTreeMap<String, String>,
+    /// JSON pointers that must remain identical across the before/after
+    /// durable-state snapshots.
+    #[serde(default)]
+    pub replay_state_pointers: Vec<String>,
+    /// Require replay records to equal the raw, run-scoped live records before
+    /// normalization. This retains source sequence gaps and nested call IDs.
+    #[serde(default)]
+    pub replay_compare_live_records: bool,
     /// Optional JSON pointer that unwraps each replay record before applying
     /// the live-stream normalization rules.
     #[serde(default)]
@@ -476,6 +513,10 @@ pub struct EventMapping {
     /// Ordered normalization rules.
     #[serde(default)]
     pub rules: Vec<EventRule>,
+}
+
+fn default_replay_mode() -> String {
+    "lines".to_owned()
 }
 
 /// One table-driven event normalization rule.
@@ -887,10 +928,93 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             manifest.events.replay_envelope_pointer
         )));
     }
+    match manifest.events.replay_mode.as_str() {
+        "lines" => {
+            if !manifest.events.replay_records_pointer.is_empty() {
+                return Err(AhrbError::Validation(
+                    "events.replay_records_pointer requires replay_mode = \"document\"".to_owned(),
+                ));
+            }
+        }
+        "document" => {
+            if manifest.events.replay_records_pointer.is_empty()
+                || !manifest.events.replay_records_pointer.starts_with('/')
+                || manifest.events.replay_records_pointer == "/"
+            {
+                return Err(AhrbError::Validation(format!(
+                    "events.replay_records_pointer {:?} is not a non-root JSON pointer",
+                    manifest.events.replay_records_pointer
+                )));
+            }
+            if !manifest.events.replay_envelope_pointer.is_empty() {
+                return Err(AhrbError::Validation(
+                    "events.replay_envelope_pointer is only valid for replay_mode = \"lines\""
+                        .to_owned(),
+                ));
+            }
+        }
+        other => {
+            return Err(AhrbError::Validation(format!(
+                "unsupported events.replay_mode {other:?}"
+            )));
+        }
+    }
+    for pointer in manifest.events.replay_assertions.keys() {
+        if !pointer.starts_with('/') || pointer == "/" {
+            return Err(AhrbError::Validation(format!(
+                "events.replay_assertions pointer {pointer:?} is not a non-root JSON pointer"
+            )));
+        }
+    }
+    if (!manifest.events.replay_state_pointers.is_empty()
+        || !manifest.events.replay_state_assertions.is_empty())
+        && manifest.events.replay_state_command.is_empty()
+    {
+        return Err(AhrbError::Validation(
+            "events replay state checks require replay_state_command".to_owned(),
+        ));
+    }
+    for pointer in manifest
+        .events
+        .replay_state_pointers
+        .iter()
+        .chain(manifest.events.replay_state_assertions.keys())
+    {
+        if !pointer.starts_with('/') || pointer == "/" {
+            return Err(AhrbError::Validation(format!(
+                "events replay state pointer {pointer:?} is not a non-root JSON pointer"
+            )));
+        }
+    }
     if manifest.events.replay_cursor_start == Some(0) {
         return Err(AhrbError::Validation(
             "events.replay_cursor_start must be greater than zero".to_owned(),
         ));
+    }
+    if manifest.events.schema_version_pointer.is_empty() {
+        if !manifest.events.schema_versions.is_empty()
+            || manifest.events.warn_unmapped_payload_kinds
+        {
+            return Err(AhrbError::Validation(
+                "events schema versions/unmapped warnings require schema_version_pointer"
+                    .to_owned(),
+            ));
+        }
+    } else {
+        if !manifest.events.schema_version_pointer.starts_with('/')
+            || manifest.events.schema_version_pointer == "/"
+        {
+            return Err(AhrbError::Validation(format!(
+                "events.schema_version_pointer {:?} is not a non-root JSON pointer",
+                manifest.events.schema_version_pointer
+            )));
+        }
+        if manifest.events.schema_versions.is_empty() {
+            return Err(AhrbError::Validation(
+                "events.schema_version_pointer requires at least one schema_versions entry"
+                    .to_owned(),
+            ));
+        }
     }
     if manifest
         .exit
