@@ -3,7 +3,7 @@
 use crate::cli::RunOptions;
 use crate::evaluate::{Badge, TestOutcome, badge_label};
 use crate::manifest::Manifest;
-use crate::report::{Report, ResourceSummary};
+use crate::report::Report;
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,33 +65,61 @@ pub struct IndexedResourceSummary {
 /// One line in `results/index.jsonl`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IndexEntry {
+    /// Version of the JSONL line contract. Legacy lines have no schema.
+    pub schema: u32,
+    /// Stable unique occurrence key for this run.
+    pub run_key: String,
+    /// UTC timestamp captured after report persistence completes.
+    pub completed_at: String,
     /// Stable adapter identity.
-    pub harness_id: String,
+    pub harness: String,
     /// Availability-probe version output.
     pub harness_version: String,
+    /// Repository-relative report path.
+    pub report_path: String,
+    /// Machine-readable report schema.
+    pub report_schema: u32,
+    /// Authoritative AHRB specification version.
+    pub spec_version: u32,
+    /// Quick or cert measurement profile.
+    pub profile: String,
+    /// Operating system guard used by resource comparisons.
+    pub os: String,
+    /// Process-topology guard used by resource comparisons.
+    pub topology: String,
     /// Canonical manifest SHA-256.
-    pub manifest_hash: String,
+    pub manifest_sha256: String,
+    /// Canonical workflow-set SHA-256.
+    pub workflow_sha256: String,
     /// AHRB build revision.
     pub ahrb_revision: String,
-    /// OS and architecture.
-    pub platform: String,
-    /// Quick or cert.
-    pub profile: String,
-    /// Matrix rows present in the bundle.
-    pub rows_run: Vec<u8>,
-    /// UTC run-start timestamp.
-    pub timestamp: String,
-    /// Outcome totals.
-    pub counts: OutcomeCounts,
-    /// Certified badge, or null.
-    pub badge: Option<Badge>,
-    /// Stable resource headline fields.
-    pub resource_summary: IndexedResourceSummary,
-    /// Repository-relative durable bundle path.
-    pub results_dir: String,
-    /// One-minute load average at run start, or null when unavailable.
-    pub load_avg_1m: Option<f64>,
 }
+
+/// Historical unversioned line emitted before the diff-capable index contract.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LegacyIndexEntry {
+    #[serde(default)]
+    harness_id: String,
+    #[serde(default)]
+    harness_version: String,
+    #[serde(default)]
+    manifest_hash: String,
+    #[serde(default)]
+    ahrb_revision: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    profile: String,
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    badge: Option<Badge>,
+    #[serde(default)]
+    results_dir: String,
+}
+
+/// Current index-line schema. Schema 1 is the implicit legacy format.
+pub const INDEX_SCHEMA: u32 = 2;
 
 /// Resolve default output and capture run-start metadata.
 pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersistence> {
@@ -183,7 +211,8 @@ pub fn persist_report(
             )?;
         }
     }
-    append_index(&index_entry(persistence, report)?)
+    let completed_at = utc_timestamp(SystemTime::now())?;
+    append_index(&index_entry(persistence, report, completed_at)?)
 }
 
 fn copy_optional(source: &Path, destination: &Path) -> Result<()> {
@@ -200,47 +229,36 @@ fn copy_optional(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-fn index_entry(persistence: &RunPersistence, report: &Report) -> Result<IndexEntry> {
+fn index_entry(
+    persistence: &RunPersistence,
+    report: &Report,
+    completed_at: String,
+) -> Result<IndexEntry> {
     let results_dir = persistence.results_dir_field.clone().ok_or_else(|| {
         AhrbError::Protocol("saved result has no repository-relative path".to_owned())
     })?;
-    let mut counts = OutcomeCounts::default();
-    for result in &report.results {
-        match result.outcome {
-            TestOutcome::Pass => counts.pass = counts.pass.saturating_add(1),
-            TestOutcome::Fail(_) => counts.fail = counts.fail.saturating_add(1),
-            TestOutcome::Unsupported(_) => {
-                counts.unsupported = counts.unsupported.saturating_add(1);
-            }
-            TestOutcome::Error(_) | TestOutcome::Absent(_) => {
-                counts.error = counts.error.saturating_add(1);
-            }
-        }
-    }
+    let report_path = format!("{results_dir}/report.json");
+    let run_key = stable_run_key(&report.fingerprint.harness, &completed_at, &report_path);
     Ok(IndexEntry {
-        harness_id: report.fingerprint.harness.clone(),
+        schema: INDEX_SCHEMA,
+        run_key,
+        completed_at,
+        harness: report.fingerprint.harness.clone(),
         harness_version: persistence.harness_version.clone(),
-        manifest_hash: report.fingerprint.manifest.clone(),
-        ahrb_revision: report.fingerprint.ahrb_revision.clone(),
-        platform: report.fingerprint.platform.clone(),
+        report_path,
+        report_schema: report.schema,
+        spec_version: report.spec_version,
         profile: report.fingerprint.profile.clone(),
-        rows_run: report.results.iter().map(|result| result.row).collect(),
-        timestamp: persistence.timestamp.clone(),
-        counts,
-        badge: report.badge.clone(),
-        resource_summary: indexed_summary(&report.resource_summary),
-        results_dir,
-        load_avg_1m: persistence.load_avg_1m,
+        os: report
+            .badge
+            .as_ref()
+            .map(|badge| badge.os.clone())
+            .unwrap_or_else(|| std::env::consts::OS.to_owned()),
+        topology: report.resource_summary.topology.clone(),
+        manifest_sha256: report.fingerprint.manifest.clone(),
+        workflow_sha256: report.fingerprint.workflows.clone(),
+        ahrb_revision: report.fingerprint.ahrb_revision.clone(),
     })
-}
-
-fn indexed_summary(summary: &ResourceSummary) -> IndexedResourceSummary {
-    IndexedResourceSummary {
-        peak_rss_mib: summary.peak_rss_mib,
-        cpu_per_turn_ms: summary.cpu_per_turn_ms,
-        wall_per_turn_ms: summary.wall_per_turn_ms,
-        sampler_overhead_pct: summary.sampler_overhead_pct,
-    }
 }
 
 fn append_index(entry: &IndexEntry) -> Result<()> {
@@ -277,6 +295,69 @@ fn append_index(entry: &IndexEntry) -> Result<()> {
 /// Print compact saved-run history. By default only the latest entry for each
 /// harness is shown; `all` retains every matching line.
 pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
+    let mut entries = read_index()?
+        .into_iter()
+        .filter(|entry| harness.is_none_or(|wanted| wanted == entry.harness))
+        .collect::<Vec<_>>();
+    if !all {
+        let mut latest: BTreeMap<String, IndexEntry> = BTreeMap::new();
+        for entry in entries {
+            let should_replace = latest.get(&entry.harness).is_none_or(|existing| {
+                (&entry.completed_at, &entry.run_key) > (&existing.completed_at, &existing.run_key)
+            });
+            if should_replace {
+                latest.insert(entry.harness.clone(), entry);
+            }
+        }
+        entries = latest.into_values().collect();
+    }
+    println!(
+        "HARNESS\tVERSION\tPROFILE\tROWS\tPASS\tFAIL\tUNSUP\tERROR\tBADGE\tCOMPLETED\tRESULTS"
+    );
+    for entry in entries {
+        let report = load_indexed_report(&entry).ok();
+        let counts = report
+            .as_ref()
+            .map(|report| outcome_counts(&report.results))
+            .unwrap_or_default();
+        let rows = report
+            .as_ref()
+            .map(|report| {
+                report
+                    .results
+                    .iter()
+                    .map(|result| result.row)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let badge = report
+            .as_ref()
+            .and_then(|report| report.badge.as_ref())
+            .map(badge_label)
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            clean_field(&entry.harness),
+            clean_field(&entry.harness_version),
+            entry.profile,
+            compact_rows(&rows),
+            counts.pass,
+            counts.fail,
+            counts.unsupported,
+            counts.error,
+            clean_field(&badge),
+            entry.completed_at,
+            Path::new(&entry.report_path)
+                .parent()
+                .map(path_string)
+                .unwrap_or_else(|| entry.report_path.clone()),
+        );
+    }
+    Ok(())
+}
+
+/// Read current and legacy index lines into the current normalized contract.
+pub fn read_index() -> Result<Vec<IndexEntry>> {
     let path = repository_root().join("results/index.jsonl");
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -284,57 +365,183 @@ pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let mut entries = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    for (line_index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let entry: IndexEntry = serde_json::from_str(line).map_err(|error| {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
             AhrbError::Protocol(format!(
                 "invalid results/index.jsonl line {}: {error}",
-                index + 1
+                line_index + 1
             ))
         })?;
-        if harness.is_none_or(|wanted| wanted == entry.harness_id) {
-            entries.push(entry);
+        let entry = if value.get("schema").is_some() {
+            let entry: IndexEntry = serde_json::from_value(value).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "invalid versioned results/index.jsonl line {}: {error}",
+                    line_index + 1
+                ))
+            })?;
+            if entry.schema != INDEX_SCHEMA {
+                return Err(AhrbError::Protocol(format!(
+                    "unsupported results/index.jsonl schema {} on line {}",
+                    entry.schema,
+                    line_index + 1
+                )));
+            }
+            entry
+        } else {
+            let legacy: LegacyIndexEntry = serde_json::from_value(value).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "invalid legacy results/index.jsonl line {}: {error}",
+                    line_index + 1
+                ))
+            })?;
+            normalize_legacy_index(legacy, line, line_index + 1)
+        };
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Resolve and deserialize the report referenced by an index occurrence.
+pub fn load_indexed_report(entry: &IndexEntry) -> Result<Report> {
+    let value = load_indexed_report_value(entry)?;
+    serde_json::from_value(value).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "could not deserialize indexed report {}: {error}",
+            entry.report_path
+        ))
+    })
+}
+
+/// Load the original report JSON without erasing old-schema field absence.
+pub fn load_indexed_report_value(entry: &IndexEntry) -> Result<serde_json::Value> {
+    let path = PathBuf::from(&entry.report_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repository_root().join(path)
+    };
+    let bytes = std::fs::read(&path).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "could not read indexed report {}: {error}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "could not parse indexed report {}: {error}",
+            path.display()
+        ))
+    })?;
+    let report_schema = value
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "indexed report {} has no valid schema",
+                path.display()
+            ))
+        })?;
+    if report_schema != entry.report_schema {
+        return Err(AhrbError::Protocol(format!(
+            "indexed report schema mismatch for {}: index {}, report {}",
+            entry.run_key, entry.report_schema, report_schema
+        )));
+    }
+    Ok(value)
+}
+
+fn normalize_legacy_index(
+    legacy: LegacyIndexEntry,
+    raw_line: &str,
+    line_number: usize,
+) -> IndexEntry {
+    let report_path = format!("{}/report.json", legacy.results_dir.trim_end_matches('/'));
+    let os = legacy
+        .badge
+        .as_ref()
+        .map(|badge| badge.os.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            legacy
+                .platform
+                .split(['-', ' '])
+                .next()
+                .unwrap_or("unknown")
+                .to_owned()
+        });
+    let topology = legacy
+        .badge
+        .as_ref()
+        .map(|badge| badge.topology.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let mut entry = IndexEntry {
+        schema: INDEX_SCHEMA,
+        run_key: stable_legacy_run_key(raw_line, line_number),
+        completed_at: legacy.timestamp,
+        harness: legacy.harness_id,
+        harness_version: legacy.harness_version,
+        report_path,
+        report_schema: 2,
+        spec_version: 1,
+        profile: legacy.profile,
+        os,
+        topology,
+        manifest_sha256: legacy.manifest_hash,
+        workflow_sha256: "legacy-unavailable".to_owned(),
+        ahrb_revision: legacy.ahrb_revision,
+    };
+    if let Ok(report) = load_report_without_schema_check(&entry) {
+        entry.report_schema = report.schema;
+        entry.spec_version = report.spec_version;
+        entry.profile = report.fingerprint.profile.clone();
+        entry.topology = if report.resource_summary.topology.is_empty() {
+            report
+                .badge
+                .as_ref()
+                .map(|badge| badge.topology.clone())
+                .unwrap_or(entry.topology)
+        } else {
+            report.resource_summary.topology
+        };
+        entry.manifest_sha256 = report.fingerprint.manifest;
+        entry.workflow_sha256 = report.fingerprint.workflows;
+        if let Some(badge) = report.badge {
+            entry.os = badge.os;
         }
     }
-    if !all {
-        let mut latest = BTreeMap::new();
-        for entry in entries {
-            latest.insert(entry.harness_id.clone(), entry);
+    entry
+}
+
+fn load_report_without_schema_check(entry: &IndexEntry) -> Result<Report> {
+    let path = PathBuf::from(&entry.report_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repository_root().join(path)
+    };
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn outcome_counts(results: &[crate::evaluate::TestResult]) -> OutcomeCounts {
+    let mut counts = OutcomeCounts::default();
+    for result in results {
+        match result.outcome {
+            TestOutcome::Pass => counts.pass = counts.pass.saturating_add(1),
+            TestOutcome::Fail(_) => counts.fail = counts.fail.saturating_add(1),
+            TestOutcome::Unsupported(_) => {
+                counts.unsupported = counts.unsupported.saturating_add(1);
+            }
+            TestOutcome::Error(_) | TestOutcome::Absent(_) => {
+                counts.error = counts.error.saturating_add(1);
+            }
         }
-        entries = latest.into_values().collect();
     }
-    println!(
-        "HARNESS\tVERSION\tPROFILE\tROWS\tPASS\tFAIL\tUNSUP\tERROR\tBADGE\tLOAD1\tSTARTED\tRESULTS"
-    );
-    for entry in entries {
-        let badge = entry
-            .badge
-            .as_ref()
-            .map(badge_label)
-            .unwrap_or_else(|| "-".to_owned());
-        let load = entry
-            .load_avg_1m
-            .map(|value| format!("{value:.2}"))
-            .unwrap_or_else(|| "-".to_owned());
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            clean_field(&entry.harness_id),
-            clean_field(&entry.harness_version),
-            entry.profile,
-            compact_rows(&entry.rows_run),
-            entry.counts.pass,
-            entry.counts.fail,
-            entry.counts.unsupported,
-            entry.counts.error,
-            clean_field(&badge),
-            load,
-            entry.timestamp,
-            entry.results_dir,
-        );
-    }
-    Ok(())
+    counts
 }
 
 fn clean_field(value: &str) -> String {
@@ -386,6 +593,26 @@ fn short_run_id(harness: &str, timestamp: &str) -> String {
     digest.update(sequence.to_le_bytes());
     let value = format!("{:x}", digest.finalize());
     value[..8].to_owned()
+}
+
+fn stable_run_key(harness: &str, completed_at: &str, report_path: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ahrb-index-v2\0");
+    digest.update(harness.as_bytes());
+    digest.update(b"\0");
+    digest.update(completed_at.as_bytes());
+    digest.update(b"\0");
+    digest.update(report_path.as_bytes());
+    format!("run-{:x}", digest.finalize())
+}
+
+fn stable_legacy_run_key(raw_line: &str, line_number: usize) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ahrb-index-legacy-v1\0");
+    digest.update(line_number.to_le_bytes());
+    digest.update(b"\0");
+    digest.update(raw_line.as_bytes());
+    format!("legacy-{:x}", digest.finalize())
 }
 
 fn utc_timestamp(now: SystemTime) -> Result<String> {

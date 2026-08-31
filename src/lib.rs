@@ -2,6 +2,8 @@
 
 pub mod adapters;
 pub mod cli;
+pub mod determinism;
+pub mod diff;
 pub mod driver;
 pub mod error;
 pub mod evaluate;

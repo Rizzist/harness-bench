@@ -2,15 +2,18 @@ use ahrb::evaluate::{TestOutcome, classify};
 use ahrb::scenarios::{PRIORITIZED_ROWS, RequirementKind, all};
 
 #[test]
-fn matrix_has_exactly_44_ordered_unique_rows() {
+fn matrix_has_implemented_rows_in_exact_order_with_unique_ids() {
     let tests = all();
-    assert_eq!(tests.len(), 44);
+    assert_eq!(tests.len(), 48);
     let rows: Vec<u8> = tests.iter().map(|test| test.row).collect();
-    assert_eq!(rows, (1_u8..=44).collect::<Vec<_>>());
+    let mut expected = (1_u8..=46).collect::<Vec<_>>();
+    expected.push(63);
+    expected.push(64);
+    assert_eq!(rows, expected);
     let mut ids: Vec<&str> = tests.iter().map(|test| test.id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 44);
+    assert_eq!(ids.len(), 48);
 }
 
 #[test]
@@ -31,6 +34,34 @@ fn row_43_is_informational_resource_evidence() {
 fn row_44_is_core_resource_evidence() {
     let definition = all().iter().find(|test| test.row == 44).expect("row 44");
     assert_eq!(definition.id, "process-hygiene");
+    assert_eq!(definition.requirement(), RequirementKind::Core);
+}
+
+#[test]
+fn row_45_is_informational_resource_evidence() {
+    let definition = all().iter().find(|test| test.row == 45).expect("row 45");
+    assert_eq!(definition.id, "time-to-first-model-request");
+    assert_eq!(definition.requirement(), RequirementKind::Informational);
+}
+
+#[test]
+fn row_46_is_informational_resource_evidence() {
+    let definition = all().iter().find(|test| test.row == 46).expect("row 46");
+    assert_eq!(definition.id, "memory-time-integral");
+    assert_eq!(definition.requirement(), RequirementKind::Informational);
+}
+
+#[test]
+fn row_63_is_informational_functionality_evidence() {
+    let definition = all().iter().find(|test| test.row == 63).expect("row 63");
+    assert_eq!(definition.id, "nondeterministic-field-report");
+    assert_eq!(definition.requirement(), RequirementKind::Informational);
+}
+
+#[test]
+fn row_64_is_core_functionality_evidence() {
+    let definition = all().iter().find(|test| test.row == 64).expect("row 64");
+    assert_eq!(definition.id, "cross-run-reproducibility");
     assert_eq!(definition.requirement(), RequirementKind::Core);
 }
 

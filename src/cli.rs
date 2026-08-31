@@ -262,7 +262,10 @@ pub(crate) fn parse_test_rows(text: &str) -> Result<Vec<u8>> {
                     "test row range {part:?} is descending"
                 )));
             }
-            rows.extend(start..=end);
+            for row in start..=end {
+                ensure_implemented_row(row)?;
+                rows.push(row);
+            }
         } else {
             rows.push(parse_test_row(part)?);
         }
@@ -276,12 +279,29 @@ fn parse_test_row(part: &str) -> Result<u8> {
     let row: u8 = part
         .parse()
         .map_err(|_| AhrbError::Usage(format!("invalid test row {part:?}")))?;
-    if !(1..=44).contains(&row) {
+    let maximum = crate::scenarios::all()
+        .last()
+        .map_or(0, |definition| definition.row);
+    if !(1..=maximum).contains(&row) {
         return Err(AhrbError::Usage(format!(
-            "test row {row} is outside 1..=44"
+            "test row {row} is outside 1..={maximum}"
         )));
     }
+    ensure_implemented_row(row)?;
     Ok(row)
+}
+
+fn ensure_implemented_row(row: u8) -> Result<()> {
+    if crate::scenarios::all()
+        .iter()
+        .any(|definition| definition.row == row)
+    {
+        Ok(())
+    } else {
+        Err(AhrbError::Usage(format!(
+            "test row {row} is not implemented in this staged matrix"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -343,8 +363,10 @@ mod tests {
         );
         assert!(parse_test_rows("4-2").is_err());
         assert!(parse_test_rows("1,").is_err());
-        assert_eq!(parse_test_rows("40-44")?, vec![40, 41, 42, 43, 44]);
-        assert!(parse_test_rows("43-45").is_err());
+        assert_eq!(parse_test_rows("40-45")?, vec![40, 41, 42, 43, 44, 45]);
+        assert_eq!(parse_test_rows("44-46")?, vec![44, 45, 46]);
+        assert!(parse_test_rows("47").is_err());
+        assert_eq!(parse_test_rows("63-64")?, vec![63, 64]);
         Ok(())
     }
 

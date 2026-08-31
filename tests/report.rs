@@ -3,10 +3,11 @@ use ahrb::evaluate::{
 };
 use ahrb::process::{ProcIdentity, ProcOwnership, Sample};
 use ahrb::report::{
-    MembershipSample, ProcessHygieneAudit, ProcessHygieneCadenceSample, ProcessHygieneCheckpoint,
-    ProcessHygieneEvidence, ProcessHygieneProcess, Report, TurnObservation,
-    evaluate_process_hygiene, evaluate_turn_latency, render_markdown, render_resource_summary,
-    summarize_resources,
+    MembershipSample, MemoryTimeIntegralEvidence, MemoryTimeIntegralSample, ProcessHygieneAudit,
+    ProcessHygieneCadenceSample, ProcessHygieneCheckpoint, ProcessHygieneEvidence,
+    ProcessHygieneProcess, Report, TurnObservation, evaluate_memory_time_integral,
+    evaluate_process_hygiene, evaluate_time_to_first_model_request, evaluate_turn_latency,
+    render_markdown, render_resource_summary, summarize_resources,
 };
 use std::time::SystemTime;
 
@@ -46,6 +47,67 @@ fn latency_turn(index: u32, start_ns: u64, wall_ns: u64) -> TurnObservation {
         terminal_ns: Some(start_ns + wall_ns),
         exit_ns: None,
         turn_wall_ns: Some(wall_ns),
+    }
+}
+
+fn first_request_turn(repetition: u32, launch_ns: u64, latency_ns: u64) -> TurnObservation {
+    TurnObservation {
+        repetition,
+        turn_index: 1,
+        actor: format!("cold-{repetition}"),
+        session_id_hash: "digest".to_owned(),
+        phase: "time-to-first-model-request".to_owned(),
+        launch_ns: Some(launch_ns),
+        submit_ns: Some(launch_ns.saturating_add(1)),
+        first_model_request_ns: Some(launch_ns.saturating_add(latency_ns)),
+        terminal_ns: Some(launch_ns.saturating_add(latency_ns).saturating_add(1)),
+        exit_ns: None,
+        turn_wall_ns: None,
+    }
+}
+
+fn memory_time_sample(
+    repetition: u32,
+    monotonic_ns: u64,
+    memory_mib: u64,
+    cpu_ns: u64,
+) -> MemoryTimeIntegralSample {
+    MemoryTimeIntegralSample {
+        repetition,
+        monotonic_ns,
+        effective_memory_bytes: memory_mib * 1_048_576,
+        cpu_ns,
+        owned_processes: 1,
+        collection_cpu_ns: 1_000,
+        collection_wall_ns: 2_000,
+        cpu_accounting_warnings: Vec::new(),
+    }
+}
+
+fn complete_memory_time_evidence(final_cpu_ns: u64) -> MemoryTimeIntegralEvidence {
+    MemoryTimeIntegralEvidence {
+        samples: vec![
+            memory_time_sample(1, 1_000_000_000, 0, 0),
+            memory_time_sample(1, 2_000_000_000, 100, final_cpu_ns / 2),
+            memory_time_sample(1, 3_000_000_000, 0, final_cpu_ns),
+        ],
+        turns: vec![TurnObservation {
+            repetition: 1,
+            turn_index: 1,
+            actor: "integral".to_owned(),
+            session_id_hash: "digest".to_owned(),
+            phase: "memory-time-integral".to_owned(),
+            launch_ns: Some(1_000_000_000),
+            submit_ns: Some(1_000_000_000),
+            first_model_request_ns: None,
+            terminal_ns: Some(3_000_000_000),
+            exit_ns: Some(3_000_000_000),
+            turn_wall_ns: Some(2_000_000_000),
+        }],
+        warm_idle_baseline_bytes: std::collections::BTreeMap::from([(1, 0)]),
+        sampler_cadence_ns: 1_000_000_000,
+        sampler_collection_cpu_ns: 3_000,
+        sampler_observation_wall_ns: 2_000_000_000,
     }
 }
 
@@ -480,6 +542,156 @@ fn turn_latency_missing_zero_or_timed_out_boundaries_are_measurement_errors() {
 }
 
 #[test]
+fn time_to_first_model_request_uses_nearest_rank_and_exact_envelope_edges() {
+    let roles = vec!["primary".to_owned(); 3];
+    let exact = evaluate_time_to_first_model_request(
+        &[
+            first_request_turn(1, 1_000, 1_000_000_000),
+            first_request_turn(2, 2_000, 2_000_000_000),
+            first_request_turn(3, 3_000, 1_500_000_000),
+        ],
+        &roles,
+        3,
+        2_001,
+    );
+    assert!(exact.measurement_complete);
+    assert!(exact.reference_envelope_pass);
+    assert_eq!(exact.p50_ms, 1_500.0);
+    assert_eq!(exact.p95_ms, 2_000.0);
+    assert_eq!(exact.max_ms, 2_000.0);
+    assert_eq!(exact.details["first_request_role"], "primary");
+
+    let p95_over = evaluate_time_to_first_model_request(
+        &[first_request_turn(1, 1_000, 2_000_000_001)],
+        &["title".to_owned()],
+        1,
+        10_001,
+    );
+    assert!(p95_over.measurement_complete);
+    assert!(!p95_over.reference_envelope_pass);
+}
+
+#[test]
+fn time_to_first_model_request_requires_every_ordered_pair_and_strict_timeout() {
+    let complete = first_request_turn(1, 1_000, 2_000_000_000);
+    let timeout_edge = evaluate_time_to_first_model_request(
+        std::slice::from_ref(&complete),
+        &["primary".to_owned()],
+        1,
+        2_000,
+    );
+    assert!(timeout_edge.measurement_complete);
+    assert!(!timeout_edge.reference_envelope_pass);
+
+    let mut missing = complete.clone();
+    missing.first_model_request_ns = None;
+    assert!(
+        !evaluate_time_to_first_model_request(&[missing], &["primary".to_owned()], 1, 10_000,)
+            .measurement_complete
+    );
+
+    let reversed = TurnObservation {
+        first_model_request_ns: Some(9_999),
+        ..first_request_turn(1, 10_000, 1)
+    };
+    assert!(
+        !evaluate_time_to_first_model_request(&[reversed], &["primary".to_owned()], 1, 10_000,)
+            .measurement_complete
+    );
+    assert!(
+        !evaluate_time_to_first_model_request(&[complete], &[], 1, 10_000,).measurement_complete
+    );
+}
+
+#[test]
+fn memory_time_integral_uses_trapezoids_and_exact_cpu_classes() {
+    let evaluation =
+        evaluate_memory_time_integral(&complete_memory_time_evidence(20_000_000), 1, 1, true);
+    assert!(evaluation.measurement_complete);
+    assert!(evaluation.reference_envelope_pass);
+    assert_eq!(evaluation.memory_time_integral_mib_s_per_turn, 100.0);
+    assert_eq!(evaluation.memory_time_integral_coverage_ratio, 1.0);
+    assert_eq!(evaluation.memory_time_integral_max_sample_gap_ms, 1_000.0);
+    assert_eq!(evaluation.cpu_per_turn_p50_ms, 20.0);
+    assert_eq!(evaluation.cpu_per_turn_p95_ms, 20.0);
+    assert_eq!(evaluation.cpu_class, "C50");
+    assert_eq!(evaluation.details["integration"], "trapezoidal");
+
+    for (cpu_ns, class) in [
+        (10_000_000, "C10"),
+        (50_000_000, "C50"),
+        (250_000_000, "C250"),
+        (250_000_001, "C250+"),
+    ] {
+        let evaluation =
+            evaluate_memory_time_integral(&complete_memory_time_evidence(cpu_ns), 1, 1, true);
+        assert!(evaluation.measurement_complete);
+        assert_eq!(evaluation.cpu_class, class);
+        assert_eq!(evaluation.reference_envelope_pass, cpu_ns <= 250_000_000);
+    }
+}
+
+#[test]
+fn memory_time_integral_bad_gap_bracketing_and_sampler_overhead_are_errors() {
+    let mut gap = complete_memory_time_evidence(20_000_000);
+    gap.sampler_cadence_ns = 499_999_999;
+    let gap = evaluate_memory_time_integral(&gap, 1, 1, true);
+    assert!(!gap.measurement_complete);
+    assert!(
+        gap.measurement_error
+            .as_deref()
+            .is_some_and(|error| error.contains("maximum sample gap"))
+    );
+
+    let mut unbracketed = complete_memory_time_evidence(20_000_000);
+    unbracketed.turns[0].launch_ns = Some(500_000_000);
+    let unbracketed = evaluate_memory_time_integral(&unbracketed, 1, 1, true);
+    assert!(!unbracketed.measurement_complete);
+    assert!(
+        unbracketed
+            .measurement_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not bracketed before start"))
+    );
+
+    let mut overloaded = complete_memory_time_evidence(20_000_000);
+    overloaded.samples[0].collection_cpu_ns = 200_000_001;
+    overloaded.samples[1].collection_cpu_ns = 0;
+    overloaded.samples[2].collection_cpu_ns = 0;
+    overloaded.sampler_collection_cpu_ns = 200_000_001;
+    let overloaded = evaluate_memory_time_integral(&overloaded, 1, 1, true);
+    assert!(!overloaded.measurement_complete);
+    assert!(
+        overloaded
+            .measurement_error
+            .as_deref()
+            .is_some_and(|error| error.contains("sampler overload"))
+    );
+
+    let mut wall_overrun = complete_memory_time_evidence(20_000_000);
+    wall_overrun.samples[1].collection_wall_ns = wall_overrun.sampler_cadence_ns.saturating_add(1);
+    let wall_overrun = evaluate_memory_time_integral(&wall_overrun, 1, 1, true);
+    assert!(!wall_overrun.measurement_complete);
+    assert!(
+        wall_overrun
+            .measurement_error
+            .as_deref()
+            .is_some_and(|error| error.contains("1 cadence overruns"))
+    );
+
+    let mut repeated_jitter = complete_memory_time_evidence(20_000_000);
+    repeated_jitter.sampler_cadence_ns = 600_000_000;
+    let repeated_jitter = evaluate_memory_time_integral(&repeated_jitter, 1, 1, true);
+    assert!(!repeated_jitter.measurement_complete);
+    assert!(
+        repeated_jitter
+            .measurement_error
+            .as_deref()
+            .is_some_and(|error| error.contains("2 cadence gaps"))
+    );
+}
+
+#[test]
 fn informational_fail_does_not_change_suite_exit_but_error_does() {
     let manifest = ahrb::manifest::load(std::path::Path::new("adapters/mock/manifest.toml"))
         .expect("load mock manifest");
@@ -516,12 +728,14 @@ fn badge_v2_adds_latency_without_an_empty_facet_segment() {
         parallel_width: 8,
         resource_class: "R96".to_owned(),
         latency_class: "L500".to_owned(),
+        cpu_class: "C50".to_owned(),
+        automation_score: 82,
         facets: Vec::new(),
         comparison_scope: "within-topology-only".to_owned(),
     };
     assert_eq!(
         badge_label(&badge),
-        "Automation Ready v2 · macos · client-process-fanout · N8 · R96 · L500"
+        "Automation Ready v2 · macos · client-process-fanout · N8 · R96 · L500 · C50 · A82"
     );
 }
 
@@ -584,6 +798,7 @@ fn resource_class_is_derived_from_marginal_memory() {
         8,
         64.0 * 1024.0 * 1024.0,
         "L500",
+        "C50",
     );
     assert!(badge.is_some());
     if let Some(badge) = badge {

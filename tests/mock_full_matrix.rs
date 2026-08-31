@@ -84,14 +84,16 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
 
     assert_eq!(status.code(), Some(0));
 
-    assert_eq!(report.results.len(), 44);
+    assert_eq!(report.results.len(), 48);
+    let mut expected_rows = (1_u8..=46).collect::<Vec<_>>();
+    expected_rows.extend([63, 64]);
     assert_eq!(
         report
             .results
             .iter()
             .map(|result| result.row)
             .collect::<Vec<_>>(),
-        (1_u8..=44).collect::<Vec<_>>()
+        expected_rows
     );
     for result in &report.results {
         assert!(matches!(result.outcome, TestOutcome::Pass));
@@ -180,17 +182,34 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     );
     assert!(report.resource_summary.scaling_alpha.is_some());
     assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
-    assert_eq!(report.turns.len(), 100);
+    assert_eq!(report.turns.len(), 163);
+    for (phase, expected) in [
+        ("turn-latency", 100),
+        ("time-to-first-model-request", 3),
+        ("memory-time-integral", 60),
+    ] {
+        assert_eq!(
+            report
+                .turns
+                .iter()
+                .filter(|turn| turn.phase == phase)
+                .count(),
+            expected,
+            "unexpected turn count for {phase}"
+        );
+    }
     assert!(report.turns.iter().all(|turn| {
-        turn.launch_ns.is_none()
-            && turn.exit_ns.is_none()
-            && turn
-                .submit_ns
-                .zip(turn.terminal_ns)
-                .zip(turn.turn_wall_ns)
-                .is_some_and(|((submit, terminal), wall)| {
-                    terminal.checked_sub(submit) == Some(wall)
-                })
+        turn.submit_ns
+            .zip(turn.terminal_ns)
+            .zip(turn.turn_wall_ns)
+            .is_some_and(|((submit, terminal), wall)| terminal.checked_sub(submit) == Some(wall))
+    }));
+    assert!(report.turns.iter().all(|turn| {
+        if turn.phase == "time-to-first-model-request" {
+            turn.launch_ns.is_some() && turn.first_model_request_ns.is_some()
+        } else {
+            turn.launch_ns.is_none() && turn.exit_ns.is_none()
+        }
     }));
     assert_eq!(report.resource_summary.topology, "shared-daemon-sessions");
     assert_eq!(

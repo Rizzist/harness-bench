@@ -2,6 +2,7 @@
 
 use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
 use crate::process::{ProcIdentity, ProcOwnership, ProcessSample, Sample};
+use crate::sampler::cadence_quality;
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -219,6 +220,33 @@ pub struct ResourceSummary {
     /// Latency class derived from p95: L100 through L1000+.
     #[serde(default)]
     pub latency_class: String,
+    /// Cold launch to first completed model-request body, nearest-rank p50.
+    #[serde(default)]
+    pub time_to_first_model_request_p50_ms: Option<f64>,
+    /// Cold launch to first completed model-request body, nearest-rank p95.
+    #[serde(default)]
+    pub time_to_first_model_request_p95_ms: Option<f64>,
+    /// Cold launch to first completed model-request body, maximum.
+    #[serde(default)]
+    pub time_to_first_model_request_max_ms: Option<f64>,
+    /// Median trapezoidal effective-memory integral per semantic turn.
+    #[serde(default)]
+    pub memory_time_integral_mib_s_per_turn: Option<f64>,
+    /// Fraction of measured turn wall covered by bracketing sample intervals.
+    #[serde(default)]
+    pub memory_time_integral_coverage_ratio: Option<f64>,
+    /// Largest sample-to-sample interval overlapping a measured turn.
+    #[serde(default)]
+    pub memory_time_integral_max_sample_gap_ms: Option<f64>,
+    /// N=1 whole-tree CPU per turn, nearest-rank p50.
+    #[serde(default)]
+    pub cpu_per_turn_p50_ms: Option<f64>,
+    /// N=1 whole-tree CPU per turn, nearest-rank p95.
+    #[serde(default)]
+    pub cpu_per_turn_p95_ms: Option<f64>,
+    /// CPU class derived from N=1 p95: C10 through C250+.
+    #[serde(default)]
+    pub cpu_class: Option<String>,
     /// Resident daemon baseline; absent for zero-process-between-turns topologies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_rss_mib: Option<f64>,
@@ -262,6 +290,9 @@ pub struct Report {
     pub resource_summary: ResourceSummary,
     /// Raw resource samples.
     pub samples: Vec<Sample>,
+    /// Raw row-46 continuous whole-tree counter samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_time_samples: Vec<MemoryTimeIntegralSample>,
     /// Raw process observations.
     pub processes: Vec<ProcessSample>,
     /// Raw recursive process-membership refresh timestamps.
@@ -292,6 +323,12 @@ pub fn write_bundle(report: &Report, directory: &Path, junit: bool) -> Result<()
         render_markdown(report).as_bytes(),
     )?;
     write_jsonl(&directory.join("samples.jsonl"), &report.samples)?;
+    if !report.memory_time_samples.is_empty() {
+        write_jsonl(
+            &directory.join("memory-time-samples.jsonl"),
+            &report.memory_time_samples,
+        )?;
+    }
     write_jsonl(&directory.join("processes.jsonl"), &report.processes)?;
     write_jsonl(&directory.join("membership.jsonl"), &report.membership)?;
     write_jsonl(&directory.join("events.jsonl"), &report.events)?;
@@ -351,6 +388,12 @@ pub fn render_markdown(report: &Report) -> String {
     let _ = writeln!(output, "# AHRB report `{}`\n", report.run_id);
     if let Some(badge) = &report.badge {
         let _ = writeln!(output, "**{}**\n", badge_label(badge));
+        if (65..=72).any(|row| !report.results.iter().any(|result| result.row == row)) {
+            let _ = writeln!(
+                output,
+                "_A provisional until rows 65–72 are measured in Wave 4._\n"
+            );
+        }
     } else {
         let _ = writeln!(output, "**No badge certified.**\n");
     }
@@ -424,7 +467,7 @@ pub fn render_markdown(report: &Report) -> String {
 /// Build the concise resource-summary line shared by `ahrb run` and `hbench`.
 pub fn render_resource_summary(summary: &ResourceSummary) -> String {
     let mut output = format!(
-        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} cpu_total_s={:.3} cpu_per_turn_ms={:.3} wall_per_turn_ms={:.3} wall_per_turn_p50_ms={:.3} wall_per_turn_p95_ms={:.3} wall_per_turn_max_ms={:.3} wall_per_turn_mad_ms={:.3} wall_per_turn_jitter_ratio={:.3} latency_class={}",
+        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} cpu_total_s={:.3} cpu_per_turn_ms={:.3} wall_per_turn_ms={:.3} wall_per_turn_p50_ms={:.3} wall_per_turn_p95_ms={:.3} wall_per_turn_max_ms={:.3} wall_per_turn_mad_ms={:.3} wall_per_turn_jitter_ratio={:.3} latency_class={} time_to_first_model_request_p50_ms={} time_to_first_model_request_p95_ms={} time_to_first_model_request_max_ms={} memory_time_integral_mib_s_per_turn={} memory_time_integral_coverage_ratio={} memory_time_integral_max_sample_gap_ms={} cpu_per_turn_p50_ms={} cpu_per_turn_p95_ms={} cpu_class={}",
         summary.peak_rss_mib,
         summary.mean_rss_mib,
         summary.median_rss_mib,
@@ -437,6 +480,15 @@ pub fn render_resource_summary(summary: &ResourceSummary) -> String {
         summary.wall_per_turn_mad_ms,
         summary.wall_per_turn_jitter_ratio,
         summary.latency_class,
+        optional_milliseconds(summary.time_to_first_model_request_p50_ms),
+        optional_milliseconds(summary.time_to_first_model_request_p95_ms),
+        optional_milliseconds(summary.time_to_first_model_request_max_ms),
+        optional_decimal(summary.memory_time_integral_mib_s_per_turn),
+        optional_decimal(summary.memory_time_integral_coverage_ratio),
+        optional_milliseconds(summary.memory_time_integral_max_sample_gap_ms),
+        optional_milliseconds(summary.cpu_per_turn_p50_ms),
+        optional_milliseconds(summary.cpu_per_turn_p95_ms),
+        summary.cpu_class.as_deref().unwrap_or("unavailable"),
     );
     if let Some(value) = summary.idle_rss_mib {
         let _ = write!(output, " idle_rss_mib={value:.3}");
@@ -453,6 +505,14 @@ pub fn render_resource_summary(summary: &ResourceSummary) -> String {
         summary.sampler_overhead_pct
     );
     output
+}
+
+fn optional_milliseconds(value: Option<f64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.3}"))
+}
+
+fn optional_decimal(value: Option<f64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.6}"))
 }
 
 /// Derive summary values exclusively from already-collected external evidence.
@@ -537,6 +597,15 @@ pub fn summarize_resources(
         wall_per_turn_mad_ms: 0.0,
         wall_per_turn_jitter_ratio: 0.0,
         latency_class: String::new(),
+        time_to_first_model_request_p50_ms: None,
+        time_to_first_model_request_p95_ms: None,
+        time_to_first_model_request_max_ms: None,
+        memory_time_integral_mib_s_per_turn: None,
+        memory_time_integral_coverage_ratio: None,
+        memory_time_integral_max_sample_gap_ms: None,
+        cpu_per_turn_p50_ms: None,
+        cpu_per_turn_p95_ms: None,
+        cpu_class: None,
         idle_rss_mib,
         parallel_beta_mib_per_agent,
         scaling_alpha,
@@ -565,6 +634,527 @@ pub struct TurnLatencyEvaluation {
     pub reference_envelope_pass: bool,
     /// Deterministic measurement diagnostic when incomplete.
     pub measurement_error: Option<String>,
+}
+
+/// Deterministic row-45 cold-launch distribution and evidence decision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeToFirstModelRequestEvaluation {
+    /// Nearest-rank p50 in milliseconds.
+    pub p50_ms: f64,
+    /// Nearest-rank p95 in milliseconds.
+    pub p95_ms: f64,
+    /// Maximum in milliseconds.
+    pub max_ms: f64,
+    /// Exact structured `details.time-to-first-model-request` value.
+    pub details: Value,
+    /// Whether every required cold boundary and role was present.
+    pub measurement_complete: bool,
+    /// Informational reference-envelope decision.
+    pub reference_envelope_pass: bool,
+    /// Deterministic measurement diagnostic when incomplete.
+    pub measurement_error: Option<String>,
+}
+
+/// Evaluate cold launch/request observations without interacting with the harness.
+pub fn evaluate_time_to_first_model_request(
+    observations: &[TurnObservation],
+    first_request_roles: &[String],
+    expected_repetitions: u32,
+    turn_timeout_ms: u64,
+) -> TimeToFirstModelRequestEvaluation {
+    let incomplete = |detail: String| TimeToFirstModelRequestEvaluation {
+        p50_ms: 0.0,
+        p95_ms: 0.0,
+        max_ms: 0.0,
+        details: serde_json::json!({"first_request_role": null}),
+        measurement_complete: false,
+        reference_envelope_pass: false,
+        measurement_error: Some(detail),
+    };
+    if observations.len() != expected_repetitions as usize
+        || first_request_roles.len() != expected_repetitions as usize
+    {
+        return incomplete(format!(
+            "expected {expected_repetitions} cold launch/request pairs and roles, observed {} pairs and {} roles",
+            observations.len(),
+            first_request_roles.len()
+        ));
+    }
+    let mut latencies = Vec::with_capacity(observations.len());
+    for (index, (observation, role)) in observations.iter().zip(first_request_roles).enumerate() {
+        let expected_repetition = index as u32 + 1;
+        if observation.repetition != expected_repetition || observation.turn_index != 1 {
+            return incomplete(format!(
+                "cold observation sequence expected repetition {expected_repetition} turn 1, observed repetition {} turn {}",
+                observation.repetition, observation.turn_index
+            ));
+        }
+        if role.is_empty() {
+            return incomplete(format!(
+                "repetition {expected_repetition} lacks a classified first-request role"
+            ));
+        }
+        let Some((launch_ns, request_ns)) = observation
+            .launch_ns
+            .zip(observation.first_model_request_ns)
+        else {
+            return incomplete(format!(
+                "repetition {expected_repetition} lacks launch/first-request boundaries"
+            ));
+        };
+        if launch_ns == 0 || request_ns == 0 {
+            return incomplete(format!(
+                "repetition {expected_repetition} has an invalid zero monotonic boundary"
+            ));
+        }
+        let Some(latency_ns) = request_ns.checked_sub(launch_ns) else {
+            return incomplete(format!(
+                "repetition {expected_repetition} first request precedes launch"
+            ));
+        };
+        latencies.push(latency_ns);
+    }
+    latencies.sort_unstable();
+    let p50_ms = nearest_rank_u64(&latencies, 50) as f64 / 1_000_000.0;
+    let p95_ms = nearest_rank_u64(&latencies, 95) as f64 / 1_000_000.0;
+    let max_ms = latencies.last().copied().unwrap_or(0) as f64 / 1_000_000.0;
+    let first_request_role = first_request_roles
+        .first()
+        .filter(|first| first_request_roles.iter().all(|role| role == *first))
+        .cloned()
+        .unwrap_or_else(|| "mixed".to_owned());
+    TimeToFirstModelRequestEvaluation {
+        p50_ms,
+        p95_ms,
+        max_ms,
+        details: serde_json::json!({"first_request_role": first_request_role}),
+        measurement_complete: true,
+        reference_envelope_pass: p95_ms <= 2_000.0
+            && max_ms <= 10_000.0
+            && max_ms < turn_timeout_ms as f64,
+        measurement_error: None,
+    }
+}
+
+/// One dense, out-of-band whole-tree counter sample used by row 46.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MemoryTimeIntegralSample {
+    /// Fresh-profile repetition number.
+    pub repetition: u32,
+    /// System-wide monotonic timestamp after counter collection.
+    pub monotonic_ns: u64,
+    /// Effective whole-tree memory: footprint on macOS, PSS/RSS on Linux.
+    pub effective_memory_bytes: u64,
+    /// Cumulative retired-aware whole-tree CPU.
+    pub cpu_ns: u64,
+    /// Number of owned process identities observed at this sample.
+    pub owned_processes: u64,
+    /// Sampler-thread CPU used by this collection.
+    pub collection_cpu_ns: u64,
+    /// Wall time used by this collection.
+    pub collection_wall_ns: u64,
+    /// Recoverable retired-process CPU-accounting warnings for this sample.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_accounting_warnings: Vec<String>,
+}
+
+/// Complete continuously sampled row-46 evidence.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct MemoryTimeIntegralEvidence {
+    /// Samples spanning every measured turn, ordered by repetition/time.
+    pub samples: Vec<MemoryTimeIntegralSample>,
+    /// Exact launch/submit and terminal/exit windows for the measured turns.
+    pub turns: Vec<TurnObservation>,
+    /// Fresh warm-idle median B by repetition; zero for per-invocation.
+    pub warm_idle_baseline_bytes: BTreeMap<u32, u64>,
+    /// Platform counter cadence used for the oracle.
+    pub sampler_cadence_ns: u64,
+    /// Sum of sampler-thread CPU over every sample.
+    pub sampler_collection_cpu_ns: u64,
+    /// Sum of sampled monotonic spans within repetitions.
+    pub sampler_observation_wall_ns: u64,
+}
+
+/// Row-46 integral, coverage, CPU distribution, and class decision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryTimeIntegralEvaluation {
+    /// Median per-turn trapezoidal MiB*s.
+    pub memory_time_integral_mib_s_per_turn: f64,
+    /// Union of covered sample intervals divided by measured turn wall.
+    pub memory_time_integral_coverage_ratio: f64,
+    /// Largest sample-to-sample interval overlapping a turn.
+    pub memory_time_integral_max_sample_gap_ms: f64,
+    /// Nearest-rank p50 whole-tree CPU per turn.
+    pub cpu_per_turn_p50_ms: f64,
+    /// Nearest-rank p95 whole-tree CPU per turn.
+    pub cpu_per_turn_p95_ms: f64,
+    /// Normative CPU class.
+    pub cpu_class: String,
+    /// Row-local sampler CPU as a percentage of one core.
+    pub sampler_overhead_pct: f64,
+    /// Collections whose wall duration exceeded the platform cadence.
+    pub sampler_cadence_overruns: usize,
+    /// Sample intervals larger than the platform cadence.
+    pub sampler_cadence_gaps: usize,
+    /// Exact structured `details.memory-time-integral` value.
+    pub details: Value,
+    /// Whether coverage, bracketing, counters, and sampler health were trustworthy.
+    pub measurement_complete: bool,
+    /// Informational reference-envelope result.
+    pub reference_envelope_pass: bool,
+    /// Deterministic diagnostic when evidence is incomplete.
+    pub measurement_error: Option<String>,
+}
+
+fn interpolate_counter(
+    samples: &[&MemoryTimeIntegralSample],
+    timestamp_ns: u64,
+    memory: bool,
+) -> Option<f64> {
+    if let Some(sample) = samples
+        .iter()
+        .find(|sample| sample.monotonic_ns == timestamp_ns)
+    {
+        return Some(if memory {
+            sample.effective_memory_bytes as f64
+        } else {
+            sample.cpu_ns as f64
+        });
+    }
+    samples.windows(2).find_map(|pair| {
+        let left = pair[0];
+        let right = pair[1];
+        if left.monotonic_ns < timestamp_ns && timestamp_ns < right.monotonic_ns {
+            let left_value = if memory {
+                left.effective_memory_bytes
+            } else {
+                left.cpu_ns
+            } as f64;
+            let right_value = if memory {
+                right.effective_memory_bytes
+            } else {
+                right.cpu_ns
+            } as f64;
+            let fraction = timestamp_ns.saturating_sub(left.monotonic_ns) as f64
+                / right.monotonic_ns.saturating_sub(left.monotonic_ns) as f64;
+            Some(left_value + (right_value - left_value) * fraction)
+        } else {
+            None
+        }
+    })
+}
+
+fn median_sorted_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+fn nearest_rank_f64(values: &[f64], percentile: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = percentile.saturating_mul(sorted.len()).saturating_add(99) / 100;
+    sorted[rank.max(1).min(sorted.len()) - 1]
+}
+
+/// Evaluate row 46 from a continuous out-of-band counter series.
+pub fn evaluate_memory_time_integral(
+    evidence: &MemoryTimeIntegralEvidence,
+    expected_repetitions: u32,
+    turns_per_repetition: u32,
+    per_invocation: bool,
+) -> MemoryTimeIntegralEvaluation {
+    let incomplete = |detail: String| MemoryTimeIntegralEvaluation {
+        memory_time_integral_mib_s_per_turn: 0.0,
+        memory_time_integral_coverage_ratio: 0.0,
+        memory_time_integral_max_sample_gap_ms: 0.0,
+        cpu_per_turn_p50_ms: 0.0,
+        cpu_per_turn_p95_ms: 0.0,
+        cpu_class: "unavailable".to_owned(),
+        sampler_overhead_pct: 0.0,
+        sampler_cadence_overruns: 0,
+        sampler_cadence_gaps: 0,
+        details: serde_json::json!({"integration": "trapezoidal"}),
+        measurement_complete: false,
+        reference_envelope_pass: false,
+        measurement_error: Some(detail),
+    };
+    if evidence.sampler_cadence_ns == 0 {
+        return incomplete("memory-time-integral sampler cadence is zero".to_owned());
+    }
+    let expected_turns = expected_repetitions.saturating_mul(turns_per_repetition) as usize;
+    if evidence.turns.len() != expected_turns {
+        return incomplete(format!(
+            "expected {expected_turns} memory-time turn windows, observed {}",
+            evidence.turns.len()
+        ));
+    }
+    let derived_collection_cpu_ns = evidence.samples.iter().fold(0_u64, |total, sample| {
+        total.saturating_add(sample.collection_cpu_ns)
+    });
+    if derived_collection_cpu_ns != evidence.sampler_collection_cpu_ns {
+        return incomplete(format!(
+            "sampler CPU accounting disagrees: declared {}, derived {derived_collection_cpu_ns}",
+            evidence.sampler_collection_cpu_ns
+        ));
+    }
+    let mut derived_observation_wall_ns = 0_u64;
+    let mut integrals = Vec::with_capacity(expected_turns);
+    let mut cpu_per_turn_ms = Vec::with_capacity(expected_turns);
+    let mut covered_ns = 0_u64;
+    let mut total_turn_wall_ns = 0_u64;
+    let mut maximum_gap_ns = 0_u64;
+    let mut cadence_overruns = 0_usize;
+    let mut cadence_gaps = 0_usize;
+    let mut cadence_untrustworthy = false;
+    for repetition in 1..=expected_repetitions {
+        let samples = evidence
+            .samples
+            .iter()
+            .filter(|sample| sample.repetition == repetition)
+            .collect::<Vec<_>>();
+        if samples.len() < 2 {
+            return incomplete(format!(
+                "repetition {repetition} has fewer than two counter samples"
+            ));
+        }
+        if samples.iter().any(|sample| sample.monotonic_ns == 0)
+            || samples
+                .windows(2)
+                .any(|pair| pair[1].monotonic_ns <= pair[0].monotonic_ns)
+        {
+            return incomplete(format!(
+                "repetition {repetition} sample times are not strictly increasing nonzero clocks"
+            ));
+        }
+        if samples
+            .windows(2)
+            .any(|pair| pair[1].cpu_ns < pair[0].cpu_ns)
+        {
+            return incomplete(format!(
+                "repetition {repetition} cumulative whole-tree CPU regressed"
+            ));
+        }
+        let first_ns = samples.first().map_or(0, |sample| sample.monotonic_ns);
+        let last_ns = samples
+            .last()
+            .map_or(first_ns, |sample| sample.monotonic_ns);
+        derived_observation_wall_ns =
+            derived_observation_wall_ns.saturating_add(last_ns.saturating_sub(first_ns));
+        let sample_times = samples
+            .iter()
+            .map(|sample| sample.monotonic_ns)
+            .collect::<Vec<_>>();
+        let (_, repetition_gaps, trustworthy) =
+            cadence_quality(&sample_times, evidence.sampler_cadence_ns);
+        cadence_gaps = cadence_gaps.saturating_add(repetition_gaps);
+        cadence_untrustworthy |= !trustworthy;
+        cadence_overruns = cadence_overruns.saturating_add(
+            samples
+                .iter()
+                .filter(|sample| sample.collection_wall_ns > evidence.sampler_cadence_ns)
+                .count(),
+        );
+        let baseline_bytes = if per_invocation {
+            0_u64
+        } else {
+            let Some(value) = evidence.warm_idle_baseline_bytes.get(&repetition).copied() else {
+                return incomplete(format!(
+                    "repetition {repetition} lacks a fresh warm-idle baseline"
+                ));
+            };
+            value
+        };
+        let turns = evidence
+            .turns
+            .iter()
+            .filter(|turn| turn.repetition == repetition)
+            .collect::<Vec<_>>();
+        if turns.len() != turns_per_repetition as usize
+            || turns
+                .iter()
+                .enumerate()
+                .any(|(index, turn)| turn.turn_index != index as u32 + 1)
+        {
+            return incomplete(format!(
+                "repetition {repetition} lacks the ordered 1..={turns_per_repetition} turn sequence"
+            ));
+        }
+        for turn in turns {
+            let boundaries = if per_invocation {
+                turn.launch_ns.zip(turn.exit_ns)
+            } else {
+                turn.submit_ns.zip(turn.terminal_ns)
+            };
+            let Some((start_ns, end_ns)) = boundaries else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks topology-specific boundaries",
+                    turn.turn_index
+                ));
+            };
+            if start_ns == 0 || end_ns <= start_ns {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} has invalid or reversed boundaries",
+                    turn.turn_index
+                ));
+            }
+            let Some(before_index) = samples
+                .iter()
+                .rposition(|sample| sample.monotonic_ns <= start_ns)
+            else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} is not bracketed before start",
+                    turn.turn_index
+                ));
+            };
+            let Some(after_index) = samples
+                .iter()
+                .position(|sample| sample.monotonic_ns >= end_ns)
+            else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} is not bracketed after end",
+                    turn.turn_index
+                ));
+            };
+            if before_index >= after_index {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks distinct bracketing samples",
+                    turn.turn_index
+                ));
+            }
+            let bracket = &samples[before_index..=after_index];
+            if !bracket.iter().any(|sample| sample.owned_processes > 0) {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} never sampled an owned process",
+                    turn.turn_index
+                ));
+            }
+            let Some(start_memory) = interpolate_counter(bracket, start_ns, true) else {
+                return incomplete("could not interpolate turn-start memory".to_owned());
+            };
+            let Some(end_memory) = interpolate_counter(bracket, end_ns, true) else {
+                return incomplete("could not interpolate turn-end memory".to_owned());
+            };
+            let Some(start_cpu) = interpolate_counter(bracket, start_ns, false) else {
+                return incomplete("could not interpolate turn-start CPU".to_owned());
+            };
+            let Some(end_cpu) = interpolate_counter(bracket, end_ns, false) else {
+                return incomplete("could not interpolate turn-end CPU".to_owned());
+            };
+            if end_cpu < start_cpu {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} interpolated CPU regressed",
+                    turn.turn_index
+                ));
+            }
+            let effective = |bytes: f64| (bytes - baseline_bytes as f64).max(0.0);
+            let mut points = vec![(start_ns, effective(start_memory))];
+            points.extend(bracket.iter().filter_map(|sample| {
+                (sample.monotonic_ns > start_ns && sample.monotonic_ns < end_ns).then_some((
+                    sample.monotonic_ns,
+                    effective(sample.effective_memory_bytes as f64),
+                ))
+            }));
+            points.push((end_ns, effective(end_memory)));
+            let integral = points.windows(2).fold(0.0_f64, |total, pair| {
+                let elapsed_seconds = pair[1].0.saturating_sub(pair[0].0) as f64 / 1_000_000_000.0;
+                let mean_mib = (pair[0].1 + pair[1].1) / 2.0 / 1_048_576.0;
+                total + mean_mib * elapsed_seconds
+            });
+            integrals.push(integral);
+            cpu_per_turn_ms.push((end_cpu - start_cpu) / 1_000_000.0);
+            total_turn_wall_ns = total_turn_wall_ns.saturating_add(end_ns.saturating_sub(start_ns));
+            for pair in bracket.windows(2) {
+                let gap_ns = pair[1].monotonic_ns.saturating_sub(pair[0].monotonic_ns);
+                let overlap_start = pair[0].monotonic_ns.max(start_ns);
+                let overlap_end = pair[1].monotonic_ns.min(end_ns);
+                if overlap_end > overlap_start {
+                    covered_ns =
+                        covered_ns.saturating_add(overlap_end.saturating_sub(overlap_start));
+                    maximum_gap_ns = maximum_gap_ns.max(gap_ns);
+                }
+            }
+        }
+    }
+    if derived_observation_wall_ns != evidence.sampler_observation_wall_ns
+        || evidence.sampler_observation_wall_ns == 0
+    {
+        return incomplete(format!(
+            "sampler observation wall accounting disagrees: declared {}, derived {derived_observation_wall_ns}",
+            evidence.sampler_observation_wall_ns
+        ));
+    }
+    let sampler_cpu_fraction =
+        evidence.sampler_collection_cpu_ns as f64 / evidence.sampler_observation_wall_ns as f64;
+    if total_turn_wall_ns == 0 {
+        return incomplete("memory-time-integral measured zero total turn wall".to_owned());
+    }
+    integrals.sort_by(f64::total_cmp);
+    let integral = median_sorted_f64(&integrals);
+    let coverage_ratio = covered_ns as f64 / total_turn_wall_ns as f64;
+    let maximum_gap_ms = maximum_gap_ns as f64 / 1_000_000.0;
+    if coverage_ratio < 0.99 {
+        return incomplete(format!(
+            "memory-time-integral coverage {coverage_ratio:.6} is below 0.99"
+        ));
+    }
+    if maximum_gap_ns > evidence.sampler_cadence_ns.saturating_mul(2) {
+        return incomplete(format!(
+            "memory-time-integral maximum sample gap {maximum_gap_ns} ns exceeds twice cadence {} ns",
+            evidence.sampler_cadence_ns
+        ));
+    }
+    if sampler_cpu_fraction > 0.10 || cadence_overruns > 0 || cadence_untrustworthy {
+        return incomplete(format!(
+            "sampler overload: {:.3}% of one core, {cadence_overruns} cadence overruns, {cadence_gaps} cadence gaps",
+            sampler_cpu_fraction * 100.0,
+        ));
+    }
+    let cpu_p50_ms = nearest_rank_f64(&cpu_per_turn_ms, 50);
+    let cpu_p95_ms = nearest_rank_f64(&cpu_per_turn_ms, 95);
+    let cpu_class = if cpu_p95_ms <= 10.0 {
+        "C10"
+    } else if cpu_p95_ms <= 50.0 {
+        "C50"
+    } else if cpu_p95_ms <= 250.0 {
+        "C250"
+    } else {
+        "C250+"
+    };
+    let sampler_overhead_pct = sampler_cpu_fraction * 100.0;
+    MemoryTimeIntegralEvaluation {
+        memory_time_integral_mib_s_per_turn: integral,
+        memory_time_integral_coverage_ratio: coverage_ratio,
+        memory_time_integral_max_sample_gap_ms: maximum_gap_ms,
+        cpu_per_turn_p50_ms: cpu_p50_ms,
+        cpu_per_turn_p95_ms: cpu_p95_ms,
+        cpu_class: cpu_class.to_owned(),
+        sampler_overhead_pct,
+        sampler_cadence_overruns: cadence_overruns,
+        sampler_cadence_gaps: cadence_gaps,
+        details: serde_json::json!({
+            "integration": "trapezoidal",
+            "sampler_cadence_ns": evidence.sampler_cadence_ns,
+            "sampler_collection_cpu_ns": evidence.sampler_collection_cpu_ns,
+            "sampler_observation_wall_ns": evidence.sampler_observation_wall_ns,
+            "sampler_overhead_pct": sampler_overhead_pct,
+            "sampler_cadence_overruns": cadence_overruns,
+            "sampler_cadence_gaps": cadence_gaps,
+            "sampler_warnings": evidence.samples.iter().flat_map(|sample| sample.cpu_accounting_warnings.iter()).cloned().collect::<BTreeSet<_>>(),
+        }),
+        measurement_complete: true,
+        reference_envelope_pass: integral <= 1_024.0 && cpu_p95_ms <= 250.0,
+        measurement_error: None,
+    }
 }
 
 /// Evaluate external row-43 turn observations without interacting with the harness.

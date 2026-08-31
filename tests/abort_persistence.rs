@@ -62,11 +62,19 @@ fn protocol_abort_is_mirrored_and_indexed_as_all_error() {
     let lines = index.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1);
     let entry: IndexEntry = serde_json::from_str(lines[0]).expect("parse abort index entry");
-    assert_eq!(entry.counts.pass, 0);
-    assert_eq!(entry.counts.fail, 0);
-    assert_eq!(entry.counts.unsupported, 0);
-    assert_eq!(entry.counts.error, 3);
-    let saved = root.join(&entry.results_dir);
+    assert_eq!(entry.harness, "ahrb-mock-exec");
+    let saved_report = root.join(&entry.report_path);
+    let saved = saved_report.parent().expect("saved report parent");
+    let saved_report: Report =
+        serde_json::from_slice(&std::fs::read(&saved_report).expect("read saved abort report"))
+            .expect("parse saved abort report");
+    assert_eq!(saved_report.results.len(), 3);
+    assert!(
+        saved_report
+            .results
+            .iter()
+            .all(|result| matches!(result.outcome, TestOutcome::Error(_)))
+    );
     assert!(saved.join("report.json").is_file());
     assert!(saved.join("run-error.txt").is_file());
     std::fs::remove_dir_all(root).expect("remove abort fixture");

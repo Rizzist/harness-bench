@@ -178,7 +178,7 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
             ),
         })
         .collect::<Vec<_>>();
-    let badge = certify(&results, &reduced_manifest, "macos", 8, 1.0, "L100")
+    let badge = certify(&results, &reduced_manifest, "macos", 8, 1.0, "L100", "C10")
         .expect("unsupported facet does not suppress badge");
     assert_eq!(
         suite_exit_code(&results, Some(&badge), &reduced_manifest),
@@ -213,7 +213,8 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
             "macos",
             8,
             1.0,
-            "L100"
+            "L100",
+            "C10",
         )
         .is_none()
     );

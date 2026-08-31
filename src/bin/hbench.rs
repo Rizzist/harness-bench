@@ -4,7 +4,15 @@
 async fn main() {
     ahrb::process::install_cleanup_handlers();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let code = if args.first().is_some_and(|argument| argument == "results") {
+    let code = if args.first().is_some_and(|argument| argument == "diff") {
+        match ahrb::diff::execute(&args[1..]) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("hbench: {error}");
+                2
+            }
+        }
+    } else if args.first().is_some_and(|argument| argument == "results") {
         match ahrb::cli::parse(&args) {
             Ok(command) => match ahrb::cli::execute(command).await {
                 Ok(code) => code,

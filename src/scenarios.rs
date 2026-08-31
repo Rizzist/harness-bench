@@ -58,7 +58,7 @@ pub enum BadgeFacetScope {
 impl TestDefinition {
     /// Return this row's certification role from authoritative matrix metadata.
     pub fn requirement(self) -> RequirementKind {
-        if (42..=43).contains(&self.row) {
+        if matches!(self.row, 42 | 43 | 45 | 46 | 63) {
             return RequirementKind::Informational;
         }
         OPTIONAL_FACETS
@@ -170,7 +170,7 @@ const AR: Pillar = Pillar::AutomationReadiness;
 /// Matrix rows that must pass early in the implementation and verification loop.
 pub const PRIORITIZED_ROWS: &[u8] = &[1, 2, 3, 9, 10, 12, 20, 26, 30, 35, 40];
 
-const TESTS: [TestDefinition; 44] = [
+const TESTS: [TestDefinition; 48] = [
     test(
         1,
         "routing",
@@ -522,6 +522,38 @@ const TESTS: [TestDefinition; 44] = [
         RS,
         "observed process, thread, and FD churn plus post-exit residue",
         "no topology-specific residue and no sustained increase in live process, thread, or FD counts",
+    ),
+    test(
+        45,
+        "time-to-first-model-request",
+        "Time to first model request",
+        RS,
+        "cold launch to first completed model request body",
+        "all cold launch/request pairs present; p95 <=2000ms; max <=10000ms and below turn timeout",
+    ),
+    test(
+        46,
+        "memory-time-integral",
+        "Memory time integral",
+        RS,
+        "trapezoidal effective-memory integral and N=1 CPU per turn",
+        "coverage >=0.99; every turn bracketed; max sample gap <=2x cadence; median <=1024 MiB*s/turn; CPU p95 <=250ms",
+    ),
+    test(
+        63,
+        "nondeterministic-field-report",
+        "Nondeterministic field report",
+        FN,
+        "cross-execution canonical request leaf stability",
+        "score >=0.99 and no varying critical request field",
+    ),
+    test(
+        64,
+        "cross-run-reproducibility",
+        "Cross-run reproducibility",
+        FN,
+        "normalized canonical request stream reproducibility",
+        "equal semantic request count and attempt multiplicity with byte-identical normalized streams",
     ),
 ];
 

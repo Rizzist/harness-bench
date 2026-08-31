@@ -1,6 +1,7 @@
 //! Four-pillar evaluation and badge certification types.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::manifest::{Manifest, TopologyFamily, topology_family};
 use crate::scenarios::{BadgeFacetScope, RequirementKind};
@@ -140,11 +141,83 @@ pub struct Badge {
     /// Turn-latency class such as L100 or L1000+.
     #[serde(default)]
     pub latency_class: String,
+    /// CPU-per-turn class such as C10 or C250+.
+    #[serde(default)]
+    pub cpu_class: String,
+    /// Equal-weight rows 65 through 72 composite, rounded half up.
+    #[serde(default)]
+    pub automation_score: u8,
     /// Certified readiness facets.
     pub facets: Vec<String>,
     /// Explicit guard against cross-topology resource ranking.
     #[serde(default)]
     pub comparison_scope: String,
+}
+
+/// Topology-scoped G2 score plus staged-rollout provenance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutomationScoreEvaluation {
+    /// Composite A score, or unavailable when component evidence is invalid.
+    pub score: Option<u8>,
+    /// True until all eight component rows are present in the matrix result.
+    pub provisional: bool,
+    /// Exact normalized component values keyed by row.
+    pub components: BTreeMap<u8, f64>,
+}
+
+/// Compute the deterministic equal-weight G2 score.
+///
+/// Missing, ABSENT, FAIL-without-a-subscore, and UNSUPPORTED components map to
+/// zero. A valid partial subscore remains meaningful on FAIL. Any ERROR,
+/// incomplete observation, non-finite subscore, or out-of-range subscore makes
+/// the composite unavailable.
+pub fn automation_score(results: &[TestResult]) -> AutomationScoreEvaluation {
+    let mut components = BTreeMap::new();
+    let mut provisional = false;
+    for row in 65..=72 {
+        let Some(result) = result_for_row(results, row) else {
+            provisional = true;
+            components.insert(row, 0.0);
+            continue;
+        };
+        if matches!(result.outcome, TestOutcome::Error(_)) || !result.metadata.measurement_complete
+        {
+            return AutomationScoreEvaluation {
+                score: None,
+                provisional,
+                components,
+            };
+        }
+        let value = match result.outcome {
+            TestOutcome::Unsupported(_) | TestOutcome::Absent(_) => 0.0,
+            TestOutcome::Pass if matches!(row, 71 | 72) => 1.0,
+            TestOutcome::Fail(_) if matches!(row, 71 | 72) => 0.0,
+            TestOutcome::Pass => result.metadata.score.unwrap_or(1.0),
+            TestOutcome::Fail(_) => result.metadata.score.unwrap_or(0.0),
+            TestOutcome::Error(_) => 0.0,
+        };
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return AutomationScoreEvaluation {
+                score: None,
+                provisional,
+                components,
+            };
+        }
+        components.insert(row, value);
+    }
+    let total = components.values().copied().sum::<f64>();
+    let rounded = (total * 100.0 / 8.0 + 0.5).floor();
+    AutomationScoreEvaluation {
+        score: Some(rounded.clamp(0.0, 100.0) as u8),
+        provisional,
+        components,
+    }
+}
+
+/// Row-69's reference envelope expressed with exact integer component counts.
+pub fn event_stream_reference_envelope(components: [bool; 6]) -> bool {
+    let passed = components.iter().filter(|value| **value).count();
+    passed >= 4 && components[0] && components[1] && components[4]
 }
 
 fn default_badge_spec_version() -> u32 {
@@ -281,11 +354,15 @@ pub fn certify(
     parallel_width: usize,
     marginal_bytes: f64,
     latency_class: &str,
+    cpu_class: &str,
 ) -> Option<Badge> {
+    let automation = automation_score(results);
     // Quick certification uses the required N=1,2,4 sweep; the full certification
     // profile reports N=8. The width remains explicit in every badge label.
     if parallel_width < 4
         || !matches!(latency_class, "L100" | "L250" | "L500" | "L1000" | "L1000+")
+        || !matches!(cpu_class, "C10" | "C50" | "C250" | "C250+")
+        || automation.score.is_none()
         || !mandatory_passes(results, manifest)
         || !badge_compatible_results(results, manifest)
     {
@@ -340,6 +417,8 @@ pub fn certify(
         parallel_width,
         resource_class: resource_class.to_owned(),
         latency_class: latency_class.to_owned(),
+        cpu_class: cpu_class.to_owned(),
+        automation_score: automation.score?,
         facets,
         comparison_scope: "within-topology-only".to_owned(),
     })
@@ -378,12 +457,90 @@ pub fn badge_label(badge: &Badge) -> String {
         );
     }
     let mut label = format!(
-        "Automation Ready v2 · {} · {} · N{} · {} · {}",
-        badge.os, badge.topology, badge.parallel_width, badge.resource_class, badge.latency_class,
+        "Automation Ready v2 · {} · {} · N{} · {} · {} · {} · A{}",
+        badge.os,
+        badge.topology,
+        badge.parallel_width,
+        badge.resource_class,
+        badge.latency_class,
+        badge.cpu_class,
+        badge.automation_score,
     );
     if !badge.facets.is_empty() {
         label.push_str(" · ");
         label.push_str(&badge.facets.join("+"));
     }
     label
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+
+    fn component(row: u8, outcome: TestOutcome, score: Option<f64>) -> TestResult {
+        let mut metadata = TestResultMetadata::for_row(row, &outcome);
+        metadata.score = score;
+        TestResult {
+            row,
+            id: format!("component-{row}"),
+            pillar: Pillar::AutomationReadiness,
+            outcome,
+            evidence: Vec::new(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn golden_components_round_half_up() {
+        let results = (65..=72)
+            .map(|row| component(row, TestOutcome::Pass, Some(0.5)))
+            .collect::<Vec<_>>();
+        let evaluation = automation_score(&results);
+        assert_eq!(evaluation.score, Some(63));
+        assert!(!evaluation.provisional);
+        assert_eq!(evaluation.components.len(), 8);
+    }
+
+    #[test]
+    fn absent_fail_unsupported_and_missing_have_deterministic_scores() {
+        let results = vec![
+            component(65, TestOutcome::Fail("no subscore".to_owned()), None),
+            component(66, TestOutcome::Fail("partial".to_owned()), Some(0.5)),
+            component(67, TestOutcome::Absent("missing".to_owned()), Some(1.0)),
+            component(
+                68,
+                TestOutcome::Unsupported("undeclared".to_owned()),
+                Some(1.0),
+            ),
+        ];
+        let evaluation = automation_score(&results);
+        assert_eq!(evaluation.score, Some(6));
+        assert!(evaluation.provisional);
+        assert_eq!(evaluation.components[&65], 0.0);
+        assert_eq!(evaluation.components[&66], 0.5);
+        assert_eq!(evaluation.components[&67], 0.0);
+        assert_eq!(evaluation.components[&68], 0.0);
+        assert_eq!(evaluation.components[&72], 0.0);
+    }
+
+    #[test]
+    fn component_error_or_invalid_score_makes_composite_unavailable() {
+        let error = component(65, TestOutcome::Error("collector".to_owned()), None);
+        assert_eq!(automation_score(&[error]).score, None);
+        let invalid = component(65, TestOutcome::Pass, Some(1.01));
+        assert_eq!(automation_score(&[invalid]).score, None);
+    }
+
+    #[test]
+    fn event_stream_envelope_uses_integer_count_and_hard_trio() {
+        assert!(event_stream_reference_envelope([
+            true, true, false, false, true, true
+        ]));
+        assert!(!event_stream_reference_envelope([
+            true, true, false, false, true, false
+        ]));
+        assert!(!event_stream_reference_envelope([
+            true, false, true, true, true, true
+        ]));
+    }
 }

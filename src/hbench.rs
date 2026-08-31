@@ -139,7 +139,7 @@ pub async fn execute(options: Options) -> Result<i32> {
 
 /// One-line command synopsis.
 pub fn usage() -> &'static str {
-    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench results [HARNESS] [--all]"
+    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
 }
 
 fn unavailable_error(name: &str, detail: &str) -> AhrbError {

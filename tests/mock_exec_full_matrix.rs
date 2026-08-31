@@ -289,7 +289,7 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
         Some(0),
         "reference per-invocation certification must exit zero"
     );
-    assert_eq!(report.results.len(), 44);
+    assert_eq!(report.results.len(), 48);
     let pass_count = report
         .results
         .iter()
@@ -302,7 +302,7 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
             matches!(result.outcome, TestOutcome::Unsupported(_)).then_some(result.row)
         })
         .collect::<Vec<_>>();
-    assert_eq!(pass_count, 38);
+    assert_eq!(pass_count, 42);
     assert_eq!(unsupported_rows, vec![4, 18, 31, 32, 33, 39]);
     assert!(
         report.results.iter().all(|result| {
@@ -331,7 +331,22 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
     );
     assert!(report.resource_summary.scaling_alpha.is_some());
     assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
-    assert_eq!(report.turns.len(), 100);
+    assert_eq!(report.turns.len(), 163);
+    for (phase, expected) in [
+        ("turn-latency", 100),
+        ("time-to-first-model-request", 3),
+        ("memory-time-integral", 60),
+    ] {
+        assert_eq!(
+            report
+                .turns
+                .iter()
+                .filter(|turn| turn.phase == phase)
+                .count(),
+            expected,
+            "unexpected turn count for {phase}"
+        );
+    }
     assert!(report.turns.iter().all(|turn| {
         turn.launch_ns
             .zip(turn.exit_ns)

@@ -161,6 +161,7 @@ fn per_invocation_badge_uses_process_marginal_and_labels_topology() {
         4,
         20.0 * 1024.0 * 1024.0,
         "L250",
+        "C50",
     )
     .expect("complete per-invocation result earns a badge");
     assert_eq!(badge.topology, "client-process-fanout");

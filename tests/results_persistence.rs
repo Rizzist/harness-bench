@@ -1,6 +1,8 @@
 mod common;
 
 use ahrb::results::IndexEntry;
+use ahrb::{evaluate::TestOutcome, report::Report};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -38,17 +40,53 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
     let lines = index_text.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 1);
     let entry: IndexEntry = serde_json::from_str(lines[0]).expect("parse results index entry");
-    assert_eq!(entry.harness_id, "ahrb-mock");
-    assert_eq!(entry.rows_run, vec![1, 2, 3]);
-    assert_eq!(entry.counts.pass, 3);
-    assert_eq!(entry.counts.fail, 0);
-    assert_eq!(entry.counts.unsupported, 0);
-    assert_eq!(entry.counts.error, 0);
+    let indexed_value: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("parse index object");
+    let exact_keys = [
+        "schema",
+        "run_key",
+        "completed_at",
+        "harness",
+        "harness_version",
+        "report_path",
+        "report_schema",
+        "spec_version",
+        "profile",
+        "os",
+        "topology",
+        "manifest_sha256",
+        "workflow_sha256",
+        "ahrb_revision",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        indexed_value
+            .as_object()
+            .expect("index line is object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        exact_keys
+    );
+    assert_eq!(entry.schema, ahrb::results::INDEX_SCHEMA);
+    assert_eq!(entry.harness, "ahrb-mock");
+    assert!(entry.run_key.starts_with("run-"));
     assert_ne!(entry.ahrb_revision, "unknown");
     assert!(!entry.harness_version.contains(['\n', '\r']));
     assert!(entry.harness_version.chars().count() <= 80);
-    assert!(entry.load_avg_1m.is_some());
-    let saved = root.join(&entry.results_dir);
+    let saved_report = root.join(&entry.report_path);
+    let saved = saved_report.parent().expect("saved report parent");
+    let report: Report =
+        serde_json::from_slice(&std::fs::read(&saved_report).expect("read saved report"))
+            .expect("parse saved report");
+    assert_eq!(report.results.len(), 3);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| matches!(result.outcome, TestOutcome::Pass))
+    );
     for file in [
         "report.json",
         "report.md",
@@ -120,10 +158,22 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
     assert_eq!(lines.len(), 2);
     let deadline_entry: IndexEntry =
         serde_json::from_str(lines[1]).expect("parse deadline index entry");
-    assert_eq!(deadline_entry.counts.error, 3);
-    assert_eq!(deadline_entry.rows_run, vec![1, 2, 3]);
+    let deadline_saved_report = root.join(&deadline_entry.report_path);
+    let deadline_report: Report = serde_json::from_slice(
+        &std::fs::read(&deadline_saved_report).expect("read deadline saved report"),
+    )
+    .expect("parse deadline saved report");
+    assert_eq!(deadline_report.results.len(), 3);
+    assert!(deadline_report.results.iter().all(|result| {
+        matches!(
+            result.outcome,
+            TestOutcome::Error(_) | TestOutcome::Absent(_)
+        )
+    }));
     assert!(
-        root.join(&deadline_entry.results_dir)
+        deadline_saved_report
+            .parent()
+            .expect("deadline report parent")
             .join("run-error.txt")
             .is_file()
     );
