@@ -118,30 +118,14 @@ fn non_directory_environment_bindings_are_scoped_and_disjoint_from_roots() {
 }
 
 #[test]
-fn detached_daemon_requires_scoped_identity_and_readiness_evidence() {
-    let mut missing_match =
+fn detached_daemon_requires_json_pid_and_scoped_readiness_evidence() {
+    let mut missing_pid =
         ahrb::manifest::load(Path::new("adapters/mock/manifest.toml")).expect("load mock manifest");
-    missing_match.daemon.launcher_exits = true;
-    missing_match.daemon.pid_locator.clear();
-    missing_match.process.pid_files.clear();
-    let error = ahrb::manifest::validate(&missing_match)
-        .expect_err("detached launch cannot use name-only process discovery");
-    assert!(error.to_string().contains("daemon.process_match"));
-
-    let mut ambient = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))
-        .expect("load Haider manifest");
-    ambient
-        .daemon
-        .process_match
-        .environment
-        .insert("TMPDIR".to_owned(), "/tmp/shared-haider".to_owned());
-    let error = ahrb::manifest::validate(&ambient)
-        .expect_err("detached daemon identity evidence must be profile-scoped");
-    assert!(
-        error
-            .to_string()
-            .contains("process_match.environment.TMPDIR")
-    );
+    missing_pid.daemon.launcher_exits = true;
+    missing_pid.daemon.readiness.pid_pointer.clear();
+    let error = ahrb::manifest::validate(&missing_pid)
+        .expect_err("detached launch must obtain its PID from readiness JSON");
+    assert!(error.to_string().contains("pid_pointer"));
 
     let mut unknown_root = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))
         .expect("load Haider manifest");

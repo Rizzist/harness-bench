@@ -45,20 +45,10 @@ fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, Str
     (result.status, report, junit)
 }
 
-fn run_profile(output: &Path) -> PathBuf {
-    let mut profiles = std::fs::read_dir(output)
-        .expect("read certification output")
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("profile-"))
-        })
-        .collect::<Vec<_>>();
-    profiles.sort();
-    assert_eq!(profiles.len(), 1, "certification must use one run profile");
-    profiles.remove(0)
+fn run_profile(report: &Report) -> PathBuf {
+    let profile = PathBuf::from(&report.profile_path);
+    assert!(profile.is_dir(), "certification profile must exist");
+    profile
 }
 
 fn provider_value(provider: &str, key: &str) -> String {
@@ -101,8 +91,8 @@ fn assert_rendered_bindings(evidence: &Value, base_url: &str, credential_fingerp
     );
 }
 
-fn assert_exec_template_propagation(output: &Path, report: &Report) {
-    let profile = run_profile(output);
+fn assert_exec_template_propagation(report: &Report) {
+    let profile = run_profile(report);
     let provider = std::fs::read_to_string(profile.join("config/provider.toml"))
         .expect("read generated provider config");
     let base_url = provider_value(&provider, "base_url");
@@ -158,7 +148,7 @@ fn assert_exec_template_propagation(output: &Path, report: &Report) {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("per-invocation-resource-repetition-"))
+                .is_some_and(|name| name.starts_with("pr"))
         })
     {
         let sessions = repetition.join("state/sessions");
@@ -265,7 +255,7 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
         .max()
         .unwrap_or(0) as f64
         / (1024.0 * 1024.0);
-    assert!((report.resource_summary.peak_rss_mib - sampled_peak).abs() < f64::EPSILON);
+    assert!((report.resource_summary.peak_rss_mib - sampled_peak).abs() <= 1e-9);
     let sampled_cpu_s = report
         .samples
         .first()
@@ -273,10 +263,11 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
         .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns))
         as f64
         / 1_000_000_000.0;
-    assert!((report.resource_summary.cpu_total_s - sampled_cpu_s).abs() < f64::EPSILON);
+    assert!((report.resource_summary.cpu_total_s - sampled_cpu_s).abs() <= 1e-9);
     assert!(junit.contains("failures=\"0\""));
     assert!(junit.contains("skipped=\"6\""));
-    assert_exec_template_propagation(&output, &report);
+    assert_exec_template_propagation(&report);
+    std::fs::remove_dir_all(&report.profile_path).expect("remove reference mock-exec profile");
     std::fs::remove_dir_all(&output).expect("remove reference mock-exec output");
 
     let variant_root = run_directory("without-durable-journal");
@@ -314,5 +305,6 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
     );
     assert!(junit.contains("failures=\"0\""));
     assert!(junit.contains("skipped=\"7\""));
+    std::fs::remove_dir_all(&report.profile_path).expect("remove variant mock-exec profile");
     std::fs::remove_dir_all(&variant_root).expect("remove variant mock-exec output");
 }

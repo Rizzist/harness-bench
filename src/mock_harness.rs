@@ -561,6 +561,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     match command {
         "serve" => serve(parse_config(&args[1..])?, false).await,
         "rpc" => serve(parse_config(&args[1..])?, true).await,
+        "status" => status_command(&args[1..]),
         "exec-turn" => exec_turn(&args[1..]).await,
         "release-checkpoint" => release_checkpoint_command(&args[1..]).await,
         "cancel-session" => cancel_session_command(&args[1..]).await,
@@ -568,7 +569,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "hook" => hook_command(&args[1..]),
         "--help" | "help" => {
             println!(
-                "ahrb-mock-harness serve|rpc --state-dir PATH [--idle-timeout-ms N] \
+                "ahrb-mock-harness serve|rpc|status --state-dir PATH [--idle-timeout-ms N] \
                  [--session-memory-mib N]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
                  --session-id ID --prompt PROMPT --key KEY \
@@ -585,6 +586,16 @@ pub async fn run(args: &[String]) -> Result<i32> {
             "unknown mock harness command {other:?}"
         ))),
     }
+}
+
+fn status_command(args: &[String]) -> Result<i32> {
+    let config = parse_config(args)?;
+    let pid = std::fs::read_to_string(config.state_dir.join("daemon.pid"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| AhrbError::Protocol(format!("invalid mock daemon PID: {error}")))?;
+    println!("{}", json!({"daemon":{"pid":pid,"ready":true}}));
+    Ok(0)
 }
 
 async fn exec_turn(args: &[String]) -> Result<i32> {
@@ -962,6 +973,40 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
             };
             Ok(json!({ "events": journal.read_after(after)? }))
         }
+        "sessions.wait-ready" => {
+            let expected = request
+                .params
+                .get("session_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let guard = harness.lock().await;
+            let ready = expected
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|id| {
+                    guard
+                        .sessions
+                        .get(*id)
+                        .is_some_and(|session| session_is_terminal(session).unwrap_or(false))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "schema":"haider.sessions.ready.v1",
+                "ready":ready.len() == expected.len(),
+                "timed_out":false,
+                "daemon_ready":true,
+                "expected_count":expected.len(),
+                "ready_count":ready.len(),
+                "total_session_count":guard.sessions.len(),
+                "expected_session_ids":expected,
+                "ready_session_ids":ready,
+                "state_counts":{},
+                "sessions":[],
+                "error":Value::Null
+            }))
+        }
         "session.resume" => {
             let id = required_str(&request.params, "session_id")?.to_owned();
             let spawn = {
@@ -1100,7 +1145,11 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
         }
         "harness.shutdown" => {
             harness.lock().await.shutting_down = true;
-            Ok(json!({ "shutdown": true }))
+            Ok(json!({
+                "schema":"haider.daemon-stop.v1",
+                "outcome":"stopped_cleanly",
+                "daemon":{"shutdown_acknowledged":true,"process_exited":true}
+            }))
         }
         other => Err(AhrbError::Protocol(format!("unknown RPC method {other:?}"))),
     }
@@ -1253,6 +1302,7 @@ async fn execute_turn(
             headers.insert("Authorization".to_owned(), format!("Bearer {key}"));
         }
         let body = serde_json::to_vec(&request)?;
+        let request_started = std::time::Instant::now();
         let response_result = model_http_post(&config, &headers, &body).await;
         let response = match response_result {
             Ok(response) => response,
@@ -1261,7 +1311,12 @@ async fn execute_turn(
                 guard.append_terminal(
                     id,
                     EventVocab::TerminalFailure,
-                    json!({ "status": "failure", "category": "idle-timeout", "message": message }),
+                    json!({
+                        "status": "failure",
+                        "category": "idle-timeout",
+                        "message": message,
+                        "elapsed_ms": u64::try_from(request_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    }),
                 )?;
                 return Ok(());
             }

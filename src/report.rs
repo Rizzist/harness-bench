@@ -101,6 +101,9 @@ pub struct Report {
     pub schema: u32,
     /// Deterministic run identifier.
     pub run_id: String,
+    /// Canonical short root holding isolated harness state for this run.
+    #[serde(default)]
+    pub profile_path: String,
     /// Reproducibility fingerprint.
     pub fingerprint: Fingerprint,
     /// Matrix results sorted by row.
@@ -110,6 +113,13 @@ pub struct Report {
     /// Named non-resource automation diagnostics. Resource observations live
     /// exclusively in `resource_metrics` so topology labels cannot be dropped.
     pub metrics: BTreeMap<String, f64>,
+    /// Typed daemon-shutdown outcomes and any owned-tree escalation performed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_notes: Vec<String>,
+    /// Raw JSON returned by headless resume/recovery controls, annotated with
+    /// the local session and action that produced it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_evidence: Vec<Value>,
     /// Resource metrics with topology labels and within-topology comparison scope.
     #[serde(default)]
     pub resource_metrics: BTreeMap<String, TopologyMetric>,
@@ -197,6 +207,9 @@ fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<()> {
 pub fn render_markdown(report: &Report) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "# AHRB report `{}`\n", report.run_id);
+    if !report.profile_path.is_empty() {
+        let _ = writeln!(output, "Profile: `{}`\n", report.profile_path);
+    }
     if let Some(badge) = &report.badge {
         let _ = writeln!(output, "**{}**\n", badge_label(badge));
     } else {

@@ -5,7 +5,7 @@ use ahrb::evaluate::TestOutcome;
 use ahrb::events::EventVocab;
 use ahrb::report::Report;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -47,18 +47,7 @@ fn per_invocation_cli_runs_against_fake_model_and_extracts_own_stdout() {
     assert!(report.events.iter().any(|event| {
         event.get("event").and_then(serde_json::Value::as_str) == Some("tool-call")
     }));
-    let mut profiles = std::fs::read_dir(&output)
-        .expect("read output directory")
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("profile-"))
-        })
-        .collect::<Vec<_>>();
-    profiles.sort();
-    let profile = profiles.first().expect("fresh exec profile");
+    let profile = PathBuf::from(&report.profile_path);
     let provider = std::fs::read_to_string(profile.join("config/provider.toml"))
         .expect("generated provider config");
     assert!(provider.contains("ahrb-fake-v1"));
@@ -85,6 +74,7 @@ fn per_invocation_cli_runs_against_fake_model_and_extracts_own_stdout() {
         .max()
         .unwrap_or(0);
     assert_eq!(maximum_turn_files, 3, "row 16 must launch three fresh CLIs");
+    std::fs::remove_dir_all(profile).expect("remove exec transport profile");
     std::fs::remove_dir_all(output).expect("remove exec transport output");
 }
 
@@ -238,21 +228,8 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
         Some("fail_fixture")
     );
 
-    let mut profiles = std::fs::read_dir(&output)
-        .expect("read native-tool output")
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("profile-"))
-        })
-        .collect::<Vec<_>>();
-    profiles.sort();
-    let workspaces = profiles
-        .first()
-        .expect("native-tool profile")
-        .join("state/workspaces");
+    let profile = PathBuf::from(&report.profile_path);
+    let workspaces = profile.join("state/workspaces");
     let effect = std::fs::read_dir(workspaces)
         .expect("read native-tool workspaces")
         .filter_map(std::result::Result::ok)
@@ -261,6 +238,7 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
         .expect("native shell filesystem effect");
     let content = std::fs::read_to_string(effect).expect("read native shell effect");
     assert!(content.contains("row-2"));
+    std::fs::remove_dir_all(profile).expect("remove native-tool profile");
     std::fs::remove_dir_all(root).expect("remove native-tool run");
 }
 
@@ -294,15 +272,19 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
         daemon: None,
         command: command.clone(),
         resume_command: command,
+        resume_control_command: Vec::new(),
+        recover_probe_command: Vec::new(),
         release_command: Vec::new(),
         cancel_command: Vec::new(),
         replay_command: Vec::new(),
+        wait_ready_command: Vec::new(),
         environment: BTreeMap::from([("AHRB_MOCK_MODEL".to_owned(), "ahrb-fake-v1".to_owned())]),
         base_variables: BTreeMap::new(),
         profile_root: profile.to_path_buf(),
         events,
         exit: manifest.exit,
         session_id_pointer: manifest.sessions.id_pointer,
+        run_id_pointer: String::new(),
         timeout: Duration::from_secs(5),
         max_output_bytes: 4096,
         gate_launch: false,

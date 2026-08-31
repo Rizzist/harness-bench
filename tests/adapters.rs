@@ -74,29 +74,10 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
     assert_eq!(haider.availability.required_exec_paths, ["haiderd"]);
     assert_eq!(haider.daemon.start, ["haider", "status", "--json"]);
     assert!(haider.daemon.launcher_exits);
-    assert_eq!(haider.daemon.process_match.executable_name, "haiderd");
     assert_eq!(
         haider
             .isolation
             .roots
-            .get("XDG_RUNTIME_DIR")
-            .map(String::as_str),
-        Some("{{profile}}/run")
-    );
-    assert_eq!(
-        haider
-            .daemon
-            .process_match
-            .environment
-            .get("TMPDIR")
-            .map(String::as_str),
-        Some("{{profile}}/tmp")
-    );
-    assert_eq!(
-        haider
-            .daemon
-            .process_match
-            .environment
             .get("XDG_RUNTIME_DIR")
             .map(String::as_str),
         Some("{{profile}}/run")
@@ -107,6 +88,8 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
         ["haider", "status", "--json"]
     );
     assert_eq!(haider.daemon.readiness.timeout_ms, 30_000);
+    assert_eq!(haider.daemon.readiness.pid_pointer, "/daemon/pid");
+    assert_eq!(haider.daemon.readiness.ready_pointer, "/daemon/ready");
     assert_eq!(
         haider
             .daemon
@@ -129,6 +112,20 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             .command
             .windows(2)
             .any(|arguments| { arguments == ["--output", "jsonl"] })
+    );
+    assert!(
+        haider
+            .transport
+            .command
+            .windows(2)
+            .any(|arguments| { arguments == ["--account", "ahrb"] })
+    );
+    assert!(
+        !haider
+            .transport
+            .command
+            .iter()
+            .any(|argument| argument == "--model")
     );
     assert!(haider.sessions.create.is_empty());
     assert!(haider.sessions.submit.is_empty());
@@ -504,9 +501,11 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
         Some("command")
     );
     assert_eq!(haider.events.type_pointer, "/payload/type");
+    assert_eq!(haider.events.replay_envelope_pointer, "/envelope");
+    assert_eq!(haider.events.replay_cursor_start, Some(2));
     assert!(haider.events.rules.iter().any(|rule| {
         rule.matches == "item"
-            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("completed")
+            && rule.match_fields.get("/payload/event").map(String::as_str) == Some("started")
             && rule
                 .match_fields
                 .get("/payload/item/item")

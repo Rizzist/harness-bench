@@ -76,11 +76,14 @@ actors reach the same validated transition.
 ## Parallel-agent memory methodology (centerpiece)
 Sweep N=1,2,4,8 (opt 16/32); cert requires N≥8. Per N/rep on a fresh isolated profile:
 start daemon/controller → one unmeasured warm-up + close → measure warm idle baseline B
-(3s) → release N starts together → wait until all N did their tool op and reached the same
-barrier → hold 3s, use last 2s as steady window (discard first 1s) → release all → measure
+(3s) → release N starts together → fence on N durable terminal/idle session records and,
+for thin-client topologies, N client exits with code 0 → hold 3s, use last 2s as steady
+window (discard first 1s) → measure
 post-turn retention → close/delete N sessions via official surface → wait ≤10s reclaim,
 measure post-close Rₙ → shutdown + orphan scan. Plateau trustworthy only if all N present
 AND final window P95–P5 ≤5% of median (else repeat / classify unstable).
+An adapter-declared cohort `wait-ready` command is advisory settle evidence only and never
+replaces the terminal/idle + client-exit PASS fence.
 
 **Whole-tree ownership** includes client(s), persistent daemon/controller, session
 workers, agent subprocesses, harness-launched tool/hook procs, reparented children;
@@ -93,9 +96,9 @@ never PID alone.
   double-counts shared pages; PSS is the preferred comparison metric).
 - macOS: `proc_listpids`/`proc_pidinfo` (PPID+start-time); `proc_pid_rusage(RUSAGE_INFO_V4)`
   for resident + physical footprint + cumulative CPU; `task_info(TASK_VM_INFO)` cross-check;
-  root = launcher PID + verified daemon-PID locator + recursive descendants. A detached
-  daemon may be located only by an exact executable plus isolated-root evidence: inherited
-  environment where inspectable, otherwise an open file/socket beneath that unique root.
+  root = launcher PID or the manifest-declared PID extracted from readiness JSON, plus
+  recursive descendants. Sampling performs no helper-subprocess discovery. Every root is
+  registered and revalidated as `(PID,start-time)`, never PID alone.
 - Terminal rusage: also `wait4` direct children, normalize ru_maxrss (bytes on macOS, KiB×1024
   on Linux) — supplemental cross-check ONLY, never a substitute for the sampled tree metric.
 Sampling cadence: membership 10ms; Linux cgroup counters 10ms; smaps_rollup 50ms + at
@@ -120,15 +123,19 @@ templates); model roles (primary/planner/title/compaction/reviewer/child); isola
 (directory-valued HOME/XDG/config/data/state/session/runtime/tmp roots, non-directory
 environment bindings, generated config files+modes, forbidden historical state roots);
 daemon lifecycle (embedded/persistent, resident or finite detached start, readiness probe,
-PID file or executable+isolated-root locator, shutdown, grace); automation transport;
+JSON PID/ready pointers, typed shutdown outcomes, grace); automation transport;
 session ops (create/submit/attach/
-resume/close-delete/list/id-extraction); next-input ops (steer/subturn/queue + capability
+resume/continue/recover/wait-ready/close-delete/list/session+run ID extraction); next-input ops (steer/subturn/queue + capability
 flags); agent ops (create/native-spawn/child-id/status/cancel/collect); concurrency
 (topology, max N, fanout mode, barrier evidence); tool semantics (aliases, schema bindings
 for shell/spawn/input, safe fixture command templates); events (source/framing/predicates/
-extractors/stable-ids/cursors/terminal maps); exit contract; process ownership; resource
+extractors/stable-ids/cursors/terminal maps, plus optional replay-envelope and cursor-origin
+metadata when durable replay differs from the live stream); exit contract; process ownership; resource
 controls; hooks; cleanup; redaction+capture caps; capabilities (required/optional + reason).
 Credentials NEVER in argv; credential files private; commands are argv arrays not shell.
+Socket-using adapters declare representative socket suffixes. AHRB allocates the isolated
+profile under a short output-independent temporary root, records it in `report.json`, makes
+runtime roots owner-private, and rejects any rendered socket candidate of 100 bytes or more.
 
 ## Exit classes and topology-relative requirements
 
@@ -228,17 +235,26 @@ different OS/topology numbers on one unlabeled leaderboard.
 29. Long-horizon stability — 1000 tiny turns (fixture tool every 10th), sample every 100; drift ≤64 KiB/turn; final residual ≤max(64 MiB,5% of B); no monotonic FD/thread leak.
 
 ### automation-readiness
-30. Session persist + replay — turn A, detach/stop, restart, attach after cursor K, continue B; ordered suffix (K,head] exactly once; same session; no gap/fabrication.
+30. Session persist + replay — turn A, then either restart+attach after cursor K or invoke a
+finite native replay surface; ordered suffix (K,head] exactly once in the same session, with
+no gap/fabrication. Adapters with a continue-existing-session surface additionally continue B.
 31. Safe-boundary next prompt (steer) — hold at boundary, inject U, release; U once at next safe boundary, affects active run.
 32. Pre-tool next prompt (subturn) — hold before pending tool completes, inject U; U observed before the effect; no effect before intervention.
 33. Queued next turn — enqueue B during A, release A, service B; A terminates before B; B runs once as distinct turn.
 34. Autonomous no-interactive-prompt — closed stdin, no PTY; allowed effect succeeds; denied fails closed; no prompt/stdin wait.
-35. Crash recovery kill/resume — kill daemon/worker at named post-accept/tool checkpoint, restart, attach, continue; readiness ≤10s; finite; committed effect at most once.
+35. Crash recovery kill/resume — kill daemon/worker after durable activity, restart, then
+attach/continue or invoke a headless native recovery probe; readiness ≤10s; finite;
+committed effect at most once.
 36. Cancellation + cleanup — cancel while N held; all terminal ≤5s; no owned PID after 2s grace; no undeclared socket/file/state; reclaim met.
 37. Resume idempotency — repeat submit/resume + attach incl. one simulated lost response; one semantic turn + one tool effect; transport dups only if normalizer dedups by stable identity.
 38. Resource-bound honoring — request L+1 agents / turn>max / oversized output / held>deadline; limits never exceeded; excess queued/typed-refused; deadline terminates within grace.
 39. Hook firing — isolated marker hook for acceptance + completion; each committed event fires once after commit; replay doesn't refire; hook child exits; no secret/env leak.
-40. **Durable journal** [MANDATORY ADDITION] — certify an append-only DURABLE event journal is the recoverable source of truth: drive several committed events, hard `kill -9` the harness/daemon at a named post-commit checkpoint, restart, read the journal + attach-after-cursor; assert the committed suffix is present exactly once, ordered, no gap/fabrication, and a partially-written final record is either fully present or cleanly absent (no torn/corrupt tail). Metric: recovered-event completeness/order, torn-record handling, journal-vs-replay agreement, durability across kill -9. Pass: no committed event lost or duplicated; tail integrity preserved. UNSUPPORTED (itself a finding) if the harness has no durable event store. Persistent-daemon journal vs one-shot session-file models both handled.
+40. **Durable journal** [MANDATORY ADDITION] — certify a DURABLE event journal as recoverable
+source of truth: drive committed events, hard `kill -9` the harness/daemon, restart, then
+read the journal or invoke its finite native replay command; assert the committed suffix is
+present exactly once, ordered, and free of gaps/fabrication. Where a safe harness-owned
+journal fault-injection surface exists, a partially-written final record must be fully
+present or cleanly absent. Native replay output must itself be well-formed and finite.
 41. Profile/network isolation — unique HOME/profile + deny egress while all roles execute; no direct external conn / undeclared outside write / credential in argv/logs; all aux calls hit the fake endpoint.
 
 ## Hard parts (design for these): portable whole-tree attribution (verified daemon-PID
