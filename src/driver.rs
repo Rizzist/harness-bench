@@ -223,7 +223,13 @@ async fn managed_daemon_readiness_satisfied(
                         "daemon readiness root environment {root_name:?} is absent"
                     ))
                 })?;
-                if !Path::new(returned).starts_with(root) {
+                let returned_path = Path::new(returned);
+                let root_path = Path::new(root);
+                let canonical_returned = std::fs::canonicalize(returned_path)
+                    .unwrap_or_else(|_| returned_path.to_path_buf());
+                let canonical_root =
+                    std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
+                if !canonical_returned.starts_with(&canonical_root) {
                     return Err(AhrbError::Protocol(format!(
                         "daemon readiness JSON path {pointer}={returned:?} is outside isolated {root_name}={root:?}"
                     )));
@@ -3959,6 +3965,35 @@ mod tests {
             .await
             .expect_err("ambient runtime path must be rejected");
         assert!(error.to_string().contains("outside isolated TMPDIR"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn command_json_readiness_accepts_private_tmp_alias_inside_tmp_root() {
+        let root = PathBuf::from(format!("/tmp/ahrb-readiness-alias-{}", std::process::id()));
+        let returned = PathBuf::from(format!(
+            "/private/tmp/ahrb-readiness-alias-{}/pipe",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&returned).expect("create readiness path through /private/tmp");
+        let probe = Probe {
+            kind: "command-json".to_owned(),
+            target: String::new(),
+            command: vec![
+                "/usr/bin/printf".to_owned(),
+                json!({"pipe_dir": returned}).to_string(),
+            ],
+            json_pointer_roots: BTreeMap::from([("/pipe_dir".to_owned(), "TMPDIR".to_owned())]),
+            timeout_ms: 1_000,
+        };
+        let environment =
+            BTreeMap::from([("TMPDIR".to_owned(), root.to_string_lossy().into_owned())]);
+
+        let ready = managed_daemon_readiness_satisfied(&probe, &environment)
+            .await
+            .expect("/private/tmp path must be contained by equivalent /tmp root");
+        assert!(ready.is_some());
+        std::fs::remove_dir_all(root).expect("remove readiness alias root");
     }
 
     #[cfg(unix)]

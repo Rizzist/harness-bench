@@ -1,5 +1,6 @@
 //! Marker-routed deterministic fake-model engine and local HTTP protocol frontends.
 
+use crate::manifest::ModelRole;
 use crate::workflow::{BarrierCoordinator, Fault, RouteMarker, Workflow, WorkflowMachine};
 use crate::{AhrbError, Result};
 use bytes::Bytes;
@@ -32,6 +33,8 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 const BIND_MAX_ATTEMPTS: usize = 8;
 const BIND_BACKOFF_MS: u64 = 10;
+const TITLE_SYSTEM_PROMPT: &str = "You are a title generator. You output ONLY a thread title.";
+const DETERMINISTIC_THREAD_TITLE: &str = "AHRB benchmark thread";
 
 // The managed source-build sandbox permits local listeners but may reject concurrent
 // binds. Serialize listener-owning unit tests; production servers are unaffected.
@@ -196,15 +199,25 @@ pub struct FakeModelEngine {
     machine: WorkflowMachine,
     barriers: BarrierCoordinator,
     requests: Mutex<BTreeMap<RequestRecordKey, ModelRequestRecord>>,
+    title_model: Option<String>,
 }
 
 impl FakeModelEngine {
     /// Build an engine from one validated declarative workflow.
     pub fn new(workflow: &Workflow) -> Result<Self> {
+        Self::with_model_roles(workflow, &BTreeMap::new())
+    }
+
+    /// Build an engine with manifest-declared auxiliary model roles.
+    pub fn with_model_roles(
+        workflow: &Workflow,
+        model_roles: &BTreeMap<String, ModelRole>,
+    ) -> Result<Self> {
         Ok(Self {
             machine: WorkflowMachine::new(workflow)?,
             barriers: BarrierCoordinator::new(workflow)?,
             requests: Mutex::new(BTreeMap::new()),
+            title_model: model_roles.get("title").map(|role| role.model.clone()),
         })
     }
 
@@ -219,7 +232,7 @@ impl FakeModelEngine {
             request_hash.clone(),
             request.dialect.clone(),
         );
-        {
+        let attempt = {
             let mut records = self.requests.lock().await;
             let record = records
                 .entry(record_key.clone())
@@ -237,18 +250,28 @@ impl FakeModelEngine {
             record.attempts = record.attempts.checked_add(1).ok_or_else(|| {
                 AhrbError::Protocol("request attempt counter overflow".to_owned())
             })?;
+            record.attempts
+        };
+
+        if self.title_model.as_deref() == Some(request.model.as_str())
+            && is_title_generation_request(&request)
+        {
+            self.mark_request_accepted(&record_key).await?;
+            return Ok(ModelResponse {
+                model: request.model,
+                scenario: marker.scenario,
+                actor: marker.actor,
+                checkpoint: marker.checkpoint,
+                request_hash,
+                value: json!({"text": DETERMINISTIC_THREAD_TITLE}),
+                fault: None,
+                retry: attempt > 1,
+                stream: request.stream,
+            });
         }
 
         let accepted = self.machine.accept(&marker, &request_hash).await?;
-        {
-            let mut records = self.requests.lock().await;
-            let Some(record) = records.get_mut(&record_key) else {
-                return Err(AhrbError::Protocol(
-                    "request evidence disappeared during transition".to_owned(),
-                ));
-            };
-            record.accepted = true;
-        }
+        self.mark_request_accepted(&record_key).await?;
         if let Some(barrier) = &accepted.response.barrier {
             self.barriers.arrive(barrier, &marker).await?;
             self.barriers.wait_for_release(barrier).await?;
@@ -276,6 +299,53 @@ impl FakeModelEngine {
     /// Return deterministic request evidence sorted independently of arrival order.
     pub async fn request_records(&self) -> Vec<ModelRequestRecord> {
         self.requests.lock().await.values().cloned().collect()
+    }
+
+    async fn mark_request_accepted(&self, record_key: &RequestRecordKey) -> Result<()> {
+        let mut records = self.requests.lock().await;
+        let Some(record) = records.get_mut(record_key) else {
+            return Err(AhrbError::Protocol(
+                "request evidence disappeared during transition".to_owned(),
+            ));
+        };
+        record.accepted = true;
+        Ok(())
+    }
+}
+
+fn is_title_generation_request(request: &ModelRequest) -> bool {
+    if request.dialect != "openai-chat-completions" {
+        return false;
+    }
+    let Some(object) = request.canonical.as_object() else {
+        return false;
+    };
+    let no_tools = object
+        .get("tools")
+        .is_none_or(|tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty));
+    let no_tool_choice = object.get("tool_choice").is_none_or(Value::is_null);
+    let title_prompt = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message
+                        .get("content")
+                        .is_some_and(is_exact_title_system_prompt)
+            })
+        });
+    no_tools && no_tool_choice && title_prompt
+}
+
+fn is_exact_title_system_prompt(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text == TITLE_SYSTEM_PROMPT,
+        Value::Array(parts) => {
+            parts.len() == 1 && parts.first().is_some_and(is_exact_title_system_prompt)
+        }
+        Value::Object(part) => part.get("text").is_some_and(is_exact_title_system_prompt),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -2217,6 +2287,179 @@ mod tests {
         assert!(retry.retry);
         assert_eq!(first.value, retry.value);
         assert_eq!(engine.request_records().await[0].attempts, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn title_role_requests_do_not_consume_main_checkpoint_identity() -> Result<()> {
+        let mut workflow = simple_workflow();
+        workflow.responses[0].response = json!({
+            "tool_calls": [{
+                "id": "call-opencode",
+                "name": "write_fixture",
+                "arguments": {"path": "opencode.txt", "content": "ok"},
+                "_ahrb_native": {
+                    "semantic": "write",
+                    "aliases": ["bash"],
+                    "bindings": {"bash.command": "command"},
+                    "argv": ["/bin/sh", "-c", "printf ok > opencode.txt"]
+                }
+            }]
+        });
+        let roles = BTreeMap::from([(
+            "title".to_owned(),
+            ModelRole {
+                model: "ahrb-title-v1".to_owned(),
+                required: false,
+            },
+        )]);
+        let engine = FakeModelEngine::with_model_roles(&workflow, &roles)?;
+        let frontend = OpenAiChatFrontend;
+        let title_body = json!({
+            "model": "ahrb-title-v1",
+            "messages": [
+                {"role": "system", "content": TITLE_SYSTEM_PROMPT},
+                {"role": "user", "content": "go [[AHRB:scenario=routing;actor=root;checkpoint=start]]"}
+            ],
+            "tool_choice": null,
+            "stream": false
+        });
+        let title_bytes = serde_json::to_vec(&title_body)?;
+        let title = frontend.parse(frontend.path(), &BTreeMap::new(), &title_bytes)?;
+
+        let first_title = engine.handle(title.clone()).await?;
+        assert_eq!(
+            first_title.value.get("text").and_then(Value::as_str),
+            Some(DETERMINISTIC_THREAD_TITLE)
+        );
+        assert!(!first_title.retry);
+
+        let main_body = json!({
+            "model": "ahrb-fake-v1",
+            "messages": [
+                {"role": "system", "content": "You are opencode, an interactive CLI tool."},
+                {"role": "user", "content": "go [[AHRB:scenario=routing;actor=root;checkpoint=start]]"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": "auto",
+            "stream": true
+        });
+        let main_bytes = serde_json::to_vec(&main_body)?;
+        let main = frontend.parse(frontend.path(), &BTreeMap::new(), &main_bytes)?;
+        let selected = engine.handle(main.clone()).await?;
+        assert_eq!(
+            selected
+                .value
+                .pointer("/tool_calls/0/name")
+                .and_then(Value::as_str),
+            Some("bash")
+        );
+        assert!(
+            selected
+                .value
+                .pointer("/tool_calls/0/arguments/command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| command.contains("printf ok > opencode.txt"))
+        );
+
+        let mut next_title_body = title_body.clone();
+        next_title_body["messages"][1]["content"] =
+            json!("another turn [[AHRB:scenario=routing;actor=root;checkpoint=start]]");
+        let next_title_bytes = serde_json::to_vec(&next_title_body)?;
+        let next_title = frontend.parse(frontend.path(), &BTreeMap::new(), &next_title_bytes)?;
+        assert_eq!(
+            engine
+                .handle(next_title)
+                .await?
+                .value
+                .get("text")
+                .and_then(Value::as_str),
+            Some(DETERMINISTIC_THREAD_TITLE)
+        );
+        assert!(engine.handle(title).await?.retry);
+        assert!(engine.handle(main).await?.retry);
+
+        let mut invalid_title_body = title_body;
+        invalid_title_body["tools"] = main_body["tools"].clone();
+        let invalid_title_bytes = serde_json::to_vec(&invalid_title_body)?;
+        let invalid_title =
+            frontend.parse(frontend.path(), &BTreeMap::new(), &invalid_title_bytes)?;
+        let error = engine
+            .handle(invalid_title)
+            .await
+            .expect_err("tool-bearing traffic must follow the normal workflow path");
+        assert!(
+            error
+                .to_string()
+                .contains("retried with different canonical request")
+        );
+
+        let records = engine.request_records().await;
+        assert_eq!(records.len(), 4);
+        assert_eq!(records.iter().filter(|record| record.accepted).count(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.request.model == "ahrb-fake-v1")
+                .map(|record| record.attempts),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_title_model_non_title_request_reaches_scripted_barrier() -> Result<()> {
+        let mut workflow = simple_workflow();
+        workflow.responses[0].barrier = Some("steady".to_owned());
+        workflow.barriers.insert(
+            "steady".to_owned(),
+            Barrier {
+                name: "steady".to_owned(),
+                actors: vec!["root".to_owned()],
+                checkpoint: "start".to_owned(),
+            },
+        );
+        let roles = BTreeMap::from([(
+            "title".to_owned(),
+            ModelRole {
+                model: "ahrb-fake".to_owned(),
+                required: false,
+            },
+        )]);
+        let engine = Arc::new(FakeModelEngine::with_model_roles(&workflow, &roles)?);
+        let frontend = OpenAiChatFrontend;
+        let request = frontend.parse(frontend.path(), &BTreeMap::new(), &request_body())?;
+        let request_engine = Arc::clone(&engine);
+        let response_task = tokio::spawn(async move { request_engine.handle(request).await });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.barriers().wait_until_ready("steady"),
+        )
+        .await
+        .map_err(|error| {
+            AhrbError::Protocol(format!("scripted barrier was not reached: {error}"))
+        })??;
+        engine.barriers().release("steady").await?;
+        let response = response_task
+            .await
+            .map_err(|error| AhrbError::Protocol(format!("request task failed: {error}")))??;
+
+        assert_eq!(response.value, json!({"text": "SUCCESS"}));
+        let records = engine.request_records().await;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].accepted);
         Ok(())
     }
 

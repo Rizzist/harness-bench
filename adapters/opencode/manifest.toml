@@ -30,11 +30,13 @@ content = '''{
         "apiKey": "{{credential}}"
       },
       "models": {
-        "{{model}}": { "name": "AHRB Fake Model" }
+        "{{model}}": { "name": "AHRB Fake Model" },
+        "ahrb-title-v1": { "name": "AHRB Deterministic Title Model" }
       }
     }
   },
   "model": "ahrb/{{model}}",
+  "small_model": "ahrb/ahrb-title-v1",
   "permission": {
     "bash": "allow"
   }
@@ -44,6 +46,10 @@ content = '''{
 [model_roles.primary]
 model = "ahrb-fake-v1"
 required = true
+
+[model_roles.title]
+model = "ahrb-title-v1"
+required = false
 
 [isolation.roots]
 HOME = "{{profile}}/home"

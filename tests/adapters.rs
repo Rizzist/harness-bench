@@ -411,6 +411,19 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
     assert!(config.content.contains("@ai-sdk/openai-compatible"));
     assert!(config.content.contains("{{base_url}}/v1"));
     assert!(config.content.contains("\"{{model}}\""));
+    assert!(config.content.contains("\"ahrb-title-v1\""));
+    assert!(
+        config
+            .content
+            .contains("\"small_model\": \"ahrb/ahrb-title-v1\"")
+    );
+    assert_eq!(
+        opencode
+            .model_roles
+            .get("title")
+            .map(|role| role.model.as_str()),
+        Some("ahrb-title-v1")
+    );
     for command in [&opencode.transport.command, &opencode.sessions.resume] {
         assert!(command.windows(2).any(|pair| pair == ["--format", "json"]));
         assert!(command.iter().any(|argument| argument == "--auto"));

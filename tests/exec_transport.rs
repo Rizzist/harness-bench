@@ -311,6 +311,7 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
 
 #[tokio::test]
 async fn terminal_is_withheld_until_the_invocation_really_exits() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let profile =
         std::env::temp_dir().join(format!("ahrb-exec-terminal-exit-{}", std::process::id()));
     if profile.exists() {
@@ -362,6 +363,7 @@ async fn terminal_is_withheld_until_the_invocation_really_exits() {
 
 #[tokio::test]
 async fn journal_file_source_is_extracted_and_persisted() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let profile =
         std::env::temp_dir().join(format!("ahrb-exec-journal-source-{}", std::process::id()));
     if profile.exists() {

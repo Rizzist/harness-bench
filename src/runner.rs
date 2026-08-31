@@ -134,7 +134,10 @@ pub async fn run(options: RunOptions) -> Result<i32> {
         options.profile,
         &manifest,
     )?;
-    let engine = Arc::new(FakeModelEngine::new(&workflow)?);
+    let engine = Arc::new(FakeModelEngine::with_model_roles(
+        &workflow,
+        &manifest.model_roles,
+    )?);
     let (server, model_environment) = start_model(
         Arc::clone(&engine),
         &workflow,
@@ -2133,9 +2136,16 @@ fn evaluate_rows(
                 .iter()
                 .filter(|record| record.request.actor.starts_with(&row_actor_prefix))
                 .count();
+            let row_primary_requests = requests
+                .iter()
+                .filter(|record| {
+                    record.request.actor.starts_with(&row_actor_prefix)
+                        && record.request.model == manifest.fake_model.model
+                })
+                .count();
             let (passed, detail) = match definition.row {
                 1 => (
-                    (row_requests == 1
+                    (row_primary_requests == 1
                         && requests.iter().any(|record| {
                             record.request.actor == "r01"
                                 && record.request.model == manifest.fake_model.model
