@@ -5,9 +5,10 @@ use ahrb::process::{ProcIdentity, ProcOwnership, Sample};
 use ahrb::report::{
     MembershipSample, MemoryTimeIntegralEvidence, MemoryTimeIntegralSample, ProcessHygieneAudit,
     ProcessHygieneCadenceSample, ProcessHygieneCheckpoint, ProcessHygieneEvidence,
-    ProcessHygieneProcess, Report, TurnObservation, evaluate_memory_time_integral,
+    ProcessHygieneProcess, Report, ResourceSummary, TurnObservation, evaluate_memory_time_integral,
     evaluate_process_hygiene, evaluate_time_to_first_model_request, evaluate_turn_latency,
-    render_markdown, render_resource_summary, summarize_resources,
+    evaluate_turn_latency_repetitions, render_markdown, render_resource_summary,
+    summarize_resources,
 };
 use std::time::SystemTime;
 
@@ -32,6 +33,52 @@ fn markdown_sorts_rows_and_names_outcomes() {
     ));
     let markdown = render_markdown(&report);
     assert!(markdown.contains("| 2 | ToolCallCorrectness | `single-tool-call` | PASS |"));
+}
+
+#[test]
+fn report_details_validate_known_blocks_and_retain_future_blocks() {
+    let mut value = serde_json::to_value(Report::default()).expect("serialize default report");
+    value["details"] = serde_json::json!({
+        "automation-score": {
+            "profile": "quick",
+            "topology": "client-process-fanout",
+            "comparison_scope": "within-topology-only",
+            "score": null
+        },
+        "future-row": {"opaque": [1, 2, 3]}
+    });
+    let report: Report = serde_json::from_value(value.clone()).expect("typed details parse");
+    assert_eq!(report.details["future-row"]["opaque"][2], 3);
+
+    value["details"]["automation-score"]["score"] = serde_json::json!("not-a-number");
+    let error = serde_json::from_value::<Report>(value)
+        .expect_err("known detail block must reject the wrong field type");
+    assert!(error.to_string().contains("details.automation-score"));
+}
+
+#[test]
+fn incomplete_resource_summary_omits_non_nullable_wave_one_derivatives() {
+    let value =
+        serde_json::to_value(ResourceSummary::default()).expect("serialize empty resource summary");
+    for field in [
+        "wall_per_turn_p50_ms",
+        "wall_per_turn_p95_ms",
+        "wall_per_turn_max_ms",
+        "wall_per_turn_mad_ms",
+        "wall_per_turn_jitter_ratio",
+        "latency_class",
+        "time_to_first_model_request_p50_ms",
+        "time_to_first_model_request_p95_ms",
+        "time_to_first_model_request_max_ms",
+        "memory_time_integral_mib_s_per_turn",
+        "memory_time_integral_coverage_ratio",
+        "memory_time_integral_max_sample_gap_ms",
+        "cpu_per_turn_p50_ms",
+        "cpu_per_turn_p95_ms",
+        "cpu_class",
+    ] {
+        assert!(value.get(field).is_none(), "{field} must be omitted");
+    }
 }
 
 fn latency_turn(index: u32, start_ns: u64, wall_ns: u64) -> TurnObservation {
@@ -176,6 +223,16 @@ fn clean_per_invocation_hygiene(turns: u32) -> ProcessHygieneEvidence {
                 processes: Vec::new(),
             })
             .collect(),
+        growth_checkpoints: (0..=turns)
+            .map(|turn| ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: turn,
+                processes: Vec::new(),
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            })
+            .collect(),
         ..ProcessHygieneEvidence::default()
     })
 }
@@ -195,6 +252,24 @@ fn daemon_hygiene(
             sampled_wall_ns: 0,
             required_cadence_ns: 0,
         }],
+        growth_checkpoints: vec![
+            ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: 0,
+                processes: vec![hygiene_process(100, 10, 20)],
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            },
+            ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: 1,
+                processes: vec![hygiene_process(100, 10, 20)],
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            },
+        ],
         post_close_audits: vec![ProcessHygieneAudit {
             repetition: 1,
             turn_index: None,
@@ -315,20 +390,25 @@ fn process_hygiene_daemon_tolerances_are_inclusive_and_residue_is_strict() {
 fn process_hygiene_adjacent_increase_threshold_is_exact() {
     let with_counts = |counts: &[u32]| {
         let mut evidence = clean_per_invocation_hygiene(counts.len() as u32);
-        for (checkpoint, count) in evidence.checkpoints.iter_mut().zip(counts) {
+        for (checkpoint, count) in evidence.growth_checkpoints.iter_mut().skip(1).zip(counts) {
             let processes = (0..*count)
                 .map(|offset| hygiene_process(2_000 + checkpoint.turn_index * 10 + offset, 1, 1))
                 .collect::<Vec<_>>();
             checkpoint.processes.clone_from(&processes);
-            for sample in &mut checkpoint.cadence_samples {
-                sample.processes.clone_from(&processes);
-            }
         }
         evidence
     };
-    // K=4 has three adjacent pairs and fails at ceil(3/2)=2 increases.
-    assert!(evaluate_process_hygiene(&with_counts(&[1, 2, 1, 1]), 1, 4, true).passed);
-    assert!(!evaluate_process_hygiene(&with_counts(&[1, 2, 1, 2]), 1, 4, true).passed);
+    let first = evaluate_process_hygiene(&with_counts(&[1, 1, 1, 1]), 1, 4, true);
+    let second = evaluate_process_hygiene(&with_counts(&[1, 2, 1, 2]), 1, 4, true);
+    assert!(first.passed && second.passed, "growth is informational");
+    assert_eq!(
+        first.details["monotonic_growth_ok"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        second.details["monotonic_growth_ok"],
+        serde_json::json!(false)
+    );
 }
 
 #[test]
@@ -487,6 +567,36 @@ fn turn_latency_reference_envelope_includes_exact_edges_only() {
 }
 
 #[test]
+fn turn_latency_aggregates_repetitions_without_hiding_a_failed_repetition() {
+    let mut turns = Vec::new();
+    for (repetition, milliseconds) in [(1, 100_u64), (2, 300), (3, 500)] {
+        for index in 1..=5 {
+            let mut turn = latency_turn(index, 1_000, milliseconds * 1_000_000);
+            turn.repetition = repetition;
+            turns.push(turn);
+        }
+    }
+    let aggregate = evaluate_turn_latency_repetitions(&turns, 3, 5, false, 2_000);
+    assert!(aggregate.measurement_complete);
+    assert_eq!(aggregate.wall_per_turn_p50_ms, 300.0);
+    assert_eq!(aggregate.wall_per_turn_p95_ms, 300.0);
+    assert_eq!(aggregate.wall_per_turn_max_ms, 500.0);
+    assert_eq!(aggregate.latency_class, "L500");
+    assert!(aggregate.reference_envelope_pass);
+
+    turns[9] = {
+        let mut turn = latency_turn(5, 1_000, 2_000_000_000);
+        turn.repetition = 2;
+        turn
+    };
+    let failed = evaluate_turn_latency_repetitions(&turns, 3, 5, false, 2_000);
+    assert!(failed.measurement_complete);
+    assert_eq!(failed.wall_per_turn_p95_ms, 500.0);
+    assert_eq!(failed.wall_per_turn_max_ms, 2_000.0);
+    assert!(!failed.reference_envelope_pass);
+}
+
+#[test]
 fn per_invocation_turn_latency_requires_launch_and_exit_boundaries() {
     let complete = TurnObservation {
         repetition: 1,
@@ -515,7 +625,7 @@ fn per_invocation_turn_latency_requires_launch_and_exit_boundaries() {
 }
 
 #[test]
-fn turn_latency_missing_zero_or_timed_out_boundaries_are_measurement_errors() {
+fn turn_latency_missing_or_zero_boundaries_error_but_measured_timeout_fails_envelope() {
     let mut missing = latency_turn(1, 1_000, 10_000_000);
     missing.terminal_ns = None;
     assert!(!evaluate_turn_latency(&[missing], 1, false, 1_000).measurement_complete);
@@ -527,18 +637,14 @@ fn turn_latency_missing_zero_or_timed_out_boundaries_are_measurement_errors() {
         zero_evaluation
             .measurement_error
             .as_deref()
-            .is_some_and(|error| error.contains("p50 is zero"))
+            .is_some_and(|error| error.contains("invalid external wall interval"))
     );
 
     let timeout = latency_turn(1, 1_000, 1_000_000_000);
     let timeout_evaluation = evaluate_turn_latency(&[timeout], 1, false, 1_000);
-    assert!(!timeout_evaluation.measurement_complete);
-    assert!(
-        timeout_evaluation
-            .measurement_error
-            .as_deref()
-            .is_some_and(|error| error.contains("not below timeout"))
-    );
+    assert!(timeout_evaluation.measurement_complete);
+    assert!(!timeout_evaluation.reference_envelope_pass);
+    assert!(timeout_evaluation.measurement_error.is_none());
 }
 
 #[test]
@@ -725,6 +831,7 @@ fn badge_v2_adds_latency_without_an_empty_facet_segment() {
         spec_version: 2,
         os: "macos".to_owned(),
         topology: "client-process-fanout".to_owned(),
+        profile: "quick".to_owned(),
         parallel_width: 8,
         resource_class: "R96".to_owned(),
         latency_class: "L500".to_owned(),
@@ -771,7 +878,7 @@ fn unsupported_is_never_silently_passed() {
 }
 
 #[test]
-fn resource_class_is_derived_from_marginal_memory() {
+fn missing_g2_components_prevent_resource_only_badge() {
     let manifest = ahrb::manifest::load(std::path::Path::new("adapters/mock/manifest.toml"))
         .expect("load mock manifest");
     let results: Vec<_> = ahrb::scenarios::all()
@@ -795,15 +902,13 @@ fn resource_class_is_derived_from_marginal_memory() {
         &results,
         &manifest,
         "macos",
+        "quick",
         8,
         64.0 * 1024.0 * 1024.0,
         "L500",
         "C50",
     );
-    assert!(badge.is_some());
-    if let Some(badge) = badge {
-        assert!(badge_label(&badge).contains("R96"));
-    }
+    assert!(badge.is_none());
 }
 
 fn sample(elapsed_ns: u64, memory_mib: u64, cpu_ns: u64) -> Sample {

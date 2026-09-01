@@ -25,10 +25,10 @@ use crate::report::{
     Fingerprint, MembershipSample, MemoryTimeIntegralEvaluation, MemoryTimeIntegralEvidence,
     MemoryTimeIntegralSample, ProcessHygieneAudit, ProcessHygieneCadenceSample,
     ProcessHygieneCheckpoint, ProcessHygieneEvaluation, ProcessHygieneEvidence,
-    ProcessHygieneProcess, Report, ResourceSummary, TimeToFirstModelRequestEvaluation,
-    TopologyMetric, TurnLatencyEvaluation, TurnObservation, evaluate_memory_time_integral,
-    evaluate_process_hygiene, evaluate_time_to_first_model_request, evaluate_turn_latency,
-    render_resource_summary, summarize_resources,
+    ProcessHygieneProcess, Report, ReportDetails, ResourceSummary,
+    TimeToFirstModelRequestEvaluation, TopologyMetric, TurnLatencyEvaluation, TurnObservation,
+    evaluate_memory_time_integral, evaluate_process_hygiene, evaluate_time_to_first_model_request,
+    evaluate_turn_latency_repetitions, render_resource_summary, summarize_resources,
 };
 use crate::resource_certification::{
     CleanupObservation, ColdStartObservation, IdleObservation, IdlePhaseRepetition,
@@ -274,12 +274,12 @@ fn apply_turn_latency_summary(
     summary: &mut crate::report::ResourceSummary,
     evaluation: &TurnLatencyEvaluation,
 ) {
-    summary.wall_per_turn_p50_ms = evaluation.wall_per_turn_p50_ms;
-    summary.wall_per_turn_p95_ms = evaluation.wall_per_turn_p95_ms;
-    summary.wall_per_turn_max_ms = evaluation.wall_per_turn_max_ms;
-    summary.wall_per_turn_mad_ms = evaluation.wall_per_turn_mad_ms;
-    summary.wall_per_turn_jitter_ratio = evaluation.wall_per_turn_jitter_ratio;
-    summary.latency_class.clone_from(&evaluation.latency_class);
+    summary.wall_per_turn_p50_ms = Some(evaluation.wall_per_turn_p50_ms);
+    summary.wall_per_turn_p95_ms = Some(evaluation.wall_per_turn_p95_ms);
+    summary.wall_per_turn_max_ms = Some(evaluation.wall_per_turn_max_ms);
+    summary.wall_per_turn_mad_ms = Some(evaluation.wall_per_turn_mad_ms);
+    summary.wall_per_turn_jitter_ratio = Some(evaluation.wall_per_turn_jitter_ratio);
+    summary.latency_class = Some(evaluation.latency_class.clone());
 }
 
 fn turn_latency_resource_metrics(evaluation: &TurnLatencyEvaluation) -> BTreeMap<String, f64> {
@@ -558,10 +558,11 @@ fn write_interrupted_report(
         }
     }
     let automation = automation_score(&results);
-    let details = BTreeMap::from([
+    let details = ReportDetails::from(BTreeMap::from([
         (
             "automation-score".to_owned(),
             json!({
+                "profile": format!("{:?}", options.profile).to_lowercase(),
                 "topology": manifest.concurrency.topology.clone(),
                 "comparison_scope": "within-topology-only",
                 "score": automation.score,
@@ -571,7 +572,7 @@ fn write_interrupted_report(
             "resource-summary".to_owned(),
             json!({"measurement_complete": false}),
         ),
-    ]);
+    ]));
     let report = Report {
         schema: 3,
         spec_version: 2,
@@ -593,6 +594,7 @@ fn write_interrupted_report(
         details,
         resource_summary: ResourceSummary {
             topology: manifest.concurrency.topology.clone(),
+            profile: format!("{:?}", options.profile).to_lowercase(),
             comparison_scope: "within-topology-only".to_owned(),
             ..ResourceSummary::default()
         },
@@ -614,13 +616,18 @@ async fn run_inner(
         for definition in &selected {
             let capability = crate::matrix_evidence::capability_for_row(&manifest, definition.row);
             if let crate::matrix_evidence::CapabilityStatus::Unsupported(reason)
-            | crate::matrix_evidence::CapabilityStatus::Absent(reason) = capability
+            | crate::matrix_evidence::CapabilityStatus::Absent(reason) = &capability
             {
+                let declaration = match &capability {
+                    crate::matrix_evidence::CapabilityStatus::Unsupported(_) => Some(false),
+                    crate::matrix_evidence::CapabilityStatus::Absent(_) => None,
+                    crate::matrix_evidence::CapabilityStatus::Supported => Some(true),
+                };
                 let mut result = classify(
                     definition.row,
                     definition.id,
                     definition.pillar,
-                    Some(false),
+                    declaration,
                     &[],
                     None,
                 );
@@ -1848,15 +1855,15 @@ async fn run_inner(
             (
                 &left.request.scenario,
                 &left.request.actor,
-                &left.request.checkpoint,
                 left.semantic_ordinal,
+                &left.request.checkpoint,
                 left.attempt,
             )
                 .cmp(&(
                     &right.request.scenario,
                     &right.request.actor,
-                    &right.request.checkpoint,
                     right.semantic_ordinal,
+                    &right.request.checkpoint,
                     right.attempt,
                 ))
         });
@@ -1938,6 +1945,7 @@ async fn run_inner(
             .copied(),
     );
     resource_summary.topology = manifest.concurrency.topology.clone();
+    resource_summary.profile = format!("{:?}", options.profile).to_lowercase();
     resource_summary.comparison_scope = "within-topology-only".to_owned();
     enforce_sampler_overhead(
         &mut resource_certification.rows,
@@ -1948,36 +1956,50 @@ async fn run_inner(
         .filter(|record| record.request.actor.starts_with("r42"))
         .cloned()
         .collect::<Vec<_>>();
-    let row42_completed_turns = state
+    let mut row42_completed_turns = BTreeMap::from([(1_u32, 0_u64), (2_u32, 0_u64)]);
+    for event in state
         .events
         .get(&42)
         .into_iter()
         .flatten()
         .filter(|event| is_terminal(&event.event))
-        .count() as u64;
-    let row42_expected_turns = match options.profile {
-        Profile::Quick => 40,
-        Profile::Cert => 200,
+    {
+        if let Some(repetition) = event
+            .actor
+            .strip_prefix("ahrb-row42-r")
+            .and_then(|value| value.split(':').next())
+            .and_then(|value| value.parse::<u32>().ok())
+            && let Some(count) = row42_completed_turns.get_mut(&repetition)
+        {
+            *count = count.saturating_add(1);
+        }
+    }
+    let row42_expected_turns_per_repetition = match options.profile {
+        Profile::Quick => 20,
+        Profile::Cert => 100,
     };
-    let row42_evaluation = crate::fake_model::evaluate_model_request_efficiency(
+    let row42_evaluation = crate::fake_model::evaluate_model_request_efficiency_repetitions(
         &row42_records,
-        row42_completed_turns,
-        row42_expected_turns,
+        &row42_completed_turns,
+        row42_expected_turns_per_repetition,
     );
-    let row43_expected_turns = match options.profile {
+    let row43_turns_per_repetition = match options.profile {
         Profile::Quick => 100,
         Profile::Cert => 1_000,
     };
+    let row43_expected_repetitions =
+        ResourceTimingPlan::for_profile(ResourceProfile::from(options.profile)).repetitions;
     let row43_observations = row43_trials
         .as_ref()
         .map_or(&[][..], |trials| trials.turns.as_slice());
-    let row43_evaluation = evaluate_turn_latency(
+    let row43_evaluation = evaluate_turn_latency_repetitions(
         row43_observations,
-        row43_expected_turns,
+        row43_expected_repetitions,
+        row43_turns_per_repetition,
         per_invocation_topology(&manifest),
         manifest.resources.turn_timeout_ms,
     );
-    if selected_rows.contains(&43) {
+    if selected_rows.contains(&43) && row43_evaluation.measurement_complete {
         apply_turn_latency_summary(&mut resource_summary, &row43_evaluation);
     }
     let row45_expected_repetitions =
@@ -2101,7 +2123,7 @@ async fn run_inner(
                 as f64
         },
     );
-    if selected_rows.contains(&43) {
+    if selected_rows.contains(&43) && row43_evaluation.measurement_complete {
         resource_metric_values.extend(turn_latency_resource_metrics(&row43_evaluation));
     }
     if selected_rows.contains(&45) && row45_evaluation.measurement_complete {
@@ -2123,6 +2145,7 @@ async fn run_inner(
                 name.clone(),
                 TopologyMetric {
                     value: *value,
+                    profile: format!("{:?}", options.profile).to_lowercase(),
                     topology: manifest.concurrency.topology.clone(),
                     comparison_scope: "within-topology-only".to_owned(),
                 },
@@ -2160,10 +2183,10 @@ async fn run_inner(
             if value { 1.0 } else { 0.0 },
         );
     }
-    if selected_rows.contains(&42) {
+    if selected_rows.contains(&42) && row42_evaluation.measurement_complete {
         metrics.extend(row42_evaluation.metrics.clone());
     }
-    if selected_rows.contains(&44) {
+    if selected_rows.contains(&44) && row44_evaluation.measurement_complete {
         metrics.extend(row44_evaluation.metrics.clone());
     }
     if selected_rows.contains(&63) && row63_evaluation.measurement_complete {
@@ -2206,7 +2229,7 @@ async fn run_inner(
             ),
         ]));
     }
-    let mut details = BTreeMap::new();
+    let mut details = ReportDetails::default();
     if selected_rows.contains(&42) {
         details.insert(
             "model-request-efficiency".to_owned(),
@@ -2244,10 +2267,29 @@ async fn run_inner(
         );
     }
     let automation = automation_score(&results);
-    let automation_provisional = automation.provisional;
+    let automation_components_missing = automation.provisional;
+    details.insert(
+        "resource-summary".to_owned(),
+        json!({
+            "measurement_complete": (!selected_rows.contains(&43) || row43_evaluation.measurement_complete)
+                && (!selected_rows.contains(&45) || row45_evaluation.measurement_complete)
+                && (!selected_rows.contains(&46) || row46_evaluation.measurement_complete),
+            "latency_class": if selected_rows.contains(&43) && row43_evaluation.measurement_complete {
+                resource_summary.latency_class.clone()
+            } else {
+                None
+            },
+            "cpu_class": if selected_rows.contains(&46) {
+                resource_summary.cpu_class.clone()
+            } else {
+                None
+            },
+        }),
+    );
     details.insert(
         "automation-score".to_owned(),
         json!({
+            "profile": format!("{:?}", options.profile).to_lowercase(),
             "topology": manifest.concurrency.topology,
             "comparison_scope": "within-topology-only",
             "score": automation.score,
@@ -2263,9 +2305,13 @@ async fn run_inner(
         &results,
         &manifest,
         std::env::consts::OS,
+        &format!("{:?}", options.profile).to_lowercase(),
         state.parallel_agents,
         marginal_bytes,
-        &resource_summary.latency_class,
+        resource_summary
+            .latency_class
+            .as_deref()
+            .unwrap_or("unavailable"),
         resource_summary
             .cpu_class
             .as_deref()
@@ -2278,28 +2324,10 @@ async fn run_inner(
         }
     }
     let processes = process_observations(&state.samples);
-    let mut model_requests = request_records
+    let model_requests = request_records
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if model_requests.is_empty() {
-        for row_events in state.events.values() {
-            for event in row_events {
-                if event.event == EventVocab::ModelRequest {
-                    if event.payload.get("request").is_some() {
-                        model_requests.push(event.payload.clone());
-                    } else {
-                        model_requests.push(json!({
-                            "event": event,
-                            "model": event.payload.get("model").cloned().unwrap_or(Value::Null),
-                            "endpoint": event.payload.get("endpoint").cloned().unwrap_or(Value::Null),
-                            "credential_fingerprint": "embedded-redacted"
-                        }));
-                    }
-                }
-            }
-        }
-    }
     let report = Report {
         schema: 3,
         spec_version: 2,
@@ -2353,6 +2381,9 @@ async fn run_inner(
             });
             turns
         },
+        stream_chunks: Vec::new(),
+        filesystem_snapshots: Vec::new(),
+        egress_attempts: Vec::new(),
     };
     crate::results::persist_report(&persistence, &report, options.junit, false)?;
     println!("{}", render_resource_summary(&report.resource_summary));
@@ -2360,8 +2391,8 @@ async fn run_inner(
         Some(badge) => println!("badge {}", badge_label(badge)),
         None => println!("badge none"),
     }
-    if automation_provisional {
-        println!("badge_note A provisional until rows 65-72 are measured");
+    if automation_components_missing {
+        println!("badge_note A unavailable until rows 65-72 are measured");
     }
     Ok(suite_exit_code(
         &report.results,
@@ -2647,7 +2678,27 @@ fn make_driver(
     profile_root: &Path,
     gate_exec_launch: bool,
 ) -> Result<HarnessDriver> {
-    let timeout = Duration::from_millis(manifest.transport.timeout_ms);
+    make_driver_with_timeout(
+        manifest,
+        command,
+        environment,
+        variables,
+        profile_root,
+        gate_exec_launch,
+        Duration::from_millis(manifest.transport.timeout_ms),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_driver_with_timeout(
+    manifest: &Manifest,
+    command: &[String],
+    environment: &BTreeMap<String, String>,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+    gate_exec_launch: bool,
+    timeout: Duration,
+) -> Result<HarnessDriver> {
     if manifest.transport.kind == TransportKind::Exec {
         let first_command = resolve_local_program(&manifest.transport.command)?;
         let continuation = if manifest.sessions.continue_turn.is_empty() {
@@ -3366,13 +3417,14 @@ async fn collect_model_request_efficiency_trials(
         } else {
             render_argv(&manifest.transport.command, &variables)?
         };
-        let mut driver = make_driver(
+        let mut driver = make_driver_with_timeout(
             manifest,
             &command,
             &environment,
             &variables,
             &profile_root,
             collect_process_hygiene && per_invocation,
+            outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
         let mut hygiene_sampler = collect_process_hygiene.then(platform_sampler);
@@ -3391,6 +3443,18 @@ async fn collect_model_request_efficiency_trials(
             .create_session(&format!("{}:row42", workflow.scenario))
             .await?;
         let mut after = None;
+        if let Some(evidence) = process_hygiene.as_mut()
+            && per_invocation
+        {
+            evidence.growth_checkpoints.push(ProcessHygieneCheckpoint {
+                repetition,
+                turn_index: 0,
+                processes: Vec::new(),
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            });
+        }
         if collect_process_hygiene && !per_invocation {
             let warmup = workflow.actors.get(&hygiene_warmup_actor).ok_or_else(|| {
                 AhrbError::Protocol(format!(
@@ -3408,7 +3472,7 @@ async fn collect_model_request_efficiency_trials(
                 &mut driver,
                 &session,
                 after,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
+                outer_turn_timeout(manifest),
             )
             .await?;
             after = suffix
@@ -3429,14 +3493,16 @@ async fn collect_model_request_efficiency_trials(
                 &format!("row44-r{repetition}-warm-baseline"),
                 evidence,
             )?;
-            evidence.warm_baselines.push(ProcessHygieneCheckpoint {
+            let baseline = ProcessHygieneCheckpoint {
                 repetition,
                 turn_index: 0,
                 processes,
                 cadence_samples: Vec::new(),
                 sampled_wall_ns: 0,
                 required_cadence_ns: 0,
-            });
+            };
+            evidence.warm_baselines.push(baseline.clone());
+            evidence.growth_checkpoints.push(baseline);
         }
         let hygiene_cadence = Duration::from_millis(
             ResourceTimingPlan::for_profile(ResourceProfile::from(profile)).membership_cadence_ms,
@@ -3519,7 +3585,7 @@ async fn collect_model_request_efficiency_trials(
                 &mut driver,
                 &session,
                 after,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
+                outer_turn_timeout(manifest),
             )
             .await;
             let turn_collection = turn_sampler
@@ -3546,21 +3612,45 @@ async fn collect_model_request_efficiency_trials(
             }
             if let (Some(sampler), Some(evidence)) =
                 (hygiene_sampler.as_deref_mut(), process_hygiene.as_mut())
-                && per_invocation
             {
-                let (waited_ms, processes) = collect_process_hygiene_audit(
-                    sampler,
-                    &turn_roots,
-                    &format!("row44-r{repetition}-turn-{turn:03}-post-exit"),
-                    evidence,
-                )
-                .await?;
-                evidence.per_turn_audits.push(ProcessHygieneAudit {
-                    repetition,
-                    turn_index: Some(turn),
-                    waited_ms,
-                    processes,
-                });
+                if per_invocation {
+                    let (waited_ms, processes) = collect_process_hygiene_audit(
+                        sampler,
+                        &turn_roots,
+                        &format!("row44-r{repetition}-turn-{turn:03}-post-exit"),
+                        evidence,
+                    )
+                    .await?;
+                    evidence.per_turn_audits.push(ProcessHygieneAudit {
+                        repetition,
+                        turn_index: Some(turn),
+                        waited_ms,
+                        processes: processes.clone(),
+                    });
+                    evidence.growth_checkpoints.push(ProcessHygieneCheckpoint {
+                        repetition,
+                        turn_index: turn,
+                        processes,
+                        cadence_samples: Vec::new(),
+                        sampled_wall_ns: 0,
+                        required_cadence_ns: 0,
+                    });
+                } else {
+                    let processes = collect_process_hygiene_snapshot(
+                        sampler,
+                        &daemon_roots,
+                        &format!("row44-r{repetition}-turn-{turn:03}-post-terminal"),
+                        evidence,
+                    )?;
+                    evidence.growth_checkpoints.push(ProcessHygieneCheckpoint {
+                        repetition,
+                        turn_index: turn,
+                        processes,
+                        cadence_samples: Vec::new(),
+                        sampled_wall_ns: 0,
+                        required_cadence_ns: 0,
+                    });
+                }
             }
         }
         if collect_process_hygiene
@@ -3613,15 +3703,15 @@ async fn collect_model_request_efficiency_trials(
         (
             &left.request.scenario,
             &left.request.actor,
-            &left.request.checkpoint,
             left.semantic_ordinal,
+            &left.request.checkpoint,
             left.attempt,
         )
             .cmp(&(
                 &right.request.scenario,
                 &right.request.actor,
-                &right.request.checkpoint,
                 right.semantic_ordinal,
+                &right.request.checkpoint,
                 right.attempt,
             ))
     });
@@ -3632,9 +3722,9 @@ async fn collect_model_request_efficiency_trials(
     })
 }
 
-fn turn_latency_workflow(profile_root: &Path, turns: u32) -> Workflow {
-    let scenario = "ahrb-row43".to_owned();
-    let actor = "r43-latency".to_owned();
+fn turn_latency_workflow(profile_root: &Path, repetition: u32, turns: u32) -> Workflow {
+    let scenario = format!("ahrb-row43-r{repetition}");
+    let actor = format!("r43-latency-r{repetition}");
     let actors = BTreeMap::from([(
         actor.clone(),
         Actor {
@@ -3703,20 +3793,17 @@ async fn await_completed_turn_boundary(
     }
 }
 
-async fn collect_turn_latency_trials(
+async fn collect_turn_latency_repetition(
     manifest: &Manifest,
-    profile: Profile,
     run_profile_root: &Path,
     manifest_hash: &str,
+    repetition: u32,
+    turns: u32,
 ) -> Result<TurnLatencyTrials> {
-    let turns = match profile {
-        Profile::Quick => 100_u32,
-        Profile::Cert => 1_000_u32,
-    };
-    let profile_root = run_profile_root.join("derived-row43");
+    let profile_root = run_profile_root.join(format!("derived-row43-r{repetition}"));
     prepare_profile(manifest, &profile_root)
         .map_err(|error| AhrbError::Protocol(format!("prepare row-43 fresh profile: {error}")))?;
-    let workflow = turn_latency_workflow(&profile_root, turns);
+    let workflow = turn_latency_workflow(&profile_root, repetition, turns);
     let engine = Arc::new(FakeModelEngine::with_request_roles(
         &workflow,
         &manifest.model_roles,
@@ -3737,7 +3824,11 @@ async fn collect_turn_latency_trials(
         ),
         ("endpoint".to_owned(), String::new()),
     ]);
-    let credential = format!("ahrb-{}-row43-{}", &manifest_hash[..16], std::process::id());
+    let credential = format!(
+        "ahrb-{}-row43-r{repetition}-{}",
+        &manifest_hash[..16],
+        std::process::id()
+    );
     let mut environment = isolated_environment(manifest, &variables)?;
     environment.extend(model_environment);
     environment.insert(
@@ -3763,38 +3854,35 @@ async fn collect_turn_latency_trials(
     } else {
         render_argv(&manifest.transport.command, &variables)?
     };
-    let mut driver = make_driver(
+    let mut driver = make_driver_with_timeout(
         manifest,
         &command,
         &environment,
         &variables,
         &profile_root,
         false,
+        outer_turn_timeout(manifest),
     )?;
     driver.start().await?;
     let session = driver
         .create_session(&format!("{}:row43", workflow.scenario))
         .await?;
     let session_id_hash = stable_evidence_hash(&session.0);
-    let actor = "r43-latency";
+    let actor = format!("r43-latency-r{repetition}");
+    let outer_timeout = outer_turn_timeout(manifest);
     let mut events = Vec::new();
     let mut observations = Vec::with_capacity(turns as usize);
     let warmup_prompt = workflow
         .actors
-        .get(actor)
+        .get(&actor)
         .map(|actor| actor.prompt.as_str())
         .ok_or_else(|| AhrbError::Protocol("row-43 actor disappeared".to_owned()))?;
     let warmup_boundary_count = driver.completed_turn_boundaries().len();
     driver
         .submit(&session, warmup_prompt, "row-43-warmup")
         .await?;
-    let warmup_events = collect_session_terminal(
-        &mut driver,
-        &session,
-        None,
-        Duration::from_millis(manifest.resources.turn_timeout_ms),
-    )
-    .await?;
+    let warmup_events =
+        collect_session_terminal(&mut driver, &session, None, outer_timeout).await?;
     let mut after = warmup_events.iter().map(|event| Cursor(event.cursor)).max();
     let warmup_terminals = warmup_events
         .iter()
@@ -3815,14 +3903,14 @@ async fn collect_turn_latency_trials(
             &session,
             after,
             warmup_boundary_count,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
+            outer_timeout,
         )
         .await?;
     }
     for turn in 1..=turns {
         let prompt = format!(
             "AHRB turn latency direct terminal turn {turn} {}",
-            route_marker(&workflow.scenario, actor, &format!("turn-{turn:04}"))
+            route_marker(&workflow.scenario, &actor, &format!("turn-{turn:04}"))
         );
         let previous_boundary_count = driver.completed_turn_boundaries().len();
         let submit_ns = monotonic_timestamp_ns();
@@ -3833,7 +3921,7 @@ async fn collect_turn_latency_trials(
             &mut driver,
             &session,
             after,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
+            outer_timeout,
             Duration::from_millis(1),
         )
         .await?;
@@ -3850,7 +3938,7 @@ async fn collect_turn_latency_trials(
                 &session,
                 after,
                 previous_boundary_count,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
+                outer_timeout,
             )
             .await?;
             let wall_ns = boundary
@@ -3867,9 +3955,9 @@ async fn collect_turn_latency_trials(
             (None, None, wall_ns)
         };
         observations.push(TurnObservation {
-            repetition: 1,
+            repetition,
             turn_index: turn,
-            actor: actor.to_owned(),
+            actor: actor.clone(),
             session_id_hash: session_id_hash.clone(),
             phase: "turn-latency".to_owned(),
             launch_ns,
@@ -3930,6 +4018,57 @@ async fn collect_turn_latency_trials(
         requests,
         turns: observations,
     })
+}
+
+async fn collect_turn_latency_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<TurnLatencyTrials> {
+    let turns = match profile {
+        Profile::Quick => 100_u32,
+        Profile::Cert => 1_000_u32,
+    };
+    let repetitions = ResourceTimingPlan::for_profile(ResourceProfile::from(profile)).repetitions;
+    let mut combined = TurnLatencyTrials {
+        events: Vec::new(),
+        requests: Vec::new(),
+        turns: Vec::new(),
+    };
+    for repetition in 1..=repetitions {
+        let trial = collect_turn_latency_repetition(
+            manifest,
+            run_profile_root,
+            manifest_hash,
+            repetition,
+            turns,
+        )
+        .await?;
+        combined.events.extend(trial.events);
+        combined.requests.extend(trial.requests);
+        combined.turns.extend(trial.turns);
+    }
+    combined.requests.sort_by(|left, right| {
+        (
+            &left.request.scenario,
+            &left.request.actor,
+            left.semantic_ordinal,
+            &left.request.checkpoint,
+            left.attempt,
+        )
+            .cmp(&(
+                &right.request.scenario,
+                &right.request.actor,
+                right.semantic_ordinal,
+                &right.request.checkpoint,
+                right.attempt,
+            ))
+    });
+    combined
+        .turns
+        .sort_by_key(|turn| (turn.repetition, turn.turn_index));
+    Ok(combined)
 }
 
 fn time_to_first_model_request_workflow(profile_root: &Path, repetition: u32) -> Workflow {
@@ -4040,13 +4179,14 @@ async fn collect_time_to_first_model_request_trials(
         } else {
             render_argv(&manifest.transport.command, &variables)?
         };
-        let mut driver = make_driver(
+        let mut driver = make_driver_with_timeout(
             manifest,
             &command,
             &environment,
             &variables,
             &profile_root,
             false,
+            outer_turn_timeout(manifest),
         )?;
         let daemon_launch_ns = (!per_invocation).then(monotonic_timestamp_ns);
         driver.start().await?;
@@ -4063,7 +4203,7 @@ async fn collect_time_to_first_model_request_trials(
             &mut driver,
             &session,
             None,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
+            outer_turn_timeout(manifest),
             Duration::from_millis(1),
         )
         .await?;
@@ -4085,7 +4225,7 @@ async fn collect_time_to_first_model_request_trials(
                     &session,
                     None,
                     previous_boundary_count,
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
+                    outer_turn_timeout(manifest),
                 )
                 .await?,
             )
@@ -4160,15 +4300,15 @@ async fn collect_time_to_first_model_request_trials(
         (
             &left.request.scenario,
             &left.request.actor,
-            &left.request.checkpoint,
             left.semantic_ordinal,
+            &left.request.checkpoint,
             left.attempt,
         )
             .cmp(&(
                 &right.request.scenario,
                 &right.request.actor,
-                &right.request.checkpoint,
                 right.semantic_ordinal,
+                &right.request.checkpoint,
                 right.attempt,
             ))
     });
@@ -4605,13 +4745,14 @@ async fn collect_determinism_trials(
         } else {
             render_argv(&manifest.transport.command, &variables)?
         };
-        let mut driver = make_driver(
+        let mut driver = make_driver_with_timeout(
             manifest,
             &command,
             &environment,
             &variables,
             &profile_root,
             false,
+            outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
         let mut execution_events = Vec::new();
@@ -4631,13 +4772,9 @@ async fn collect_determinism_trials(
                     &format!("row-63-run-{execution}-{actor_name}"),
                 )
                 .await?;
-            let events = collect_session_terminal(
-                &mut driver,
-                &session,
-                None,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
-            )
-            .await?;
+            let events =
+                collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(manifest))
+                    .await?;
             if events
                 .iter()
                 .filter(|event| is_terminal(&event.event))
@@ -4718,15 +4855,15 @@ async fn collect_determinism_trials(
         (
             &left.request.scenario,
             &left.request.actor,
-            &left.request.checkpoint,
             left.semantic_ordinal,
+            &left.request.checkpoint,
             left.attempt,
         )
             .cmp(&(
                 &right.request.scenario,
                 &right.request.actor,
-                &right.request.checkpoint,
                 right.semantic_ordinal,
+                &right.request.checkpoint,
                 right.attempt,
             ))
     });
@@ -4822,13 +4959,14 @@ async fn collect_memory_time_integral_trials(
         } else {
             render_argv(&manifest.transport.command, &variables)?
         };
-        let mut driver = make_driver(
+        let mut driver = make_driver_with_timeout(
             manifest,
             &command,
             &environment,
             &variables,
             &profile_root,
             per_invocation,
+            outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
         let daemon_roots = if per_invocation {
@@ -4866,21 +5004,13 @@ async fn collect_memory_time_integral_trials(
             sampler.set_roots(&roots)?;
             let sampling_boundary = monotonic_timestamp_ns();
             sampler
-                .wait_for_sample_after(
-                    sampling_boundary,
-                    true,
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
-                )
+                .wait_for_sample_after(sampling_boundary, true, outer_turn_timeout(manifest))
                 .await?;
             driver.release_invocations().await?;
         }
-        let warmup_events = collect_session_terminal(
-            &mut driver,
-            &session,
-            None,
-            Duration::from_millis(manifest.resources.turn_timeout_ms),
-        )
-        .await?;
+        let warmup_events =
+            collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(manifest))
+                .await?;
         let mut after = warmup_events.iter().map(|event| Cursor(event.cursor)).max();
         if per_invocation {
             let boundary = await_completed_turn_boundary(
@@ -4888,16 +5018,12 @@ async fn collect_memory_time_integral_trials(
                 &session,
                 after,
                 warmup_boundary_count,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
+                outer_turn_timeout(manifest),
             )
             .await?;
             sampler.set_roots(&[])?;
             sampler
-                .wait_for_sample_after(
-                    boundary.exit_ns,
-                    false,
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
-                )
+                .wait_for_sample_after(boundary.exit_ns, false, outer_turn_timeout(manifest))
                 .await?;
         }
         if warmup_events
@@ -4918,11 +5044,7 @@ async fn collect_memory_time_integral_trials(
             tokio::time::sleep(Duration::from_millis(plan.idle_baseline_ms)).await;
             let baseline_end_ns = monotonic_timestamp_ns();
             sampler
-                .wait_for_sample_after(
-                    baseline_end_ns,
-                    true,
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
-                )
+                .wait_for_sample_after(baseline_end_ns, true, outer_turn_timeout(manifest))
                 .await?;
             let mut baseline_values = sampler
                 .snapshot()?
@@ -4975,11 +5097,7 @@ async fn collect_memory_time_integral_trials(
                 sampler.set_roots(&roots)?;
                 let sampling_boundary = monotonic_timestamp_ns();
                 sampler
-                    .wait_for_sample_after(
-                        sampling_boundary,
-                        true,
-                        Duration::from_millis(manifest.resources.turn_timeout_ms),
-                    )
+                    .wait_for_sample_after(sampling_boundary, true, outer_turn_timeout(manifest))
                     .await?;
                 driver.release_invocations().await?;
             }
@@ -4987,7 +5105,7 @@ async fn collect_memory_time_integral_trials(
                 &mut driver,
                 &session,
                 after,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
+                outer_turn_timeout(manifest),
                 Duration::from_millis(1),
             )
             .await?;
@@ -5015,7 +5133,7 @@ async fn collect_memory_time_integral_trials(
                         &session,
                         after,
                         previous_boundary_count,
-                        Duration::from_millis(manifest.resources.turn_timeout_ms),
+                        outer_turn_timeout(manifest),
                     )
                     .await?,
                 )
@@ -5035,11 +5153,7 @@ async fn collect_memory_time_integral_trials(
                     (None, None, terminal_ns.checked_sub(submit_ns), terminal_ns)
                 };
             sampler
-                .wait_for_sample_after(
-                    sample_after_ns,
-                    false,
-                    Duration::from_millis(manifest.resources.turn_timeout_ms),
-                )
+                .wait_for_sample_after(sample_after_ns, false, outer_turn_timeout(manifest))
                 .await?;
             evidence.turns.push(TurnObservation {
                 repetition,
@@ -5092,15 +5206,15 @@ async fn collect_memory_time_integral_trials(
         (
             &left.request.scenario,
             &left.request.actor,
-            &left.request.checkpoint,
             left.semantic_ordinal,
+            &left.request.checkpoint,
             left.attempt,
         )
             .cmp(&(
                 &right.request.scenario,
                 &right.request.actor,
-                &right.request.checkpoint,
                 right.semantic_ordinal,
+                &right.request.checkpoint,
                 right.attempt,
             ))
     });
@@ -5741,6 +5855,10 @@ fn is_terminal(event: &EventVocab) -> bool {
     )
 }
 
+fn outer_turn_timeout(manifest: &Manifest) -> Duration {
+    Duration::from_millis(manifest.resources.turn_timeout_ms.saturating_add(3_000))
+}
+
 fn fixture_effect_matches(
     profile_root: &Path,
     state: &RunState,
@@ -5813,16 +5931,20 @@ fn evaluate_rows(
                 capability,
                 crate::matrix_evidence::CapabilityStatus::Supported
             ) {
-                let reason = match capability {
-                    crate::matrix_evidence::CapabilityStatus::Unsupported(reason)
-                    | crate::matrix_evidence::CapabilityStatus::Absent(reason) => reason,
-                    crate::matrix_evidence::CapabilityStatus::Supported => String::new(),
+                let (declaration, reason) = match capability {
+                    crate::matrix_evidence::CapabilityStatus::Unsupported(reason) => {
+                        (Some(false), reason)
+                    }
+                    crate::matrix_evidence::CapabilityStatus::Absent(reason) => (None, reason),
+                    crate::matrix_evidence::CapabilityStatus::Supported => {
+                        (Some(true), String::new())
+                    }
                 };
                 let mut result = classify(
                     definition.row,
                     definition.id,
                     definition.pillar,
-                    Some(false),
+                    declaration,
                     &[],
                     None,
                 );
@@ -8102,15 +8224,17 @@ async fn run_long_horizon(
     driver.close(&session).await?;
     let closed_session_id = Some(session.0.clone());
     let final_post_close_phase = format!("resource-r{}-long-final", identity.repetition);
+    // The quick profile's generic 100 ms discard can straddle delayed allocator
+    // reclamation after a 100-turn session on macOS. Keep the normative trailing
+    // steady window unchanged, but collect a full second of discardable,
+    // out-of-band post-close evidence before it so a reclaim step is not
+    // misclassified as an unstable steady plateau.
+    let final_discard_ms = timing.barrier_discard_ms.max(1_000);
     collector
         .sample_phase(
             roots,
             &final_post_close_phase,
-            Duration::from_millis(
-                timing
-                    .barrier_discard_ms
-                    .saturating_add(timing.barrier_steady_ms),
-            ),
+            Duration::from_millis(final_discard_ms.saturating_add(timing.barrier_steady_ms)),
         )
         .await?;
     let final_plateau = collector.series.trailing_plateau(
@@ -8912,6 +9036,24 @@ mod resource_sampler_tests {
             waited_ms: 2_000,
             processes: Vec::new(),
         });
+        evidence.growth_checkpoints.extend([
+            ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: 0,
+                processes: Vec::new(),
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            },
+            ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: 1,
+                processes: Vec::new(),
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            },
+        ]);
         let evaluation = evaluate_process_hygiene(&evidence, 1, 1, true);
         assert!(
             evaluation.measurement_complete,
@@ -8970,8 +9112,26 @@ mod resource_sampler_tests {
             repetition: 1,
             turn_index: Some(1),
             waited_ms,
-            processes: residue,
+            processes: residue.clone(),
         });
+        evidence.growth_checkpoints.extend([
+            ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: 0,
+                processes: Vec::new(),
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            },
+            ProcessHygieneCheckpoint {
+                repetition: 1,
+                turn_index: 1,
+                processes: residue,
+                cadence_samples: Vec::new(),
+                sampled_wall_ns: 0,
+                required_cadence_ns: 0,
+            },
+        ]);
 
         let group = i32::try_from(root_pid).expect("fixture PID fits pid_t");
         // SAFETY: `process_group(0)` above made the just-spawned leader's PID the

@@ -151,7 +151,7 @@ fn capability_resolution_treats_missing_operations_as_unsupported() {
 }
 
 #[test]
-fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
+fn unsupported_operation_is_nonfatal_but_missing_g2_rows_suppress_v2_badge() {
     let mut reduced_manifest = manifest();
     reduced_manifest
         .capabilities
@@ -178,19 +178,21 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
             ),
         })
         .collect::<Vec<_>>();
-    let badge = certify(&results, &reduced_manifest, "macos", 8, 1.0, "L100", "C10")
-        .expect("unsupported facet does not suppress badge");
+    let badge = certify(
+        &results,
+        &reduced_manifest,
+        "macos",
+        "quick",
+        8,
+        1.0,
+        "L100",
+        "C10",
+    );
     assert_eq!(
-        suite_exit_code(&results, Some(&badge), &reduced_manifest),
+        suite_exit_code(&results, badge.as_ref(), &reduced_manifest),
         0
     );
-    assert!(
-        !badge
-            .facets
-            .iter()
-            .any(|facet| facet == "native-delegation")
-    );
-    assert!(badge.facets.iter().any(|facet| facet == "queue"));
+    assert!(badge.is_none(), "missing rows 65-72 make A unavailable");
 
     let core_unsupported = results
         .iter()
@@ -211,6 +213,7 @@ fn unsupported_operation_is_nonfatal_and_omitted_from_badge_facets() {
             &core_unsupported,
             &reduced_manifest,
             "macos",
+            "quick",
             8,
             1.0,
             "L100",

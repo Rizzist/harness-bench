@@ -104,7 +104,8 @@ impl TestResultMetadata {
             }
             Some(RequirementKind::Informational) => ("informational", None),
         };
-        let measurement_complete = !matches!(outcome, TestOutcome::Error(_));
+        let measurement_complete =
+            !matches!(outcome, TestOutcome::Error(_) | TestOutcome::Absent(_));
         let informational = matches!(
             crate::scenarios::all()
                 .iter()
@@ -134,6 +135,9 @@ pub struct Badge {
     pub os: String,
     /// Process topology label.
     pub topology: String,
+    /// Quick or certification profile for every badge component.
+    #[serde(default)]
+    pub profile: String,
     /// Certified parallel width.
     pub parallel_width: usize,
     /// Resource class such as R32 or R256+.
@@ -167,20 +171,26 @@ pub struct AutomationScoreEvaluation {
 
 /// Compute the deterministic equal-weight G2 score.
 ///
-/// Missing, ABSENT, FAIL-without-a-subscore, and UNSUPPORTED components map to
-/// zero. A valid partial subscore remains meaningful on FAIL. Any ERROR,
-/// incomplete observation, non-finite subscore, or out-of-range subscore makes
-/// the composite unavailable.
+/// A verified UNSUPPORTED component maps to zero. Missing, ABSENT, ERROR,
+/// incomplete, invalid, or missing required component scores make the composite
+/// unavailable. Complete graded PASS/FAIL rows use their explicit score; boolean
+/// rows 71 and 72 map PASS/FAIL to one/zero.
 pub fn automation_score(results: &[TestResult]) -> AutomationScoreEvaluation {
     let mut components = BTreeMap::new();
     let mut provisional = false;
     for row in 65..=72 {
         let Some(result) = result_for_row(results, row) else {
             provisional = true;
-            components.insert(row, 0.0);
-            continue;
+            return AutomationScoreEvaluation {
+                score: None,
+                provisional,
+                components,
+            };
         };
-        if matches!(result.outcome, TestOutcome::Error(_)) || !result.metadata.measurement_complete
+        if matches!(
+            result.outcome,
+            TestOutcome::Error(_) | TestOutcome::Absent(_)
+        ) || !result.metadata.measurement_complete
         {
             return AutomationScoreEvaluation {
                 score: None,
@@ -189,12 +199,33 @@ pub fn automation_score(results: &[TestResult]) -> AutomationScoreEvaluation {
             };
         }
         let value = match result.outcome {
-            TestOutcome::Unsupported(_) | TestOutcome::Absent(_) => 0.0,
+            TestOutcome::Unsupported(_) if matches!(row, 65 | 66 | 67 | 68 | 70) => 0.0,
+            TestOutcome::Unsupported(_) => {
+                return AutomationScoreEvaluation {
+                    score: None,
+                    provisional,
+                    components,
+                };
+            }
             TestOutcome::Pass if matches!(row, 71 | 72) => 1.0,
             TestOutcome::Fail(_) if matches!(row, 71 | 72) => 0.0,
-            TestOutcome::Pass => result.metadata.score.unwrap_or(1.0),
-            TestOutcome::Fail(_) => result.metadata.score.unwrap_or(0.0),
-            TestOutcome::Error(_) => 0.0,
+            TestOutcome::Pass | TestOutcome::Fail(_) => {
+                let Some(score) = result.metadata.score else {
+                    return AutomationScoreEvaluation {
+                        score: None,
+                        provisional,
+                        components,
+                    };
+                };
+                score
+            }
+            TestOutcome::Error(_) | TestOutcome::Absent(_) => {
+                return AutomationScoreEvaluation {
+                    score: None,
+                    provisional,
+                    components,
+                };
+            }
         };
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return AutomationScoreEvaluation {
@@ -318,6 +349,31 @@ pub fn mandatory_passes(results: &[TestResult], manifest: &Manifest) -> bool {
             })
 }
 
+fn optional_rows_satisfied(results: &[TestResult], manifest: &Manifest) -> bool {
+    crate::scenarios::all()
+        .iter()
+        .filter(|definition| {
+            matches!(
+                definition.requirement(),
+                RequirementKind::OptionalFacet { .. }
+            )
+        })
+        .all(|definition| {
+            let Some(result) = result_for_row(results, definition.row) else {
+                return false;
+            };
+            match crate::matrix_evidence::capability_for_row(manifest, definition.row) {
+                crate::matrix_evidence::CapabilityStatus::Supported => {
+                    matches!(result.outcome, TestOutcome::Pass)
+                }
+                crate::matrix_evidence::CapabilityStatus::Unsupported(_) => {
+                    optional_unsupported_is_honest(manifest, result)
+                }
+                crate::matrix_evidence::CapabilityStatus::Absent(_) => false,
+            }
+        })
+}
+
 fn badge_compatible_results(results: &[TestResult], manifest: &Manifest) -> bool {
     results.iter().all(|result| {
         if matches!(result.outcome, TestOutcome::Pass) {
@@ -341,29 +397,34 @@ fn badge_compatible_results(results: &[TestResult], manifest: &Manifest) -> bool
                 matches!(definition.requirement(), RequirementKind::Informational)
             });
         (informational && matches!(result.outcome, TestOutcome::Fail(_)))
+            || (result.row == 65
+                && result.metadata.measurement_complete
+                && matches!(result.outcome, TestOutcome::Unsupported(_)))
             || optional_unsupported_is_honest(manifest, result)
     })
 }
 
 /// Construct a topology-relative badge only when every CORE row passed and
-/// every other observed row either passed or was an honestly absent facet.
+/// every implemented optional row passed or was honestly undeclared.
+#[allow(clippy::too_many_arguments)]
 pub fn certify(
     results: &[TestResult],
     manifest: &Manifest,
     os: &str,
+    profile: &str,
     parallel_width: usize,
     marginal_bytes: f64,
     latency_class: &str,
     cpu_class: &str,
 ) -> Option<Badge> {
     let automation = automation_score(results);
-    // Quick certification uses the required N=1,2,4 sweep; the full certification
-    // profile reports N=8. The width remains explicit in every badge label.
-    if parallel_width < 4
+    if manifest.identity.schema != 2
+        || parallel_width < 8
         || !matches!(latency_class, "L100" | "L250" | "L500" | "L1000" | "L1000+")
         || !matches!(cpu_class, "C10" | "C50" | "C250" | "C250+")
         || automation.score.is_none()
         || !mandatory_passes(results, manifest)
+        || !optional_rows_satisfied(results, manifest)
         || !badge_compatible_results(results, manifest)
     {
         return None;
@@ -414,6 +475,7 @@ pub fn certify(
         spec_version: 2,
         os: os.to_owned(),
         topology: manifest.concurrency.topology.clone(),
+        profile: profile.to_owned(),
         parallel_width,
         resource_class: resource_class.to_owned(),
         latency_class: latency_class.to_owned(),
@@ -502,7 +564,7 @@ mod automation_tests {
     }
 
     #[test]
-    fn absent_fail_unsupported_and_missing_have_deterministic_scores() {
+    fn absent_missing_or_missing_required_scores_make_composite_unavailable() {
         let results = vec![
             component(65, TestOutcome::Fail("no subscore".to_owned()), None),
             component(66, TestOutcome::Fail("partial".to_owned()), Some(0.5)),
@@ -514,13 +576,9 @@ mod automation_tests {
             ),
         ];
         let evaluation = automation_score(&results);
-        assert_eq!(evaluation.score, Some(6));
-        assert!(evaluation.provisional);
-        assert_eq!(evaluation.components[&65], 0.0);
-        assert_eq!(evaluation.components[&66], 0.5);
-        assert_eq!(evaluation.components[&67], 0.0);
-        assert_eq!(evaluation.components[&68], 0.0);
-        assert_eq!(evaluation.components[&72], 0.0);
+        assert_eq!(evaluation.score, None);
+        assert!(!evaluation.provisional);
+        assert!(evaluation.components.is_empty());
     }
 
     #[test]
@@ -542,5 +600,13 @@ mod automation_tests {
         assert!(!event_stream_reference_envelope([
             true, false, true, true, true, true
         ]));
+    }
+
+    #[test]
+    fn badge_rejects_omitted_implemented_optional_rows() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/mock/manifest.toml");
+        let manifest = crate::manifest::load(&path).expect("mock manifest should load");
+        assert!(!optional_rows_satisfied(&[], &manifest));
     }
 }

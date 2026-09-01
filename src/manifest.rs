@@ -703,9 +703,9 @@ pub struct DoctorReport {
 
 /// Validate invariants that can be checked without starting a harness.
 pub fn validate(manifest: &Manifest) -> Result<()> {
-    if manifest.identity.schema != 1 {
+    if !matches!(manifest.identity.schema, 1 | 2) {
         return Err(AhrbError::Validation(format!(
-            "unsupported manifest schema {} (expected 1)",
+            "unsupported manifest schema {} (expected 1 or 2)",
             manifest.identity.schema
         )));
     }

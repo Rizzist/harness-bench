@@ -270,7 +270,7 @@ fn results_by_id(results: &[TestResult]) -> Result<BTreeMap<String, &TestResult>
 fn requirement_for(result: &TestResult) -> RequirementKind {
     crate::scenarios::all()
         .iter()
-        .find(|definition| definition.id == result.id || definition.row == result.row)
+        .find(|definition| definition.id == result.id)
         .map_or_else(
             || match result.metadata.requirement.as_str() {
                 "informational" => RequirementKind::Informational,
@@ -312,6 +312,23 @@ fn row_change(
     };
     let before_class = outcome_label(&before.outcome);
     let after_class = outcome_label(&after.outcome);
+    if matches!(requirement, RequirementKind::OptionalFacet { .. }) {
+        let before_declared = optional_capability_declared(before);
+        let after_declared = optional_capability_declared(after);
+        if before_declared == Some(false) && after_declared == Some(true) {
+            return if after_class == "PASS" {
+                ("facet-added", false)
+            } else {
+                ("facet-added-nonpass", false)
+            };
+        }
+        if before_declared == Some(true)
+            && after_declared == Some(false)
+            && after_class == "UNSUPPORTED"
+        {
+            return ("facet-removed", before_class == "PASS");
+        }
+    }
     if before_class == after_class {
         return ("unchanged", false);
     }
@@ -319,6 +336,13 @@ fn row_change(
         return informational_change(before_class, after_class);
     }
     if matches!(requirement, RequirementKind::OptionalFacet { .. }) {
+        if before_class == "UNSUPPORTED"
+            && optional_capability_declared(before) == Some(false)
+            && optional_capability_declared(after) == Some(true)
+            && after_class != "PASS"
+        {
+            return ("facet-added-nonpass", false);
+        }
         if before_class == "UNSUPPORTED" && after_class == "PASS" {
             return if optional_capability_declared(before) == Some(false) {
                 ("facet-added", false)
@@ -346,7 +370,7 @@ fn row_change(
 }
 
 fn optional_capability_declared(result: &TestResult) -> Option<bool> {
-    result.evidence.iter().find_map(|evidence| {
+    let evidence = result.evidence.iter().find_map(|evidence| {
         let detail = evidence.strip_prefix("capability: capability ")?;
         if detail.ends_with(" is not declared by this architecture") {
             Some(false)
@@ -355,7 +379,8 @@ fn optional_capability_declared(result: &TestResult) -> Option<bool> {
         } else {
             None
         }
-    })
+    });
+    evidence.or_else(|| (!matches!(result.outcome, TestOutcome::Unsupported(_))).then_some(true))
 }
 
 fn informational_change(before: &str, after: &str) -> (&'static str, bool) {
@@ -364,6 +389,8 @@ fn informational_change(before: &str, after: &str) -> (&'static str, bool) {
         ("FAIL", "PASS") => ("informational-improvement", false),
         ("PASS" | "FAIL", "ERROR" | "ABSENT") => ("evidence-regression", false),
         ("ERROR" | "ABSENT", "PASS" | "FAIL") => ("evidence-improvement", false),
+        ("PASS" | "FAIL", "UNSUPPORTED") => ("evidence-regression", false),
+        ("UNSUPPORTED", "PASS" | "FAIL") => ("evidence-improvement", false),
         ("ERROR", "ABSENT") | ("ABSENT", "ERROR") => ("changed-nonpass", false),
         _ => ("changed-nonpass", false),
     }
@@ -384,16 +411,46 @@ const RESOURCE_FIELDS: &[&str] = &[
     "cpu_per_turn_p50_ms",
     "cpu_per_turn_p95_ms",
     "cpu_total_s",
+    "disk_write_bytes_per_turn_max",
+    "disk_write_bytes_per_turn_p50",
+    "disk_write_bytes_per_turn_p95",
+    "disk_write_growth_slope_bytes_per_turn2",
+    "fairness_latency_cv",
+    "fairness_latency_max_min_ratio",
+    "fairness_latency_spread_ms",
+    "fairness_starved_agents",
+    "fanout_cliff_n_rss",
+    "fanout_cliff_n_wall",
+    "fanout_global_rss_alpha",
+    "fanout_max_local_rss_alpha",
+    "fanout_max_local_wall_alpha",
+    "fanout_max_measured_n",
     "idle_rss_mib",
+    "latency_last_first_decile_ratio",
+    "latency_slope_ms_per_100_turns",
+    "log_growth_bytes_per_turn",
     "mean_rss_mib",
     "median_rss_mib",
     "memory_time_integral_coverage_ratio",
     "memory_time_integral_max_sample_gap_ms",
     "memory_time_integral_mib_s_per_turn",
+    "model_wait_cpu_one_core_max_ratio",
+    "model_wait_cpu_p50_ms",
+    "model_wait_wall_p50_ms",
     "parallel_beta_mib_per_agent",
     "peak_rss_mib",
     "sampler_overhead_pct",
     "scaling_alpha",
+    "session_journal_growth_bytes_per_turn",
+    "session_residue_final_mib",
+    "session_residue_slope_mib_per_session",
+    "session_store_byte_slope_per_session",
+    "session_store_file_count_slope_per_session",
+    "session_store_final_residue_bytes",
+    "session_store_final_residue_files",
+    "resume_latency_p50_ms",
+    "resume_latency_p95_ms",
+    "resume_latency_slope_ms_per_turn",
     "time_to_first_model_request_max_ms",
     "time_to_first_model_request_p50_ms",
     "time_to_first_model_request_p95_ms",
@@ -410,14 +467,10 @@ fn compare_resources(
     right: &serde_json::Value,
     comparable: bool,
 ) -> BTreeMap<String, ResourceDelta> {
-    let left_available = resource_summary_available(left);
-    let right_available = resource_summary_available(right);
     let mut deltas = BTreeMap::new();
     for field in RESOURCE_FIELDS {
-        let before = left_available.then(|| numeric_field(left, field)).flatten();
-        let after = right_available
-            .then(|| numeric_field(right, field))
-            .flatten();
+        let before = numeric_field(left, field);
+        let after = numeric_field(right, field);
         let value = if !comparable {
             ResourceDelta {
                 before,
@@ -480,6 +533,37 @@ fn resource_field_id(field: &str) -> Option<&'static str> {
         | "memory_time_integral_max_sample_gap_ms"
         | "cpu_per_turn_p50_ms"
         | "cpu_per_turn_p95_ms" => Some("memory-time-integral"),
+        "disk_write_bytes_per_turn_p50"
+        | "disk_write_bytes_per_turn_p95"
+        | "disk_write_bytes_per_turn_max"
+        | "session_journal_growth_bytes_per_turn"
+        | "log_growth_bytes_per_turn"
+        | "disk_write_growth_slope_bytes_per_turn2" => Some("disk-io-per-turn"),
+        "model_wait_cpu_p50_ms"
+        | "model_wait_wall_p50_ms"
+        | "model_wait_cpu_one_core_max_ratio" => Some("model-wait-cpu"),
+        "latency_slope_ms_per_100_turns" | "latency_last_first_decile_ratio" => {
+            Some("latency-vs-turn-index")
+        }
+        "session_residue_slope_mib_per_session"
+        | "session_residue_final_mib"
+        | "session_store_byte_slope_per_session"
+        | "session_store_file_count_slope_per_session"
+        | "session_store_final_residue_bytes"
+        | "session_store_final_residue_files" => Some("session-residue-sweep"),
+        "resume_latency_p50_ms" | "resume_latency_p95_ms" | "resume_latency_slope_ms_per_turn" => {
+            Some("resume-latency-vs-length")
+        }
+        "fanout_cliff_n_rss"
+        | "fanout_cliff_n_wall"
+        | "fanout_max_local_rss_alpha"
+        | "fanout_max_local_wall_alpha"
+        | "fanout_global_rss_alpha"
+        | "fanout_max_measured_n" => Some("fanout-cliff"),
+        "fairness_latency_cv"
+        | "fairness_latency_max_min_ratio"
+        | "fairness_latency_spread_ms"
+        | "fairness_starved_agents" => Some("fairness-under-fanout"),
         _ => None,
     }
 }
@@ -497,13 +581,6 @@ fn row_measurement_complete(value: &serde_json::Value, id: &str) -> bool {
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
         })
-}
-
-fn resource_summary_available(value: &serde_json::Value) -> bool {
-    value
-        .pointer("/details/resource-summary/measurement_complete")
-        .and_then(serde_json::Value::as_bool)
-        != Some(false)
 }
 
 #[cfg(test)]
@@ -532,6 +609,38 @@ mod tests {
         )];
         let (rows, regression) = compare_rows(&left, &right)?;
         assert_eq!(rows[0].change, "informational-regression");
+        assert!(!regression);
+        Ok(())
+    }
+
+    #[test]
+    fn stable_id_not_conflicting_row_number_controls_requirement() -> Result<()> {
+        let left = vec![result(1, "model-request-efficiency", TestOutcome::Pass)];
+        let right = vec![result(
+            1,
+            "model-request-efficiency",
+            TestOutcome::Fail("envelope".to_owned()),
+        )];
+        let (rows, regression) = compare_rows(&left, &right)?;
+        assert_eq!(rows[0].badge_impact, "informational");
+        assert_eq!(rows[0].change, "informational-regression");
+        assert!(!regression);
+        Ok(())
+    }
+
+    #[test]
+    fn informational_unsupported_transitions_are_evidence_changes() -> Result<()> {
+        let passed = vec![result(42, "model-request-efficiency", TestOutcome::Pass)];
+        let unsupported = vec![result(
+            42,
+            "model-request-efficiency",
+            TestOutcome::Unsupported("not measurable".to_owned()),
+        )];
+        let (removed, regression) = compare_rows(&passed, &unsupported)?;
+        assert_eq!(removed[0].change, "evidence-regression");
+        assert!(!regression);
+        let (restored, regression) = compare_rows(&unsupported, &passed)?;
+        assert_eq!(restored[0].change, "evidence-improvement");
         assert!(!regression);
         Ok(())
     }
@@ -577,10 +686,72 @@ mod tests {
     }
 
     #[test]
+    fn newly_declared_optional_nonpass_has_total_neutral_change() -> Result<()> {
+        let mut before = result(
+            4,
+            "parallel-tools",
+            TestOutcome::Unsupported("undeclared".to_owned()),
+        );
+        before.evidence.push(
+            "capability: capability parallel_tool_execution is not declared by this architecture"
+                .to_owned(),
+        );
+        let mut after = result(
+            4,
+            "parallel-tools",
+            TestOutcome::Fail("declared behavior failed".to_owned()),
+        );
+        after.evidence.push(
+            "capability: capability parallel_tool_execution is declared but its operation surface is absent"
+                .to_owned(),
+        );
+        let (rows, regression) = compare_rows(&[before], &[after])?;
+        assert_eq!(rows[0].change, "facet-added-nonpass");
+        assert!(!regression);
+        Ok(())
+    }
+
+    #[test]
+    fn optional_declaration_changes_are_visible_when_both_states_are_unsupported() -> Result<()> {
+        let mut undeclared = result(
+            4,
+            "parallel-tools",
+            TestOutcome::Unsupported("undeclared".to_owned()),
+        );
+        undeclared.evidence.push(
+            "capability: capability parallel_tool_execution is not declared by this architecture"
+                .to_owned(),
+        );
+        let mut declared = result(
+            4,
+            "parallel-tools",
+            TestOutcome::Unsupported("declared surface absent".to_owned()),
+        );
+        declared.evidence.push(
+            "capability: capability parallel_tool_execution is declared but its operation surface is absent"
+                .to_owned(),
+        );
+
+        let (added, regression) = compare_rows(
+            std::slice::from_ref(&undeclared),
+            std::slice::from_ref(&declared),
+        )?;
+        assert_eq!(added[0].change, "facet-added-nonpass");
+        assert!(!regression);
+        let (removed, regression) = compare_rows(&[declared], &[undeclared])?;
+        assert_eq!(removed[0].change, "facet-removed");
+        assert!(!regression);
+        Ok(())
+    }
+
+    #[test]
     fn zero_resource_baseline_has_null_percentage() -> Result<()> {
-        let left = crate::report::ResourceSummary::default();
+        let left = crate::report::ResourceSummary {
+            wall_per_turn_p95_ms: Some(0.0),
+            ..crate::report::ResourceSummary::default()
+        };
         let right = crate::report::ResourceSummary {
-            wall_per_turn_p95_ms: 10.0,
+            wall_per_turn_p95_ms: Some(10.0),
             ..crate::report::ResourceSummary::default()
         };
         let row = serde_json::json!([{
@@ -636,5 +807,25 @@ mod tests {
             "resource_summary": {"wall_per_turn_p95_ms": 0.0}
         });
         assert_eq!(numeric_field(&report, "wall_per_turn_p95_ms"), None);
+    }
+
+    #[test]
+    fn one_incomplete_resource_row_does_not_mask_other_complete_rows() {
+        let report = serde_json::json!({
+            "details": {"resource-summary": {"measurement_complete": false}},
+            "results": [
+                {"id": "turn-latency-distribution", "measurement_complete": true},
+                {"id": "memory-time-integral", "measurement_complete": false}
+            ],
+            "resource_summary": {
+                "wall_per_turn_p95_ms": 125.0,
+                "memory_time_integral_mib_s_per_turn": 9.0
+            }
+        });
+        assert_eq!(numeric_field(&report, "wall_per_turn_p95_ms"), Some(125.0));
+        assert_eq!(
+            numeric_field(&report, "memory_time_integral_mib_s_per_turn"),
+            None
+        );
     }
 }

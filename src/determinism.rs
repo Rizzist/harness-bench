@@ -100,6 +100,7 @@ struct SemanticAttemptKey {
 struct ComparableRequest {
     dialect: String,
     canonical: Value,
+    semantic_attempts_total: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -365,6 +366,7 @@ fn comparable_requests(
                 &record.request.canonical,
                 &run.normalization,
             ),
+            semantic_attempts_total: record.semantic_attempts_total,
         };
         if requests.insert(key, request).is_some() {
             return Err(format!(
@@ -477,24 +479,31 @@ fn normalized_stream_sha256(
 fn attempt_multiplicity(
     requests: &BTreeMap<SemanticRequestKey, ComparableRequest>,
 ) -> Result<BTreeMap<SemanticAttemptKey, u64>, String> {
-    let mut attempts = BTreeMap::<SemanticAttemptKey, BTreeSet<u64>>::new();
-    for key in requests.keys() {
-        attempts
-            .entry(attempt_key(key))
-            .or_default()
-            .insert(key.attempt);
+    let mut attempts = BTreeMap::<SemanticAttemptKey, (BTreeSet<u64>, BTreeSet<u64>)>::new();
+    for (key, request) in requests {
+        let (observed, declared_totals) = attempts.entry(attempt_key(key)).or_default();
+        observed.insert(key.attempt);
+        declared_totals.insert(request.semantic_attempts_total);
     }
     let mut multiplicity = BTreeMap::new();
-    for (key, observed) in attempts {
-        let count = observed.len() as u64;
-        let expected = (1..=count).collect::<BTreeSet<_>>();
-        if observed != expected {
+    for (key, (observed, declared_totals)) in attempts {
+        let Some(&declared_total) = declared_totals.iter().next() else {
+            return Err("semantic request attempt total is absent".to_owned());
+        };
+        if declared_totals.len() != 1 || declared_total == 0 {
             return Err(format!(
-                "semantic request {}:{}:{}:{} has non-contiguous physical attempts {observed:?}",
+                "semantic request {}:{}:{}:{} has inconsistent declared attempt totals {declared_totals:?}",
                 key.scenario, key.actor, key.checkpoint, key.semantic_ordinal,
             ));
         }
-        multiplicity.insert(key, count);
+        let expected = (1..=declared_total).collect::<BTreeSet<_>>();
+        if observed != expected {
+            return Err(format!(
+                "semantic request {}:{}:{}:{} has physical attempts {observed:?}, expected 1..={declared_total}",
+                key.scenario, key.actor, key.checkpoint, key.semantic_ordinal,
+            ));
+        }
+        multiplicity.insert(key, declared_total);
     }
     Ok(multiplicity)
 }
@@ -633,6 +642,14 @@ pub fn evaluate_cross_run_reproducibility(
             "cross-run-reproducibility has no baseline attempt map".to_owned(),
         );
     };
+    for (index, comparison_attempts) in multiplicities.iter().enumerate().skip(1) {
+        if comparison_attempts.keys().ne(baseline_attempts.keys()) {
+            return cross_run_incomplete(format!(
+                "run {} has missing or added semantic request evidence",
+                index + 1
+            ));
+        }
+    }
     let mut first_difference = None;
     for (index, comparison) in normalized_runs.iter().enumerate().skip(1) {
         let comparison_run = index as u32 + 1;
@@ -723,8 +740,12 @@ pub fn evaluate_nondeterministic_fields(
     let mut comparable = 0_u64;
     let mut varying = 0_u64;
     let mut fields = BTreeMap::<String, VaryingField>::new();
+    let mut all_comparisons_pass = true;
     for (comparison_index, comparison) in normalized_runs.iter().enumerate().skip(1) {
         let comparison_run = comparison_index as u32 + 1;
+        let mut comparison_comparable = 0_u64;
+        let mut comparison_varying = 0_u64;
+        let mut comparison_has_critical_variation = false;
         let keys = baseline
             .keys()
             .chain(comparison.keys())
@@ -746,6 +767,9 @@ pub fn evaluate_nondeterministic_fields(
                 // denominator occurrence, rather than zero or every present leaf.
                 comparable = comparable.saturating_add(1);
                 varying = varying.saturating_add(1);
+                comparison_comparable = comparison_comparable.saturating_add(1);
+                comparison_varying = comparison_varying.saturating_add(1);
+                comparison_has_critical_variation = true;
                 let field = fields.entry(String::new()).or_default();
                 field.occurrences = field.occurrences.saturating_add(1);
                 field.comparison_runs.insert(comparison_run);
@@ -777,12 +801,15 @@ pub fn evaluate_nondeterministic_fields(
                 .collect::<BTreeSet<_>>();
             for pointer in pointers {
                 comparable = comparable.saturating_add(1);
+                comparison_comparable = comparison_comparable.saturating_add(1);
                 let before_value = before.get(&pointer);
                 let after_value = after.get(&pointer);
                 if before_value == after_value {
                     continue;
                 }
                 varying = varying.saturating_add(1);
+                comparison_varying = comparison_varying.saturating_add(1);
+                let critical_pointer = is_critical_pointer(&dialects, &pointer);
                 let field = fields.entry(pointer).or_default();
                 field.occurrences = field.occurrences.saturating_add(1);
                 field.comparison_runs.insert(comparison_run);
@@ -791,8 +818,16 @@ pub fn evaluate_nondeterministic_fields(
                     .insert(json_type(before_value).to_owned());
                 field.after_types.insert(json_type(after_value).to_owned());
                 field.dialects.extend(dialects.iter().cloned());
+                comparison_has_critical_variation |= critical_pointer;
             }
         }
+        if comparison_comparable == 0 {
+            return incomplete(format!(
+                "nondeterministic-field-report comparison run {comparison_run} has a zero comparable leaf denominator"
+            ));
+        }
+        let comparison_score = 1.0 - comparison_varying as f64 / comparison_comparable as f64;
+        all_comparisons_pass &= comparison_score >= 0.99 && !comparison_has_critical_variation;
     }
     if comparable == 0 {
         return incomplete(
@@ -812,6 +847,7 @@ pub fn evaluate_nondeterministic_fields(
                 "comparison_runs": field.comparison_runs,
                 "before_types": field.before_types,
                 "after_types": field.after_types,
+                "dialects": field.dialects,
             })
         })
         .collect::<Vec<_>>();
@@ -827,7 +863,7 @@ pub fn evaluate_nondeterministic_fields(
             "run_hashes": run_hashes,
         }),
         measurement_complete: true,
-        reference_envelope_pass: score >= 0.99 && critical == 0,
+        reference_envelope_pass: all_comparisons_pass,
         measurement_error: None,
     }
 }

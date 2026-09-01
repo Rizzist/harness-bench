@@ -506,7 +506,20 @@ fn normalize_legacy_index(
     if let Ok(report) = load_report_without_schema_check(&entry) {
         entry.report_schema = report.schema;
         entry.spec_version = report.spec_version;
-        entry.profile = report.fingerprint.profile.clone();
+        entry.harness.clone_from(&report.fingerprint.harness);
+        entry
+            .harness_version
+            .clone_from(&report.fingerprint.harness_version);
+        entry.profile.clone_from(&report.fingerprint.profile);
+        entry
+            .manifest_sha256
+            .clone_from(&report.fingerprint.manifest);
+        entry
+            .workflow_sha256
+            .clone_from(&report.fingerprint.workflows);
+        entry
+            .ahrb_revision
+            .clone_from(&report.fingerprint.ahrb_revision);
         entry.topology = if report.resource_summary.topology.is_empty() {
             report
                 .badge
@@ -516,11 +529,18 @@ fn normalize_legacy_index(
         } else {
             report.resource_summary.topology
         };
-        entry.manifest_sha256 = report.fingerprint.manifest;
-        entry.workflow_sha256 = report.fingerprint.workflows;
-        if let Some(badge) = report.badge {
-            entry.os = badge.os;
-        }
+        entry.os = report.badge.map_or_else(
+            || {
+                report
+                    .fingerprint
+                    .platform
+                    .split(['-', ' '])
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_owned()
+            },
+            |badge| badge.os,
+        );
     }
     entry
 }
@@ -618,7 +638,7 @@ fn stable_run_key(harness: &str, completed_at: &str, report_path: &str) -> Strin
 fn stable_legacy_run_key(raw_line: &str, line_number: usize) -> String {
     let mut digest = Sha256::new();
     digest.update(b"ahrb-index-legacy-v1\0");
-    digest.update(line_number.to_le_bytes());
+    digest.update((line_number as u64).to_le_bytes());
     digest.update(b"\0");
     digest.update(raw_line.as_bytes());
     format!("legacy-{:x}", digest.finalize())

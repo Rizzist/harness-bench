@@ -44,8 +44,9 @@ fn report(info_outcome: TestOutcome, wall_p95: f64) -> Report {
         ],
         resource_summary: ResourceSummary {
             topology: "persistent-daemon".to_owned(),
+            profile: "quick".to_owned(),
             comparison_scope: "within-topology-only".to_owned(),
-            wall_per_turn_p95_ms: wall_p95,
+            wall_per_turn_p95_ms: Some(wall_p95),
             ..ResourceSummary::default()
         },
         ..Report::default()
@@ -79,12 +80,12 @@ fn diff_latest_reads_mixed_legacy_and_v2_index_lines() {
         &report(TestOutcome::Fail("reference envelope".to_owned()), 150.0),
     );
     let legacy_line = json!({
-        "harness_id": "ahrb-mock",
-        "harness_version": "mock-v",
-        "manifest_hash": "manifest",
-        "ahrb_revision": "revision",
-        "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        "profile": "quick",
+        "harness_id": "stale-legacy-harness",
+        "harness_version": "stale-legacy-version",
+        "manifest_hash": "stale-legacy-manifest",
+        "ahrb_revision": "stale-legacy-revision",
+        "platform": "stale-os-stale-arch",
+        "profile": "cert",
         "rows_run": [1, 42],
         "timestamp": "2026-01-01T00:00:00Z",
         "counts": {"PASS": 2, "FAIL": 0, "UNSUPPORTED": 0, "ERROR": 0},
@@ -121,12 +122,15 @@ fn diff_latest_reads_mixed_legacy_and_v2_index_lines() {
     );
     std::fs::write(root.join("results/index.jsonl"), index).expect("write mixed index");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hbench"))
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-        .env("AHRB_RESULTS_ROOT", &root)
-        .args(["diff", "--latest", "ahrb-mock"])
-        .output()
-        .expect("run hbench diff");
+    let run_diff = || {
+        Command::new(env!("CARGO_BIN_EXE_hbench"))
+            .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .env("AHRB_RESULTS_ROOT", &root)
+            .args(["diff", "--latest", "ahrb-mock"])
+            .output()
+            .expect("run hbench diff")
+    };
+    let output = run_diff();
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -140,6 +144,11 @@ fn diff_latest_reads_mixed_legacy_and_v2_index_lines() {
             .as_str()
             .is_some_and(|value| value.starts_with("legacy-"))
     );
+    assert_eq!(diff["left"]["harness"], "ahrb-mock");
+    assert_eq!(diff["left"]["harness_version"], "mock-v");
+    assert_eq!(diff["left"]["ahrb_revision"], "revision");
+    assert_eq!(diff["left"]["os"], std::env::consts::OS);
+    assert_eq!(diff["left"]["profile"], "quick");
     assert_eq!(diff["right"]["run_key"], "run-current");
     assert_eq!(
         diff["rows"][1]["change"],
@@ -149,5 +158,8 @@ fn diff_latest_reads_mixed_legacy_and_v2_index_lines() {
         diff["resource_summary_deltas"]["wall_per_turn_p95_ms"]["delta"],
         50.0
     );
+    let repeated = run_diff();
+    assert!(repeated.status.success());
+    assert_eq!(output.stdout, repeated.stdout);
     std::fs::remove_dir_all(root).expect("remove diff fixture");
 }

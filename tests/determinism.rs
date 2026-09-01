@@ -142,6 +142,53 @@ fn row63_pairs_semantically_and_reports_exact_pointer_occurrences() {
 }
 
 #[test]
+fn row63_requires_every_baseline_comparison_to_meet_the_score() {
+    let canonical = Value::Object(
+        (0..100)
+            .map(|index| (format!("field-{index:03}"), json!(index)))
+            .collect(),
+    );
+    let mut changed = canonical.clone();
+    let object = changed.as_object_mut().expect("canonical object");
+    object.insert("field-000".to_owned(), json!("changed"));
+    object.insert("field-001".to_owned(), json!("changed"));
+
+    let mut runs = vec![run(
+        1,
+        vec![record(
+            "openai-chat-completions",
+            "direct",
+            1,
+            1,
+            canonical.clone(),
+        )],
+    )];
+    runs.push(run(
+        2,
+        vec![record("openai-chat-completions", "direct", 1, 1, changed)],
+    ));
+    for repetition in 3..=7 {
+        runs.push(run(
+            repetition,
+            vec![record(
+                "openai-chat-completions",
+                "direct",
+                1,
+                1,
+                canonical.clone(),
+            )],
+        ));
+    }
+    let evaluation = evaluate_nondeterministic_fields(&runs, 7);
+    assert!(evaluation.measurement_complete);
+    assert!(
+        evaluation.score > 0.99,
+        "global score demonstrates dilution"
+    );
+    assert!(!evaluation.reference_envelope_pass);
+}
+
+#[test]
 fn a_wholly_missing_request_is_exactly_one_denominator_occurrence() {
     let evaluation = evaluate_nondeterministic_fields(
         &[
@@ -178,7 +225,7 @@ fn zero_comparable_denominator_is_an_error() {
         evaluation
             .measurement_error
             .as_deref()
-            .is_some_and(|detail| detail.contains("denominator is zero"))
+            .is_some_and(|detail| detail.contains("zero comparable leaf denominator"))
     );
 }
 
@@ -284,6 +331,61 @@ fn row64_uses_complete_semantic_order_not_record_arrival_order() {
 }
 
 #[test]
+fn row64_requires_all_declared_physical_attempts() {
+    let mut missing_attempt = record(
+        "openai-chat-completions",
+        "direct",
+        1,
+        1,
+        json!({"messages":[{"role":"user","content":"same"}]}),
+    );
+    missing_attempt.semantic_attempts_total = 2;
+    let evaluation = evaluate_cross_run_reproducibility(
+        &[
+            run(1, vec![missing_attempt.clone()]),
+            run(2, vec![missing_attempt]),
+        ],
+        2,
+    );
+    assert!(!evaluation.measurement_complete);
+    assert!(
+        evaluation
+            .measurement_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("expected 1..=2"))
+    );
+}
+
+#[test]
+fn row64_treats_a_missing_request_as_incomplete_evidence() {
+    let present = record(
+        "openai-chat-completions",
+        "direct",
+        1,
+        1,
+        json!({"messages":[{"role":"user","content":"same"}]}),
+    );
+    let second = record(
+        "openai-chat-completions",
+        "tool",
+        1,
+        1,
+        json!({"messages":[{"role":"user","content":"second"}]}),
+    );
+    let evaluation = evaluate_cross_run_reproducibility(
+        &[run(1, vec![present.clone(), second]), run(2, vec![present])],
+        2,
+    );
+    assert!(!evaluation.measurement_complete);
+    assert!(
+        evaluation
+            .measurement_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("missing or added semantic request evidence"))
+    );
+}
+
+#[test]
 fn row64_reports_body_and_attempt_multiplicity_differences() {
     let body_difference = evaluate_cross_run_reproducibility(
         &[
@@ -317,6 +419,14 @@ fn row64_reports_body_and_attempt_multiplicity_differences() {
         "canonical-body"
     );
 
+    let mut comparison_attempt_one = record(
+        "openai-chat-completions",
+        "actor-a",
+        1,
+        1,
+        json!({"same":true}),
+    );
+    comparison_attempt_one.semantic_attempts_total = 2;
     let attempt_difference = evaluate_cross_run_reproducibility(
         &[
             run(
@@ -332,13 +442,7 @@ fn row64_reports_body_and_attempt_multiplicity_differences() {
             run(
                 2,
                 vec![
-                    record(
-                        "openai-chat-completions",
-                        "actor-a",
-                        1,
-                        1,
-                        json!({"same":true}),
-                    ),
+                    comparison_attempt_one,
                     record(
                         "openai-chat-completions",
                         "actor-a",

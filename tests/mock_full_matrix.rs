@@ -56,13 +56,23 @@ fn json_text(values: &[Value]) -> String {
 }
 
 fn derived_row43_journal(report: &Report) -> String {
-    let profiles = [PathBuf::from(&report.profile_path)];
-    assert_eq!(profiles.len(), 1, "daemon run uses one canonical profile");
-    assert!(profiles[0].is_dir(), "canonical daemon profile exists");
-    let sessions = profiles[0].join("derived-row43/state/sessions");
-    std::fs::read_dir(sessions)
-        .expect("read derived row-43 sessions")
+    let profile = PathBuf::from(&report.profile_path);
+    assert!(profile.is_dir(), "canonical daemon profile exists");
+    std::fs::read_dir(&profile)
+        .expect("read canonical profile")
         .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("derived-row43-r"))
+        })
+        .flat_map(|entry| {
+            std::fs::read_dir(entry.path().join("state/sessions"))
+                .into_iter()
+                .flatten()
+                .filter_map(std::result::Result::ok)
+        })
         .filter_map(|entry| std::fs::read_to_string(entry.path().join("journal.jsonl")).ok())
         .collect::<Vec<_>>()
         .join("\n")
@@ -173,9 +183,9 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     );
     assert!(report.resource_summary.scaling_alpha.is_some());
     assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
-    assert_eq!(report.turns.len(), 163);
+    assert_eq!(report.turns.len(), 363);
     for (phase, expected) in [
-        ("turn-latency", 100),
+        ("turn-latency", 300),
         ("time-to-first-model-request", 3),
         ("memory-time-integral", 60),
     ] {
@@ -203,16 +213,32 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         }
     }));
     assert_eq!(report.resource_summary.topology, "shared-daemon-sessions");
+    assert_eq!(report.resource_summary.profile, "quick");
     assert_eq!(
         report.resource_summary.comparison_scope,
         "within-topology-only"
     );
-    assert!(report.resource_summary.wall_per_turn_p95_ms <= 1_000.0);
-    assert!(report.resource_summary.wall_per_turn_jitter_ratio <= 0.25);
+    assert!(
+        report
+            .resource_summary
+            .wall_per_turn_p95_ms
+            .is_some_and(|value| value <= 1_000.0)
+    );
+    assert!(
+        report
+            .resource_summary
+            .wall_per_turn_jitter_ratio
+            .is_some_and(|value| value <= 0.25)
+    );
     let row43_events = report
         .events
         .iter()
-        .filter(|event| event.get("actor").and_then(Value::as_str) == Some("ahrb-row43:row43"))
+        .filter(|event| {
+            event
+                .get("actor")
+                .and_then(Value::as_str)
+                .is_some_and(|actor| actor.starts_with("ahrb-row43-r") && actor.ends_with(":row43"))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         row43_events
@@ -221,7 +247,7 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
                 event.get("event").and_then(Value::as_str) == Some("terminal-success")
             })
             .count(),
-        100
+        300
     );
     assert!(row43_events.iter().all(|event| {
         event.pointer("/payload/key").and_then(Value::as_str) != Some("row-43-warmup")
@@ -230,12 +256,15 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         .model_requests
         .iter()
         .filter(|request| {
-            request.pointer("/request/scenario").and_then(Value::as_str) == Some("ahrb-row43")
+            request
+                .pointer("/request/scenario")
+                .and_then(Value::as_str)
+                .is_some_and(|scenario| scenario.starts_with("ahrb-row43-r"))
                 && request.get("accepted").and_then(Value::as_bool) == Some(true)
                 && request.get("role").and_then(Value::as_str) == Some("primary")
         })
         .collect::<Vec<_>>();
-    assert_eq!(row43_primary_requests.len(), 100);
+    assert_eq!(row43_primary_requests.len(), 300);
     assert!(row43_primary_requests.iter().all(|request| {
         request
             .pointer("/request/checkpoint")
@@ -245,7 +274,7 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     let row43_journal = derived_row43_journal(&report);
     assert_eq!(
         row43_journal.matches("\"key\":\"row-43-warmup\"").count(),
-        1
+        3
     );
     let sampled_peak = report
         .samples
@@ -274,33 +303,26 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     assert!((report.resource_summary.cpu_total_s - sampled_cpu_s).abs() < f64::EPSILON);
     assert!(report.resource_metrics.values().all(|metric| {
         metric.topology == "shared-daemon-sessions"
+            && metric.profile == "quick"
             && metric.comparison_scope == "within-topology-only"
     }));
     assert!(report.metrics["crash_recovery_ms"] < 10_000.0);
     assert_eq!(report.metrics["crash_recovery_valid"], 1.0);
     assert!(report.metrics["journal_recovered_events"] >= 1.0);
     assert_eq!(report.metrics["journal_torn_tail_injected"], 1.0);
-    let badge = report.badge.as_ref().expect("full matrix badge");
-    assert_eq!(badge.os, std::env::consts::OS);
-    assert_eq!(badge.topology, "shared-daemon-sessions");
-    assert_eq!(badge.parallel_width, 4);
-    assert_eq!(badge.spec_version, 2);
-    assert!(matches!(
-        badge.latency_class.as_str(),
-        "L100" | "L250" | "L500" | "L1000"
-    ));
-    assert_eq!(
-        badge.facets,
-        vec![
-            "replay",
-            "crash",
-            "steer",
-            "queue",
-            "native-delegation",
-            "subturn",
-            "hooks"
-        ]
+    assert!(
+        report.badge.is_none(),
+        "missing rows 65-72 make A unavailable"
     );
+    assert!(matches!(
+        report.resource_summary.latency_class.as_deref(),
+        Some("L100" | "L250" | "L500" | "L1000")
+    ));
+    assert!(matches!(
+        report.resource_summary.cpu_class.as_deref(),
+        Some("C10" | "C50" | "C250")
+    ));
+    assert!(report.details["automation-score"]["score"].is_null());
 
     for artifact in [
         "report.md",
@@ -311,6 +333,9 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         "events.jsonl",
         "model-requests.jsonl",
         "turns.jsonl",
+        "stream-chunks.jsonl",
+        "filesystem-snapshots.jsonl",
+        "egress-attempts.jsonl",
         "junit.xml",
     ] {
         assert!(
@@ -352,7 +377,7 @@ fn derived_latency_trials_do_not_delay_cancel_cleanup() {
         latency.outcome,
         TestOutcome::Error(_) | TestOutcome::Unsupported(_)
     ));
-    assert_eq!(report.turns.len(), 100);
+    assert_eq!(report.turns.len(), 300);
 
     std::fs::remove_dir_all(&output).expect("remove isolated cancellation-latency report");
 }

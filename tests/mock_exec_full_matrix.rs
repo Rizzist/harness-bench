@@ -52,9 +52,21 @@ fn run_profile(report: &Report) -> PathBuf {
 }
 
 fn derived_row43_journal(profile: &Path) -> String {
-    std::fs::read_dir(profile.join("derived-row43/state/sessions"))
-        .expect("read derived row-43 sessions")
+    std::fs::read_dir(profile)
+        .expect("read certification profile")
         .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("derived-row43-r"))
+        })
+        .flat_map(|entry| {
+            std::fs::read_dir(entry.path().join("state/sessions"))
+                .into_iter()
+                .flatten()
+                .filter_map(std::result::Result::ok)
+        })
         .filter_map(|entry| std::fs::read_to_string(entry.path().join("journal.jsonl")).ok())
         .collect::<Vec<_>>()
         .join("\n")
@@ -146,7 +158,9 @@ fn assert_exec_template_propagation(report: &Report) {
     let derived_profiles = BTreeMap::from([
         ("ahrb-row42-r1:row42", "derived-row42-r1"),
         ("ahrb-row42-r2:row42", "derived-row42-r2"),
-        ("ahrb-row43:row43", "derived-row43"),
+        ("ahrb-row43-r1:row43", "derived-row43-r1"),
+        ("ahrb-row43-r2:row43", "derived-row43-r2"),
+        ("ahrb-row43-r3:row43", "derived-row43-r3"),
     ]);
     let mut derived_credentials = Vec::new();
     let mut derived_accepted_turns = 0_usize;
@@ -170,17 +184,20 @@ fn assert_exec_template_propagation(report: &Report) {
         }
         derived_credentials.push(derived_credential);
     }
-    assert_eq!(derived_accepted_turns, 140);
+    assert_eq!(derived_accepted_turns, 340);
     let row43_primary_requests = report
         .model_requests
         .iter()
         .filter(|request| {
-            request.pointer("/request/scenario").and_then(Value::as_str) == Some("ahrb-row43")
+            request
+                .pointer("/request/scenario")
+                .and_then(Value::as_str)
+                .is_some_and(|scenario| scenario.starts_with("ahrb-row43-r"))
                 && request.get("accepted").and_then(Value::as_bool) == Some(true)
                 && request.get("role").and_then(Value::as_str) == Some("primary")
         })
         .collect::<Vec<_>>();
-    assert_eq!(row43_primary_requests.len(), 100);
+    assert_eq!(row43_primary_requests.len(), 300);
     assert!(row43_primary_requests.iter().all(|request| {
         request
             .pointer("/request/checkpoint")
@@ -190,7 +207,7 @@ fn assert_exec_template_propagation(report: &Report) {
     let row43_journal = derived_row43_journal(&profile);
     assert_eq!(
         row43_journal.matches("\"key\":\"row-43-warmup\"").count(),
-        1
+        3
     );
 
     let mut turns_by_session = BTreeMap::<&str, usize>::new();
@@ -268,7 +285,7 @@ fn assert_exec_template_propagation(report: &Report) {
 }
 
 #[test]
-fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge() {
+fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
     let reference = repository.join("adapters/mock-exec/manifest.toml");
     let output = run_directory("reference");
@@ -299,17 +316,26 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
             !matches!(result.outcome, TestOutcome::Fail(_) | TestOutcome::Error(_))
         })
     );
-    let badge = report.badge.as_ref().expect("reduced-facet badge");
-    assert_eq!(badge.topology, "client-process-fanout");
-    assert_eq!(badge.parallel_width, 4);
-    assert_eq!(badge.spec_version, 2);
+    assert!(
+        report.badge.is_none(),
+        "missing rows 65-72 make A unavailable"
+    );
     assert!(matches!(
-        badge.latency_class.as_str(),
-        "L100" | "L250" | "L500" | "L1000"
+        report.resource_summary.latency_class.as_deref(),
+        Some("L100" | "L250" | "L500" | "L1000")
     ));
-    assert_eq!(badge.facets, vec!["replay", "crash", "resume"]);
-    assert_eq!(badge.comparison_scope, "within-topology-only");
+    assert!(matches!(
+        report.resource_summary.cpu_class.as_deref(),
+        Some("C10" | "C50" | "C250")
+    ));
+    assert!(report.details["automation-score"]["score"].is_null());
     assert!(report.resource_summary.peak_rss_mib > 0.0);
+    assert_eq!(report.resource_summary.profile, "quick");
+    assert!(report.resource_metrics.values().all(|metric| {
+        metric.profile == "quick"
+            && metric.topology == "client-process-fanout"
+            && metric.comparison_scope == "within-topology-only"
+    }));
     assert!(report.resource_summary.mean_rss_mib > 0.0);
     assert!(report.resource_summary.wall_per_turn_ms > 0.0);
     assert!(report.resource_summary.idle_rss_mib.is_none());
@@ -321,9 +347,9 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
     );
     assert!(report.resource_summary.scaling_alpha.is_some());
     assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
-    assert_eq!(report.turns.len(), 163);
+    assert_eq!(report.turns.len(), 363);
     for (phase, expected) in [
-        ("turn-latency", 100),
+        ("turn-latency", 300),
         ("time-to-first-model-request", 3),
         ("memory-time-integral", 60),
     ] {
@@ -348,8 +374,18 @@ fn per_invocation_reference_certifies_and_core_underdeclaration_suppresses_badge
         report.resource_summary.comparison_scope,
         "within-topology-only"
     );
-    assert!(report.resource_summary.wall_per_turn_p95_ms <= 1_000.0);
-    assert!(report.resource_summary.wall_per_turn_jitter_ratio <= 0.25);
+    assert!(
+        report
+            .resource_summary
+            .wall_per_turn_p95_ms
+            .is_some_and(|value| value <= 1_000.0)
+    );
+    assert!(
+        report
+            .resource_summary
+            .wall_per_turn_jitter_ratio
+            .is_some_and(|value| value <= 0.25)
+    );
     let sampled_peak = report
         .samples
         .iter()

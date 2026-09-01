@@ -120,7 +120,7 @@ fn per_invocation_resource_rows_measure_process_fanout_without_idle_penalty() {
 }
 
 #[test]
-fn per_invocation_badge_uses_process_marginal_and_labels_topology() {
+fn per_invocation_badge_waits_for_unimplemented_g2_components() {
     let manifest = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
         .expect("load exec manifest");
     let results = ahrb::scenarios::all()
@@ -158,16 +158,13 @@ fn per_invocation_badge_uses_process_marginal_and_labels_topology() {
         &results,
         &manifest,
         "macos",
-        4,
+        "quick",
+        8,
         20.0 * 1024.0 * 1024.0,
         "L250",
         "C50",
-    )
-    .expect("complete per-invocation result earns a badge");
-    assert_eq!(badge.topology, "client-process-fanout");
-    assert_eq!(badge.resource_class, "R32");
-    assert_eq!(badge.comparison_scope, "within-topology-only");
-    assert_eq!(badge.facets, vec!["replay", "crash", "resume"]);
+    );
+    assert!(badge.is_none());
 }
 
 #[tokio::test]

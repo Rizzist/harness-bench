@@ -1,5 +1,5 @@
 [identity]
-schema = 1
+schema = 2
 id = "ahrb-mock-exec"
 name = "AHRB built-in per-invocation reference harness"
 revision = "1"

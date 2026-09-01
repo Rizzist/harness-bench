@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 /// One auditable recursive process-membership refresh boundary.
@@ -55,11 +56,264 @@ pub struct Fingerprint {
 pub struct TopologyMetric {
     /// Numeric observation in the unit encoded by the metric name.
     pub value: f64,
+    /// Quick or certification profile under which the value was measured.
+    #[serde(default)]
+    pub profile: String,
     /// Architecture topology under which the observation was measured.
     pub topology: String,
     /// Normative comparison guard. Resource classes and marginal beta values
     /// may only be compared when this topology label is identical.
     pub comparison_scope: String,
+}
+
+/// Schema-validated named report detail blocks. Unknown future block names are
+/// retained verbatim; every Wave-1 block is type-checked while deserializing.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(transparent)]
+pub struct ReportDetails(BTreeMap<String, Value>);
+
+impl ReportDetails {
+    /// Insert one internally produced named block.
+    pub fn insert(&mut self, name: String, value: Value) -> Option<Value> {
+        self.0.insert(name, value)
+    }
+}
+
+impl From<BTreeMap<String, Value>> for ReportDetails {
+    fn from(values: BTreeMap<String, Value>) -> Self {
+        Self(values)
+    }
+}
+
+impl Deref for ReportDetails {
+    type Target = BTreeMap<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a ReportDetails {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for ReportDetails {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let values = BTreeMap::<String, Value>::deserialize(deserializer)?;
+        for (name, value) in &values {
+            let validation = match name.as_str() {
+                "model-request-efficiency" => {
+                    serde_json::from_value::<ModelRequestEfficiencyDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "process-hygiene" => {
+                    serde_json::from_value::<ProcessHygieneDetails>(value.clone()).map(|_| ())
+                }
+                "time-to-first-model-request" => {
+                    serde_json::from_value::<TimeToFirstModelRequestDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "memory-time-integral" => {
+                    serde_json::from_value::<MemoryTimeIntegralDetails>(value.clone()).map(|_| ())
+                }
+                "nondeterministic-field-report" => {
+                    serde_json::from_value::<NondeterministicFieldDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "cross-run-reproducibility" => {
+                    serde_json::from_value::<CrossRunReproducibilityDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "resource-summary" => {
+                    serde_json::from_value::<ResourceSummaryDetails>(value.clone()).map(|_| ())
+                }
+                "automation-score" => {
+                    serde_json::from_value::<AutomationScoreDetails>(value.clone()).map(|_| ())
+                }
+                _ => Ok(()),
+            };
+            validation.map_err(|error| {
+                D::Error::custom(format!("invalid details.{name} block: {error}"))
+            })?;
+        }
+        Ok(Self(values))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ModelRequestEfficiencyDetails {
+    #[serde(default)]
+    side_channel_requests_by_role: BTreeMap<String, u64>,
+    #[serde(default)]
+    unclassified_requests: Vec<UnclassifiedRequestDetail>,
+    #[serde(default)]
+    repetitions: Vec<ModelRequestEfficiencyRepetitionDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct UnclassifiedRequestDetail {
+    scenario: String,
+    actor: String,
+    checkpoint: String,
+    semantic_ordinal: u64,
+    attempt: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ModelRequestEfficiencyRepetitionDetail {
+    repetition: u32,
+    completed_turns: u64,
+    primary_turns: u64,
+    one_primary_per_turn: bool,
+    side_channel_requests: u64,
+    retry_attempts: u64,
+    context_tax_slope_bytes_per_turn: f64,
+    measurement_complete: bool,
+    reference_envelope_pass: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ProcessHygieneDetails {
+    #[serde(default)]
+    residue_identities: Vec<ResidueIdentityDetail>,
+    #[serde(default)]
+    audits: Vec<ProcessAuditDetail>,
+    #[serde(default)]
+    growth_diagnostics: Vec<GrowthDiagnosticDetail>,
+    #[serde(default)]
+    monotonic_growth_ok: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ResidueIdentityDetail {
+    pid: u32,
+    start_time: u64,
+    command: String,
+    ownership: String,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ProcessAuditDetail {
+    repetition: u32,
+    turn_index: Option<u32>,
+    waited_ms: u64,
+    processes: u64,
+    threads: u64,
+    fds: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct GrowthDiagnosticDetail {
+    repetition: u32,
+    checkpoints: u64,
+    failure_threshold: u64,
+    increases: BTreeMap<String, u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct TimeToFirstModelRequestDetails {
+    first_request_role: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct MemoryTimeIntegralDetails {
+    integration: String,
+    #[serde(default)]
+    collector: Option<String>,
+    #[serde(default)]
+    repetitions: Vec<MemoryTimeIntegralRepetitionDetail>,
+    #[serde(default)]
+    sampler_cadence_ns: Option<u64>,
+    #[serde(default)]
+    sampler_collection_cpu_ns: Option<u64>,
+    #[serde(default)]
+    sampler_observation_wall_ns: Option<u64>,
+    #[serde(default)]
+    sampler_overhead_pct: Option<f64>,
+    #[serde(default)]
+    sampler_cadence_overruns: Option<u64>,
+    #[serde(default)]
+    sampler_cadence_gaps: Option<u64>,
+    #[serde(default)]
+    sampler_warnings: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct MemoryTimeIntegralRepetitionDetail {
+    repetition: u32,
+    turns: u32,
+    coverage_ratio: f64,
+    max_sample_gap_ms: f64,
+    memory_time_integral_mib_s_per_turn: f64,
+    cpu_per_turn_p95_ms: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct NondeterministicFieldDetails {
+    #[serde(default)]
+    varying_fields: Vec<VaryingFieldDetail>,
+    #[serde(default)]
+    run_hashes: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct VaryingFieldDetail {
+    pointer: String,
+    occurrences: u64,
+    comparison_runs: Vec<u32>,
+    before_types: Vec<String>,
+    after_types: Vec<String>,
+    #[serde(default)]
+    dialects: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct CrossRunReproducibilityDetails {
+    #[serde(default)]
+    stream_sha256_by_run: BTreeMap<String, String>,
+    #[serde(default)]
+    first_difference: Option<Value>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ResourceSummaryDetails {
+    measurement_complete: bool,
+    #[serde(default)]
+    latency_class: Option<String>,
+    #[serde(default)]
+    cpu_class: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct AutomationScoreDetails {
+    profile: String,
+    topology: String,
+    comparison_scope: String,
+    score: Option<u8>,
 }
 
 /// One externally observed semantic-turn interval on the shared monotonic clock.
@@ -87,6 +341,63 @@ pub struct TurnObservation {
     pub exit_ns: Option<u64>,
     /// Exact topology-specific external turn interval.
     pub turn_wall_ns: Option<u64>,
+}
+
+/// One fake-provider response frame boundary used by streaming rows.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StreamChunkObservation {
+    /// Fresh-profile repetition number.
+    pub repetition: u32,
+    /// Stable logical actor ID.
+    pub actor: String,
+    /// Stable streaming case name.
+    pub case: String,
+    /// One-based frame ordinal.
+    pub ordinal: u32,
+    /// AHRB-owned scheduled monotonic boundary.
+    pub scheduled_ns: u64,
+    /// Fake-provider `Body::poll_frame` yield boundary.
+    pub frame_yielded_ns: u64,
+    /// Payload bytes in this frame.
+    pub bytes: u64,
+}
+
+/// One profile-contained filesystem snapshot with stable file identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FilesystemSnapshot {
+    /// Fresh-profile repetition number.
+    pub repetition: u32,
+    /// Stable before/after/checkpoint boundary.
+    pub boundary: String,
+    /// Journal, log, session, workspace, or other declared category.
+    pub category: String,
+    /// Lexically profile-relative path.
+    pub path_under_profile: String,
+    /// Unix device identifier.
+    pub device_id: u64,
+    /// Unix inode or platform-equivalent file identifier.
+    pub inode_or_file_id: u64,
+    /// File size at this boundary.
+    pub size_bytes: u64,
+    /// Lowercase SHA-256 of the complete captured file.
+    pub sha256: String,
+}
+
+/// One same-confinement network egress observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EgressAttempt {
+    /// Fresh-profile repetition number.
+    pub repetition: u32,
+    /// External monotonic observation boundary.
+    pub monotonic_ns: u64,
+    /// Non-secret destination label.
+    pub destination: String,
+    /// Loopback, public, DNS, or other schema-defined category.
+    pub category: String,
+    /// Whether confinement allowed the attempt.
+    pub allowed: bool,
+    /// Concrete OS enforcement mechanism.
+    pub enforcement: String,
 }
 
 /// One externally sampled process identity and its hygiene counters.
@@ -156,6 +467,10 @@ pub struct ProcessHygieneAudit {
 pub struct ProcessHygieneEvidence {
     /// Active-turn checkpoints in repetition/turn order.
     pub checkpoints: Vec<ProcessHygieneCheckpoint>,
+    /// Exact K=T+1 post-audit growth checkpoints per repetition, including
+    /// checkpoint zero before the first measured turn.
+    #[serde(default)]
+    pub growth_checkpoints: Vec<ProcessHygieneCheckpoint>,
     /// One warm controller baseline per daemon repetition.
     pub warm_baselines: Vec<ProcessHygieneCheckpoint>,
     /// Per-invocation audits after every child exit.
@@ -187,6 +502,9 @@ pub struct ResourceSummary {
     /// Architecture topology under which resource values were measured.
     #[serde(default)]
     pub topology: String,
+    /// Quick or certification profile under which the values were measured.
+    #[serde(default)]
+    pub profile: String,
     /// Normative comparison guard for every resource value.
     #[serde(default)]
     pub comparison_scope: String,
@@ -203,50 +521,121 @@ pub struct ResourceSummary {
     /// Mean external AHRB turn wall clock.
     pub wall_per_turn_ms: f64,
     /// Nearest-rank median external turn wall clock.
-    #[serde(default)]
-    pub wall_per_turn_p50_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_per_turn_p50_ms: Option<f64>,
     /// Nearest-rank p95 external turn wall clock.
-    #[serde(default)]
-    pub wall_per_turn_p95_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_per_turn_p95_ms: Option<f64>,
     /// Maximum external turn wall clock.
-    #[serde(default)]
-    pub wall_per_turn_max_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_per_turn_max_ms: Option<f64>,
     /// Median absolute deviation from the nearest-rank median.
-    #[serde(default)]
-    pub wall_per_turn_mad_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_per_turn_mad_ms: Option<f64>,
     /// MAD divided by p50.
-    #[serde(default)]
-    pub wall_per_turn_jitter_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_per_turn_jitter_ratio: Option<f64>,
     /// Latency class derived from p95: L100 through L1000+.
-    #[serde(default)]
-    pub latency_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_class: Option<String>,
     /// Cold launch to first completed model-request body, nearest-rank p50.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_model_request_p50_ms: Option<f64>,
     /// Cold launch to first completed model-request body, nearest-rank p95.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_model_request_p95_ms: Option<f64>,
     /// Cold launch to first completed model-request body, maximum.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_model_request_max_ms: Option<f64>,
     /// Median trapezoidal effective-memory integral per semantic turn.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_time_integral_mib_s_per_turn: Option<f64>,
     /// Fraction of measured turn wall covered by bracketing sample intervals.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_time_integral_coverage_ratio: Option<f64>,
     /// Largest sample-to-sample interval overlapping a measured turn.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_time_integral_max_sample_gap_ms: Option<f64>,
     /// N=1 whole-tree CPU per turn, nearest-rank p50.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_per_turn_p50_ms: Option<f64>,
     /// N=1 whole-tree CPU per turn, nearest-rank p95.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_per_turn_p95_ms: Option<f64>,
     /// CPU class derived from N=1 p95: C10 through C250+.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_class: Option<String>,
+    /// Whole-tree disk-write distribution and growth fields (row 47).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_turn_p50: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_turn_p95: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_turn_max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_journal_growth_bytes_per_turn: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_growth_bytes_per_turn: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_growth_slope_bytes_per_turn2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_io_counter_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded_disk_growth: Option<bool>,
+    /// Model-wait CPU fields (row 48).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_wait_cpu_p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_wait_wall_p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_wait_cpu_one_core_max_ratio: Option<f64>,
+    /// Long-session latency fields (row 49).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_slope_ms_per_100_turns: Option<f64>,
+    #[serde(default)]
+    pub latency_last_first_decile_ratio: Option<f64>,
+    /// Session residue/store fields (row 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_residue_slope_mib_per_session: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_residue_final_mib: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store_byte_slope_per_session: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store_file_count_slope_per_session: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store_final_residue_bytes: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store_final_residue_files: Option<u64>,
+    /// Resume latency fields (row 52).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_latency_p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_latency_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_latency_slope_ms_per_turn: Option<f64>,
+    /// Fanout cliff/scaling fields (row 54).
+    #[serde(default)]
+    pub fanout_cliff_n_rss: Option<u32>,
+    #[serde(default)]
+    pub fanout_cliff_n_wall: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_max_local_rss_alpha: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_max_local_wall_alpha: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_global_rss_alpha: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_max_measured_n: Option<u32>,
+    /// Fairness fields (row 55).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fairness_latency_cv: Option<f64>,
+    #[serde(default)]
+    pub fairness_latency_max_min_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fairness_latency_spread_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fairness_starved_agents: Option<u32>,
     /// Resident daemon baseline; absent for zero-process-between-turns topologies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_rss_mib: Option<f64>,
@@ -284,7 +673,7 @@ pub struct Report {
     pub metrics: BTreeMap<String, f64>,
     /// Row-keyed structured details that cannot live in the numeric metric map.
     #[serde(default)]
-    pub details: BTreeMap<String, Value>,
+    pub details: ReportDetails,
     /// Typed daemon-shutdown outcomes and any owned-tree escalation performed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_notes: Vec<String>,
@@ -315,6 +704,15 @@ pub struct Report {
     /// External per-turn boundary evidence.
     #[serde(default)]
     pub turns: Vec<TurnObservation>,
+    /// Raw streaming-frame evidence.
+    #[serde(default)]
+    pub stream_chunks: Vec<StreamChunkObservation>,
+    /// Raw filesystem identity/size/digest evidence.
+    #[serde(default)]
+    pub filesystem_snapshots: Vec<FilesystemSnapshot>,
+    /// Raw same-confinement network enforcement evidence.
+    #[serde(default)]
+    pub egress_attempts: Vec<EgressAttempt>,
 }
 
 fn default_spec_version() -> u32 {
@@ -347,6 +745,18 @@ pub fn write_bundle(report: &Report, directory: &Path, junit: bool) -> Result<()
         &report.model_requests,
     )?;
     write_jsonl(&directory.join("turns.jsonl"), &report.turns)?;
+    write_jsonl(
+        &directory.join("stream-chunks.jsonl"),
+        &report.stream_chunks,
+    )?;
+    write_jsonl(
+        &directory.join("filesystem-snapshots.jsonl"),
+        &report.filesystem_snapshots,
+    )?;
+    write_jsonl(
+        &directory.join("egress-attempts.jsonl"),
+        &report.egress_attempts,
+    )?;
     if junit {
         write_atomic(
             &directory.join("junit.xml"),
@@ -401,12 +811,6 @@ pub fn render_markdown(report: &Report) -> String {
     }
     if let Some(badge) = &report.badge {
         let _ = writeln!(output, "**{}**\n", badge_label(badge));
-        if (65..=72).any(|row| !report.results.iter().any(|result| result.row == row)) {
-            let _ = writeln!(
-                output,
-                "_A provisional until rows 65–72 are measured in Wave 4._\n"
-            );
-        }
     } else {
         let _ = writeln!(output, "**No badge certified.**\n");
     }
@@ -445,8 +849,8 @@ pub fn render_markdown(report: &Report) -> String {
         for (name, metric) in &report.resource_metrics {
             let _ = writeln!(
                 output,
-                "- `{name}`: {:.3} (topology: `{}`; scope: `{}`)",
-                metric.value, metric.topology, metric.comparison_scope
+                "- `{name}`: {:.3} (topology: `{}`; profile: `{}`; scope: `{}`)",
+                metric.value, metric.topology, metric.profile, metric.comparison_scope
             );
         }
     }
@@ -480,19 +884,19 @@ pub fn render_markdown(report: &Report) -> String {
 /// Build the concise resource-summary line shared by `ahrb run` and `hbench`.
 pub fn render_resource_summary(summary: &ResourceSummary) -> String {
     let mut output = format!(
-        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} cpu_total_s={:.3} cpu_per_turn_ms={:.3} wall_per_turn_ms={:.3} wall_per_turn_p50_ms={:.3} wall_per_turn_p95_ms={:.3} wall_per_turn_max_ms={:.3} wall_per_turn_mad_ms={:.3} wall_per_turn_jitter_ratio={:.3} latency_class={} time_to_first_model_request_p50_ms={} time_to_first_model_request_p95_ms={} time_to_first_model_request_max_ms={} memory_time_integral_mib_s_per_turn={} memory_time_integral_coverage_ratio={} memory_time_integral_max_sample_gap_ms={} cpu_per_turn_p50_ms={} cpu_per_turn_p95_ms={} cpu_class={}",
+        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} cpu_total_s={:.3} cpu_per_turn_ms={:.3} wall_per_turn_ms={:.3} wall_per_turn_p50_ms={} wall_per_turn_p95_ms={} wall_per_turn_max_ms={} wall_per_turn_mad_ms={} wall_per_turn_jitter_ratio={} latency_class={} time_to_first_model_request_p50_ms={} time_to_first_model_request_p95_ms={} time_to_first_model_request_max_ms={} memory_time_integral_mib_s_per_turn={} memory_time_integral_coverage_ratio={} memory_time_integral_max_sample_gap_ms={} cpu_per_turn_p50_ms={} cpu_per_turn_p95_ms={} cpu_class={}",
         summary.peak_rss_mib,
         summary.mean_rss_mib,
         summary.median_rss_mib,
         summary.cpu_total_s,
         summary.cpu_per_turn_ms,
         summary.wall_per_turn_ms,
-        summary.wall_per_turn_p50_ms,
-        summary.wall_per_turn_p95_ms,
-        summary.wall_per_turn_max_ms,
-        summary.wall_per_turn_mad_ms,
-        summary.wall_per_turn_jitter_ratio,
-        summary.latency_class,
+        optional_milliseconds(summary.wall_per_turn_p50_ms),
+        optional_milliseconds(summary.wall_per_turn_p95_ms),
+        optional_milliseconds(summary.wall_per_turn_max_ms),
+        optional_milliseconds(summary.wall_per_turn_mad_ms),
+        optional_decimal(summary.wall_per_turn_jitter_ratio),
+        summary.latency_class.as_deref().unwrap_or("unavailable"),
         optional_milliseconds(summary.time_to_first_model_request_p50_ms),
         optional_milliseconds(summary.time_to_first_model_request_p95_ms),
         optional_milliseconds(summary.time_to_first_model_request_max_ms),
@@ -597,6 +1001,7 @@ pub fn summarize_resources(
     };
     ResourceSummary {
         topology: String::new(),
+        profile: String::new(),
         comparison_scope: String::new(),
         peak_rss_mib: peak_bytes as f64 / MIB,
         mean_rss_mib: mean_bytes / MIB,
@@ -604,12 +1009,12 @@ pub fn summarize_resources(
         cpu_total_s: cpu_ns as f64 / 1_000_000_000.0,
         cpu_per_turn_ms,
         wall_per_turn_ms,
-        wall_per_turn_p50_ms: 0.0,
-        wall_per_turn_p95_ms: 0.0,
-        wall_per_turn_max_ms: 0.0,
-        wall_per_turn_mad_ms: 0.0,
-        wall_per_turn_jitter_ratio: 0.0,
-        latency_class: String::new(),
+        wall_per_turn_p50_ms: None,
+        wall_per_turn_p95_ms: None,
+        wall_per_turn_max_ms: None,
+        wall_per_turn_mad_ms: None,
+        wall_per_turn_jitter_ratio: None,
+        latency_class: None,
         time_to_first_model_request_p50_ms: None,
         time_to_first_model_request_p95_ms: None,
         time_to_first_model_request_max_ms: None,
@@ -623,6 +1028,7 @@ pub fn summarize_resources(
         parallel_beta_mib_per_agent,
         scaling_alpha,
         sampler_overhead_pct,
+        ..ResourceSummary::default()
     }
 }
 
@@ -923,13 +1329,19 @@ pub fn evaluate_memory_time_integral(
     let mut derived_observation_wall_ns = 0_u64;
     let mut integrals = Vec::with_capacity(expected_turns);
     let mut cpu_per_turn_ms = Vec::with_capacity(expected_turns);
-    let mut covered_ns = 0_u64;
-    let mut total_turn_wall_ns = 0_u64;
+    let mut minimum_coverage_ratio = 1.0_f64;
     let mut maximum_gap_ns = 0_u64;
     let mut cadence_overruns = 0_usize;
     let mut cadence_gaps = 0_usize;
     let mut cadence_untrustworthy = false;
+    let mut repetition_details = Vec::new();
+    let mut all_repetitions_pass = true;
     for repetition in 1..=expected_repetitions {
+        let mut repetition_integrals = Vec::with_capacity(turns_per_repetition as usize);
+        let mut repetition_cpu_ms = Vec::with_capacity(turns_per_repetition as usize);
+        let mut repetition_covered_ns = 0_u64;
+        let mut repetition_turn_wall_ns = 0_u64;
+        let mut repetition_maximum_gap_ns = 0_u64;
         let samples = evidence
             .samples
             .iter()
@@ -1084,19 +1496,54 @@ pub fn evaluate_memory_time_integral(
                 total + mean_mib * elapsed_seconds
             });
             integrals.push(integral);
-            cpu_per_turn_ms.push((end_cpu - start_cpu) / 1_000_000.0);
-            total_turn_wall_ns = total_turn_wall_ns.saturating_add(end_ns.saturating_sub(start_ns));
+            repetition_integrals.push(integral);
+            let cpu_ms = (end_cpu - start_cpu) / 1_000_000.0;
+            cpu_per_turn_ms.push(cpu_ms);
+            repetition_cpu_ms.push(cpu_ms);
+            repetition_turn_wall_ns =
+                repetition_turn_wall_ns.saturating_add(end_ns.saturating_sub(start_ns));
             for pair in bracket.windows(2) {
                 let gap_ns = pair[1].monotonic_ns.saturating_sub(pair[0].monotonic_ns);
                 let overlap_start = pair[0].monotonic_ns.max(start_ns);
                 let overlap_end = pair[1].monotonic_ns.min(end_ns);
                 if overlap_end > overlap_start {
-                    covered_ns =
-                        covered_ns.saturating_add(overlap_end.saturating_sub(overlap_start));
-                    maximum_gap_ns = maximum_gap_ns.max(gap_ns);
+                    repetition_covered_ns = repetition_covered_ns
+                        .saturating_add(overlap_end.saturating_sub(overlap_start));
+                    repetition_maximum_gap_ns = repetition_maximum_gap_ns.max(gap_ns);
                 }
             }
         }
+        if repetition_turn_wall_ns == 0 {
+            return incomplete(format!(
+                "repetition {repetition} measured zero total turn wall"
+            ));
+        }
+        let repetition_coverage = repetition_covered_ns as f64 / repetition_turn_wall_ns as f64;
+        if repetition_coverage < 0.99 {
+            return incomplete(format!(
+                "repetition {repetition} memory-time-integral coverage {repetition_coverage:.6} is below 0.99"
+            ));
+        }
+        if repetition_maximum_gap_ns > evidence.sampler_cadence_ns.saturating_mul(2) {
+            return incomplete(format!(
+                "repetition {repetition} maximum sample gap {repetition_maximum_gap_ns} ns exceeds twice cadence {} ns",
+                evidence.sampler_cadence_ns
+            ));
+        }
+        repetition_integrals.sort_by(f64::total_cmp);
+        let repetition_integral = median_sorted_f64(&repetition_integrals);
+        let repetition_cpu_p95 = nearest_rank_f64(&repetition_cpu_ms, 95);
+        all_repetitions_pass &= repetition_integral <= 1_024.0 && repetition_cpu_p95 <= 250.0;
+        minimum_coverage_ratio = minimum_coverage_ratio.min(repetition_coverage);
+        maximum_gap_ns = maximum_gap_ns.max(repetition_maximum_gap_ns);
+        repetition_details.push(serde_json::json!({
+            "repetition": repetition,
+            "turns": turns_per_repetition,
+            "coverage_ratio": repetition_coverage,
+            "max_sample_gap_ms": repetition_maximum_gap_ns as f64 / 1_000_000.0,
+            "memory_time_integral_mib_s_per_turn": repetition_integral,
+            "cpu_per_turn_p95_ms": repetition_cpu_p95,
+        }));
     }
     if derived_observation_wall_ns != evidence.sampler_observation_wall_ns
         || evidence.sampler_observation_wall_ns == 0
@@ -1108,24 +1555,10 @@ pub fn evaluate_memory_time_integral(
     }
     let sampler_cpu_fraction =
         evidence.sampler_collection_cpu_ns as f64 / evidence.sampler_observation_wall_ns as f64;
-    if total_turn_wall_ns == 0 {
-        return incomplete("memory-time-integral measured zero total turn wall".to_owned());
-    }
     integrals.sort_by(f64::total_cmp);
     let integral = median_sorted_f64(&integrals);
-    let coverage_ratio = covered_ns as f64 / total_turn_wall_ns as f64;
+    let coverage_ratio = minimum_coverage_ratio;
     let maximum_gap_ms = maximum_gap_ns as f64 / 1_000_000.0;
-    if coverage_ratio < 0.99 {
-        return incomplete(format!(
-            "memory-time-integral coverage {coverage_ratio:.6} is below 0.99"
-        ));
-    }
-    if maximum_gap_ns > evidence.sampler_cadence_ns.saturating_mul(2) {
-        return incomplete(format!(
-            "memory-time-integral maximum sample gap {maximum_gap_ns} ns exceeds twice cadence {} ns",
-            evidence.sampler_cadence_ns
-        ));
-    }
     if sampler_cpu_fraction > 0.10 || cadence_overruns > 0 || cadence_untrustworthy {
         return incomplete(format!(
             "sampler overload: {:.3}% of one core, {cadence_overruns} cadence overruns, {cadence_gaps} cadence gaps",
@@ -1156,6 +1589,8 @@ pub fn evaluate_memory_time_integral(
         sampler_cadence_gaps: cadence_gaps,
         details: serde_json::json!({
             "integration": "trapezoidal",
+            "collector": "continuous-long-horizon",
+            "repetitions": repetition_details,
             "sampler_cadence_ns": evidence.sampler_cadence_ns,
             "sampler_collection_cpu_ns": evidence.sampler_collection_cpu_ns,
             "sampler_observation_wall_ns": evidence.sampler_observation_wall_ns,
@@ -1165,7 +1600,7 @@ pub fn evaluate_memory_time_integral(
             "sampler_warnings": evidence.samples.iter().flat_map(|sample| sample.cpu_accounting_warnings.iter()).cloned().collect::<BTreeSet<_>>(),
         }),
         measurement_complete: true,
-        reference_envelope_pass: integral <= 1_024.0 && cpu_p95_ms <= 250.0,
+        reference_envelope_pass: all_repetitions_pass,
         measurement_error: None,
     }
 }
@@ -1174,6 +1609,24 @@ pub fn evaluate_memory_time_integral(
 pub fn evaluate_turn_latency(
     observations: &[TurnObservation],
     expected_turns: u32,
+    per_invocation: bool,
+    turn_timeout_ms: u64,
+) -> TurnLatencyEvaluation {
+    evaluate_turn_latency_repetitions(
+        observations,
+        1,
+        expected_turns,
+        per_invocation,
+        turn_timeout_ms,
+    )
+}
+
+/// Evaluate row 43 per fresh-profile repetition and then aggregate its exact
+/// headline statistics without allowing one repetition to hide another.
+pub fn evaluate_turn_latency_repetitions(
+    observations: &[TurnObservation],
+    expected_repetitions: u32,
+    turns_per_repetition: u32,
     per_invocation: bool,
     turn_timeout_ms: u64,
 ) -> TurnLatencyEvaluation {
@@ -1188,82 +1641,103 @@ pub fn evaluate_turn_latency(
         reference_envelope_pass: false,
         measurement_error: Some(detail),
     };
+    let expected_turns = expected_repetitions.saturating_mul(turns_per_repetition);
     if observations.len() != expected_turns as usize {
         return incomplete(format!(
             "expected {expected_turns} turn intervals, observed {}",
             observations.len()
         ));
     }
-    let mut expected_index = 1_u32;
-    let mut walls = Vec::with_capacity(observations.len());
-    for observation in observations {
-        if observation.turn_index != expected_index {
-            return incomplete(format!(
-                "turn index sequence expected {expected_index}, observed {}",
-                observation.turn_index
-            ));
-        }
-        expected_index = expected_index.saturating_add(1);
-        let boundaries = if per_invocation {
-            observation.launch_ns.zip(observation.exit_ns)
-        } else {
-            observation.submit_ns.zip(observation.terminal_ns)
-        };
-        let Some((start_ns, end_ns)) = boundaries else {
-            return incomplete(format!(
-                "turn {} lacks required {} boundaries",
-                observation.turn_index,
-                if per_invocation {
-                    "launch/exit"
-                } else {
-                    "submit/terminal"
-                }
-            ));
-        };
-        let Some(expected_wall_ns) = end_ns.checked_sub(start_ns) else {
-            return incomplete(format!(
-                "turn {} external boundaries are reversed",
-                observation.turn_index
-            ));
-        };
-        let Some(wall_ns) = observation.turn_wall_ns else {
-            return incomplete(format!(
-                "turn {} lacks turn_wall_ns",
-                observation.turn_index
-            ));
-        };
-        if wall_ns != expected_wall_ns {
-            return incomplete(format!(
-                "turn {} wall interval disagrees with external boundaries",
-                observation.turn_index
-            ));
-        }
-        walls.push(wall_ns);
-    }
-    walls.sort_unstable();
-    let p50_ns = nearest_rank_u64(&walls, 50);
-    if p50_ns == 0 {
-        return incomplete("turn latency p50 is zero; jitter is unavailable".to_owned());
-    }
-    let p95_ns = nearest_rank_u64(&walls, 95);
-    let max_ns = walls.last().copied().unwrap_or(0);
     let timeout_ns = turn_timeout_ms.saturating_mul(1_000_000);
-    if max_ns >= timeout_ns {
-        return incomplete(format!(
-            "maximum turn interval {max_ns} ns is not below timeout {timeout_ns} ns"
-        ));
+    let mut p50_values = Vec::new();
+    let mut p95_values = Vec::new();
+    let mut mad_values = Vec::new();
+    let mut jitter_values = Vec::new();
+    let mut maximum_ns = 0_u64;
+    let mut all_repetitions_pass = true;
+    for repetition in 1..=expected_repetitions {
+        let repetition_observations = observations
+            .iter()
+            .filter(|observation| observation.repetition == repetition)
+            .collect::<Vec<_>>();
+        if repetition_observations.len() != turns_per_repetition as usize {
+            return incomplete(format!(
+                "repetition {repetition} expected {turns_per_repetition} turn intervals, observed {}",
+                repetition_observations.len()
+            ));
+        }
+        let mut walls = Vec::with_capacity(repetition_observations.len());
+        for (index, observation) in repetition_observations.iter().enumerate() {
+            let expected_index = index as u32 + 1;
+            if observation.turn_index != expected_index {
+                return incomplete(format!(
+                    "repetition {repetition} turn index expected {expected_index}, observed {}",
+                    observation.turn_index
+                ));
+            }
+            let boundaries = if per_invocation {
+                observation.launch_ns.zip(observation.exit_ns)
+            } else {
+                observation.submit_ns.zip(observation.terminal_ns)
+            };
+            let Some((start_ns, end_ns)) = boundaries else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks required {} boundaries",
+                    observation.turn_index,
+                    if per_invocation {
+                        "launch/exit"
+                    } else {
+                        "submit/terminal"
+                    }
+                ));
+            };
+            let Some(expected_wall_ns) = end_ns.checked_sub(start_ns) else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} external boundaries are reversed",
+                    observation.turn_index
+                ));
+            };
+            let Some(wall_ns) = observation.turn_wall_ns else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks turn_wall_ns",
+                    observation.turn_index
+                ));
+            };
+            if wall_ns == 0 || wall_ns != expected_wall_ns {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} has an invalid external wall interval",
+                    observation.turn_index
+                ));
+            }
+            walls.push(wall_ns);
+        }
+        walls.sort_unstable();
+        let p50_ns = nearest_rank_u64(&walls, 50);
+        let p95_ns = nearest_rank_u64(&walls, 95);
+        let max_ns = walls.last().copied().unwrap_or(0);
+        let mut absolute_deviations = walls
+            .iter()
+            .map(|value| value.abs_diff(p50_ns))
+            .collect::<Vec<_>>();
+        absolute_deviations.sort_unstable();
+        let mad_ns = nearest_rank_u64(&absolute_deviations, 50);
+        let jitter = mad_ns as f64 / p50_ns as f64;
+        p50_values.push(p50_ns as f64 / 1_000_000.0);
+        p95_values.push(p95_ns as f64 / 1_000_000.0);
+        mad_values.push(mad_ns as f64 / 1_000_000.0);
+        jitter_values.push(jitter);
+        maximum_ns = maximum_ns.max(max_ns);
+        all_repetitions_pass &= max_ns < timeout_ns && p95_ns <= 1_000_000_000 && jitter <= 0.25;
     }
-    let mut absolute_deviations = walls
-        .iter()
-        .map(|value| value.abs_diff(p50_ns))
-        .collect::<Vec<_>>();
-    absolute_deviations.sort_unstable();
-    let mad_ns = nearest_rank_u64(&absolute_deviations, 50);
-    let p50_ms = p50_ns as f64 / 1_000_000.0;
-    let p95_ms = p95_ns as f64 / 1_000_000.0;
-    let max_ms = max_ns as f64 / 1_000_000.0;
-    let mad_ms = mad_ns as f64 / 1_000_000.0;
-    let jitter = mad_ns as f64 / p50_ns as f64;
+    p50_values.sort_by(f64::total_cmp);
+    p95_values.sort_by(f64::total_cmp);
+    mad_values.sort_by(f64::total_cmp);
+    jitter_values.sort_by(f64::total_cmp);
+    let p50_ms = median_sorted_f64(&p50_values);
+    let p95_ms = median_sorted_f64(&p95_values);
+    let max_ms = maximum_ns as f64 / 1_000_000.0;
+    let mad_ms = median_sorted_f64(&mad_values);
+    let jitter = median_sorted_f64(&jitter_values);
     let latency_class = if p95_ms <= 100.0 {
         "L100"
     } else if p95_ms <= 250.0 {
@@ -1283,7 +1757,7 @@ pub fn evaluate_turn_latency(
         wall_per_turn_jitter_ratio: jitter,
         latency_class: latency_class.to_owned(),
         measurement_complete: true,
-        reference_envelope_pass: p95_ms <= 1_000.0 && jitter <= 0.25,
+        reference_envelope_pass: all_repetitions_pass,
         measurement_error: None,
     }
 }
@@ -1414,6 +1888,21 @@ pub fn evaluate_process_hygiene(
         {
             return incomplete(format!(
                 "repetition {repetition} lacks the exact ordered 1..={turns_per_repetition} checkpoint sequence"
+            ));
+        }
+        let growth = evidence
+            .growth_checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.repetition == repetition)
+            .collect::<Vec<_>>();
+        if growth.len() != turns_per_repetition as usize + 1
+            || growth
+                .iter()
+                .enumerate()
+                .any(|(index, checkpoint)| checkpoint.turn_index != index as u32)
+        {
+            return incomplete(format!(
+                "repetition {repetition} lacks the exact ordered 0..={turns_per_repetition} growth checkpoint sequence"
             ));
         }
     }
@@ -1568,6 +2057,12 @@ pub fn evaluate_process_hygiene(
         )
         .chain(
             evidence
+                .growth_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.processes.as_slice()),
+        )
+        .chain(
+            evidence
                 .per_turn_audits
                 .iter()
                 .map(|audit| audit.processes.as_slice()),
@@ -1629,12 +2124,10 @@ pub fn evaluate_process_hygiene(
             .iter()
             .filter(|checkpoint| checkpoint.repetition == repetition)
             .collect::<Vec<_>>();
-        let mut ordered_totals = Vec::with_capacity(checkpoints.len());
         for checkpoint in checkpoints {
             let mut turn_threads = 0_u64;
             let mut turn_fds = 0_u64;
             let mut new_processes = 0_u64;
-            let mut turn_peak = (0_u64, 0_u64, 0_u64);
             for sample in &checkpoint.cadence_samples {
                 let Some(current) = hygiene_counter_map(&sample.processes) else {
                     return incomplete(format!(
@@ -1660,34 +2153,52 @@ pub fn evaluate_process_hygiene(
                 peak_processes = peak_processes.max(totals.0);
                 peak_threads = peak_threads.max(totals.1);
                 peak_fds = peak_fds.max(totals.2);
-                turn_peak.0 = turn_peak.0.max(totals.0);
-                turn_peak.1 = turn_peak.1.max(totals.1);
-                turn_peak.2 = turn_peak.2.max(totals.2);
                 previous = current;
             }
             spawned.push(new_processes);
             threads_created.push(turn_threads);
             fds_opened.push(turn_fds);
-            ordered_totals.push(turn_peak);
         }
-        let threshold = ordered_totals.len() / 2;
-        if threshold > 0 {
-            for (label, dimension) in [("process", 0_usize), ("thread", 1), ("FD", 2)] {
-                let increases = ordered_totals
-                    .windows(2)
-                    .filter(|pair| match dimension {
-                        0 => pair[1].0 > pair[0].0,
-                        1 => pair[1].1 > pair[0].1,
-                        _ => pair[1].2 > pair[0].2,
-                    })
-                    .count();
-                if increases >= threshold {
-                    failures.push(format!(
-                        "repetition {repetition} {label} live count increased in {increases} adjacent pairs (failure threshold {threshold})"
-                    ));
-                }
-            }
+    }
+
+    let mut monotonic_growth_ok = true;
+    let mut growth_diagnostics = Vec::new();
+    for repetition in 1..=expected_repetitions {
+        let growth = evidence
+            .growth_checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.repetition == repetition)
+            .collect::<Vec<_>>();
+        let mut totals = Vec::with_capacity(growth.len());
+        for checkpoint in growth {
+            let Some(total) = hygiene_totals(&checkpoint.processes) else {
+                return incomplete(format!(
+                    "repetition {repetition} growth checkpoint {} has incomplete counters",
+                    checkpoint.turn_index
+                ));
+            };
+            totals.push(total);
         }
+        let threshold = (turns_per_repetition as usize).div_ceil(2);
+        let mut counts = BTreeMap::new();
+        for (label, dimension) in [("process", 0_usize), ("thread", 1), ("fd", 2)] {
+            let increases = totals
+                .windows(2)
+                .filter(|pair| match dimension {
+                    0 => pair[1].0 > pair[0].0,
+                    1 => pair[1].1 > pair[0].1,
+                    _ => pair[1].2 > pair[0].2,
+                })
+                .count();
+            counts.insert(label, increases);
+            monotonic_growth_ok &= increases < threshold;
+        }
+        growth_diagnostics.push(serde_json::json!({
+            "repetition": repetition,
+            "checkpoints": totals.len(),
+            "failure_threshold": threshold,
+            "increases": counts,
+        }));
     }
 
     let mut residue_processes = 0_u64;
@@ -1867,10 +2378,32 @@ pub fn evaluate_process_hygiene(
             })
         })
         .collect::<Vec<_>>();
+    let audits = evidence
+        .per_turn_audits
+        .iter()
+        .chain(evidence.post_close_audits.iter())
+        .chain(evidence.shutdown_audits.iter())
+        .map(|audit| {
+            let totals = hygiene_totals(&audit.processes).unwrap_or((0, 0, 0));
+            serde_json::json!({
+                "repetition": audit.repetition,
+                "turn_index": audit.turn_index,
+                "waited_ms": audit.waited_ms,
+                "processes": totals.0,
+                "threads": totals.1,
+                "fds": totals.2,
+            })
+        })
+        .collect::<Vec<_>>();
     let failure_detail = (!failures.is_empty()).then(|| failures.join("; "));
     ProcessHygieneEvaluation {
         metrics,
-        details: serde_json::json!({"residue_identities": residue}),
+        details: serde_json::json!({
+            "residue_identities": residue,
+            "audits": audits,
+            "growth_diagnostics": growth_diagnostics,
+            "monotonic_growth_ok": monotonic_growth_ok,
+        }),
         measurement_complete: true,
         passed: failure_detail.is_none(),
         measurement_error: None,

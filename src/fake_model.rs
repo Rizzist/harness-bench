@@ -225,6 +225,20 @@ pub fn evaluate_model_request_efficiency(
     completed_semantic_turns: u64,
     expected_semantic_turns: u64,
 ) -> ModelRequestEfficiencyEvaluation {
+    evaluate_model_request_efficiency_repetitions(
+        records,
+        &BTreeMap::from([(1_u32, completed_semantic_turns)]),
+        expected_semantic_turns,
+    )
+}
+
+/// Aggregate the two row-42 fresh-profile repetitions and enforce every
+/// per-repetition oracle before publishing pooled headline metrics.
+pub fn evaluate_model_request_efficiency_repetitions(
+    records: &[ModelRequestRecord],
+    completed_turns_by_repetition: &BTreeMap<u32, u64>,
+    expected_turns_per_repetition: u64,
+) -> ModelRequestEfficiencyEvaluation {
     let physical_requests = records.len() as u64;
     let primary_requests = records
         .iter()
@@ -232,7 +246,7 @@ pub fn evaluate_model_request_efficiency(
         .count() as u64;
     let side_channel_requests = records
         .iter()
-        .filter(|record| record.role == "side-channel")
+        .filter(|record| record.role != "primary")
         .count() as u64;
     let unclassified = records
         .iter()
@@ -241,6 +255,23 @@ pub fn evaluate_model_request_efficiency(
                 || record.side_channel_kind.as_deref() == Some("unknown-side-channel")
         })
         .collect::<Vec<_>>();
+    let missing_role_evidence = records.iter().any(|record| {
+        !matches!(
+            record.role.as_str(),
+            "primary" | "side-channel" | "unclassified"
+        ) || (record.role == "side-channel"
+            && !matches!(
+                record.side_channel_kind.as_deref(),
+                Some(
+                    "title"
+                        | "summary"
+                        | "compaction"
+                        | "reviewer"
+                        | "child"
+                        | "unknown-side-channel"
+                )
+            ))
+    });
     let mut semantic_attempts = BTreeMap::new();
     for record in records {
         semantic_attempts
@@ -264,24 +295,114 @@ pub fn evaluate_model_request_efficiency(
         .collect::<Vec<_>>();
     let context_sizes = records
         .iter()
-        .map(|record| canonical_context_tax_bytes(&record.request.canonical))
+        .map(|record| {
+            canonical_context_tax_bytes_for_dialect(
+                &record.request.dialect,
+                &record.request.canonical,
+            )
+        })
         .collect::<Vec<_>>();
-    let mut primary_semantics = BTreeMap::<(&str, &str), BTreeMap<(u64, &str), u64>>::new();
-    for record in records.iter().filter(|record| record.role == "primary") {
-        primary_semantics
-            .entry((
-                record.request.scenario.as_str(),
-                record.request.actor.as_str(),
-            ))
-            .or_default()
-            .entry((record.semantic_ordinal, record.request.checkpoint.as_str()))
-            .or_insert_with(|| canonical_context_tax_bytes(&record.request.canonical));
+    let repetition_for = |record: &ModelRequestRecord| {
+        record
+            .request
+            .scenario
+            .strip_prefix("ahrb-row42-r")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1)
+    };
+    let mut context_slopes = Vec::new();
+    let mut repetitions = Vec::new();
+    let mut repetitions_pass = true;
+    for (&repetition, &completed_turns) in completed_turns_by_repetition {
+        let repetition_records = records
+            .iter()
+            .filter(|record| repetition_for(record) == repetition)
+            .collect::<Vec<_>>();
+        let mut primary_by_turn =
+            BTreeMap::<(&str, &str, u64, &str), Vec<&ModelRequestRecord>>::new();
+        for record in repetition_records
+            .iter()
+            .copied()
+            .filter(|record| record.role == "primary")
+        {
+            primary_by_turn
+                .entry((
+                    record.request.scenario.as_str(),
+                    record.request.actor.as_str(),
+                    record.semantic_ordinal,
+                    record.request.checkpoint.as_str(),
+                ))
+                .or_default()
+                .push(record);
+        }
+        let one_primary_per_turn = primary_by_turn.len() as u64 == expected_turns_per_repetition
+            && primary_by_turn.values().all(|attempts| attempts.len() == 1);
+        let repetition_context = primary_by_turn
+            .values()
+            .filter_map(|attempts| attempts.first().copied())
+            .map(|record| {
+                canonical_context_tax_bytes_for_dialect(
+                    &record.request.dialect,
+                    &record.request.canonical,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut repetition_attempts = BTreeMap::new();
+        for record in &repetition_records {
+            repetition_attempts
+                .entry((
+                    record.request.scenario.as_str(),
+                    record.request.actor.as_str(),
+                    record.semantic_ordinal,
+                    record.request.checkpoint.as_str(),
+                ))
+                .and_modify(|total: &mut u64| {
+                    *total = (*total).max(record.semantic_attempts_total);
+                })
+                .or_insert(record.semantic_attempts_total);
+        }
+        let repetition_retries = repetition_attempts.values().fold(0_u64, |total, attempts| {
+            total.saturating_add(attempts.saturating_sub(1))
+        });
+        let repetition_side_channels = repetition_records
+            .iter()
+            .filter(|record| record.role != "primary")
+            .count() as u64;
+        let repetition_unclassified = repetition_records.iter().any(|record| {
+            record.role == "unclassified"
+                || record.side_channel_kind.as_deref() == Some("unknown-side-channel")
+        });
+        let slope = theil_sen_by_index(&repetition_context);
+        context_slopes.push(slope);
+        let complete = completed_turns == expected_turns_per_repetition
+            && !repetition_records.is_empty()
+            && repetition_records
+                .iter()
+                .all(|record| record.body_bytes > 0)
+            && !missing_role_evidence;
+        let denominator = completed_turns.max(1) as f64;
+        let passed = complete
+            && one_primary_per_turn
+            && !repetition_unclassified
+            && repetition_side_channels as f64 / denominator <= 0.05
+            && repetition_retries == 0
+            && nearest_rank(&repetition_context, 95) <= 1_048_576
+            && slope.abs() <= 1_024.0;
+        repetitions_pass &= passed;
+        repetitions.push(json!({
+            "repetition": repetition,
+            "completed_turns": completed_turns,
+            "primary_turns": primary_by_turn.len(),
+            "one_primary_per_turn": one_primary_per_turn,
+            "side_channel_requests": repetition_side_channels,
+            "retry_attempts": repetition_retries,
+            "context_tax_slope_bytes_per_turn": slope,
+            "measurement_complete": complete,
+            "reference_envelope_pass": passed,
+        }));
     }
-    let mut context_slopes = primary_semantics
-        .values()
-        .map(|turns| theil_sen_by_index(&turns.values().copied().collect::<Vec<_>>()))
-        .collect::<Vec<_>>();
     context_slopes.sort_by(f64::total_cmp);
+    let completed_semantic_turns = completed_turns_by_repetition.values().copied().sum::<u64>();
     let denominator = completed_semantic_turns as f64;
     let rate = |count: u64| {
         if completed_semantic_turns == 0 {
@@ -364,22 +485,20 @@ pub fn evaluate_model_request_efficiency(
             })
         })
         .collect::<Vec<_>>();
-    let measurement_complete = completed_semantic_turns > 0
-        && completed_semantic_turns == expected_semantic_turns
+    let expected_total =
+        expected_turns_per_repetition.saturating_mul(completed_turns_by_repetition.len() as u64);
+    let measurement_complete = !completed_turns_by_repetition.is_empty()
+        && completed_semantic_turns == expected_total
         && !records.is_empty()
-        && records.iter().all(|record| record.body_bytes > 0);
-    let reference_envelope_pass = measurement_complete
-        && unclassified.is_empty()
-        && metrics["model_request_efficiency.primary_requests_per_turn"] <= 1.0
-        && metrics["model_request_efficiency.side_channel_requests_per_turn"] <= 0.05
-        && metrics["model_request_efficiency.retry_attempts_per_turn"] == 0.0
-        && metrics["model_request_efficiency.context_tax_bytes_p95"] <= 1_048_576.0
-        && context_slope.abs() <= 1_024.0;
+        && records.iter().all(|record| record.body_bytes > 0)
+        && !missing_role_evidence;
+    let reference_envelope_pass = measurement_complete && repetitions_pass;
     ModelRequestEfficiencyEvaluation {
         metrics,
         details: json!({
             "side_channel_requests_by_role": side_channel_requests_by_role,
-            "unclassified_requests": unclassified_requests
+            "unclassified_requests": unclassified_requests,
+            "repetitions": repetitions,
         }),
         measurement_complete,
         reference_envelope_pass,
@@ -388,34 +507,49 @@ pub fn evaluate_model_request_efficiency(
 
 /// Canonical encoded system/developer instructions plus tool definitions.
 pub fn canonical_context_tax_bytes(canonical: &Value) -> u64 {
-    let mut bytes = 0_u64;
-    let mut add = |value: &Value| {
-        if let Ok(encoded) = serde_json::to_vec(value) {
-            bytes = bytes.saturating_add(encoded.len() as u64);
+    let dialect = if canonical.get("instructions").is_some() {
+        "openai-responses"
+    } else if canonical.get("system").is_some() && canonical.get("messages").is_some() {
+        "anthropic-messages"
+    } else {
+        "openai-chat-completions"
+    };
+    canonical_context_tax_bytes_for_dialect(dialect, canonical)
+}
+
+/// Serialize exactly the dialect instruction/tool envelope used by row 42.
+pub fn canonical_context_tax_bytes_for_dialect(dialect: &str, canonical: &Value) -> u64 {
+    let tools = canonical.get("tools").cloned().unwrap_or_else(|| json!([]));
+    let value = match dialect {
+        "openai-responses" => json!({
+            "instructions": canonical.get("instructions").cloned().unwrap_or(Value::Null),
+            "tools": tools,
+        }),
+        "anthropic-messages" => json!({
+            "system": canonical.get("system").cloned().unwrap_or(Value::Null),
+            "tools": tools,
+        }),
+        _ => {
+            let messages = canonical
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            matches!(
+                                item.get("role").and_then(Value::as_str),
+                                Some("system" | "developer")
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            json!({"messages": messages, "tools": tools})
         }
     };
-    if let Some(value) = canonical.get("system") {
-        add(value);
-    }
-    if let Some(value) = canonical.get("instructions") {
-        add(value);
-    }
-    for field in ["messages", "input"] {
-        if let Some(items) = canonical.get(field).and_then(Value::as_array) {
-            for item in items {
-                if matches!(
-                    item.get("role").and_then(Value::as_str),
-                    Some("system" | "developer")
-                ) {
-                    add(item);
-                }
-            }
-        }
-    }
-    if let Some(tools) = canonical.get("tools") {
-        add(tools);
-    }
-    bytes
+    serde_json::to_vec(&value).map_or(0, |encoded| encoded.len() as u64)
 }
 
 fn nearest_rank(values: &[u64], percentile: usize) -> u64 {
@@ -668,15 +802,15 @@ impl FakeModelEngine {
             (
                 &left.request.scenario,
                 &left.request.actor,
-                &left.request.checkpoint,
                 left.semantic_ordinal,
+                &left.request.checkpoint,
                 left.attempt,
             )
                 .cmp(&(
                     &right.request.scenario,
                     &right.request.actor,
-                    &right.request.checkpoint,
                     right.semantic_ordinal,
+                    &right.request.checkpoint,
                     right.attempt,
                 ))
         });
@@ -3927,13 +4061,18 @@ mod tests {
         let mut unclassified_records = (1..=20)
             .map(|turn| efficiency_record(turn, "primary", None))
             .collect::<Vec<_>>();
-        unclassified_records.push(efficiency_record(
-            21,
-            "unclassified",
-            Some("unknown-side-channel"),
-        ));
+        unclassified_records.push(efficiency_record(21, "unclassified", None));
         let unclassified = evaluate_model_request_efficiency(&unclassified_records, 20, 20);
+        assert!(unclassified.measurement_complete);
         assert!(!unclassified.reference_envelope_pass);
+        assert_eq!(
+            unclassified.metrics["model_request_efficiency.side_channel_requests_per_turn"],
+            0.05
+        );
+        assert_eq!(
+            unclassified.details["repetitions"][0]["side_channel_requests"],
+            1
+        );
         assert_eq!(
             unclassified.details["unclassified_requests"]
                 .as_array()
