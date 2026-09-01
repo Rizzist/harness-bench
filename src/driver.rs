@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// An opaque harness session identifier.
@@ -92,6 +92,14 @@ pub trait Transport: Send {
     fn request(&mut self, request: TransportRequest) -> DriverFuture<'_, TransportResponse>;
     /// Stop persistent transport resources.
     fn stop(&mut self) -> DriverFuture<'_, ()>;
+    /// Close a persistent stdin input/control surface and expose completion.
+    fn close_input(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async {
+            Err(AhrbError::Unsupported(
+                "transport has no closable stdin input surface".to_owned(),
+            ))
+        })
+    }
     /// Launcher/controller PIDs directly owned by this transport.
     fn owned_pids(&self) -> Vec<u32> {
         Vec::new()
@@ -100,6 +108,10 @@ pub trait Transport: Send {
     /// from the client transport.
     fn daemon_pid(&self) -> Option<u32> {
         None
+    }
+    /// Poll the owned harness/controller process without sending a signal.
+    fn process_exit(&mut self) -> Result<ClientExit> {
+        Ok(ClientExit::NotApplicable)
     }
     /// Lifecycle notes emitted while reclaiming owned daemon processes.
     fn lifecycle_notes(&self) -> Vec<String> {
@@ -937,6 +949,7 @@ pub struct ManagedDaemonTransport<T: Transport> {
     inner: T,
     config: ManagedDaemonConfig,
     daemon: Option<ManagedDaemonProcess>,
+    observed_exit: ClientExit,
     lifecycle_notes: Vec<String>,
 }
 
@@ -947,6 +960,7 @@ impl<T: Transport> ManagedDaemonTransport<T> {
             inner,
             config,
             daemon: None,
+            observed_exit: ClientExit::NotApplicable,
             lifecycle_notes: Vec::new(),
         }
     }
@@ -993,6 +1007,10 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
         })
     }
 
+    fn close_input(&mut self) -> DriverFuture<'_, ()> {
+        self.inner.close_input()
+    }
+
     fn owned_pids(&self) -> Vec<u32> {
         let mut pids = self.inner.owned_pids();
         if let Some(pid) = self.daemon.as_ref().and_then(ManagedDaemonProcess::pid) {
@@ -1005,6 +1023,27 @@ impl<T: Transport> Transport for ManagedDaemonTransport<T> {
 
     fn daemon_pid(&self) -> Option<u32> {
         self.daemon.as_ref().and_then(ManagedDaemonProcess::pid)
+    }
+
+    fn process_exit(&mut self) -> Result<ClientExit> {
+        if self.config.launcher_exits {
+            return Ok(ClientExit::NotApplicable);
+        }
+        let Some(daemon) = self.daemon.as_mut() else {
+            return Ok(self.observed_exit);
+        };
+        let Some(child) = daemon.child.as_mut() else {
+            return Ok(self.observed_exit);
+        };
+        let Some(status) = child.try_wait()? else {
+            return Ok(ClientExit::Running);
+        };
+        if let Some(pid) = child.id() {
+            crate::process::retire_process(pid)?;
+        }
+        daemon.child = None;
+        self.observed_exit = ClientExit::Exited(status.code());
+        Ok(self.observed_exit)
     }
 
     fn lifecycle_notes(&self) -> Vec<String> {
@@ -1061,12 +1100,20 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
         (**self).stop()
     }
 
+    fn close_input(&mut self) -> DriverFuture<'_, ()> {
+        (**self).close_input()
+    }
+
     fn owned_pids(&self) -> Vec<u32> {
         (**self).owned_pids()
     }
 
     fn daemon_pid(&self) -> Option<u32> {
         (**self).daemon_pid()
+    }
+
+    fn process_exit(&mut self) -> Result<ClientExit> {
+        (**self).process_exit()
     }
 
     fn lifecycle_notes(&self) -> Vec<String> {
@@ -1124,12 +1171,36 @@ pub trait Driver: Send {
         marker: &str,
         prompt: Option<&str>,
     ) -> DriverFuture<'_, SessionId>;
+    /// Query the declared public status operation for a native child.
+    fn agent_status(&mut self, _child: &SessionId) -> DriverFuture<'_, Value> {
+        Box::pin(async {
+            Err(AhrbError::Unsupported(
+                "driver does not declare native child status".to_owned(),
+            ))
+        })
+    }
+    /// Collect normalized terminal evidence through the declared public child operation.
+    fn agent_collect(&mut self, _child: &SessionId) -> DriverFuture<'_, Vec<NormalizedEvent>> {
+        Box::pin(async {
+            Err(AhrbError::Unsupported(
+                "driver does not declare native child collect".to_owned(),
+            ))
+        })
+    }
     /// Cancel active work.
     fn cancel(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
     /// Close and delete a session.
     fn close(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
     /// Shut down and clean up the harness.
     fn shutdown(&mut self) -> DriverFuture<'_, ()>;
+    /// Successfully close the harness stdin input/control surface.
+    fn close_stdin(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async {
+            Err(AhrbError::Unsupported(
+                "driver has no closable stdin input surface".to_owned(),
+            ))
+        })
+    }
     /// Reap launcher handles after AHRB has externally killed the owned tree.
     ///
     /// This must not send a graceful control request or mutate harness state.
@@ -1173,6 +1244,10 @@ pub trait Driver: Send {
     /// Last observed thin-client process state for a logical session.
     fn client_exit(&self, _session: &SessionId) -> ClientExit {
         ClientExit::NotApplicable
+    }
+    /// Poll the owned harness/controller exit status without affecting it.
+    fn harness_exit(&mut self) -> Result<ClientExit> {
+        Ok(ClientExit::NotApplicable)
     }
     /// Parsed JSON returned by headless control commands for this session.
     fn control_evidence(&self, _session: &SessionId) -> Vec<Value> {
@@ -1242,6 +1317,16 @@ pub struct DriverOperations {
     pub release_checkpoint: String,
     /// Spawn a native child.
     pub spawn_agent: String,
+    /// JSON pointer selecting the spawned child identifier.
+    pub agent_child_id_pointer: String,
+    /// Query a native child's public status.
+    pub agent_status: String,
+    /// JSON pointer selecting the public status result.
+    pub agent_status_result_pointer: String,
+    /// Collect a native child's public result/event stream.
+    pub agent_collect: String,
+    /// JSON pointer selecting the collected normalized event array.
+    pub agent_collect_events_pointer: String,
     /// Cancel active work.
     pub cancel: String,
     /// Close and delete a session.
@@ -1266,6 +1351,11 @@ impl Default for DriverOperations {
             queue: "session.queue".to_owned(),
             release_checkpoint: "checkpoint.release".to_owned(),
             spawn_agent: "agent.spawn".to_owned(),
+            agent_child_id_pointer: "/session_id".to_owned(),
+            agent_status: "session.attach".to_owned(),
+            agent_status_result_pointer: "/events".to_owned(),
+            agent_collect: "session.attach".to_owned(),
+            agent_collect_events_pointer: "/events".to_owned(),
             cancel: "session.cancel".to_owned(),
             close: "session.close".to_owned(),
             shutdown: "harness.shutdown".to_owned(),
@@ -1424,6 +1514,7 @@ impl<T: Transport> Driver for GenericDriver<T> {
         let marker = marker.to_owned();
         let prompt = prompt.map(str::to_owned);
         let operation = self.operations.spawn_agent.clone();
+        let child_id_pointer = self.operations.agent_child_id_pointer.clone();
         Box::pin(async move {
             let value = self
                 .call(
@@ -1431,7 +1522,28 @@ impl<T: Transport> Driver for GenericDriver<T> {
                     json!({ "parent_session_id": parent, "marker": marker, "prompt": prompt }),
                 )
                 .await?;
-            extract_session_id(&value)
+            extract_session_id_at(&value, &child_id_pointer, "agent.spawn")
+        })
+    }
+
+    fn agent_status(&mut self, child: &SessionId) -> DriverFuture<'_, Value> {
+        let child = child.0.clone();
+        let operation = self.operations.agent_status.clone();
+        let result_pointer = self.operations.agent_status_result_pointer.clone();
+        Box::pin(async move {
+            let value = self.call(&operation, json!({"session_id":child})).await?;
+            extract_operation_result(&value, &result_pointer, "agent.status")
+        })
+    }
+
+    fn agent_collect(&mut self, child: &SessionId) -> DriverFuture<'_, Vec<NormalizedEvent>> {
+        let child = child.0.clone();
+        let operation = self.operations.agent_collect.clone();
+        let events_pointer = self.operations.agent_collect_events_pointer.clone();
+        Box::pin(async move {
+            let value = self.call(&operation, json!({"session_id":child})).await?;
+            let events = extract_operation_result(&value, &events_pointer, "agent.collect")?;
+            Ok(serde_json::from_value(events)?)
         })
     }
 
@@ -1472,6 +1584,10 @@ impl<T: Transport> Driver for GenericDriver<T> {
         })
     }
 
+    fn close_stdin(&mut self) -> DriverFuture<'_, ()> {
+        self.transport.close_input()
+    }
+
     fn wait_ready(
         &mut self,
         sessions: &[SessionId],
@@ -1508,6 +1624,10 @@ impl<T: Transport> Driver for GenericDriver<T> {
         self.transport.daemon_pid()
     }
 
+    fn harness_exit(&mut self) -> Result<ClientExit> {
+        self.transport.process_exit()
+    }
+
     fn lifecycle_notes(&self) -> Vec<String> {
         self.lifecycle_notes.clone()
     }
@@ -1531,6 +1651,26 @@ fn extract_session_id(value: &Value) -> Result<SessionId> {
         .or_else(|| value.as_str())
         .map(|id| SessionId(id.to_owned()))
         .ok_or_else(|| AhrbError::Protocol("response omitted session_id".to_owned()))
+}
+
+fn extract_session_id_at(value: &Value, pointer: &str, operation: &str) -> Result<SessionId> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(|id| SessionId(id.to_owned()))
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "{operation} response omitted child ID string at {pointer:?}"
+            ))
+        })
+}
+
+fn extract_operation_result(value: &Value, pointer: &str, operation: &str) -> Result<Value> {
+    value.pointer(pointer).cloned().ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "{operation} response omitted declared result at {pointer:?}"
+        ))
+    })
 }
 
 fn command_from_argv(argv: &[String]) -> Result<Command> {
@@ -3956,6 +4096,7 @@ pub struct StdinRpcTransport {
     stdout: Option<tokio::io::Lines<BufReader<ChildStdout>>>,
     readiness: Option<Probe>,
     readiness_pid: Option<u32>,
+    observed_exit: ClientExit,
 }
 
 impl StdinRpcTransport {
@@ -3971,6 +4112,7 @@ impl StdinRpcTransport {
             stdout: None,
             readiness: None,
             readiness_pid: None,
+            observed_exit: ClientExit::NotApplicable,
         }
     }
 
@@ -4018,6 +4160,7 @@ impl Transport for StdinRpcTransport {
             self.stdin = Some(stdin);
             self.stdout = Some(BufReader::new(stdout).lines());
             self.child = Some(child);
+            self.observed_exit = ClientExit::Running;
             Ok(())
         })
     }
@@ -4133,10 +4276,11 @@ impl Transport for StdinRpcTransport {
                 let child_pid = child.id();
                 match tokio::time::timeout(self.timeout, child.wait()).await {
                     Ok(status) => {
-                        status?;
+                        let status = status?;
                         if let Some(pid) = child_pid {
                             crate::process::retire_process(pid)?;
                         }
+                        self.observed_exit = ClientExit::Exited(status.code());
                     }
                     Err(_) => {
                         stop_managed_child(&mut child, Duration::from_millis(100)).await?;
@@ -4148,12 +4292,41 @@ impl Transport for StdinRpcTransport {
         })
     }
 
+    fn close_input(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            let stdin = self.stdin.take().ok_or_else(|| {
+                AhrbError::Protocol("stdin-RPC stdin is already closed".to_owned())
+            })?;
+            drop(stdin);
+            Ok(())
+        })
+    }
+
     fn owned_pids(&self) -> Vec<u32> {
         self.pid().into_iter().collect()
     }
 
     fn daemon_pid(&self) -> Option<u32> {
         self.readiness_pid.or_else(|| self.pid())
+    }
+
+    fn process_exit(&mut self) -> Result<ClientExit> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(self.observed_exit);
+        };
+        let pid = child.id();
+        let Some(status) = child.try_wait()? else {
+            return Ok(ClientExit::Running);
+        };
+        if let Some(pid) = pid {
+            crate::process::retire_process(pid)?;
+        }
+        self.child = None;
+        self.stdin = None;
+        self.stdout = None;
+        self.readiness_pid = None;
+        self.observed_exit = ClientExit::Exited(status.code());
+        Ok(self.observed_exit)
     }
 }
 
@@ -4282,11 +4455,31 @@ pub(crate) async fn http_post(
     body: &[u8],
     timeout: Duration,
 ) -> Result<HttpResponse> {
+    http_post_with_connector(endpoint, headers, body, timeout, |host, port| async move {
+        Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+    })
+    .await
+}
+
+/// POST through a caller-owned connector after applying the same loopback-only
+/// URL validation as the ordinary HTTP path. The reference mock uses this to
+/// make its owned egress boundary the one place that can open an IP socket.
+pub(crate) async fn http_post_with_connector<C, F>(
+    endpoint: &str,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    timeout: Duration,
+    connector: C,
+) -> Result<HttpResponse>
+where
+    C: FnOnce(String, u16) -> F,
+    F: Future<Output = Result<tokio::net::TcpStream>>,
+{
     let endpoint = ParsedHttpUrl::parse(endpoint)?;
-    let future = async {
-        let mut stream =
-            tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
-        let mut request = format!(
+    let mut stream = tokio::time::timeout(timeout, connector(endpoint.host.clone(), endpoint.port))
+        .await
+        .map_err(|_| AhrbError::Timeout("HTTP connect idle deadline".to_owned()))??;
+    let mut request = format!(
             "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
             endpoint.path,
             endpoint.host,
@@ -4294,30 +4487,26 @@ pub(crate) async fn http_post(
             body.len()
         )
         .into_bytes();
-        for (name, value) in headers {
-            if !valid_header(name) || value.contains(['\r', '\n']) {
-                return Err(AhrbError::Validation(format!(
-                    "invalid HTTP header {name:?}"
-                )));
-            }
-            request.extend_from_slice(name.as_bytes());
-            request.extend_from_slice(b": ");
-            request.extend_from_slice(value.as_bytes());
-            request.extend_from_slice(b"\r\n");
+    for (name, value) in headers {
+        if !valid_header(name) || value.contains(['\r', '\n']) {
+            return Err(AhrbError::Validation(format!(
+                "invalid HTTP header {name:?}"
+            )));
         }
+        request.extend_from_slice(name.as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
         request.extend_from_slice(b"\r\n");
-        request.extend_from_slice(body);
-        stream.write_all(&request).await?;
-        let mut response = Vec::new();
-        stream
-            .take(16 * 1024 * 1024)
-            .read_to_end(&mut response)
-            .await?;
-        parse_http_response(&response)
-    };
-    tokio::time::timeout(timeout, future)
+    }
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    tokio::time::timeout(timeout, stream.write_all(&request))
         .await
-        .map_err(|_| AhrbError::Timeout("HTTP request idle deadline".to_owned()))?
+        .map_err(|_| AhrbError::Timeout("HTTP write idle deadline".to_owned()))??;
+    let response =
+        read_http_response_with_idle_timeout(&mut stream, timeout, "HTTP request idle deadline")
+            .await?;
+    parse_http_response(&response)
 }
 
 /// POST the same bounded HTTP request over a Unix-domain socket.
@@ -4334,20 +4523,70 @@ pub(crate) async fn unix_http_post(
             "Unix HTTP request path must be absolute".to_owned(),
         ));
     }
-    let future = async {
-        let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
-        let request = http_request_bytes(path, "localhost", headers, body)?;
-        stream.write_all(&request).await?;
-        let mut response = Vec::new();
-        stream
-            .take(16 * 1024 * 1024)
-            .read_to_end(&mut response)
-            .await?;
-        parse_http_response(&response)
-    };
-    tokio::time::timeout(timeout, future)
+    let mut stream = tokio::time::timeout(timeout, tokio::net::UnixStream::connect(socket_path))
         .await
-        .map_err(|_| AhrbError::Timeout("Unix HTTP request idle deadline".to_owned()))?
+        .map_err(|_| AhrbError::Timeout("Unix HTTP connect idle deadline".to_owned()))??;
+    let request = http_request_bytes(path, "localhost", headers, body)?;
+    tokio::time::timeout(timeout, stream.write_all(&request))
+        .await
+        .map_err(|_| AhrbError::Timeout("Unix HTTP write idle deadline".to_owned()))??;
+    let response = read_http_response_with_idle_timeout(
+        &mut stream,
+        timeout,
+        "Unix HTTP request idle deadline",
+    )
+    .await?;
+    parse_http_response(&response)
+}
+
+/// POST one bounded HTTP/1 request over an already-connected inherited Unix stream.
+#[cfg(unix)]
+pub(crate) async fn preconnected_unix_http_post(
+    stream: &mut tokio::net::UnixStream,
+    path: &str,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<HttpResponse> {
+    let request = http_request_bytes(path, "localhost", headers, body)?;
+    tokio::time::timeout(timeout, stream.write_all(&request))
+        .await
+        .map_err(|_| AhrbError::Timeout("preconnected HTTP write idle deadline".to_owned()))??;
+    let response = read_http_response_with_idle_timeout(
+        stream,
+        timeout,
+        "preconnected HTTP request idle deadline",
+    )
+    .await?;
+    parse_http_response(&response)
+}
+
+async fn read_http_response_with_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<Vec<u8>> {
+    const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = tokio::time::timeout(timeout, reader.read(&mut buffer))
+            .await
+            .map_err(|_| AhrbError::Timeout(timeout_message.to_owned()))??;
+        if read == 0 {
+            return Ok(response);
+        }
+        let next_len = response
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| AhrbError::Protocol("HTTP response length overflow".to_owned()))?;
+        if next_len > MAX_RESPONSE_BYTES {
+            return Err(AhrbError::Protocol(format!(
+                "HTTP response exceeds {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
 }
 
 #[cfg(unix)]
@@ -4467,6 +4706,39 @@ mod tests {
     use crate::manifest::{EventMapping, EventRule};
 
     struct NoopTransport;
+
+    #[tokio::test]
+    async fn http_response_reader_resets_idle_deadline_on_each_byte() -> Result<()> {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            for byte in b"abcdef" {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                writer.write_all(&[*byte]).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let response = read_http_response_with_idle_timeout(
+            &mut reader,
+            Duration::from_millis(500),
+            "test idle deadline",
+        )
+        .await?;
+        writer_task
+            .await
+            .map_err(|error| AhrbError::Protocol(format!("test writer task: {error}")))??;
+        assert_eq!(response, b"abcdef");
+
+        let (mut stalled_reader, stalled_writer) = tokio::io::duplex(64);
+        let stalled = read_http_response_with_idle_timeout(
+            &mut stalled_reader,
+            Duration::from_millis(20),
+            "test idle deadline",
+        )
+        .await;
+        drop(stalled_writer);
+        assert!(matches!(stalled, Err(AhrbError::Timeout(_))));
+        Ok(())
+    }
 
     impl Transport for NoopTransport {
         fn start(&mut self) -> DriverFuture<'_, ()> {

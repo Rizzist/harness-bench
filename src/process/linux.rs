@@ -1,8 +1,8 @@
 //! Linux cgroup-v2 and procfs whole-tree sampler.
 
 use crate::process::{
-    ProcIdentity, ProcOwnership, ProcessInfo, ProcessSample, ProcessTree, Sample, Sampler,
-    TreeCpuTracker,
+    ProcIdentity, ProcOwnership, ProcessDiskObservation, ProcessInfo, ProcessSample, ProcessTree,
+    Sample, Sampler, TreeCpuTracker,
 };
 use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -306,6 +306,31 @@ impl Sampler for LinuxSampler {
             cpu_accounting_warnings: cpu_update.warnings,
         })
     }
+
+    fn disk_counters(&mut self, tree: &ProcessTree) -> Result<ProcessDiskObservation> {
+        let mut observation = ProcessDiskObservation {
+            expected_identities: tree.members.keys().copied().collect(),
+            cgroup_write_bytes: self
+                .cgroup
+                .as_ref()
+                .map(|path| read_cgroup_io_stat(&path.join("io.stat")))
+                .transpose()?
+                .flatten(),
+            ..ProcessDiskObservation::default()
+        };
+        for identity in &observation.expected_identities {
+            if let Some(write_bytes) = self.disk_counter_for_identity(*identity)? {
+                observation
+                    .write_bytes_by_identity
+                    .insert(*identity, write_bytes);
+            }
+        }
+        Ok(observation)
+    }
+
+    fn disk_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
+        read_process_disk_counter(&self.proc_root, identity)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +568,91 @@ fn read_cpu_stat(path: &Path) -> Result<Option<u64>> {
     Ok(None)
 }
 
+fn parse_proc_io(pid: u32, text: &str) -> Result<u64> {
+    let mut write_bytes = None;
+    for line in text.lines() {
+        let Some((name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() != "write_bytes" {
+            continue;
+        }
+        if write_bytes.is_some() {
+            return Err(AhrbError::Protocol(format!(
+                "/proc/{pid}/io contains duplicate write_bytes counters"
+            )));
+        }
+        let value = raw_value.trim().parse::<u64>().map_err(|_| {
+            AhrbError::Protocol(format!(
+                "/proc/{pid}/io contains an invalid write_bytes counter: {}",
+                raw_value.trim()
+            ))
+        })?;
+        write_bytes = Some(value);
+    }
+    write_bytes.ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "/proc/{pid}/io did not contain a write_bytes counter"
+        ))
+    })
+}
+
+fn read_process_disk_counter(proc_root: &Path, identity: ProcIdentity) -> Result<Option<u64>> {
+    let process_root = proc_root.join(identity.pid.to_string());
+    let Some(stat_text) = read_transient_text(&process_root.join("stat"))? else {
+        return Ok(None);
+    };
+    if parse_stat(identity.pid, &stat_text)?.identity() != identity {
+        return Ok(None);
+    }
+    let Some(io_text) = read_transient_text(&process_root.join("io"))? else {
+        return Ok(None);
+    };
+    parse_proc_io(identity.pid, &io_text).map(Some)
+}
+
+fn read_cgroup_io_stat(path: &Path) -> Result<Option<u64>> {
+    let Some(text) = read_optional_text(path)? else {
+        return Ok(None);
+    };
+    let mut total = 0_u64;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let Some(device) = fields.next() else {
+            continue;
+        };
+        let mut device_write_bytes = None;
+        for field in fields {
+            let Some((name, value)) = field.split_once('=') else {
+                continue;
+            };
+            if name != "wbytes" {
+                continue;
+            }
+            if device_write_bytes.is_some() {
+                return Err(AhrbError::Protocol(format!(
+                    "{} contains duplicate wbytes for device {device}",
+                    path.display()
+                )));
+            }
+            device_write_bytes = Some(value.parse::<u64>().map_err(|_| {
+                AhrbError::Protocol(format!(
+                    "{} contains invalid wbytes for device {device}: {value}",
+                    path.display()
+                ))
+            })?);
+        }
+        let value = device_write_bytes.ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "{} has no wbytes counter for device {device}",
+                path.display()
+            ))
+        })?;
+        total = total.saturating_add(value);
+    }
+    Ok(Some(total))
+}
+
 fn read_u64_file(path: &Path) -> Result<Option<u64>> {
     let Some(text) = read_optional_text(path)? else {
         return Ok(None);
@@ -708,6 +818,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_proc_write_bytes_without_confusing_cancelled_writes() -> Result<()> {
+        let parsed = parse_proc_io(
+            7,
+            "rchar: 1\nwchar: 2\nsyscr: 3\nsyscw: 4\nwrite_bytes: 8192\ncancelled_write_bytes: 4096\n",
+        )?;
+        assert_eq!(parsed, 8_192);
+        Ok(())
+    }
+
+    #[test]
+    fn sums_cgroup_wbytes_across_devices() -> Result<()> {
+        let root = fixture_dir("io-stat")?;
+        let path = root.join("io.stat");
+        fs::write(
+            &path,
+            "8:0 rbytes=10 wbytes=20 rios=1 wios=2\n8:16 rbytes=30 wbytes=40 rios=3 wios=4\n",
+        )?;
+        assert_eq!(read_cgroup_io_stat(&path)?, Some(60));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn cgroup_membership_survives_reparenting() -> Result<()> {
         let root = fixture_dir("membership")?;
         let proc_root = root.join("proc");
@@ -777,6 +910,40 @@ mod tests {
         assert_eq!(second.process_samples.len(), 1);
         assert_eq!(second.open_fds, Some(3));
         assert_eq!(second.thread_count, Some(2));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn samples_identity_checked_process_and_cgroup_disk_counters() -> Result<()> {
+        let root = fixture_dir("disk-counters")?;
+        let proc_root = root.join("proc");
+        let cgroup = root.join("cgroup");
+        fs::create_dir_all(&proc_root)?;
+        fs::create_dir_all(&cgroup)?;
+        write_sample_process(&proc_root, 100, &stat(100, "root", 1, 10), 3)?;
+        fs::write(
+            proc_root.join("100/io"),
+            "rchar: 1\nwrite_bytes: 12288\ncancelled_write_bytes: 0\n",
+        )?;
+        fs::write(cgroup.join("io.stat"), "8:0 rbytes=0 wbytes=16384\n")?;
+
+        let mut sampler = LinuxSampler::with_roots(proc_root, Some(cgroup));
+        let tree = sampler.discover(&[100])?;
+        let observation = sampler.disk_counters(&tree)?;
+        let root_identity = ProcIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        assert_eq!(
+            observation.expected_identities,
+            BTreeSet::from([root_identity])
+        );
+        assert_eq!(
+            observation.write_bytes_by_identity,
+            BTreeMap::from([(root_identity, 12_288)])
+        );
+        assert_eq!(observation.cgroup_write_bytes, Some(16_384));
         fs::remove_dir_all(root)?;
         Ok(())
     }

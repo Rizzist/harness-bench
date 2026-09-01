@@ -48,6 +48,7 @@ fn model_record(actor: &str) -> ModelRequestRecord {
         role: "primary".to_owned(),
         side_channel_kind: None,
         response_status: Some(200),
+        response_headers_ns: Some(1),
         response_first_frame_yield_ns: None,
         response_last_frame_yield_ns: None,
         semantic_attempts_total: 1,

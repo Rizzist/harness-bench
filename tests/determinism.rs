@@ -34,6 +34,7 @@ fn record(
         role: "primary".to_owned(),
         side_channel_kind: None,
         response_status: Some(200),
+        response_headers_ns: Some(1),
         response_first_frame_yield_ns: Some(2),
         response_last_frame_yield_ns: Some(3),
         semantic_attempts_total: attempt,

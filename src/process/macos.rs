@@ -1,8 +1,8 @@
 //! macOS libproc whole-tree sampler.
 
 use crate::process::{
-    ProcIdentity, ProcOwnership, ProcessInfo, ProcessSample, ProcessTree, Sample, Sampler,
-    TreeCpuTracker,
+    ProcIdentity, ProcOwnership, ProcessDiskObservation, ProcessInfo, ProcessSample, ProcessTree,
+    Sample, Sampler, TreeCpuTracker,
 };
 use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -567,6 +567,31 @@ impl Sampler for MacOsSampler {
             cpu_accounting_warnings: cpu_update.warnings,
         })
     }
+
+    fn disk_counters(&mut self, tree: &ProcessTree) -> Result<ProcessDiskObservation> {
+        let mut observation = ProcessDiskObservation {
+            expected_identities: tree.members.keys().copied().collect(),
+            ..ProcessDiskObservation::default()
+        };
+        for identity in &observation.expected_identities {
+            if let Some(write_bytes) = self.disk_counter_for_identity(*identity)? {
+                observation
+                    .write_bytes_by_identity
+                    .insert(*identity, write_bytes);
+            }
+        }
+        Ok(observation)
+    }
+
+    fn disk_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
+        let Some(current) = bsd_info(identity.pid)? else {
+            return Ok(None);
+        };
+        if identity_of(&current) != identity {
+            return Ok(None);
+        }
+        Ok(rusage(identity.pid)?.map(|usage| usage.ri_diskio_byteswritten))
+    }
 }
 
 fn add_descendants(
@@ -1003,6 +1028,16 @@ mod tests {
         assert!(serialized.get("identity").is_some());
         assert!(serialized.get("rss_bytes").is_some());
         assert!(serialized.get("process").is_none());
+        let disk = sampler.disk_counters(&tree)?;
+        assert_eq!(
+            disk.expected_identities,
+            tree.members.keys().copied().collect()
+        );
+        assert!(
+            disk.write_bytes_by_identity
+                .keys()
+                .any(|identity| identity.pid == std::process::id())
+        );
         assert_eq!(sample.phase, "self");
         Ok(())
     }

@@ -31,6 +31,9 @@ pub struct Manifest {
     pub sessions: SessionOps,
     /// Inputs injected into an active or queued turn.
     pub next_input: NextInputOps,
+    /// Typed facts about the harness's prompt input surface.
+    #[serde(default, skip_serializing_if = "InputConfig::is_absent")]
+    pub input: InputConfig,
     /// Native agent operations.
     pub agents: AgentOps,
     /// Concurrency capabilities.
@@ -393,6 +396,20 @@ pub struct NextInputOps {
     pub queue: Vec<String>,
 }
 
+/// Typed facts about prompt input which cannot be inferred from transport alone.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct InputConfig {
+    /// Whether prompts use the harness process's standard input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_uses_stdin: Option<bool>,
+}
+
+impl InputConfig {
+    fn is_absent(&self) -> bool {
+        self.prompt_uses_stdin.is_none()
+    }
+}
+
 /// Native delegation operations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AgentOps {
@@ -414,6 +431,12 @@ pub struct AgentOps {
     /// Child ID JSON pointer.
     #[serde(default)]
     pub child_id_pointer: String,
+    /// JSON pointer selecting the declared child-status result.
+    #[serde(default)]
+    pub status_result_pointer: String,
+    /// JSON pointer selecting the normalized child-event array returned by collect.
+    #[serde(default)]
+    pub collect_events_pointer: String,
 }
 
 /// Harness concurrency topology and limits.
@@ -626,6 +649,21 @@ pub struct ResourceControls {
     pub idle_timeout_ms: u64,
     /// Maximum captured output bytes.
     pub max_output_bytes: usize,
+    /// Maximum physical provider requests, including the first request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u32>,
+    /// Initial retry delay in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_base_delay_ms: Option<u64>,
+    /// Capped retry delay in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_ms: Option<u64>,
+    /// Harness log paths. `None` means omitted; `Some([])` is an explicit no-log claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_paths: Option<Vec<String>>,
+    /// Additional journal paths; `events.path` is always implicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_paths: Option<Vec<String>>,
 }
 
 /// Acceptance and completion hook argv templates.
@@ -663,6 +701,16 @@ pub struct CapturePolicy {
     /// Maximum bytes captured per stream.
     #[serde(default)]
     pub max_bytes: usize,
+    /// Structured marker used when model-visible tool output is truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_marker: Option<TruncationMarker>,
+}
+
+/// Regex contract for a normalized, model-visible truncation marker.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TruncationMarker {
+    /// Regex with the four named captures required by manifest schema 2.
+    pub regex: String,
 }
 
 /// Required and optional capability declarations.
@@ -862,6 +910,7 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "idle timeout must be strictly less than turn timeout".to_owned(),
         ));
     }
+    validate_wave_2_resources(manifest)?;
     if manifest.concurrency.max_agents == 0 {
         return Err(AhrbError::Validation(
             "concurrency.max_agents must be positive".to_owned(),
@@ -880,6 +929,18 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
                 "tools.aliases.{semantic} repeats a native tool name"
             )));
         }
+    }
+    if let Some(argv) = manifest.tools.fixtures.get("large_output") {
+        let placeholder_count = argv
+            .iter()
+            .map(|argument| argument.match_indices("{{bytes}}").count())
+            .sum::<usize>();
+        if argv.is_empty() || placeholder_count == 0 {
+            return Err(AhrbError::Validation(
+                "tools.fixtures.large_output must be nonempty and contain {{bytes}}".to_owned(),
+            ));
+        }
+        validate_wave_2_capture_limits(manifest)?;
     }
     let topology_family = topology_family(&manifest.concurrency.topology);
     let topology_matches_lifecycle = matches!(
@@ -953,10 +1014,22 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "sessions.run_id_pointer",
             manifest.sessions.run_id_pointer.as_str(),
         ),
+        (
+            "agents.child_id_pointer",
+            manifest.agents.child_id_pointer.as_str(),
+        ),
+        (
+            "agents.status_result_pointer",
+            manifest.agents.status_result_pointer.as_str(),
+        ),
+        (
+            "agents.collect_events_pointer",
+            manifest.agents.collect_events_pointer.as_str(),
+        ),
     ] {
         if !pointer.is_empty() && (!pointer.starts_with('/') || pointer == "/") {
             return Err(AhrbError::Validation(format!(
-                "daemon {label} {pointer:?} is not a non-root JSON pointer"
+                "manifest {label} {pointer:?} is not a non-root JSON pointer"
             )));
         }
     }
@@ -1011,6 +1084,23 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         return Err(AhrbError::Validation(
             "events.path must be lexically contained under {{profile}}".to_owned(),
         ));
+    }
+    for (label, paths) in [
+        ("resources.log_paths", manifest.resources.log_paths.as_ref()),
+        (
+            "resources.journal_paths",
+            manifest.resources.journal_paths.as_ref(),
+        ),
+    ] {
+        if let Some(paths) = paths {
+            for path in paths {
+                if !profile_scoped_template(path) {
+                    return Err(AhrbError::Validation(format!(
+                        "{label} entry {path:?} must be lexically contained under {{{{profile}}}}"
+                    )));
+                }
+            }
+        }
     }
     if !manifest.events.replay_envelope_pointer.is_empty()
         && (!manifest.events.replay_envelope_pointer.starts_with('/')
@@ -1119,6 +1209,31 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "failure exit codes must differ from success".to_owned(),
         ));
     }
+    if let Some(marker) = &manifest.capture.truncation_marker {
+        validate_wave_2_capture_limits(manifest)?;
+        let regex = regex::Regex::new(&marker.regex).map_err(|error| {
+            AhrbError::Validation(format!(
+                "capture.truncation_marker.regex is invalid: {error}"
+            ))
+        })?;
+        let names = regex
+            .capture_names()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        for required in ["truncated", "original_bytes", "payload_bytes", "sha256"] {
+            if !names.contains(required) {
+                return Err(AhrbError::Validation(format!(
+                    "capture.truncation_marker.regex requires named capture {required:?}"
+                )));
+            }
+        }
+        if marker.regex.contains("encoded_bytes") || names.contains("encoded_bytes") {
+            return Err(AhrbError::Validation(
+                "capture.truncation_marker.regex must not expose or render encoded_bytes"
+                    .to_owned(),
+            ));
+        }
+    }
     for (label, argv) in command_vectors(manifest) {
         if !manifest.capture.allow_credential_argv
             && argv.iter().any(|arg| arg.contains("{{credential}}"))
@@ -1157,6 +1272,81 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
                 file.path
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_wave_2_resources(manifest: &Manifest) -> Result<()> {
+    match (
+        manifest.resources.retry_max_attempts,
+        manifest.resources.retry_base_delay_ms,
+        manifest.resources.retry_max_delay_ms,
+    ) {
+        (None, None, None) => {}
+        (Some(max_attempts), Some(base_delay_ms), Some(max_delay_ms)) => {
+            if !(2..=6).contains(&max_attempts) {
+                return Err(AhrbError::Validation(
+                    "resources.retry_max_attempts must be in 2..=6".to_owned(),
+                ));
+            }
+            if base_delay_ms < 50 {
+                return Err(AhrbError::Validation(
+                    "resources.retry_base_delay_ms must be at least 50".to_owned(),
+                ));
+            }
+            if max_delay_ms == 0 {
+                return Err(AhrbError::Validation(
+                    "resources.retry_max_delay_ms must be positive".to_owned(),
+                ));
+            }
+            if base_delay_ms > max_delay_ms {
+                return Err(AhrbError::Validation(
+                    "resources.retry_base_delay_ms must not exceed retry_max_delay_ms".to_owned(),
+                ));
+            }
+
+            let delay_sum_ms = (0..max_attempts.saturating_sub(1))
+                .map(|exponent| {
+                    (u128::from(base_delay_ms) * (1_u128 << exponent)).min(u128::from(max_delay_ms))
+                })
+                .sum::<u128>();
+            // Twice the specified `1.5 * sum(delays) + 1_000` formula avoids
+            // losing a possible half millisecond to integer rounding.
+            let worst_case_twice_ms = 3 * delay_sum_ms + 2_000;
+            if worst_case_twice_ms > 20_000 {
+                return Err(AhrbError::Validation(
+                    "the declared retry worst case must not exceed 10,000 ms".to_owned(),
+                ));
+            }
+            if worst_case_twice_ms > 2 * u128::from(manifest.resources.turn_timeout_ms) {
+                return Err(AhrbError::Validation(
+                    "the declared retry worst case must not exceed resources.turn_timeout_ms"
+                        .to_owned(),
+                ));
+            }
+        }
+        _ => {
+            return Err(AhrbError::Validation(
+                "retry policy requires retry_max_attempts, retry_base_delay_ms, and retry_max_delay_ms together"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wave_2_capture_limits(manifest: &Manifest) -> Result<()> {
+    const MAX_CAPTURE_BYTES: usize = 1_048_576;
+    if !(1..=MAX_CAPTURE_BYTES).contains(&manifest.resources.max_output_bytes) {
+        return Err(AhrbError::Validation(
+            "resources.max_output_bytes must be in 1..=1,048,576 for large output capture"
+                .to_owned(),
+        ));
+    }
+    if !(1..=MAX_CAPTURE_BYTES).contains(&manifest.capture.max_bytes) {
+        return Err(AhrbError::Validation(
+            "capture.max_bytes must be in 1..=1,048,576 for large output capture".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1358,7 +1548,16 @@ fn resolve_executable(candidate: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod version_tests {
-    use super::{RequestRoleRule, SideChannelKind, concise_version, validate};
+    use super::{
+        Manifest, RequestRoleRule, SideChannelKind, TruncationMarker, concise_version, validate,
+    };
+
+    fn wave_2_manifest() -> Manifest {
+        let mut manifest = super::load(std::path::Path::new("adapters/aider/manifest.toml"))
+            .expect("load schema-1 reference manifest");
+        manifest.identity.schema = 2;
+        manifest
+    }
 
     #[test]
     fn version_probe_keeps_only_matching_line_or_first_line_and_caps_it() {
@@ -1403,5 +1602,155 @@ mod version_tests {
         assert!(validate(&manifest).is_err());
         manifest.request_role_rules[1].json_pointer.clear();
         assert!(validate(&manifest).is_err());
+    }
+
+    #[test]
+    fn wave_2_optional_fields_preserve_absence_and_explicit_empty_paths() {
+        let manifest = wave_2_manifest();
+        assert!(manifest.resources.log_paths.is_none());
+        assert!(manifest.resources.journal_paths.is_none());
+        assert!(manifest.input.prompt_uses_stdin.is_none());
+        assert!(manifest.capture.truncation_marker.is_none());
+
+        let absent = serde_json::to_value(&manifest).expect("serialize absent fields");
+        assert!(absent.get("input").is_none());
+        assert!(absent["resources"].get("log_paths").is_none());
+        assert!(absent["resources"].get("journal_paths").is_none());
+        assert!(absent["capture"].get("truncation_marker").is_none());
+
+        let mut explicit = manifest;
+        explicit.resources.log_paths = Some(Vec::new());
+        explicit.resources.journal_paths = Some(Vec::new());
+        explicit.input.prompt_uses_stdin = Some(false);
+        let encoded = toml::to_string(&explicit).expect("serialize explicit Wave-2 fields");
+        let decoded: Manifest = toml::from_str(&encoded).expect("parse explicit Wave-2 fields");
+        assert_eq!(decoded.resources.log_paths, Some(Vec::new()));
+        assert_eq!(decoded.resources.journal_paths, Some(Vec::new()));
+        assert_eq!(decoded.input.prompt_uses_stdin, Some(false));
+    }
+
+    #[test]
+    fn wave_2_paths_must_be_profile_scoped() {
+        let mut manifest = wave_2_manifest();
+        manifest.resources.log_paths = Some(Vec::new());
+        manifest.resources.journal_paths = Some(vec!["{{profile}}/state/extra.jsonl".to_owned()]);
+        validate(&manifest).expect("explicit no-log and profile journal are valid");
+
+        manifest.resources.log_paths = Some(vec!["state/harness.log".to_owned()]);
+        let error = validate(&manifest).expect_err("relative log path must be rejected");
+        assert!(error.to_string().contains("resources.log_paths"));
+
+        manifest.resources.log_paths = Some(Vec::new());
+        manifest.resources.journal_paths = Some(vec!["{{profile}}/../journal".to_owned()]);
+        let error = validate(&manifest).expect_err("traversing journal path must be rejected");
+        assert!(error.to_string().contains("resources.journal_paths"));
+    }
+
+    #[test]
+    fn retry_policy_is_complete_bounded_and_has_a_certifiable_worst_case() {
+        let mut manifest = wave_2_manifest();
+        manifest.resources.retry_max_attempts = Some(3);
+        let error = validate(&manifest).expect_err("partial retry policy must be rejected");
+        assert!(error.to_string().contains("requires retry_max_attempts"));
+
+        manifest.resources.retry_base_delay_ms = Some(50);
+        manifest.resources.retry_max_delay_ms = Some(200);
+        validate(&manifest).expect("minimum retry base is valid");
+
+        manifest.resources.retry_max_attempts = Some(1);
+        let error = validate(&manifest).expect_err("one attempt cannot prove bounded retry");
+        assert!(error.to_string().contains("2..=6"));
+
+        manifest.resources.retry_max_attempts = Some(3);
+        manifest.resources.retry_base_delay_ms = Some(49);
+        let error = validate(&manifest).expect_err("retry base below floor must be rejected");
+        assert!(error.to_string().contains("at least 50"));
+
+        manifest.resources.retry_base_delay_ms = Some(50);
+        manifest.resources.retry_max_delay_ms = Some(0);
+        let error = validate(&manifest).expect_err("zero retry cap must be rejected");
+        assert!(error.to_string().contains("must be positive"));
+
+        manifest.resources.retry_base_delay_ms = Some(200);
+        manifest.resources.retry_max_delay_ms = Some(100);
+        let error = validate(&manifest).expect_err("retry base above cap must be rejected");
+        assert!(error.to_string().contains("must not exceed"));
+
+        manifest.resources.retry_max_attempts = Some(6);
+        manifest.resources.retry_base_delay_ms = Some(1_500);
+        manifest.resources.retry_max_delay_ms = Some(1_500);
+        let error = validate(&manifest).expect_err("retry envelope above 10 seconds");
+        assert!(error.to_string().contains("10,000 ms"));
+
+        manifest.resources.retry_max_attempts = Some(2);
+        manifest.resources.retry_base_delay_ms = Some(100);
+        manifest.resources.retry_max_delay_ms = Some(100);
+        manifest.resources.turn_timeout_ms = 1_100;
+        manifest.resources.idle_timeout_ms = 1_000;
+        let error = validate(&manifest).expect_err("retry envelope above turn timeout");
+        assert!(error.to_string().contains("turn_timeout_ms"));
+    }
+
+    #[test]
+    fn large_output_fixture_and_truncation_marker_are_typed_and_bounded() {
+        let mut manifest = wave_2_manifest();
+        manifest.tools.fixtures.insert(
+            "large_output".to_owned(),
+            vec![
+                "ahrb-fixture".to_owned(),
+                "emit".to_owned(),
+                "--bytes".to_owned(),
+                "{{bytes}}".to_owned(),
+            ],
+        );
+        manifest.capture.truncation_marker = Some(TruncationMarker {
+            regex: r"TRUNCATED truncated=(?P<truncated>true) original=(?P<original_bytes>[0-9]+) payload=(?P<payload_bytes>[0-9]+) sha256=(?P<sha256>[0-9a-f]{64})"
+                .to_owned(),
+        });
+        validate(&manifest).expect("valid large-output declarations");
+
+        manifest.tools.fixtures.insert(
+            "large_output".to_owned(),
+            vec!["ahrb-fixture".to_owned(), "emit".to_owned()],
+        );
+        let error = validate(&manifest).expect_err("missing bytes placeholder");
+        assert!(error.to_string().contains("contain {{bytes}}"));
+
+        manifest.tools.fixtures.insert(
+            "large_output".to_owned(),
+            vec!["ahrb-fixture".to_owned(), "{{bytes}}{{bytes}}".to_owned()],
+        );
+        validate(&manifest).expect("the specification only requires the placeholder to occur");
+
+        manifest.tools.fixtures.insert(
+            "large_output".to_owned(),
+            vec!["ahrb-fixture".to_owned(), "{{bytes}}".to_owned()],
+        );
+        manifest.capture.truncation_marker = Some(TruncationMarker {
+            regex: r"(?P<truncated>true)-(?P<original_bytes>[0-9]+)-(?P<payload_bytes>[0-9]+)"
+                .to_owned(),
+        });
+        let error = validate(&manifest).expect_err("missing sha256 capture");
+        assert!(error.to_string().contains("sha256"));
+
+        manifest.capture.truncation_marker = Some(TruncationMarker {
+            regex: r"(?P<truncated>true)-(?P<original_bytes>[0-9]+)-(?P<payload_bytes>[0-9]+)-(?P<sha256>[0-9a-f]{64})-encoded_bytes"
+                .to_owned(),
+        });
+        let error = validate(&manifest).expect_err("encoded byte field is self-referential");
+        assert!(error.to_string().contains("encoded_bytes"));
+
+        manifest.capture.truncation_marker = Some(TruncationMarker {
+            regex: r"(?P<truncated>true)-(?P<original_bytes>[0-9]+)-(?P<payload_bytes>[0-9]+)-(?P<sha256>[0-9a-f]{64})"
+                .to_owned(),
+        });
+        manifest.resources.max_output_bytes = 1_048_577;
+        let error = validate(&manifest).expect_err("oversized harness output limit");
+        assert!(error.to_string().contains("resources.max_output_bytes"));
+
+        manifest.resources.max_output_bytes = 1_048_576;
+        manifest.capture.max_bytes = 0;
+        let error = validate(&manifest).expect_err("zero evidence capture limit");
+        assert!(error.to_string().contains("capture.max_bytes"));
     }
 }

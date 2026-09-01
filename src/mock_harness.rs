@@ -5,9 +5,9 @@
 //! can observe it.  Replay reads that journal again, making it the recoverable source of
 //! truth rather than an in-memory event buffer.
 
-use crate::driver::http_post;
+use crate::driver::{http_post, http_post_with_connector};
 #[cfg(unix)]
-use crate::driver::unix_http_post;
+use crate::driver::{preconnected_unix_http_post, unix_http_post};
 use crate::events::{EventVocab, NormalizedEvent};
 use crate::fake_model::{
     FakeModelEngine, OpenAiChatFrontend, ProtocolFrontend, ProviderMailboxRequest,
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -41,10 +42,193 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_SESSION_MEMORY_MIB: u64 = 4;
 
 const MIB: u64 = 1024 * 1024;
+const OWNED_EGRESS_BOUNDARY: &str = "reference-mock-loopback-connector-v1";
 static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEW_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static REPLACE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_MAILBOX_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// One durable decision emitted by the reference mock's owned connector.
+///
+/// Row 62 supplies the nonce and ledger path out of band, then binds this PID
+/// to the independently sampled harness tree and this boundary to the resolved
+/// reference-mock executable digest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OwnedEgressLedgerRecord {
+    pub schema: u32,
+    pub sequence: u64,
+    pub nonce: String,
+    pub pid: u32,
+    pub boundary: String,
+    pub destination: String,
+    pub category: String,
+    pub allowed: bool,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedEgressGuard {
+    ledger_path: PathBuf,
+    nonce: String,
+    forbidden_address: SocketAddr,
+    write_lock: Arc<Mutex<()>>,
+    sequence: Arc<AtomicU64>,
+}
+
+impl OwnedEgressGuard {
+    fn from_environment(state_dir: &Path) -> Result<Option<Self>> {
+        let ledger_path = optional_unicode_environment("AHRB_MOCK_OWNED_EGRESS_LEDGER")?;
+        let nonce = optional_unicode_environment("AHRB_MOCK_OWNED_EGRESS_NONCE")?;
+        let forbidden = optional_unicode_environment("AHRB_MOCK_OWNED_EGRESS_FORBIDDEN")?;
+        if ledger_path.is_none() && nonce.is_none() && forbidden.is_none() {
+            return Ok(None);
+        }
+        let (Some(ledger_path), Some(nonce), Some(forbidden)) = (ledger_path, nonce, forbidden)
+        else {
+            return Err(AhrbError::Validation(
+                "owned egress guard environment is incomplete".to_owned(),
+            ));
+        };
+        let ledger_path = PathBuf::from(ledger_path);
+        let profile_root = state_dir.parent().ok_or_else(|| {
+            AhrbError::Validation("mock state directory has no profile parent".to_owned())
+        })?;
+        if !ledger_path.is_absolute()
+            || !ledger_path.starts_with(profile_root)
+            || ledger_path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(AhrbError::Validation(
+                "owned egress ledger must be an absolute path under the mock profile".to_owned(),
+            ));
+        }
+        if nonce.len() != 64
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AhrbError::Validation(
+                "owned egress nonce must be 64 lowercase hexadecimal characters".to_owned(),
+            ));
+        }
+        let forbidden_address = forbidden.parse::<SocketAddr>().map_err(|_| {
+            AhrbError::Validation(
+                "owned egress forbidden destination must be an IP socket address".to_owned(),
+            )
+        })?;
+        if forbidden_address.ip().is_loopback() {
+            return Err(AhrbError::Validation(
+                "owned egress forbidden destination must not be loopback".to_owned(),
+            ));
+        }
+        Ok(Some(Self {
+            ledger_path,
+            nonce,
+            forbidden_address,
+            write_lock: Arc::new(Mutex::new(())),
+            sequence: Arc::new(AtomicU64::new(1)),
+        }))
+    }
+
+    async fn record(
+        &self,
+        destination: String,
+        category: &str,
+        allowed: bool,
+        outcome: &str,
+    ) -> Result<()> {
+        let _write_guard = self.write_lock.lock().await;
+        if let Some(parent) = self.ledger_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let record = OwnedEgressLedgerRecord {
+            schema: 1,
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+            nonce: self.nonce.clone(),
+            pid: std::process::id(),
+            boundary: OWNED_EGRESS_BOUNDARY.to_owned(),
+            destination,
+            category: category.to_owned(),
+            allowed,
+            outcome: outcome.to_owned(),
+        };
+        let mut bytes = serde_json::to_vec(&record)?;
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.ledger_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    async fn connect_socket(
+        &self,
+        address: SocketAddr,
+        category: &str,
+    ) -> Result<tokio::net::TcpStream> {
+        let destination = address.to_string();
+        if !address.ip().is_loopback() {
+            self.record(destination, category, false, "blocked-permission-denied")
+                .await?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "reference mock owned egress boundary denied non-loopback connect",
+            )
+            .into());
+        }
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(stream) => {
+                self.record(destination, category, true, "connected-loopback")
+                    .await?;
+                Ok(stream)
+            }
+            Err(error) => {
+                self.record(destination, category, true, "loopback-connect-error")
+                    .await?;
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn connect_provider(&self, host: String, port: u16) -> Result<tokio::net::TcpStream> {
+        let parsed = host.parse::<IpAddr>().map_err(|_| {
+            AhrbError::Validation(
+                "owned egress guard requires the injected TCP provider to use a literal loopback address"
+                    .to_owned(),
+            )
+        })?;
+        self.connect_socket(SocketAddr::new(parsed, port), "provider")
+            .await
+    }
+
+    async fn verify_forbidden_probe(&self) -> Result<()> {
+        match self
+            .connect_socket(self.forbidden_address, "control-probe")
+            .await
+        {
+            Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Ok(())
+            }
+            Err(error) => Err(AhrbError::Protocol(format!(
+                "owned egress control probe returned an unrelated error: {error}"
+            ))),
+            Ok(stream) => {
+                drop(stream);
+                Err(AhrbError::Protocol(
+                    "owned egress control probe escaped the reference mock boundary".to_owned(),
+                ))
+            }
+        }
+    }
+
+    async fn record_local_provider(&self, destination: String) -> Result<()> {
+        self.record(destination, "provider", true, "connected-local-ipc")
+            .await
+    }
+}
 
 /// Durable append-only event storage for one session.
 #[derive(Clone, Debug)]
@@ -124,17 +308,34 @@ impl DurableJournal {
 #[derive(Clone, Debug)]
 struct MockConfig {
     state_dir: PathBuf,
+    workspace_override: Option<PathBuf>,
     base_url: Option<String>,
     unix_socket: Option<PathBuf>,
     provider_mailbox: Option<PathBuf>,
+    #[cfg(unix)]
+    provider_stream: Option<Arc<Mutex<tokio::net::UnixStream>>>,
     embedded_model: Option<Arc<FakeModelEngine>>,
     api_key: Option<String>,
     model: String,
     idle_timeout: Duration,
+    turn_timeout: Duration,
+    retry_max_attempts: u32,
+    retry_base_delay_ms: u64,
+    retry_max_delay_ms: u64,
+    max_output_bytes: usize,
     session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
     declare_native_shell: bool,
+    owned_egress_guard: Option<OwnedEgressGuard>,
+}
+
+impl MockConfig {
+    fn workspace_path(&self, session: &str) -> PathBuf {
+        self.workspace_override
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("workspaces").join(session))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -425,7 +626,7 @@ impl MockHarness {
         };
         write_new_synced(&directory.join("meta.json"), &serde_json::to_vec(&meta)?)?;
         let journal = DurableJournal::open(directory.join("journal.jsonl"))?;
-        fs::create_dir(self.config.state_dir.join("workspaces").join(id))?;
+        fs::create_dir_all(self.config.workspace_path(id))?;
         sync_directory(&directory)?;
         sync_directory(&self.config.state_dir.join("sessions"))?;
         self.sessions.insert(
@@ -575,7 +776,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "--help" | "help" => {
             println!(
                 "ahrb-mock-harness serve|rpc|status --state-dir PATH [--idle-timeout-ms N] \
-                 [--session-memory-mib N]\n\
+                 [--session-memory-mib N] [--retry-max-attempts N] \
+                 [--retry-base-delay-ms N] [--retry-max-delay-ms N]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
                  --session-id ID --prompt PROMPT --key KEY \
                  [--base-url URL]\n\
@@ -631,7 +833,12 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
                     .parse()
                     .map_err(|_| AhrbError::Usage("invalid post-output delay".to_owned()))?;
             }
-            "--state-dir" | "--idle-timeout-ms" | "--session-memory-mib" => {
+            "--state-dir"
+            | "--idle-timeout-ms"
+            | "--session-memory-mib"
+            | "--retry-max-attempts"
+            | "--retry-base-delay-ms"
+            | "--retry-max-delay-ms" => {
                 config_args.push(option.to_owned());
                 config_args.push(value.clone());
             }
@@ -699,6 +906,13 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     }
     let terminal = if spawn || resume_pending {
         let started = std::time::Instant::now();
+        #[cfg(unix)]
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        #[cfg(unix)]
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        #[cfg(unix)]
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
         loop {
             let events = journal.read_after(after)?;
             if let Some(terminal) = events.iter().rev().find(|event| is_terminal(&event.event)) {
@@ -707,6 +921,26 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             if started.elapsed() >= Duration::from_secs(60) {
                 return Err(AhrbError::Timeout("mock exec turn".to_owned()));
             }
+            #[cfg(unix)]
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                signal = sigterm.recv() => {
+                    if signal.is_some() {
+                        terminalize_active_for_control(&harness, "sigterm").await?;
+                    }
+                }
+                signal = sigint.recv() => {
+                    if signal.is_some() {
+                        terminalize_active_for_control(&harness, "sigint").await?;
+                    }
+                }
+                signal = sighup.recv() => {
+                    if signal.is_some() {
+                        terminalize_active_for_control(&harness, "sighup").await?;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     } else {
@@ -772,7 +1006,7 @@ async fn cancel_session_command(args: &[String]) -> Result<i32> {
             EventVocab::TerminalCancelled,
             json!({"status":"cancelled", "cleanup":"workspace-removed"}),
         )?;
-        guard.config.state_dir.join("workspaces").join(&session_id)
+        guard.config.workspace_path(&session_id)
     };
     if workspace.exists() {
         fs::remove_dir_all(&workspace)?;
@@ -820,6 +1054,9 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     let mut state_dir = None;
     let mut idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS;
     let mut session_memory_mib = DEFAULT_SESSION_MEMORY_MIB;
+    let mut retry_max_attempts = None;
+    let mut retry_base_delay_ms = None;
+    let mut retry_max_delay_ms = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -844,6 +1081,39 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
                     })?
                     .parse()
                     .map_err(|_| AhrbError::Usage("invalid session memory size".to_owned()))?;
+            }
+            "--retry-max-attempts" => {
+                index += 1;
+                retry_max_attempts = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage("--retry-max-attempts needs a value".to_owned())
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| AhrbError::Usage("invalid retry maximum".to_owned()))?,
+                );
+            }
+            "--retry-base-delay-ms" => {
+                index += 1;
+                retry_base_delay_ms = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage("--retry-base-delay-ms needs a value".to_owned())
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| AhrbError::Usage("invalid retry base delay".to_owned()))?,
+                );
+            }
+            "--retry-max-delay-ms" => {
+                index += 1;
+                retry_max_delay_ms = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage("--retry-max-delay-ms needs a value".to_owned())
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| AhrbError::Usage("invalid retry maximum delay".to_owned()))?,
+                );
             }
             option => {
                 return Err(AhrbError::Usage(format!("unknown option {option:?}")));
@@ -872,20 +1142,116 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         }
         None => None,
     };
+    let retry_max_attempts = retry_max_attempts.map_or_else(
+        || parse_u64_environment("AHRB_MOCK_RETRY_MAX_ATTEMPTS", 1),
+        Ok,
+    )?;
+    let retry_max_attempts = u32::try_from(retry_max_attempts)
+        .map_err(|_| AhrbError::Validation("mock retry maximum does not fit u32".to_owned()))?;
+    let retry_base_delay_ms = retry_base_delay_ms.map_or_else(
+        || parse_u64_environment("AHRB_MOCK_RETRY_BASE_DELAY_MS", 50),
+        Ok,
+    )?;
+    let retry_max_delay_ms = retry_max_delay_ms.map_or_else(
+        || parse_u64_environment("AHRB_MOCK_RETRY_MAX_DELAY_MS", 50),
+        Ok,
+    )?;
+    let max_output_bytes = parse_u64_environment("AHRB_MOCK_MAX_OUTPUT_BYTES", 1_048_576)?;
+    let turn_timeout_ms = parse_u64_environment("AHRB_MOCK_TURN_TIMEOUT_MS", 10_000)?;
+    let max_output_bytes = usize::try_from(max_output_bytes).map_err(|_| {
+        AhrbError::Validation("mock maximum output bytes do not fit usize".to_owned())
+    })?;
+    if retry_max_attempts == 0 || retry_max_attempts > 6 {
+        return Err(AhrbError::Validation(
+            "mock retry maximum must be in 1..=6".to_owned(),
+        ));
+    }
+    if retry_max_attempts > 1
+        && (retry_base_delay_ms < 50
+            || retry_max_delay_ms == 0
+            || retry_base_delay_ms > retry_max_delay_ms)
+    {
+        return Err(AhrbError::Validation(
+            "mock retry delays require base >= 50 ms and 0 < base <= max".to_owned(),
+        ));
+    }
+    if !(1..=1_048_576).contains(&max_output_bytes) {
+        return Err(AhrbError::Validation(
+            "mock maximum output bytes must be in 1..=1,048,576".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    let provider_stream = inherited_provider_stream()?;
+    let owned_egress_guard = OwnedEgressGuard::from_environment(&state_dir)?;
     Ok(MockConfig {
         state_dir,
+        workspace_override: std::env::var_os("AHRB_MOCK_WORKSPACE_OVERRIDE").map(PathBuf::from),
         base_url,
         unix_socket: std::env::var_os("AHRB_MOCK_UNIX_SOCKET").map(PathBuf::from),
         provider_mailbox: std::env::var_os("AHRB_MOCK_PROVIDER_MAILBOX").map(PathBuf::from),
+        #[cfg(unix)]
+        provider_stream,
         embedded_model,
         api_key: std::env::var("AHRB_MOCK_API_KEY").ok(),
         model: std::env::var("AHRB_MOCK_MODEL").unwrap_or_else(|_| "ahrb-fake-v1".to_owned()),
         idle_timeout: Duration::from_millis(idle_timeout_ms),
+        turn_timeout: Duration::from_millis(turn_timeout_ms),
+        retry_max_attempts,
+        retry_base_delay_ms,
+        retry_max_delay_ms,
+        max_output_bytes,
         session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
         declare_native_shell: false,
+        owned_egress_guard,
     })
+}
+
+#[cfg(unix)]
+fn inherited_provider_stream() -> Result<Option<Arc<Mutex<tokio::net::UnixStream>>>> {
+    use std::os::fd::FromRawFd as _;
+
+    let Some(value) = std::env::var_os("AHRB_MOCK_PROVIDER_FD") else {
+        return Ok(None);
+    };
+    let fd = value
+        .to_string_lossy()
+        .parse::<libc::c_int>()
+        .map_err(|_| AhrbError::Validation("AHRB_MOCK_PROVIDER_FD is not an integer".to_owned()))?;
+    if fd < 3 {
+        return Err(AhrbError::Validation(
+            "AHRB_MOCK_PROVIDER_FD must not alias stdio".to_owned(),
+        ));
+    }
+    // SAFETY: the runner passes one inherited, non-CLOEXEC descriptor and the
+    // child claims sole ownership exactly once while constructing MockConfig.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
+    let stream = tokio::net::UnixStream::from_std(stream)?;
+    Ok(Some(Arc::new(Mutex::new(stream))))
+}
+
+fn parse_u64_environment(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| AhrbError::Validation(format!("{name} must be an unsigned integer"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(AhrbError::Validation(format!("{name} is not Unicode")))
+        }
+    }
+}
+
+fn optional_unicode_environment(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(AhrbError::Validation(format!("{name} is not Unicode")))
+        }
+    }
 }
 
 fn parse_hook_env(name: &str) -> Result<Vec<String>> {
@@ -904,7 +1270,41 @@ async fn serve(config: MockConfig, one_request: bool) -> Result<i32> {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    loop {
+        #[cfg(unix)]
+        let line = tokio::select! {
+            line = lines.next_line() => line?,
+            signal = sigterm.recv() => {
+                if signal.is_some() {
+                    terminalize_active_for_control(&harness, "sigterm").await?;
+                }
+                None
+            }
+            signal = sigint.recv() => {
+                if signal.is_some() {
+                    terminalize_active_for_control(&harness, "sigint").await?;
+                }
+                None
+            }
+            signal = sighup.recv() => {
+                if signal.is_some() {
+                    terminalize_active_for_control(&harness, "sighup").await?;
+                }
+                None
+            }
+        };
+        #[cfg(not(unix))]
+        let line = lines.next_line().await?;
+        let Some(line) = line else {
+            terminalize_active_for_control(&harness, "stdin-eof").await?;
+            break;
+        };
         let request: RpcRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
@@ -934,6 +1334,33 @@ async fn serve(config: MockConfig, one_request: bool) -> Result<i32> {
         Err(error) => return Err(error.into()),
     }
     Ok(0)
+}
+
+async fn terminalize_active_for_control(
+    harness: &Arc<Mutex<MockHarness>>,
+    cause: &str,
+) -> Result<()> {
+    let mut guard = harness.lock().await;
+    let active = guard
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.active)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in active {
+        guard.append_terminal(
+            &id,
+            EventVocab::TerminalCancelled,
+            json!({"status":"cancelled","cause":cause,"structured":true}),
+        )?;
+        if let Some(session) = guard.sessions.get_mut(&id) {
+            session.active = false;
+            session.cancelled = true;
+            session.pending = None;
+        }
+    }
+    guard.shutting_down = true;
+    Ok(())
 }
 
 async fn write_reply(stdout: &mut tokio::io::Stdout, reply: &RpcReply) -> Result<()> {
@@ -1057,6 +1484,7 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
             Ok(json!({ "queued": true }))
         }
         "agent.spawn" => {
+            let parent_operation_started = tokio::time::Instant::now();
             let parent = required_str(&request.params, "parent_session_id")?.to_owned();
             let marker = required_str(&request.params, "marker")?.to_owned();
             let prompt = request
@@ -1064,6 +1492,8 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
                 .get("prompt")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let scripted_crash = marker.contains("row56-crash");
+            let scripted_hang = marker.contains("row56-hang");
             let child = {
                 let mut guard = harness.lock().await;
                 let child = guard.create_session(&marker)?;
@@ -1072,8 +1502,69 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
                     EventVocab::AgentSpawned,
                     json!({ "child_session_id": child, "marker": marker }),
                 )?;
+                if scripted_crash || scripted_hang {
+                    guard.append(
+                        &parent,
+                        EventVocab::TurnAccepted,
+                        json!({"operation":"agent.spawn","child_session_id":child}),
+                    )?;
+                    guard.append(
+                        &child,
+                        EventVocab::TurnAccepted,
+                        json!({"operation":"native-child","parent_session_id":parent}),
+                    )?;
+                }
                 child
             };
+            if scripted_crash {
+                let mut guard = harness.lock().await;
+                guard.append_terminal(
+                    &child,
+                    EventVocab::TerminalFailure,
+                    json!({"status":"failure","category":"scripted-child-crash","checkpoint":"row56-crash"}),
+                )?;
+                guard.append_terminal(
+                    &parent,
+                    EventVocab::TerminalFailure,
+                    json!({"status":"failure","category":"child-failure","child_session_id":child}),
+                )?;
+                return Ok(json!({"session_id":child}));
+            }
+            if scripted_hang {
+                let timeout = harness.lock().await.config.turn_timeout;
+                {
+                    let mut guard = harness.lock().await;
+                    guard.append(
+                        &child,
+                        EventVocab::ModelRequest,
+                        json!({"checkpoint":"row56-hang","fault":"stall"}),
+                    )?;
+                    guard.append(
+                        &child,
+                        EventVocab::ModelResponse,
+                        json!({"checkpoint":"row56-hang","response_headers":true,"fault":"stall"}),
+                    )?;
+                }
+                let remaining = timeout.saturating_sub(parent_operation_started.elapsed());
+                let task_harness = Arc::clone(&harness);
+                let task_parent = parent.clone();
+                let task_child = child.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(remaining).await;
+                    let mut guard = task_harness.lock().await;
+                    let _ = guard.append_terminal(
+                        &task_child,
+                        EventVocab::TerminalCancelled,
+                        json!({"status":"cancelled","category":"parent-deadline"}),
+                    );
+                    let _ = guard.append_terminal(
+                        &task_parent,
+                        EventVocab::TerminalFailure,
+                        json!({"status":"failure","category":"child-deadline","child_session_id":task_child}),
+                    );
+                });
+                return Ok(json!({"session_id":child}));
+            }
             if let Some(prompt) = prompt {
                 let key = format!("native-spawn:{parent}:{child}");
                 let spawn =
@@ -1264,6 +1755,9 @@ async fn execute_turn(
     turn: &PendingTurn,
 ) -> Result<()> {
     let config = harness.lock().await.config.clone();
+    if let Some(guard) = &config.owned_egress_guard {
+        guard.verify_forbidden_probe().await?;
+    }
     if config.base_url.is_none()
         && config.unix_socket.is_none()
         && config.provider_mailbox.is_none()
@@ -1303,50 +1797,75 @@ async fn execute_turn(
             headers.insert("Authorization".to_owned(), format!("Bearer {key}"));
         }
         let body = serde_json::to_vec(&request)?;
-        {
-            let mut guard = harness.lock().await;
-            guard.append(
-                id,
-                EventVocab::ModelRequest,
-                json!({ "model": config.model, "endpoint": "/v1/chat/completions", "checkpoint": checkpoint }),
-            )?;
-        }
-        let request_started = std::time::Instant::now();
-        let response_result = model_http_post(&config, &headers, &body).await;
-        let response = match response_result {
-            Ok(response) => response,
-            Err(AhrbError::Timeout(message)) => {
+        let mut physical_attempt = 0_u32;
+        let response = loop {
+            physical_attempt = physical_attempt.saturating_add(1);
+            {
                 let mut guard = harness.lock().await;
-                guard.append_terminal(
+                guard.append(
                     id,
-                    EventVocab::TerminalFailure,
+                    EventVocab::ModelRequest,
                     json!({
-                        "status": "failure",
-                        "category": "idle-timeout",
-                        "message": message,
-                        "elapsed_ms": u64::try_from(request_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        "model": config.model,
+                        "endpoint": "/v1/chat/completions",
+                        "checkpoint": checkpoint,
+                        "physical_attempt": physical_attempt,
                     }),
                 )?;
-                return Ok(());
             }
-            Err(error) => return Err(error),
+            let request_started = std::time::Instant::now();
+            let response_result = model_http_post(&config, &headers, &body).await;
+            let response = match response_result {
+                Ok(response) => response,
+                Err(AhrbError::Timeout(message)) => {
+                    let mut guard = harness.lock().await;
+                    guard.append_terminal(
+                        id,
+                        EventVocab::TerminalFailure,
+                        json!({
+                            "status": "failure",
+                            "category": "idle-timeout",
+                            "message": message,
+                            "elapsed_ms": u64::try_from(request_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    )?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let retryable = matches!(response.status, 429 | 500);
+            if retryable && physical_attempt < config.retry_max_attempts {
+                let delay_ms = jittered_retry_delay_ms(&config, physical_attempt);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            break response;
         };
         if !(200..300).contains(&response.status) {
             let mut guard = harness.lock().await;
             guard.append_terminal(
                 id,
                 EventVocab::TerminalFailure,
-                json!({ "status": "failure", "category": "provider", "http_status": response.status }),
+                json!({
+                    "status": "failure",
+                    "category": "provider",
+                    "http_status": response.status,
+                    "physical_attempts": physical_attempt,
+                }),
             )?;
             return Ok(());
         }
-        let value: Value = serde_json::from_slice(&response.body)?;
-        let message = value
-            .pointer("/choices/0/message")
-            .cloned()
-            .ok_or_else(|| {
-                AhrbError::Protocol("model response omitted choices[0].message".to_owned())
-            })?;
+        let message = if is_trickle_success_body(&response.body) {
+            json!({"role":"assistant","content":"SUCCESS"})
+        } else {
+            let value: Value = serde_json::from_slice(&response.body)?;
+            value
+                .pointer("/choices/0/message")
+                .cloned()
+                .ok_or_else(|| {
+                    AhrbError::Protocol("model response omitted choices[0].message".to_owned())
+                })?
+        };
         {
             let mut guard = harness.lock().await;
             if session_should_stop(guard.session_mut(id)?)? {
@@ -1458,6 +1977,24 @@ async fn execute_turn(
     Ok(())
 }
 
+fn is_trickle_success_body(body: &[u8]) -> bool {
+    const MARKER: &[u8] = b"AHRB-TRICKLE-SUCCESS";
+    matches!(body.len(), 5 | 20) && body == &MARKER[..body.len()]
+}
+
+fn jittered_retry_delay_ms(config: &MockConfig, completed_attempt: u32) -> u64 {
+    let exponent = completed_attempt.saturating_sub(1).min(63);
+    let nominal = config
+        .retry_base_delay_ms
+        .saturating_mul(1_u64.checked_shl(exponent).unwrap_or(u64::MAX))
+        .min(config.retry_max_delay_ms);
+    if completed_attempt % 2 == 1 {
+        nominal.saturating_mul(3) / 5
+    } else {
+        nominal.saturating_mul(13) / 10
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_prepared_tool_call(
     harness: Arc<Mutex<MockHarness>>,
@@ -1489,14 +2026,12 @@ async fn execute_prepared_tool_call(
     let prepared_result = match duplicate {
         Some(_) => None,
         None if name == "native_shell" => {
-            Some(native_shell_result(&config.state_dir, &session_id, &args).await?)
+            Some(native_shell_result(&config, &session_id, &args).await?)
         }
-        None => Some(fixture_result(
-            &config.state_dir,
-            &session_id,
-            &name,
-            &args,
-        )?),
+        None if matches!(name.as_str(), "large_output" | "large_output_fixture") => {
+            Some(large_output_result(config.max_output_bytes, &args).await?)
+        }
+        None => Some(fixture_result(&config, &session_id, &name, &args)?),
     };
     let result = {
         let mut guard = harness.lock().await;
@@ -1911,40 +2446,89 @@ async fn model_http_post(
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> Result<crate::driver::HttpResponse> {
+    #[cfg(unix)]
+    if let Some(stream) = &config.provider_stream {
+        if let Some(guard) = &config.owned_egress_guard {
+            guard
+                .record_local_provider("inherited-unix-stream".to_owned())
+                .await?;
+        }
+        let mut stream = stream.lock().await;
+        return preconnected_unix_http_post(
+            &mut stream,
+            "/v1/chat/completions",
+            headers,
+            body,
+            config.idle_timeout,
+        )
+        .await;
+    }
     if let Some(directory) = &config.provider_mailbox {
+        if let Some(guard) = &config.owned_egress_guard {
+            guard
+                .record_local_provider(format!("mailbox:{}", directory.display()))
+                .await?;
+        }
         return provider_mailbox_post(directory, headers, body, config.idle_timeout).await;
     }
     if let Some(engine) = &config.embedded_model {
+        if let Some(guard) = &config.owned_egress_guard {
+            guard
+                .record_local_provider("embedded-provider".to_owned())
+                .await?;
+        }
         let frontend = OpenAiChatFrontend;
-        let future = async {
-            let request = frontend.parse("/v1/chat/completions", headers, body)?;
-            let response = engine.handle(request).await?;
-            match &response.fault {
-                Some(Fault::HttpStatus { status, body }) => Ok(crate::driver::HttpResponse {
-                    status: *status,
-                    body: body.as_bytes().to_vec(),
-                }),
-                Some(Fault::Stall) => {
-                    std::future::pending::<Result<crate::driver::HttpResponse>>().await
+        let request = frontend.parse("/v1/chat/completions", headers, body)?;
+        let response = tokio::time::timeout(config.idle_timeout, engine.handle(request))
+            .await
+            .map_err(|_| AhrbError::Timeout("embedded model idle deadline".to_owned()))??;
+        return match &response.fault {
+            Some(
+                Fault::HttpStatus { status, body } | Fault::SustainedHttpStatus { status, body },
+            ) => Ok(crate::driver::HttpResponse {
+                status: *status,
+                body: body.as_bytes().to_vec(),
+            }),
+            Some(Fault::Stall) => tokio::time::timeout(
+                config.idle_timeout,
+                std::future::pending::<Result<crate::driver::HttpResponse>>(),
+            )
+            .await
+            .map_err(|_| AhrbError::Timeout("embedded model idle deadline".to_owned()))?,
+            Some(Fault::Trickle { cadence_ms, count }) => {
+                let cadence = Duration::from_millis(*cadence_ms);
+                for _ in 0..*count {
+                    tokio::time::timeout(config.idle_timeout, tokio::time::sleep(cadence))
+                        .await
+                        .map_err(|_| {
+                            AhrbError::Timeout("embedded model idle deadline".to_owned())
+                        })?;
                 }
-                Some(Fault::MidStreamDisconnect { .. }) => Err(AhrbError::Protocol(
-                    "embedded fake model injected a mid-stream disconnect".to_owned(),
-                )),
-                None | Some(Fault::Fragment { .. }) | Some(Fault::RepeatFrame { .. }) => {
-                    let rendered = frontend.render(&response)?;
-                    Ok(crate::driver::HttpResponse {
-                        status: rendered.status,
-                        body: rendered.body,
-                    })
-                }
+                let rendered = frontend.render(&response)?;
+                Ok(crate::driver::HttpResponse {
+                    status: rendered.status,
+                    body: rendered.body,
+                })
+            }
+            Some(Fault::MidStreamDisconnect { .. }) => Err(AhrbError::Protocol(
+                "embedded fake model injected a mid-stream disconnect".to_owned(),
+            )),
+            None | Some(Fault::Fragment { .. }) | Some(Fault::RepeatFrame { .. }) => {
+                let rendered = frontend.render(&response)?;
+                Ok(crate::driver::HttpResponse {
+                    status: rendered.status,
+                    body: rendered.body,
+                })
             }
         };
-        return tokio::time::timeout(config.idle_timeout, future)
-            .await
-            .map_err(|_| AhrbError::Timeout("embedded model idle deadline".to_owned()))?;
     }
     #[cfg(unix)]
     if let Some(socket_path) = &config.unix_socket {
+        if let Some(guard) = &config.owned_egress_guard {
+            guard
+                .record_local_provider(format!("unix:{}", socket_path.display()))
+                .await?;
+        }
         return unix_http_post(
             socket_path,
             "/v1/chat/completions",
@@ -1959,6 +2543,17 @@ async fn model_http_post(
         .as_ref()
         .ok_or_else(|| AhrbError::Validation("mock model endpoint is not configured".to_owned()))?;
     let endpoint = format!("{base_url}/v1/chat/completions");
+    if let Some(guard) = &config.owned_egress_guard {
+        let guard = guard.clone();
+        return http_post_with_connector(
+            &endpoint,
+            headers,
+            body,
+            config.idle_timeout,
+            move |host, port| async move { guard.connect_provider(host, port).await },
+        )
+        .await;
+    }
     http_post(&endpoint, headers, body, config.idle_timeout).await
 }
 
@@ -2016,20 +2611,23 @@ fn fixture_tools(declare_native_shell: bool) -> Value {
         {"type":"function","function":{"name":"write_fixture","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"ahrb_checkpoint":{"$ref":"#/$defs/ahrb_checkpoint"}},"required":["path","content"],"$defs":{"ahrb_checkpoint":{"type":"object","properties":{"name":{"type":"string"},"phase":{"type":"string","enum":["before-effect","after-commit"]}},"required":["name"]}}}}},
         {"type":"function","function":{"name":"read_fixture","parameters":{"type":"object","properties":{"path":{"type":"string"},"ahrb_checkpoint":{"$ref":"#/$defs/ahrb_checkpoint"}},"required":["path"],"$defs":{"ahrb_checkpoint":{"type":"object","properties":{"name":{"type":"string"},"phase":{"type":"string","enum":["before-effect","after-commit"]}},"required":["name"]}}}}},
         {"type":"function","function":{"name":"fail_fixture","parameters":{"type":"object","properties":{"message":{"type":"string"}}}}},
+        {"type":"function","function":{"name":"large_output","parameters":{"type":"object","properties":{"bytes":{"type":"integer","const":10485760}},"required":["bytes"]}}},
         {"type":"function","function":{"name":"native_shell","parameters":{"type":"object","properties":{"command":{"type":"string"},"route":{"type":"string"},"expected_from_a":{"type":"string"},"ahrb_checkpoint":{"$ref":"#/$defs/ahrb_checkpoint"}},"required":["command"],"additionalProperties":false,"$defs":{"ahrb_checkpoint":{"type":"object","properties":{"name":{"type":"string"},"phase":{"type":"string","enum":["before-effect","after-commit"]}},"required":["name"]}}}}},
         {"type":"function","function":{"name":"barrier","parameters":{"type":"object","properties":{"name":{"type":"string"},"wait_for_release":{"type":"boolean"}},"required":["name"]}}}
     ]);
     if !declare_native_shell {
         if let Some(tools) = tools.as_array_mut() {
-            tools.remove(3);
+            tools.retain(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) != Some("native_shell")
+            });
         }
     }
     tools
 }
 
-async fn native_shell_result(state_dir: &Path, session: &str, args: &Value) -> Result<Value> {
+async fn native_shell_result(config: &MockConfig, session: &str, args: &Value) -> Result<Value> {
     let command = required_str(args, "command")?;
-    let workspace = state_dir.join("workspaces").join(session);
+    let workspace = config.workspace_path(session);
     fs::create_dir_all(&workspace)?;
     let output = tokio::process::Command::new("/bin/sh")
         .args(["-c", command])
@@ -2048,17 +2646,51 @@ async fn native_shell_result(state_dir: &Path, session: &str, args: &Value) -> R
     }))
 }
 
-fn fixture_result(state_dir: &Path, session: &str, name: &str, args: &Value) -> Result<Value> {
+fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) -> Result<Value> {
     match name {
         "write_fixture" | "fixture_write" => {
-            safe_relative(required_str(args, "path")?)?;
+            let relative = safe_relative(required_str(args, "path")?)?;
             let content = required_str(args, "content")?;
+            let workspace = config.workspace_path(session);
+            let path = workspace.join(&relative);
+            let parent = path.parent().ok_or_else(|| {
+                AhrbError::Validation("fixture destination has no parent directory".to_owned())
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let parent_is_read_only = match parent.metadata() {
+                    Ok(metadata) => metadata.permissions().mode() & 0o222 == 0,
+                    Err(_) => false,
+                };
+                if parent_is_read_only {
+                    let attempted = OpenOptions::new().write(true).create_new(true).open(&path);
+                    return match attempted {
+                        Ok(file) => {
+                            drop(file);
+                            let _ = fs::remove_file(&path);
+                            Ok(json!({
+                                "ok": true,
+                                "bytes": content.len(),
+                                "path": required_str(args, "path")?,
+                                "write_errno": Value::Null,
+                                "workspace_fault_control_bypassed": true
+                            }))
+                        }
+                        Err(error) => Ok(json!({
+                            "ok": false,
+                            "error": error.to_string(),
+                            "write_errno": error.raw_os_error(),
+                            "path": required_str(args, "path")?
+                        })),
+                    };
+                }
+            }
             Ok(json!({ "ok": true, "bytes": content.len(), "path": required_str(args, "path")? }))
         }
         "read_fixture" | "fixture_read" => {
             let relative = safe_relative(required_str(args, "path")?)?;
-            let content =
-                fs::read_to_string(state_dir.join("workspaces").join(session).join(relative))?;
+            let content = fs::read_to_string(config.workspace_path(session).join(relative))?;
             Ok(json!({ "ok": true, "content": content }))
         }
         "fail_fixture" | "fixture_fail" => Ok(json!({
@@ -2072,6 +2704,74 @@ fn fixture_result(state_dir: &Path, session: &str, name: &str, args: &Value) -> 
         })),
         other => Ok(json!({ "ok": false, "error": "unknown tool", "name": other })),
     }
+}
+
+async fn large_output_result(max_output_bytes: usize, args: &Value) -> Result<Value> {
+    use tokio::io::AsyncReadExt as _;
+    const PRODUCED_BYTES: u64 = 10_485_760;
+    const CHUNK_BYTES: usize = 16 * 1024;
+    let requested_bytes = args
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| AhrbError::Validation("large_output.bytes must be an integer".to_owned()))?;
+    if requested_bytes != PRODUCED_BYTES {
+        return Err(AhrbError::Validation(format!(
+            "large_output.bytes must be {PRODUCED_BYTES}, got {requested_bytes}"
+        )));
+    }
+    // The OpenAI tool message contains `serde_json::to_string(result)`.  A JSON
+    // string adds two quotes and escapes the marker separator newline, so keep
+    // those three bytes inside the declared complete encoded limit.
+    let content_limit = max_output_bytes.checked_sub(3).ok_or_else(|| {
+        AhrbError::Validation(
+            "large-output limit is too small for a JSON string truncation marker".to_owned(),
+        )
+    })?;
+    let mut capture = crate::wave2::BoundedToolCapture::new(content_limit);
+    let executable = std::env::current_exe()?;
+    let fixture = executable
+        .parent()
+        .map(|parent| parent.join("ahrb-fixture"))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            AhrbError::Protocol(
+                "declared large-output fixture is not next to the mock harness".to_owned(),
+            )
+        })?;
+    let mut child = tokio::process::Command::new(fixture)
+        .args(["emit", "--bytes", &requested_bytes.to_string()])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        AhrbError::Protocol("declared large-output fixture has no stdout pipe".to_owned())
+    })?;
+    let mut chunk = [0_u8; CHUNK_BYTES];
+    loop {
+        let count = stdout.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        capture.push(&chunk[..count]);
+    }
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "declared large-output fixture exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let captured = capture.finish(content_limit);
+    let content = String::from_utf8(captured.encoded).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "large-output fixture produced non-UTF-8 content: {error}"
+        ))
+    })?;
+    Ok(Value::String(content))
 }
 
 fn reconcile_durable_tool_effects(
@@ -2518,6 +3218,15 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compact_trickle_success_marker_accepts_only_defined_profiles() {
+        assert!(is_trickle_success_body(b"AHRB-"));
+        assert!(is_trickle_success_body(b"AHRB-TRICKLE-SUCCESS"));
+        assert!(!is_trickle_success_body(b"AHRB"));
+        assert!(!is_trickle_success_body(b"AHRB-TRICKLE-SUCCES"));
+        assert!(!is_trickle_success_body(b"AHRB-TRICKLE-SUCCESS!"));
+    }
+
     fn temporary_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ahrb-mock-{name}-{}", std::process::id()))
     }
@@ -2525,18 +3234,69 @@ mod tests {
     fn test_config(state_dir: PathBuf) -> MockConfig {
         MockConfig {
             state_dir,
+            workspace_override: None,
             base_url: None,
             unix_socket: None,
             provider_mailbox: None,
+            #[cfg(unix)]
+            provider_stream: None,
             embedded_model: None,
             api_key: None,
             model: "ahrb-fake-v1".to_owned(),
             idle_timeout: Duration::from_millis(250),
+            turn_timeout: Duration::from_secs(10),
+            retry_max_attempts: 1,
+            retry_base_delay_ms: 50,
+            retry_max_delay_ms: 50,
+            max_output_bytes: 1_048_576,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
             declare_native_shell: false,
+            owned_egress_guard: None,
         }
+    }
+
+    #[test]
+    fn retry_fixture_uses_bounded_observable_jitter() {
+        let mut config = test_config(PathBuf::new());
+        config.retry_base_delay_ms = 100;
+        config.retry_max_delay_ms = 200;
+        assert_eq!(jittered_retry_delay_ms(&config, 1), 60);
+        assert_eq!(jittered_retry_delay_ms(&config, 2), 260);
+        assert_eq!(jittered_retry_delay_ms(&config, 3), 120);
+    }
+
+    #[tokio::test]
+    async fn owned_egress_connector_really_refuses_public_control_probe() -> Result<()> {
+        let directory = temporary_dir("owned-egress-probe");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let ledger_path = directory.join("egress.jsonl");
+        let guard = OwnedEgressGuard {
+            ledger_path: ledger_path.clone(),
+            nonce: "a".repeat(64),
+            forbidden_address: "203.0.113.1:9".parse().map_err(|_| {
+                AhrbError::Protocol("test control destination did not parse".to_owned())
+            })?,
+            write_lock: Arc::new(Mutex::new(())),
+            sequence: Arc::new(AtomicU64::new(1)),
+        };
+        guard.verify_forbidden_probe().await?;
+        let record: OwnedEgressLedgerRecord = serde_json::from_slice(
+            fs::read(&ledger_path)?
+                .split(|byte| *byte == b'\n')
+                .next()
+                .ok_or_else(|| AhrbError::Protocol("owned egress ledger was empty".to_owned()))?,
+        )?;
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.boundary, OWNED_EGRESS_BOUNDARY);
+        assert_eq!(record.destination, "203.0.113.1:9");
+        assert_eq!(record.category, "control-probe");
+        assert!(!record.allowed);
+        assert_eq!(record.outcome, "blocked-permission-denied");
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
@@ -2633,7 +3393,7 @@ mod tests {
         let mut harness = MockHarness::open(config.clone())?;
         let session = harness.create_session("redo-actor")?;
         let args = json!({ "path": "nested/effect.txt", "content": "durable" });
-        let result = fixture_result(&directory, &session, "write_fixture", &args)?;
+        let result = fixture_result(&config, &session, "write_fixture", &args)?;
         harness.append(
             &session,
             EventVocab::ToolCall,
@@ -3513,17 +4273,26 @@ mod tests {
         };
         let config = MockConfig {
             state_dir: directory.join("state"),
+            workspace_override: None,
             base_url: None,
             unix_socket: Some(server.socket_path().to_path_buf()),
             provider_mailbox: None,
+            #[cfg(unix)]
+            provider_stream: None,
             embedded_model: None,
             api_key: Some("unix-secret".to_owned()),
             model: "ahrb-fake-v1".to_owned(),
             idle_timeout: Duration::from_secs(2),
+            turn_timeout: Duration::from_secs(10),
+            retry_max_attempts: 1,
+            retry_base_delay_ms: 50,
+            retry_max_delay_ms: 50,
+            max_output_bytes: 1_048_576,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
             declare_native_shell: false,
+            owned_egress_guard: None,
         };
         let harness =
             Arc::new(Mutex::new(MockHarness::open(config).map_err(|error| {

@@ -1,6 +1,7 @@
 //! Small deterministic fixture executable invoked through real harness tools.
 
 use ahrb::{AhrbError, Result};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 fn main() {
@@ -36,6 +37,58 @@ fn run(args: &[String]) -> Result<i32> {
             let message = required(args, "--message")?;
             eprintln!("{message}");
             Ok(1)
+        }
+        Some("emit") => {
+            let bytes = required(args, "--bytes")?
+                .parse::<u64>()
+                .map_err(|_| AhrbError::Usage("--bytes must be an unsigned integer".to_owned()))?;
+            emit_deterministic(bytes)?;
+            Ok(0)
+        }
+        Some("egress-probe") => {
+            use std::net::{SocketAddr, TcpStream};
+            use std::time::Duration;
+            let address = required(args, "--address")?
+                .parse::<SocketAddr>()
+                .map_err(|_| AhrbError::Usage("--address must be host:port".to_owned()))?;
+            let timeout_ms = required(args, "--timeout-ms")?
+                .parse::<u64>()
+                .map_err(|_| AhrbError::Usage("--timeout-ms must be an integer".to_owned()))?;
+            match TcpStream::connect_timeout(&address, Duration::from_millis(timeout_ms)) {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) =>
+                {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "blocked":true,
+                            "errno":error.raw_os_error(),
+                            "address":address.to_string()
+                        })
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "blocked":false,
+                            "errno":error.raw_os_error(),
+                            "error":error.to_string(),
+                            "address":address.to_string()
+                        })
+                    );
+                    Ok(3)
+                }
+                Ok(stream) => {
+                    drop(stream);
+                    println!(
+                        "{}",
+                        serde_json::json!({"blocked":false,"connected":true,"address":address.to_string()})
+                    );
+                    Ok(4)
+                }
+            }
         }
         Some("process-tree") => {
             let child_pid = required(args, "--child-pid")?;
@@ -87,9 +140,41 @@ fn run(args: &[String]) -> Result<i32> {
             "unknown fixture command {other:?}"
         ))),
         None => Err(AhrbError::Usage(
-            "expected write, read, or fail fixture command".to_owned(),
+            "expected write, read, fail, emit, egress-probe, or process-tree fixture command"
+                .to_owned(),
         )),
     }
+}
+
+fn emit_deterministic(bytes: u64) -> Result<()> {
+    const CHUNK_BYTES: usize = 16 * 1024;
+    let mut chunk = [0_u8; CHUNK_BYTES];
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    let mut remaining = bytes;
+    let mut stream_offset = 0_u64;
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(CHUNK_BYTES as u64)).map_err(|_| {
+            AhrbError::Protocol("large-output chunk length does not fit usize".to_owned())
+        })?;
+        for (index, byte) in chunk[..count].iter_mut().enumerate() {
+            let index = u64::try_from(index).map_err(|_| {
+                AhrbError::Protocol("large-output alphabet index does not fit u64".to_owned())
+            })?;
+            let offset = u8::try_from(stream_offset.saturating_add(index) % 26).map_err(|_| {
+                AhrbError::Protocol("large-output alphabet offset does not fit u8".to_owned())
+            })?;
+            *byte = b'a'.saturating_add(offset);
+        }
+        output.write_all(&chunk[..count])?;
+        let written = u64::try_from(count).map_err(|_| {
+            AhrbError::Protocol("large-output chunk length does not fit u64".to_owned())
+        })?;
+        remaining = remaining.saturating_sub(written);
+        stream_offset = stream_offset.saturating_add(written);
+    }
+    output.flush()?;
+    Ok(())
 }
 
 fn park_forever() -> Result<i32> {

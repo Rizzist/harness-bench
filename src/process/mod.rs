@@ -87,6 +87,339 @@ pub struct ProcessSample {
     pub thread_count: Option<u64>,
 }
 
+/// One out-of-band read of cumulative disk-write counters for an owned tree.
+///
+/// `expected_identities` is kept separately from `write_bytes_by_identity` so
+/// a process that disappears between discovery and counter collection cannot
+/// be mistaken for a process that wrote zero bytes.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ProcessDiskObservation {
+    /// Identities attributed to the owned tree at the discovery boundary.
+    pub expected_identities: BTreeSet<ProcIdentity>,
+    /// Successfully read per-process cumulative bytes-written counters.
+    pub write_bytes_by_identity: BTreeMap<ProcIdentity, u64>,
+    /// Linux cgroup-v2 cumulative `wbytes`, when a dedicated cgroup exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_write_bytes: Option<u64>,
+}
+
+/// How one identity's disk counter is accounted at a boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskIdentityStatus {
+    /// The process is live and its cumulative counter was read at this boundary.
+    Live,
+    /// A discovered live identity had no readable counter at this boundary.
+    CounterUnavailable,
+    /// The identity disappeared without durable retirement evidence.
+    MissingWithoutRetirementEvidence,
+    /// Its structured terminal was seen, but no later pre-reap sample was recorded.
+    TerminalAwaitingFinalSample,
+    /// A final sample was recorded after the structured terminal and before reap.
+    FinalSampleBeforeReap,
+    /// The identity was explicitly retired after its terminal-before-reap sample.
+    RetiredAfterFinalSample,
+    /// A post-quiet durable cgroup counter accounts for the retired identity.
+    RetiredByDurableCgroup,
+}
+
+/// Per-identity evidence emitted by [`TreeDiskTracker`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiskIdentityEvidence {
+    /// Stable process identity.
+    pub identity: ProcIdentity,
+    /// Last cumulative process counter, absent if it was never readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_bytes: Option<u64>,
+    /// Explicit accounting state at this boundary.
+    pub status: DiskIdentityStatus,
+}
+
+/// Cumulative disk-accounting state for an owned tree.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TreeDiskSnapshot {
+    /// Authoritative cumulative bytes when every identity is completely accounted.
+    ///
+    /// This is deliberately absent, rather than a favorable partial value, when
+    /// any identity lacks a current counter or valid retirement evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_write_bytes: Option<u64>,
+    /// Best observed aggregate, retained only for diagnostics when incomplete.
+    pub observed_write_bytes: u64,
+    /// Whether all live and retired identity counters are complete.
+    pub counter_complete: bool,
+    /// Identities preventing complete accounting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_identities: Vec<ProcIdentity>,
+    /// Deterministically ordered per-identity evidence.
+    pub identities: Vec<DiskIdentityEvidence>,
+    /// Latest cumulative cgroup value, when exposed by Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_write_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiskRetirement {
+    TerminalFinalSample,
+    DurableCgroup,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiskIdentityState {
+    write_bytes: Option<u64>,
+    present: bool,
+    expected: bool,
+    terminal_observed: bool,
+    final_sample_observed: bool,
+    retirement: Option<DiskRetirement>,
+}
+
+/// Monotonic disk accounting across owned-process lifecycles.
+///
+/// Merely retaining the last poll for a disappeared process never completes
+/// retirement. The caller must either record the ordered structured-terminal,
+/// final-sample, and retirement operations, or explicitly retire missing
+/// identities using a durable cgroup counter captured after membership is
+/// quiet.
+#[derive(Debug, Default)]
+pub struct TreeDiskTracker {
+    identities: BTreeMap<ProcIdentity, DiskIdentityState>,
+    cgroup_write_bytes: Option<u64>,
+}
+
+impl TreeDiskTracker {
+    /// Incorporate one live-tree counter observation.
+    pub fn observe(&mut self, observation: &ProcessDiskObservation) -> Result<TreeDiskSnapshot> {
+        if let (Some(previous), Some(current)) =
+            (self.cgroup_write_bytes, observation.cgroup_write_bytes)
+            && current < previous
+        {
+            return Err(AhrbError::Protocol(format!(
+                "cgroup cumulative disk writes regressed from {previous} to {current}"
+            )));
+        }
+        if let Some(current) = observation.cgroup_write_bytes {
+            self.cgroup_write_bytes = Some(current);
+        }
+
+        for state in self.identities.values_mut() {
+            state.present = false;
+            state.expected = false;
+        }
+        for identity in &observation.expected_identities {
+            let state = self.identities.entry(*identity).or_default();
+            state.expected = true;
+        }
+        for (identity, write_bytes) in &observation.write_bytes_by_identity {
+            if !observation.expected_identities.contains(identity) {
+                return Err(AhrbError::Protocol(format!(
+                    "disk counter observed unexpected process identity ({},{})",
+                    identity.pid, identity.start_time
+                )));
+            }
+            let state = self.identities.entry(*identity).or_default();
+            if state.retirement.is_some() {
+                return Err(AhrbError::Protocol(format!(
+                    "retired disk identity ({},{}) was observed again",
+                    identity.pid, identity.start_time
+                )));
+            }
+            update_disk_counter(*identity, state, *write_bytes)?;
+            state.present = true;
+            state.expected = true;
+        }
+        Ok(self.snapshot())
+    }
+
+    /// Record that the harness observed the process's structured terminal.
+    pub fn note_structured_terminal(&mut self, identity: ProcIdentity) -> Result<()> {
+        let state = self.identities.get_mut(&identity).ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "structured terminal references unknown disk identity ({},{})",
+                identity.pid, identity.start_time
+            ))
+        })?;
+        if state.retirement.is_some() {
+            return Err(AhrbError::Protocol(format!(
+                "structured terminal references retired disk identity ({},{})",
+                identity.pid, identity.start_time
+            )));
+        }
+        state.terminal_observed = true;
+        state.final_sample_observed = false;
+        Ok(())
+    }
+
+    /// Record the cumulative process counter sampled after its structured
+    /// terminal and before the process was reaped.
+    pub fn record_final_sample_before_reap(
+        &mut self,
+        identity: ProcIdentity,
+        write_bytes: u64,
+    ) -> Result<()> {
+        let state = self.identities.get_mut(&identity).ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "final disk sample references unknown identity ({},{})",
+                identity.pid, identity.start_time
+            ))
+        })?;
+        if !state.terminal_observed {
+            return Err(AhrbError::Protocol(format!(
+                "final disk sample for ({},{}) preceded its structured terminal",
+                identity.pid, identity.start_time
+            )));
+        }
+        if state.retirement.is_some() {
+            return Err(AhrbError::Protocol(format!(
+                "final disk sample references retired identity ({},{})",
+                identity.pid, identity.start_time
+            )));
+        }
+        update_disk_counter(identity, state, write_bytes)?;
+        state.present = true;
+        state.final_sample_observed = true;
+        Ok(())
+    }
+
+    /// Retire an identity whose post-terminal final sample was captured before reap.
+    pub fn retire_after_final_sample(&mut self, identity: ProcIdentity) -> Result<()> {
+        let state = self.identities.get_mut(&identity).ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "disk retirement references unknown identity ({},{})",
+                identity.pid, identity.start_time
+            ))
+        })?;
+        if !state.terminal_observed || !state.final_sample_observed {
+            return Err(AhrbError::Protocol(format!(
+                "disk identity ({},{}) lacks a terminal-before-reap final sample",
+                identity.pid, identity.start_time
+            )));
+        }
+        state.present = false;
+        state.expected = false;
+        state.retirement = Some(DiskRetirement::TerminalFinalSample);
+        Ok(())
+    }
+
+    /// Retire missing identities using a cumulative cgroup `io.stat` value
+    /// captured after cgroup membership became quiet.
+    pub fn retire_with_cgroup_after_quiet(
+        &mut self,
+        identities: &BTreeSet<ProcIdentity>,
+        cgroup_write_bytes: u64,
+    ) -> Result<()> {
+        if let Some(previous) = self.cgroup_write_bytes
+            && cgroup_write_bytes < previous
+        {
+            return Err(AhrbError::Protocol(format!(
+                "post-quiet cgroup disk writes regressed from {previous} to {cgroup_write_bytes}"
+            )));
+        }
+        for identity in identities {
+            let state = self.identities.get_mut(identity).ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "cgroup disk retirement references unknown identity ({},{})",
+                    identity.pid, identity.start_time
+                ))
+            })?;
+            if state.present {
+                return Err(AhrbError::Protocol(format!(
+                    "cgroup disk retirement identity ({},{}) is still present",
+                    identity.pid, identity.start_time
+                )));
+            }
+            state.expected = false;
+            state.retirement = Some(DiskRetirement::DurableCgroup);
+        }
+        self.cgroup_write_bytes = Some(cgroup_write_bytes);
+        Ok(())
+    }
+
+    /// Return current accounting evidence without changing tracker state.
+    pub fn snapshot(&self) -> TreeDiskSnapshot {
+        let identities = self
+            .identities
+            .iter()
+            .map(|(identity, state)| DiskIdentityEvidence {
+                identity: *identity,
+                write_bytes: state.write_bytes,
+                status: disk_identity_status(state),
+            })
+            .collect::<Vec<_>>();
+        let incomplete_identities = identities
+            .iter()
+            .filter(|evidence| {
+                matches!(
+                    evidence.status,
+                    DiskIdentityStatus::CounterUnavailable
+                        | DiskIdentityStatus::MissingWithoutRetirementEvidence
+                        | DiskIdentityStatus::TerminalAwaitingFinalSample
+                )
+            })
+            .map(|evidence| evidence.identity)
+            .collect::<Vec<_>>();
+        let counter_complete = incomplete_identities.is_empty();
+        let per_process_total = self.identities.values().fold(0_u64, |total, state| {
+            // The repository forbids unwrap-style operations in production code.
+            #[allow(
+                clippy::manual_unwrap_or,
+                clippy::manual_unwrap_or_default,
+                reason = "production process accounting intentionally avoids unwrap-style APIs"
+            )]
+            let write_bytes = match state.write_bytes {
+                Some(value) => value,
+                None => 0,
+            };
+            total.saturating_add(write_bytes)
+        });
+        let observed_write_bytes = match self.cgroup_write_bytes {
+            Some(value) => value,
+            None => per_process_total,
+        };
+        TreeDiskSnapshot {
+            cumulative_write_bytes: counter_complete.then_some(observed_write_bytes),
+            observed_write_bytes,
+            counter_complete,
+            incomplete_identities,
+            identities,
+            cgroup_write_bytes: self.cgroup_write_bytes,
+        }
+    }
+}
+
+fn update_disk_counter(
+    identity: ProcIdentity,
+    state: &mut DiskIdentityState,
+    write_bytes: u64,
+) -> Result<()> {
+    if let Some(previous) = state.write_bytes
+        && write_bytes < previous
+    {
+        return Err(AhrbError::Protocol(format!(
+            "process ({},{}) cumulative disk writes regressed from {previous} to {write_bytes}",
+            identity.pid, identity.start_time
+        )));
+    }
+    state.write_bytes = Some(write_bytes);
+    Ok(())
+}
+
+fn disk_identity_status(state: &DiskIdentityState) -> DiskIdentityStatus {
+    match state.retirement {
+        Some(DiskRetirement::TerminalFinalSample) => DiskIdentityStatus::RetiredAfterFinalSample,
+        Some(DiskRetirement::DurableCgroup) => DiskIdentityStatus::RetiredByDurableCgroup,
+        None if state.terminal_observed && state.final_sample_observed => {
+            DiskIdentityStatus::FinalSampleBeforeReap
+        }
+        None if state.terminal_observed => DiskIdentityStatus::TerminalAwaitingFinalSample,
+        None if state.expected && state.present && state.write_bytes.is_some() => {
+            DiskIdentityStatus::Live
+        }
+        None if state.expected => DiskIdentityStatus::CounterUnavailable,
+        None => DiskIdentityStatus::MissingWithoutRetirementEvidence,
+    }
+}
+
 /// Complete process membership at one instant.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProcessTree {
@@ -226,6 +559,63 @@ pub(crate) fn signal_registered_tree(identity: ProcIdentity, signal: i32) -> Res
     if let Some(members) = snapshot.trees.get(&identity) {
         for member in members {
             signal_identity(*member, signal)?;
+        }
+    }
+    Ok(())
+}
+
+/// Deliver a benchmark stimulus signal to a live registered owned tree.
+///
+/// Unlike cleanup signaling, disappearance is an evidence failure: callers use
+/// successful return as the external delivery boundary for signal semantics.
+#[cfg(unix)]
+pub(crate) fn deliver_registered_tree_signal(identity: ProcIdentity, signal: i32) -> Result<()> {
+    let snapshot = registry_lock()?.clone();
+    let process_group = snapshot
+        .identity_groups
+        .get(&identity)
+        .copied()
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "no registered process group for signal target PID {}",
+                identity.pid
+            ))
+        })?;
+    let leader = snapshot
+        .groups
+        .get(&process_group)
+        .copied()
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "registered process group {process_group} has no owned leader"
+            ))
+        })?;
+    let group_members = verified_group_members(&snapshot, process_group, leader)?;
+    if group_members.is_empty() {
+        return Err(AhrbError::Protocol(format!(
+            "owned process group {process_group} disappeared before signal delivery"
+        )));
+    }
+    let group_target = i32::try_from(process_group)
+        .map_err(|_| AhrbError::Protocol("owned process group exceeds pid_t range".to_owned()))?;
+    // SAFETY: the group leader and membership were revalidated immediately above.
+    if unsafe { libc::kill(-group_target, signal) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if let Some(members) = snapshot.trees.get(&identity) {
+        for member in members {
+            let Some((current, current_group)) = process_identity_and_group(member.pid)? else {
+                continue;
+            };
+            if current != *member || current_group == process_group {
+                continue;
+            }
+            let pid = i32::try_from(member.pid)
+                .map_err(|_| AhrbError::Protocol("owned PID exceeds pid_t range".to_owned()))?;
+            // SAFETY: the stable PID identity was revalidated immediately above.
+            if unsafe { libc::kill(pid, signal) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
     }
     Ok(())
@@ -808,6 +1198,26 @@ pub trait Sampler: Send {
     fn discover(&mut self, roots: &[u32]) -> Result<ProcessTree>;
     /// Capture one boundary or cadence sample.
     fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample>;
+    /// Capture per-identity cumulative disk-write counters out of band.
+    ///
+    /// Implementations retain identities whose counters disappear in
+    /// `expected_identities`; consumers must feed the result through
+    /// [`TreeDiskTracker`] rather than treating a missing counter as zero.
+    fn disk_counters(&mut self, _tree: &ProcessTree) -> Result<ProcessDiskObservation> {
+        Err(AhrbError::Unsupported(
+            "disk counters are not implemented by this sampler".to_owned(),
+        ))
+    }
+    /// Read one identity's cumulative bytes-written counter.
+    ///
+    /// This narrow operation lets a lifecycle owner take the required final
+    /// sample after a structured terminal and immediately before reap, without
+    /// relying on a prior cadence poll.
+    fn disk_counter_for_identity(&mut self, _identity: ProcIdentity) -> Result<Option<u64>> {
+        Err(AhrbError::Unsupported(
+            "per-identity disk counters are not implemented by this sampler".to_owned(),
+        ))
+    }
 }
 
 /// Reap a direct child with `wait4` and return supplemental terminal usage.
@@ -935,6 +1345,107 @@ mod tests {
             .update(&BTreeMap::from([(root, 99), (worker, 50)]))
             .expect_err("same-identity CPU regression must be rejected");
         assert!(regression.to_string().contains("CPU regressed"));
+        Ok(())
+    }
+
+    #[test]
+    fn tree_disk_does_not_complete_a_disappeared_identity_from_its_last_poll() -> Result<()> {
+        let worker = identity(20);
+        let mut tracker = TreeDiskTracker::default();
+        let live = ProcessDiskObservation {
+            expected_identities: BTreeSet::from([worker]),
+            write_bytes_by_identity: BTreeMap::from([(worker, 4_096)]),
+            cgroup_write_bytes: None,
+        };
+        assert!(tracker.observe(&live)?.counter_complete);
+
+        let missing = tracker.observe(&ProcessDiskObservation::default())?;
+        assert!(!missing.counter_complete);
+        assert_eq!(missing.cumulative_write_bytes, None);
+        assert_eq!(missing.observed_write_bytes, 4_096);
+        assert_eq!(missing.incomplete_identities, vec![worker]);
+        assert_eq!(
+            missing.identities[0].status,
+            DiskIdentityStatus::MissingWithoutRetirementEvidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_disk_requires_terminal_before_final_sample_and_explicit_retirement() -> Result<()> {
+        let worker = identity(20);
+        let mut tracker = TreeDiskTracker::default();
+        tracker.observe(&ProcessDiskObservation {
+            expected_identities: BTreeSet::from([worker]),
+            write_bytes_by_identity: BTreeMap::from([(worker, 100)]),
+            cgroup_write_bytes: None,
+        })?;
+        let out_of_order = tracker
+            .record_final_sample_before_reap(worker, 120)
+            .expect_err("a final sample before the structured terminal must be rejected");
+        assert!(out_of_order.to_string().contains("preceded"));
+
+        tracker.note_structured_terminal(worker)?;
+        assert!(!tracker.snapshot().counter_complete);
+        tracker.record_final_sample_before_reap(worker, 120)?;
+        let final_sample = tracker.snapshot();
+        assert!(final_sample.counter_complete);
+        assert_eq!(
+            final_sample.identities[0].status,
+            DiskIdentityStatus::FinalSampleBeforeReap
+        );
+        tracker.retire_after_final_sample(worker)?;
+        let retired = tracker.snapshot();
+        assert!(retired.counter_complete);
+        assert_eq!(retired.cumulative_write_bytes, Some(120));
+        assert_eq!(
+            retired.identities[0].status,
+            DiskIdentityStatus::RetiredAfterFinalSample
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_disk_accepts_post_quiet_cgroup_retirement() -> Result<()> {
+        let worker = identity(20);
+        let mut tracker = TreeDiskTracker::default();
+        tracker.observe(&ProcessDiskObservation {
+            expected_identities: BTreeSet::from([worker]),
+            write_bytes_by_identity: BTreeMap::from([(worker, 100)]),
+            cgroup_write_bytes: Some(500),
+        })?;
+        tracker.observe(&ProcessDiskObservation {
+            expected_identities: BTreeSet::new(),
+            write_bytes_by_identity: BTreeMap::new(),
+            cgroup_write_bytes: Some(600),
+        })?;
+        assert!(!tracker.snapshot().counter_complete);
+        tracker.retire_with_cgroup_after_quiet(&BTreeSet::from([worker]), 640)?;
+        let retired = tracker.snapshot();
+        assert!(retired.counter_complete);
+        assert_eq!(retired.cumulative_write_bytes, Some(640));
+        assert_eq!(
+            retired.identities[0].status,
+            DiskIdentityStatus::RetiredByDurableCgroup
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_disk_keeps_unreadable_expected_counter_incomplete() -> Result<()> {
+        let worker = identity(20);
+        let mut tracker = TreeDiskTracker::default();
+        let snapshot = tracker.observe(&ProcessDiskObservation {
+            expected_identities: BTreeSet::from([worker]),
+            write_bytes_by_identity: BTreeMap::new(),
+            cgroup_write_bytes: None,
+        })?;
+        assert!(!snapshot.counter_complete);
+        assert_eq!(snapshot.cumulative_write_bytes, None);
+        assert_eq!(
+            snapshot.identities[0].status,
+            DiskIdentityStatus::CounterUnavailable
+        );
         Ok(())
     }
 }

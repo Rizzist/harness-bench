@@ -344,6 +344,20 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
     if row == 36 && manifest.agents.cancel.is_empty() {
         return CapabilityStatus::Unsupported("agent cancellation operation is absent".to_owned());
     }
+    if row == 57 && manifest.input.prompt_uses_stdin.is_none() {
+        return CapabilityStatus::Absent(
+            "typed input.prompt_uses_stdin declaration is absent".to_owned(),
+        );
+    }
+    if row == 58
+        && (manifest.resources.retry_max_attempts.is_none()
+            || manifest.resources.retry_base_delay_ms.is_none()
+            || manifest.resources.retry_max_delay_ms.is_none())
+    {
+        return CapabilityStatus::Absent(
+            "documented retry_max_attempts/base_delay/max_delay policy is absent".to_owned(),
+        );
+    }
     CapabilityStatus::Supported
 }
 
@@ -357,6 +371,14 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
             !manifest.agents.spawn.is_empty()
                 && !manifest.agents.status.is_empty()
                 && !manifest.agents.collect.is_empty()
+        }
+        56 => {
+            !manifest.agents.spawn.is_empty()
+                && !manifest.agents.status.is_empty()
+                && !manifest.agents.collect.is_empty()
+                && !manifest.agents.child_id_pointer.is_empty()
+                && !manifest.agents.status_result_pointer.is_empty()
+                && !manifest.agents.collect_events_pointer.is_empty()
         }
         30 => {
             if manifest.transport.kind == TransportKind::Exec {

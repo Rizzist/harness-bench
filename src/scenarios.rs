@@ -58,7 +58,7 @@ pub enum BadgeFacetScope {
 impl TestDefinition {
     /// Return this row's certification role from authoritative matrix metadata.
     pub fn requirement(self) -> RequirementKind {
-        if matches!(self.row, 42 | 43 | 45 | 46 | 63) {
+        if matches!(self.row, 42 | 43 | 45 | 46 | 47 | 63) {
             return RequirementKind::Informational;
         }
         OPTIONAL_FACETS
@@ -78,13 +78,17 @@ struct OptionalFacet {
     capability: &'static str,
 }
 
-const OPTIONAL_FACETS: [OptionalFacet; 6] = [
+const OPTIONAL_FACETS: [OptionalFacet; 7] = [
     OptionalFacet {
         row: 4,
         capability: "parallel_tool_execution",
     },
     OptionalFacet {
         row: 18,
+        capability: "native_delegation",
+    },
+    OptionalFacet {
+        row: 56,
         capability: "native_delegation",
     },
     OptionalFacet {
@@ -170,7 +174,7 @@ const AR: Pillar = Pillar::AutomationReadiness;
 /// Matrix rows that must pass early in the implementation and verification loop.
 pub const PRIORITIZED_ROWS: &[u8] = &[1, 2, 3, 9, 10, 12, 20, 26, 30, 35, 40];
 
-const TESTS: [TestDefinition; 48] = [
+const TESTS: [TestDefinition; 57] = [
     test(
         1,
         "routing",
@@ -538,6 +542,78 @@ const TESTS: [TestDefinition; 48] = [
         RS,
         "trapezoidal effective-memory integral and N=1 CPU per turn",
         "coverage >=0.99; every turn bracketed; max sample gap <=2x cadence; median <=1024 MiB*s/turn; CPU p95 <=250ms",
+    ),
+    test(
+        47,
+        "disk-io-per-turn",
+        "Disk I/O per turn",
+        RS,
+        "owned-tree bytes written plus journal and declared-log growth",
+        "complete live/retired counters; disk p95 <=64 MiB/turn; bounded journal/log medians and growth slope",
+    ),
+    test(
+        48,
+        "model-wait-cpu",
+        "Model wait CPU",
+        RS,
+        "owned-tree CPU while a paced provider response is pending",
+        "all paced frames arrive once; exactly one success; owned-tree CPU <=5% of one core",
+    ),
+    test(
+        56,
+        "child-failure-propagation",
+        "Child failure propagation",
+        FN,
+        "parent terminal latency after a native child crash or hang",
+        "parent fails within the declared bound, cancels the child, and leaves no owned residue",
+    ),
+    test(
+        57,
+        "signal-matrix",
+        "Signal matrix",
+        AR,
+        "structured terminal and owned-tree cleanup for signals and stdin EOF",
+        "each applicable operation emits one clean terminal within grace and leaves zero residue",
+    ),
+    test(
+        58,
+        "retry-budget",
+        "Retry budget",
+        TC,
+        "physical attempts, backoff intervals, terminal count, and committed effects",
+        "sustained 429/500 exhausts the documented bounded jittered policy with one failure terminal",
+    ),
+    test(
+        59,
+        "slow-stream-vs-stall",
+        "Slow stream versus stall",
+        TC,
+        "reset-on-byte idle handling and true-stall terminalization",
+        "paced bytes prevent idle timeout while zero-byte stall self-aborts within the declared idle bound",
+    ),
+    test(
+        60,
+        "large-tool-output",
+        "Large tool output",
+        TC,
+        "bounded correlated capture of a deterministic ten-MiB tool result",
+        "capture is bounded with an exact truncation marker, digest, correlation, and memory envelope",
+    ),
+    test(
+        61,
+        "workspace-fault",
+        "Workspace fault",
+        TC,
+        "ordinary fixture write failure in an externally verified read-only workspace",
+        "one structured errno-bearing failure, no escape or crash, and no process residue",
+    ),
+    test(
+        62,
+        "offline-mode",
+        "Offline mode",
+        AR,
+        "successful provider-only run under a reviewed same-confinement egress guard",
+        "provider remains reachable, every other connection is blocked, and the independent control probe is denied",
     ),
     test(
         63,

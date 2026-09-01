@@ -126,6 +126,9 @@ impl<'de> Deserialize<'de> for ReportDetails {
                 "memory-time-integral" => {
                     serde_json::from_value::<MemoryTimeIntegralDetails>(value.clone()).map(|_| ())
                 }
+                "retry-budget" => {
+                    serde_json::from_value::<RetryBudgetDetails>(value.clone()).map(|_| ())
+                }
                 "nondeterministic-field-report" => {
                     serde_json::from_value::<NondeterministicFieldDetails>(value.clone())
                         .map(|_| ())
@@ -183,6 +186,35 @@ struct ModelRequestEfficiencyRepetitionDetail {
     context_tax_slope_bytes_per_turn: f64,
     measurement_complete: bool,
     reference_envelope_pass: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct RetryBudgetDetails {
+    attempts: Vec<RetryBudgetAttemptDetail>,
+    timer_calibration: Vec<RetryTimerCalibrationDetail>,
+    timer_tolerance_ms: f64,
+    post_terminal_observation_ms: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct RetryBudgetAttemptDetail {
+    status: u16,
+    repetition: u32,
+    attempt: u64,
+    received_ns: u64,
+    previous_backoff_ms: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct RetryTimerCalibrationDetail {
+    status: u16,
+    index: u32,
+    requested_ms: u64,
+    actual_ms: f64,
+    absolute_error_ms: f64,
 }
 
 #[allow(dead_code)]
@@ -401,8 +433,14 @@ pub struct EgressAttempt {
     pub category: String,
     /// Whether confinement allowed the attempt.
     pub allowed: bool,
+    /// Stable blocked/connected/error classification.
+    #[serde(default)]
+    pub outcome: String,
     /// Concrete OS enforcement mechanism.
     pub enforcement: String,
+    /// Reviewed identity binding the harness and independent probe to one guard.
+    #[serde(default)]
+    pub confinement_identity: String,
 }
 
 /// One externally sampled process identity and its hygiene counters.
@@ -594,6 +632,9 @@ pub struct ResourceSummary {
     pub model_wait_wall_p50_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_wait_cpu_one_core_max_ratio: Option<f64>,
+    /// Peak effective-memory increase while streaming the row-60 tool result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_tool_output_peak_rss_delta_mib: Option<f64>,
     /// Long-session latency fields (row 49).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_slope_ms_per_100_turns: Option<f64>,
@@ -935,6 +976,25 @@ pub fn render_resource_summary(summary: &ResourceSummary) -> String {
     }
     let _ = write!(
         output,
+        " disk_write_bytes_per_turn_p50={} disk_write_bytes_per_turn_p95={} disk_write_bytes_per_turn_max={} session_journal_growth_bytes_per_turn={} log_growth_bytes_per_turn={} disk_write_growth_slope_bytes_per_turn2={} disk_io_counter_complete={} unbounded_disk_growth={}",
+        optional_decimal(summary.disk_write_bytes_per_turn_p50),
+        optional_decimal(summary.disk_write_bytes_per_turn_p95),
+        optional_decimal(summary.disk_write_bytes_per_turn_max),
+        optional_decimal(summary.session_journal_growth_bytes_per_turn),
+        optional_decimal(summary.log_growth_bytes_per_turn),
+        optional_decimal(summary.disk_write_growth_slope_bytes_per_turn2),
+        optional_bool(summary.disk_io_counter_complete),
+        optional_bool(summary.unbounded_disk_growth),
+    );
+    let _ = write!(
+        output,
+        " model_wait_cpu_p50_ms={} model_wait_wall_p50_ms={} model_wait_cpu_one_core_max_ratio={}",
+        optional_milliseconds(summary.model_wait_cpu_p50_ms),
+        optional_milliseconds(summary.model_wait_wall_p50_ms),
+        optional_decimal(summary.model_wait_cpu_one_core_max_ratio),
+    );
+    let _ = write!(
+        output,
         " sampler_overhead_pct={:.3}",
         summary.sampler_overhead_pct
     );
@@ -947,6 +1007,14 @@ fn optional_milliseconds(value: Option<f64>) -> String {
 
 fn optional_decimal(value: Option<f64>) -> String {
     value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.6}"))
+}
+
+fn optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unavailable",
+    }
 }
 
 /// Derive summary values exclusively from already-collected external evidence.

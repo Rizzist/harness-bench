@@ -89,12 +89,12 @@ fn per_invocation_mock_executes_request_declared_native_tool_translation() {
     std::fs::create_dir(&root).expect("create native-tool run directory");
     let source = std::fs::read_to_string(repository.join("adapters/mock-exec/manifest.toml"))
         .expect("read mock-exec manifest");
-    let native_tools = r#"[tools.aliases]
+    let native_aliases = r#"[tools.aliases]
 write = "native_shell"
 read = "native_shell"
 fail = "native_shell"
-
-[tools.bindings]
+"#;
+    let native_fixtures = r#"[tools.bindings]
 command = "command"
 
 [tools.fixtures]
@@ -102,7 +102,9 @@ write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{cont
 read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
 fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 "#;
-    let manifest_source = source.replacen("[tools]\n", native_tools, 1);
+    let manifest_source = source
+        .replacen("[tools.aliases]\n", native_aliases, 1)
+        .replacen("[tools.fixtures]\n", native_fixtures, 1);
     assert_ne!(
         manifest_source, source,
         "mock-exec [tools] section not found"

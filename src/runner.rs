@@ -6,28 +6,32 @@ use crate::determinism::{
     NormalizationContext, evaluate_cross_run_reproducibility, evaluate_nondeterministic_fields,
 };
 use crate::driver::{
-    Cursor, Driver, DriverOperations, GenericDriver, HttpTransport, ManagedDaemonConfig,
-    ManagedDaemonTransport, PerInvocationConfig, PerInvocationDriver, SocketJsonRpcTransport,
-    StdinRpcTransport, Transport,
+    ClientExit, Cursor, Driver, DriverOperations, GenericDriver, HttpTransport,
+    ManagedDaemonConfig, ManagedDaemonTransport, PerInvocationConfig, PerInvocationDriver,
+    SocketJsonRpcTransport, StdinRpcTransport, Transport,
 };
 use crate::evaluate::{
     Assertion, TestOutcome, TestResult, TestResultMetadata, automation_score, badge_label, certify,
     classify, suite_exit_code,
 };
-use crate::events::{EventVocab, NormalizedEvent};
+use crate::events::{EventVocab, NormalizedEvent, rule_matches};
 use crate::fake_model::{
-    FakeModelEngine, FakeModelMailboxServer, FakeModelServer, FakeModelUnixServer,
-    is_transient_bind_error, monotonic_timestamp_ns,
+    FakeModelEngine, FakeModelMailboxServer, FakeModelPreconnectedServer, FakeModelServer,
+    FakeModelUnixServer, is_transient_bind_error, monotonic_timestamp_ns,
 };
 use crate::manifest::{Manifest, TransportKind};
-use crate::process::{ProcessSample, ProcessTree, Sample, Sampler};
+use crate::mock_harness::OwnedEgressLedgerRecord;
+use crate::process::{
+    DiskIdentityStatus, ProcessSample, ProcessTree, Sample, Sampler, TreeDiskTracker,
+};
 use crate::report::{
-    Fingerprint, MembershipSample, MemoryTimeIntegralEvaluation, MemoryTimeIntegralEvidence,
-    MemoryTimeIntegralSample, ProcessHygieneAudit, ProcessHygieneCadenceSample,
-    ProcessHygieneCheckpoint, ProcessHygieneEvaluation, ProcessHygieneEvidence,
-    ProcessHygieneProcess, Report, ReportDetails, ResourceSummary,
-    TimeToFirstModelRequestEvaluation, TopologyMetric, TurnLatencyEvaluation, TurnObservation,
-    evaluate_memory_time_integral, evaluate_process_hygiene, evaluate_time_to_first_model_request,
+    EgressAttempt, FilesystemSnapshot, Fingerprint, MembershipSample, MemoryTimeIntegralEvaluation,
+    MemoryTimeIntegralEvidence, MemoryTimeIntegralSample, ProcessHygieneAudit,
+    ProcessHygieneCadenceSample, ProcessHygieneCheckpoint, ProcessHygieneEvaluation,
+    ProcessHygieneEvidence, ProcessHygieneProcess, Report, ReportDetails, ResourceSummary,
+    StreamChunkObservation, TimeToFirstModelRequestEvaluation, TopologyMetric,
+    TurnLatencyEvaluation, TurnObservation, evaluate_memory_time_integral,
+    evaluate_process_hygiene, evaluate_time_to_first_model_request,
     evaluate_turn_latency_repetitions, render_resource_summary, summarize_resources,
 };
 use crate::resource_certification::{
@@ -40,17 +44,33 @@ use crate::resource_certification::{
     evaluate_per_invocation_resources, evaluate_resources,
 };
 use crate::sampler::{MemoryMetric, SampleSeries};
+use crate::wave2::{
+    DiskIoEvaluation, DiskTurnEvidence, LargeOutputEvaluation, LargeOutputTrial, LogEvidenceKind,
+    ModelWaitCpuEvaluation, ModelWaitCpuSample, ModelWaitCpuTrialEvidence,
+    SlowStreamStallEvaluation, SlowStreamStallTrialEvidence, WorkspaceFaultEvaluation,
+    WorkspaceFaultTrial, evaluate_disk_io_per_turn, evaluate_large_tool_output,
+    evaluate_model_wait_cpu, evaluate_slow_stream_vs_stall, evaluate_workspace_fault,
+    interpolated_model_wait_cpu_ns,
+};
+use crate::wave2_automation::{
+    ChildFailureCase, ChildFailureEvaluation, ChildFailureTrial, OfflineAttempt,
+    OfflineModeEvaluation, OfflineTrial, SignalCaseTrial, SignalMatrixEvaluation,
+    evaluate_child_failure_propagation, evaluate_offline_mode, evaluate_signal_matrix,
+};
 use crate::workflow::{Actor, Barrier, Fault, ScriptedResponse, WORKFLOW_SCHEMA_VERSION, Workflow};
 use crate::{AhrbError, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt as _;
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -63,6 +83,7 @@ enum ModelServer {
         directory: PathBuf,
     },
     Mailbox(FakeModelMailboxServer),
+    Preconnected(FakeModelPreconnectedServer),
     Embedded,
 }
 
@@ -76,6 +97,7 @@ impl ModelServer {
                 Ok(())
             }
             Self::Mailbox(server) => server.shutdown().await,
+            Self::Preconnected(server) => server.shutdown().await,
             Self::Embedded => Ok(()),
         }
     }
@@ -181,10 +203,475 @@ struct MemoryTimeIntegralTrials {
     evidence: MemoryTimeIntegralEvidence,
 }
 
+struct DiskIoTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    turns: Vec<DiskTurnEvidence>,
+    counter_snapshots: Vec<Value>,
+    filesystem_snapshots: Vec<FilesystemSnapshot>,
+    log_evidence: LogEvidenceKind,
+}
+
+struct ModelWaitCpuTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    evidence: Vec<ModelWaitCpuTrialEvidence>,
+    stream_chunks: Vec<StreamChunkObservation>,
+}
+
+struct SlowStreamStallTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    evidence: Vec<SlowStreamStallTrialEvidence>,
+    stream_chunks: Vec<StreamChunkObservation>,
+}
+
+struct LargeOutputTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    evidence: Vec<LargeOutputTrial>,
+}
+
+struct WorkspaceFaultTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    evidence: Vec<WorkspaceFaultTrial>,
+    filesystem_snapshots: Vec<FilesystemSnapshot>,
+}
+
+struct ChildFailureTrials {
+    events: Vec<NormalizedEvent>,
+    evidence: Vec<ChildFailureTrial>,
+    status_observations: Vec<Value>,
+}
+
+struct SignalMatrixTrials {
+    events: Vec<NormalizedEvent>,
+    evidence: Vec<SignalCaseTrial>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+}
+
+struct OfflineModeTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    evidence: Vec<OfflineTrial>,
+    egress_attempts: Vec<EgressAttempt>,
+}
+
 struct DeterminismTrials {
     events: Vec<NormalizedEvent>,
     runs: Vec<DeterminismRun>,
     requests: Vec<crate::fake_model::ModelRequestRecord>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RetryTimerCalibration {
+    status: u16,
+    index: u32,
+    requested_ms: u64,
+    actual_ms: f64,
+    absolute_error_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RetryTrialEvidence {
+    status: u16,
+    repetition: u32,
+    actor: String,
+    terminal_received_ns: u64,
+    events: Vec<NormalizedEvent>,
+    post_terminal_requested_ms: u64,
+    post_terminal_actual_ms: f64,
+    requests_at_terminal: u64,
+    requests_after_observation: u64,
+    effects_after_terminal: u64,
+}
+
+struct RetryBudgetTrials {
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+    calibrations: Vec<RetryTimerCalibration>,
+    trials: Vec<RetryTrialEvidence>,
+}
+
+/// Minimum scheduling error that row 58 treats as calibratable on a loaded
+/// general-purpose host. The retry ladder still has its independent 50%-150%
+/// timing envelope, so this floor only prevents ordinary scheduler jitter from
+/// invalidating the measurement itself.
+const RETRY_TIMER_ABSOLUTE_TOLERANCE_FLOOR_MS: f64 = 5.0;
+
+fn retry_timer_calibratable_tolerance_ms(requested_ms: u64) -> f64 {
+    (requested_ms as f64 * 0.02).max(RETRY_TIMER_ABSOLUTE_TOLERANCE_FLOOR_MS)
+}
+
+#[derive(Clone, Debug, Default)]
+struct RetryBudgetEvaluation {
+    metrics: BTreeMap<String, f64>,
+    details: Value,
+    measurement_complete: bool,
+    measurement_error: Option<String>,
+    reference_envelope_pass: bool,
+}
+
+fn evaluate_retry_budget(
+    collected: Option<&RetryBudgetTrials>,
+    manifest: &Manifest,
+    profile: Profile,
+) -> RetryBudgetEvaluation {
+    let Some(collected) = collected else {
+        return RetryBudgetEvaluation {
+            details: json!({
+                "attempts": [],
+                "timer_calibration": [],
+                "timer_tolerance_ms": 0.0,
+                "post_terminal_observation_ms": 0.0,
+            }),
+            measurement_error: Some("retry-budget trials were not collected".to_owned()),
+            ..RetryBudgetEvaluation::default()
+        };
+    };
+    let (Some(max_attempts), Some(base_delay_ms), Some(max_delay_ms)) = (
+        manifest.resources.retry_max_attempts,
+        manifest.resources.retry_base_delay_ms,
+        manifest.resources.retry_max_delay_ms,
+    ) else {
+        return RetryBudgetEvaluation {
+            details: json!({
+                "attempts": [],
+                "timer_calibration": [],
+                "timer_tolerance_ms": 0.0,
+                "post_terminal_observation_ms": 0.0,
+            }),
+            measurement_error: Some("documented retry policy is absent".to_owned()),
+            ..RetryBudgetEvaluation::default()
+        };
+    };
+    let expected_statuses = match profile {
+        Profile::Quick => vec![429_u16],
+        Profile::Cert => vec![429_u16, 500_u16],
+    };
+    let requested_calibration_ms = base_delay_ms.min(100);
+    let mut infrastructure_errors = Vec::new();
+    let mut timer_tolerance_ms = 0.0_f64;
+    for status in &expected_statuses {
+        let calibration = collected
+            .calibrations
+            .iter()
+            .filter(|sample| sample.status == *status)
+            .collect::<Vec<_>>();
+        if calibration.len() != 20 {
+            infrastructure_errors.push(format!(
+                "status {status} has {} timer calibration samples; expected 20",
+                calibration.len()
+            ));
+            continue;
+        }
+        let calibration_indices = calibration
+            .iter()
+            .map(|sample| sample.index)
+            .collect::<BTreeSet<_>>();
+        if calibration_indices != (1..=20_u32).collect::<BTreeSet<_>>()
+            || calibration.iter().any(|sample| {
+                sample.requested_ms != requested_calibration_ms
+                    || !sample.actual_ms.is_finite()
+                    || !sample.absolute_error_ms.is_finite()
+            })
+        {
+            infrastructure_errors.push(format!(
+                "status {status} has invalid timer calibration boundaries"
+            ));
+            continue;
+        }
+        let mut errors = calibration
+            .iter()
+            .map(|sample| sample.absolute_error_ms)
+            .collect::<Vec<_>>();
+        errors.sort_by(f64::total_cmp);
+        let (Some(median_lower), Some(median_upper), Some(p95_error)) =
+            (errors.get(9), errors.get(10), errors.get(18))
+        else {
+            infrastructure_errors.push(format!(
+                "status {status} has incomplete sorted timer calibration"
+            ));
+            continue;
+        };
+        let median_error = (*median_lower + *median_upper) / 2.0;
+        let calibration_limit = retry_timer_calibratable_tolerance_ms(requested_calibration_ms);
+        timer_tolerance_ms = timer_tolerance_ms.max((*p95_error).max(calibration_limit));
+        if median_error > calibration_limit {
+            infrastructure_errors.push(format!(
+                "status {status} timer calibration median error {median_error:.3}ms exceeds {calibration_limit:.3}ms"
+            ));
+        }
+    }
+
+    let delay_sum_ms = (0..max_attempts.saturating_sub(1))
+        .map(|exponent| {
+            (u128::from(base_delay_ms) * (1_u128 << exponent)).min(u128::from(max_delay_ms))
+        })
+        .sum::<u128>();
+    let declared_worst_case_ms = 1.5 * delay_sum_ms as f64 + 1_000.0;
+    let required_post_terminal_ms = max_delay_ms.saturating_add(250).max(1_000);
+    let mut attempts_details = Vec::new();
+    let mut trial_details = Vec::new();
+    let mut requests_total = 0_u64;
+    let mut elapsed_ms = 0.0_f64;
+    let mut failure_terminals = 0_u64;
+    let mut committed_effects = 0_u64;
+    let mut backoff_jittered = false;
+    let mut status_jittered = BTreeMap::new();
+    let mut all_trials_pass = true;
+    let mut minimum_post_observation_ms = f64::INFINITY;
+
+    for status in &expected_statuses {
+        let status_trials = collected
+            .trials
+            .iter()
+            .filter(|trial| trial.status == *status)
+            .collect::<Vec<_>>();
+        let repetitions = status_trials
+            .iter()
+            .map(|trial| trial.repetition)
+            .collect::<BTreeSet<_>>();
+        if status_trials.len() != 3 || repetitions != BTreeSet::from([1_u32, 2, 3]) {
+            infrastructure_errors.push(format!(
+                "status {status} lacks the exact three repetition set"
+            ));
+        }
+        let mut jitter_observed_for_status = false;
+        for trial in status_trials {
+            let mut records = collected
+                .requests
+                .iter()
+                .filter(|record| record.request.actor == trial.actor)
+                .collect::<Vec<_>>();
+            records.sort_by_key(|record| record.attempt);
+            let attempt_ordinals = records
+                .iter()
+                .map(|record| record.attempt)
+                .collect::<Vec<_>>();
+            let expected_ordinals = (1..=records.len() as u64).collect::<Vec<_>>();
+            if attempt_ordinals != expected_ordinals
+                || records.iter().any(|record| record.received_ns == 0)
+            {
+                infrastructure_errors.push(format!(
+                    "status {status} repetition {} has incomplete attempt boundaries",
+                    trial.repetition
+                ));
+            }
+            let requests = records.len() as u64;
+            requests_total = requests_total.max(requests);
+            let first_request_received_ns = records.first().map_or(0, |first| first.received_ns);
+            let trial_elapsed_ms = trial
+                .terminal_received_ns
+                .saturating_sub(first_request_received_ns)
+                as f64
+                / 1_000_000.0;
+            elapsed_ms = elapsed_ms.max(trial_elapsed_ms);
+            if records.is_empty() || trial.terminal_received_ns == 0 {
+                infrastructure_errors.push(format!(
+                    "status {status} repetition {} lacks elapsed boundaries",
+                    trial.repetition
+                ));
+            }
+
+            let terminal_events = trial
+                .events
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .collect::<Vec<_>>();
+            let provider_failures = terminal_events
+                .iter()
+                .filter(|event| {
+                    event.event == EventVocab::TerminalFailure
+                        && event.payload.get("category").and_then(Value::as_str) == Some("provider")
+                        && event.payload.get("http_status").and_then(Value::as_u64)
+                            == Some(u64::from(*status))
+                })
+                .count() as u64;
+            failure_terminals = failure_terminals.saturating_add(provider_failures);
+            let effects = trial
+                .events
+                .iter()
+                .filter(|event| event.event == EventVocab::ToolResult)
+                .count() as u64;
+            committed_effects = committed_effects.saturating_add(effects);
+
+            let mut intervals_in_bounds = true;
+            for (index, record) in records.iter().enumerate() {
+                let previous_backoff_ms = if index == 0 {
+                    None
+                } else {
+                    Some(
+                        record
+                            .received_ns
+                            .saturating_sub(records[index - 1].received_ns)
+                            as f64
+                            / 1_000_000.0,
+                    )
+                };
+                if let Some(measured_ms) = previous_backoff_ms {
+                    let exponent = u32::try_from(index.saturating_sub(1)).unwrap_or(u32::MAX);
+                    let nominal_ms = base_delay_ms
+                        .saturating_mul(1_u64.checked_shl(exponent).unwrap_or(u64::MAX))
+                        .min(max_delay_ms) as f64;
+                    let lower = (0.5 * nominal_ms - timer_tolerance_ms).max(0.0);
+                    let upper = 1.5 * nominal_ms + timer_tolerance_ms;
+                    intervals_in_bounds &= measured_ms >= lower && measured_ms <= upper;
+                    let jitter_threshold = (0.05 * nominal_ms).max(timer_tolerance_ms);
+                    if (measured_ms - nominal_ms).abs() >= jitter_threshold {
+                        jitter_observed_for_status = true;
+                        backoff_jittered = true;
+                    }
+                }
+                attempts_details.push(json!({
+                    "status": status,
+                    "repetition": trial.repetition,
+                    "attempt": record.attempt,
+                    "received_ns": record.received_ns,
+                    "previous_backoff_ms": previous_backoff_ms,
+                }));
+            }
+            let response_statuses_match = records
+                .iter()
+                .all(|record| record.response_status == Some(*status));
+            let observation_complete = trial.post_terminal_requested_ms
+                == required_post_terminal_ms
+                && trial.post_terminal_actual_ms >= required_post_terminal_ms as f64;
+            if !observation_complete {
+                infrastructure_errors.push(format!(
+                    "status {status} repetition {} has incomplete post-terminal observation",
+                    trial.repetition
+                ));
+            }
+            let post_terminal_quiet = trial.requests_at_terminal
+                == trial.requests_after_observation
+                && trial.effects_after_terminal == 0;
+            minimum_post_observation_ms =
+                minimum_post_observation_ms.min(trial.post_terminal_actual_ms);
+            let trial_pass = (2..=u64::from(max_attempts)).contains(&requests)
+                && trial_elapsed_ms <= declared_worst_case_ms
+                && declared_worst_case_ms <= 10_000.0
+                && intervals_in_bounds
+                && terminal_events.len() == 1
+                && provider_failures == 1
+                && effects <= 1
+                && response_statuses_match
+                && observation_complete
+                && post_terminal_quiet;
+            all_trials_pass &= trial_pass;
+            trial_details.push(json!({
+                "status": status,
+                "repetition": trial.repetition,
+                "requests": requests,
+                "first_request_received_ns": first_request_received_ns,
+                "terminal_received_ns": trial.terminal_received_ns,
+                "elapsed_ms": trial_elapsed_ms,
+                "failure_terminals": provider_failures,
+                "committed_effects": effects,
+                "post_terminal_requested_ms": trial.post_terminal_requested_ms,
+                "post_terminal_actual_ms": trial.post_terminal_actual_ms,
+                "requests_at_terminal": trial.requests_at_terminal,
+                "requests_after_observation": trial.requests_after_observation,
+                "effects_after_terminal": trial.effects_after_terminal,
+                "observation_complete": observation_complete,
+                "post_terminal_quiet": post_terminal_quiet,
+                "intervals_in_bounds": intervals_in_bounds,
+                "passed": trial_pass,
+            }));
+        }
+        status_jittered.insert(*status, jitter_observed_for_status);
+        all_trials_pass &= jitter_observed_for_status;
+    }
+
+    attempts_details.sort_by(|left, right| {
+        (
+            left.get("status").and_then(Value::as_u64),
+            left.get("repetition").and_then(Value::as_u64),
+            left.get("attempt").and_then(Value::as_u64),
+        )
+            .cmp(&(
+                right.get("status").and_then(Value::as_u64),
+                right.get("repetition").and_then(Value::as_u64),
+                right.get("attempt").and_then(Value::as_u64),
+            ))
+    });
+    trial_details.sort_by(|left, right| {
+        (
+            left.get("status").and_then(Value::as_u64),
+            left.get("repetition").and_then(Value::as_u64),
+        )
+            .cmp(&(
+                right.get("status").and_then(Value::as_u64),
+                right.get("repetition").and_then(Value::as_u64),
+            ))
+    });
+    let mut calibrations = collected.calibrations.clone();
+    calibrations.sort_by_key(|sample| (sample.status, sample.index));
+    let post_terminal_observation_ms = if minimum_post_observation_ms.is_finite() {
+        minimum_post_observation_ms
+    } else {
+        0.0
+    };
+    let metrics = BTreeMap::from([
+        (
+            "retry_budget.requests_total".to_owned(),
+            requests_total as f64,
+        ),
+        (
+            "retry_budget.declared_max_requests".to_owned(),
+            f64::from(max_attempts),
+        ),
+        (
+            "retry_budget.declared_worst_case_ms".to_owned(),
+            declared_worst_case_ms,
+        ),
+        ("retry_budget.elapsed_ms".to_owned(), elapsed_ms),
+        (
+            "retry_budget.backoff_jittered".to_owned(),
+            if backoff_jittered { 1.0 } else { 0.0 },
+        ),
+        (
+            "retry_budget.failure_terminals".to_owned(),
+            failure_terminals as f64,
+        ),
+        (
+            "retry_budget.committed_effects".to_owned(),
+            committed_effects as f64,
+        ),
+    ]);
+    let details = json!({
+        "attempts": attempts_details,
+        "timer_calibration": calibrations,
+        "timer_tolerance_ms": timer_tolerance_ms,
+        "post_terminal_observation_ms": post_terminal_observation_ms,
+        "status_jittered": status_jittered,
+        "trials": trial_details,
+    });
+    let measurement_complete = infrastructure_errors.is_empty();
+    RetryBudgetEvaluation {
+        metrics,
+        details,
+        measurement_complete,
+        measurement_error: (!measurement_complete).then(|| infrastructure_errors.join("; ")),
+        reference_envelope_pass: measurement_complete && all_trials_pass,
+    }
+}
+
+#[cfg(test)]
+mod retry_timer_tolerance_tests {
+    use super::*;
+
+    #[test]
+    fn retry_timer_calibration_uses_five_millisecond_floor_for_small_bases() {
+        assert_eq!(retry_timer_calibratable_tolerance_ms(50), 5.0);
+        assert_eq!(retry_timer_calibratable_tolerance_ms(100), 5.0);
+    }
+
+    #[test]
+    fn retry_timer_calibration_retains_percentage_for_large_delays() {
+        assert_eq!(retry_timer_calibratable_tolerance_ms(1_000), 20.0);
+    }
 }
 
 struct DerivedRowEvaluations<'a> {
@@ -193,6 +680,15 @@ struct DerivedRowEvaluations<'a> {
     process_hygiene: &'a ProcessHygieneEvaluation,
     time_to_first_model_request: &'a TimeToFirstModelRequestEvaluation,
     memory_time_integral: &'a MemoryTimeIntegralEvaluation,
+    disk_io_per_turn: &'a DiskIoEvaluation,
+    model_wait_cpu: &'a ModelWaitCpuEvaluation,
+    child_failure_propagation: &'a ChildFailureEvaluation,
+    signal_matrix: &'a SignalMatrixEvaluation,
+    retry_budget: &'a RetryBudgetEvaluation,
+    slow_stream_vs_stall: &'a SlowStreamStallEvaluation,
+    large_tool_output: &'a LargeOutputEvaluation,
+    workspace_fault: &'a WorkspaceFaultEvaluation,
+    offline_mode: &'a OfflineModeEvaluation,
     nondeterministic_fields: &'a NondeterministicFieldEvaluation,
     cross_run_reproducibility: &'a CrossRunReproducibilityEvaluation,
 }
@@ -213,6 +709,40 @@ fn apply_memory_time_integral_summary(
     summary.sampler_overhead_pct = summary
         .sampler_overhead_pct
         .max(evaluation.sampler_overhead_pct);
+}
+
+fn apply_disk_io_summary(summary: &mut ResourceSummary, evaluation: &DiskIoEvaluation) {
+    summary.disk_write_bytes_per_turn_p50 = evaluation
+        .resource_values
+        .get("disk_write_bytes_per_turn_p50")
+        .copied();
+    summary.disk_write_bytes_per_turn_p95 = evaluation
+        .resource_values
+        .get("disk_write_bytes_per_turn_p95")
+        .copied();
+    summary.disk_write_bytes_per_turn_max = evaluation
+        .resource_values
+        .get("disk_write_bytes_per_turn_max")
+        .copied();
+    summary.session_journal_growth_bytes_per_turn = evaluation
+        .resource_values
+        .get("session_journal_growth_bytes_per_turn")
+        .copied();
+    summary.log_growth_bytes_per_turn = evaluation.log_growth_bytes_per_turn;
+    summary.disk_write_growth_slope_bytes_per_turn2 = evaluation
+        .resource_values
+        .get("disk_write_growth_slope_bytes_per_turn2")
+        .copied();
+    summary.disk_io_counter_complete = Some(evaluation.disk_io_counter_complete);
+    summary.unbounded_disk_growth = Some(evaluation.unbounded_disk_growth);
+}
+
+fn disk_io_resource_metrics(evaluation: &DiskIoEvaluation) -> BTreeMap<String, f64> {
+    let mut metrics = evaluation.resource_values.clone();
+    if let Some(value) = evaluation.log_growth_bytes_per_turn {
+        metrics.insert("log_growth_bytes_per_turn".to_owned(), value);
+    }
+    metrics
 }
 
 fn memory_time_integral_resource_metrics(
@@ -688,6 +1218,14 @@ async fn run_inner(
         "AHRB_MOCK_MODEL".to_owned(),
         manifest.fake_model.model.clone(),
     );
+    environment.insert(
+        "AHRB_MOCK_MAX_OUTPUT_BYTES".to_owned(),
+        manifest.resources.max_output_bytes.to_string(),
+    );
+    environment.insert(
+        "AHRB_MOCK_TURN_TIMEOUT_MS".to_owned(),
+        manifest.resources.turn_timeout_ms.to_string(),
+    );
     variables.insert(
         "base_url".to_owned(),
         environment
@@ -877,7 +1415,7 @@ async fn run_inner(
     let mut cancel_cleanup_detail = None;
 
     for (row, actor_names) in &actors_by_row {
-        if (20..=29).contains(row) || matches!(*row, 42..=46 | 63 | 64) {
+        if (20..=29).contains(row) || matches!(*row, 42..=47 | 56..=58 | 60 | 63 | 64) {
             continue;
         }
         if !matches!(
@@ -1760,6 +2298,223 @@ async fn run_inner(
     } else {
         None
     };
+    let row47_trials = if selected_rows.contains(&47) {
+        match collect_disk_io_trials(&manifest, options.profile, &profile_root, &manifest_hash)
+            .await
+        {
+            Ok(trials) => {
+                events.insert(47_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("disk-io-per-turn evidence collection: {error}");
+                row_errors.insert(47, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(47, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row48_trials = if selected_rows.contains(&48) {
+        match collect_model_wait_cpu_trials(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &manifest_hash,
+        )
+        .await
+        {
+            Ok(trials) => {
+                events.insert(48_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("model-wait-cpu evidence collection: {error}");
+                row_errors.insert(48, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(48, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row56_trials = if selected_rows.contains(&56)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 56),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_child_failure_trials(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &manifest_hash,
+        )
+        .await
+        {
+            Ok(trials) => {
+                events.insert(56_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("child-failure-propagation evidence collection: {error}");
+                row_errors.insert(56, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(56, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row57_trials = if selected_rows.contains(&57)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 57),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_signal_matrix_trials(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &manifest_hash,
+        )
+        .await
+        {
+            Ok(trials) => {
+                events.insert(57_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("signal-matrix evidence collection: {error}");
+                row_errors.insert(57, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(57, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row58_trials = if selected_rows.contains(&58)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 58),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_retry_budget_trials(&manifest, options.profile, &profile_root, &manifest_hash)
+            .await
+        {
+            Ok(trials) => {
+                events.insert(58_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("retry-budget evidence collection: {error}");
+                row_errors.insert(58, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(58, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row59_trials = if selected_rows.contains(&59) {
+        match collect_slow_stream_stall_trials(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &manifest_hash,
+        )
+        .await
+        {
+            Ok(trials) => {
+                events.insert(59_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("slow-stream-vs-stall evidence collection: {error}");
+                row_errors.insert(59, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(59, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row60_trials = if selected_rows.contains(&60) {
+        match collect_large_output_trials(&manifest, options.profile, &profile_root, &manifest_hash)
+            .await
+        {
+            Ok(trials) => {
+                events.insert(60_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("large-tool-output evidence collection: {error}");
+                row_errors.insert(60, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(60, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row61_trials = if selected_rows.contains(&61) {
+        match collect_workspace_fault_trials(
+            &manifest,
+            options.profile,
+            &profile_root,
+            &manifest_hash,
+        )
+        .await
+        {
+            Ok(trials) => {
+                events.insert(61_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("workspace-fault evidence collection: {error}");
+                row_errors.insert(61, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(61, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row62_trials = if selected_rows.contains(&62) {
+        match collect_offline_mode_trials(&manifest, options.profile, &profile_root, &manifest_hash)
+            .await
+        {
+            Ok(trials) => {
+                events.insert(62_u8, trials.events.clone());
+                Some(trials)
+            }
+            Err(error) => {
+                let detail = format!("egress enforcement unavailable: {error}");
+                row_errors.insert(62, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(62, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let determinism_trials = if selected_rows.contains(&63) || selected_rows.contains(&64) {
         match collect_determinism_trials(&manifest, options.profile, &profile_root, &manifest_hash)
             .await
@@ -1843,6 +2598,30 @@ async fn run_inner(
     if let Some(trials) = &row46_trials {
         request_records.extend(trials.requests.clone());
     }
+    if let Some(trials) = &row47_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row48_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row57_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row58_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row59_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row60_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row61_trials {
+        request_records.extend(trials.requests.clone());
+    }
+    if let Some(trials) = &row62_trials {
+        request_records.extend(trials.requests.clone());
+    }
     if let Some(trials) = &determinism_trials {
         request_records.extend(trials.requests.clone());
     }
@@ -1850,6 +2629,14 @@ async fn run_inner(
         || row43_trials.is_some()
         || row45_trials.is_some()
         || row46_trials.is_some()
+        || row47_trials.is_some()
+        || row48_trials.is_some()
+        || row57_trials.is_some()
+        || row58_trials.is_some()
+        || row59_trials.is_some()
+        || row60_trials.is_some()
+        || row61_trials.is_some()
+        || row62_trials.is_some()
         || determinism_trials.is_some()
     {
         request_records.sort_by(|left, right| {
@@ -2046,6 +2833,121 @@ async fn run_inner(
             apply_memory_time_integral_summary(&mut resource_summary, &row46_evaluation);
         }
     }
+    let row47_expected_repetitions = match options.profile {
+        Profile::Quick => 3_u32,
+        Profile::Cert => 7_u32,
+    };
+    let row47_expected_turns = match options.profile {
+        Profile::Quick => 20_u32,
+        Profile::Cert => 100_u32,
+    };
+    let row47_log_evidence = row47_trials.as_ref().map_or(
+        match manifest.resources.log_paths.as_ref() {
+            None => LogEvidenceKind::Omitted,
+            Some(paths) if paths.is_empty() => LogEvidenceKind::VerifiedNoLog,
+            Some(_) => LogEvidenceKind::DeclaredPaths,
+        },
+        |trials| trials.log_evidence,
+    );
+    let row47_evaluation = evaluate_disk_io_per_turn(
+        row47_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.turns.as_slice()),
+        row47_expected_repetitions,
+        row47_expected_turns,
+        row47_log_evidence,
+    );
+    if selected_rows.contains(&47) {
+        apply_disk_io_summary(&mut resource_summary, &row47_evaluation);
+    }
+    let streaming_repetitions =
+        ResourceTimingPlan::for_profile(ResourceProfile::from(options.profile)).repetitions;
+    let streaming_count = match options.profile {
+        Profile::Quick => 5_u32,
+        Profile::Cert => 20_u32,
+    };
+    let row48_evaluation = evaluate_model_wait_cpu(
+        row48_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        streaming_repetitions,
+        streaming_count,
+        manifest.resources.idle_timeout_ms,
+    );
+    if selected_rows.contains(&48) && row48_evaluation.measurement_complete {
+        resource_summary.model_wait_cpu_p50_ms = Some(row48_evaluation.cpu_p50_ms);
+        resource_summary.model_wait_wall_p50_ms = Some(row48_evaluation.wall_p50_ms);
+        resource_summary.model_wait_cpu_one_core_max_ratio =
+            Some(row48_evaluation.one_core_max_ratio);
+    }
+    let child_failure_repetitions = match options.profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let mut row56_evaluation = evaluate_child_failure_propagation(
+        row56_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        child_failure_repetitions,
+        manifest.resources.turn_timeout_ms,
+    );
+    if let Some(object) = row56_evaluation.details.as_object_mut() {
+        object.insert(
+            "status_observations".to_owned(),
+            Value::Array(
+                row56_trials
+                    .as_ref()
+                    .map_or_else(Vec::new, |trials| trials.status_observations.clone()),
+            ),
+        );
+    }
+    let signal_matrix_repetitions = match options.profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let row57_evaluation = evaluate_signal_matrix(
+        row57_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        signal_matrix_repetitions,
+        manifest.daemon.grace_ms,
+        manifest.resources.turn_timeout_ms.saturating_add(3_000),
+    );
+    let row58_evaluation = evaluate_retry_budget(row58_trials.as_ref(), &manifest, options.profile);
+    let row59_evaluation = evaluate_slow_stream_vs_stall(
+        row59_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        streaming_repetitions,
+        streaming_count,
+        manifest.resources.idle_timeout_ms,
+    );
+    let fault_repetitions = match options.profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let row60_evaluation = evaluate_large_tool_output(
+        row60_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        fault_repetitions,
+    );
+    if selected_rows.contains(&60) && row60_evaluation.measurement_complete {
+        resource_summary.large_tool_output_peak_rss_delta_mib = row60_evaluation.peak_rss_delta_mib;
+    }
+    let row61_evaluation = evaluate_workspace_fault(
+        row61_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        fault_repetitions,
+        manifest.resources.turn_timeout_ms,
+    );
+    let row62_evaluation = evaluate_offline_mode(
+        row62_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
+        fault_repetitions,
+    );
     let determinism_expected_runs = match options.profile {
         Profile::Quick => 2_u32,
         Profile::Cert => 7_u32,
@@ -2085,6 +2987,15 @@ async fn run_inner(
             process_hygiene: &row44_evaluation,
             time_to_first_model_request: &row45_evaluation,
             memory_time_integral: &row46_evaluation,
+            disk_io_per_turn: &row47_evaluation,
+            model_wait_cpu: &row48_evaluation,
+            child_failure_propagation: &row56_evaluation,
+            signal_matrix: &row57_evaluation,
+            retry_budget: &row58_evaluation,
+            slow_stream_vs_stall: &row59_evaluation,
+            large_tool_output: &row60_evaluation,
+            workspace_fault: &row61_evaluation,
+            offline_mode: &row62_evaluation,
             nondeterministic_fields: &row63_evaluation,
             cross_run_reproducibility: &row64_evaluation,
         },
@@ -2135,6 +3046,31 @@ async fn run_inner(
     }
     if selected_rows.contains(&46) && row46_evaluation.measurement_complete {
         resource_metric_values.extend(memory_time_integral_resource_metrics(&row46_evaluation));
+    }
+    if selected_rows.contains(&48) && row48_evaluation.measurement_complete {
+        resource_metric_values.extend(BTreeMap::from([
+            (
+                "model_wait_cpu_p50_ms".to_owned(),
+                row48_evaluation.cpu_p50_ms,
+            ),
+            (
+                "model_wait_wall_p50_ms".to_owned(),
+                row48_evaluation.wall_p50_ms,
+            ),
+            (
+                "model_wait_cpu_one_core_max_ratio".to_owned(),
+                row48_evaluation.one_core_max_ratio,
+            ),
+        ]));
+    }
+    if selected_rows.contains(&47) && row47_evaluation.measurement_complete {
+        resource_metric_values.extend(disk_io_resource_metrics(&row47_evaluation));
+    }
+    if selected_rows.contains(&60)
+        && row60_evaluation.measurement_complete
+        && let Some(value) = row60_evaluation.peak_rss_delta_mib
+    {
+        resource_metric_values.insert("large_tool_output_peak_rss_delta_mib".to_owned(), value);
     }
     let marginal_bytes = resource_metric_values
         .get("parallel_beta_bytes_per_agent")
@@ -2191,6 +3127,30 @@ async fn run_inner(
     if selected_rows.contains(&44) && row44_evaluation.measurement_complete {
         metrics.extend(row44_evaluation.metrics.clone());
     }
+    if selected_rows.contains(&48) && row48_evaluation.measurement_complete {
+        metrics.extend(row48_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&56) && row56_evaluation.measurement_complete {
+        metrics.extend(row56_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&57) && row57_evaluation.measurement_complete {
+        metrics.extend(row57_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&58) && row58_evaluation.measurement_complete {
+        metrics.extend(row58_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&59) && row59_evaluation.measurement_complete {
+        metrics.extend(row59_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&60) && row60_evaluation.measurement_complete {
+        metrics.extend(row60_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&61) && row61_evaluation.measurement_complete {
+        metrics.extend(row61_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&62) && row62_evaluation.measurement_complete {
+        metrics.extend(row62_evaluation.metrics.clone());
+    }
     if selected_rows.contains(&63) && row63_evaluation.measurement_complete {
         metrics.extend(BTreeMap::from([
             (
@@ -2232,6 +3192,28 @@ async fn run_inner(
         ]));
     }
     let mut details = ReportDetails::default();
+    if selected_rows.contains(&47) {
+        let mut disk_details = row47_evaluation.details.clone();
+        if let Some(object) = disk_details.as_object_mut() {
+            object.insert(
+                "turns".to_owned(),
+                serde_json::to_value(
+                    row47_trials
+                        .as_ref()
+                        .map_or(&[][..], |trials| trials.turns.as_slice()),
+                )?,
+            );
+            object.insert(
+                "counter_snapshots".to_owned(),
+                Value::Array(
+                    row47_trials
+                        .as_ref()
+                        .map_or_else(Vec::new, |trials| trials.counter_snapshots.clone()),
+                ),
+            );
+        }
+        details.insert("disk-io-per-turn".to_owned(), disk_details);
+    }
     if selected_rows.contains(&42) {
         details.insert(
             "model-request-efficiency".to_owned(),
@@ -2256,6 +3238,49 @@ async fn run_inner(
             row46_evaluation.details.clone(),
         );
     }
+    if selected_rows.contains(&48) {
+        details.insert(
+            "model-wait-cpu".to_owned(),
+            row48_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&56) {
+        details.insert(
+            "child-failure-propagation".to_owned(),
+            row56_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&57) {
+        details.insert("signal-matrix".to_owned(), row57_evaluation.details.clone());
+    }
+    if selected_rows.contains(&58) {
+        details.insert("retry-budget".to_owned(), row58_evaluation.details.clone());
+    }
+    if selected_rows.contains(&59) {
+        details.insert(
+            "slow-stream-vs-stall".to_owned(),
+            row59_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&60) {
+        details.insert(
+            "large-tool-output".to_owned(),
+            row60_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&61) {
+        details.insert(
+            "workspace-fault".to_owned(),
+            row61_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&62) {
+        let detail = state.row_errors.get(&62).map_or_else(
+            || row62_evaluation.details.clone(),
+            |error| json!({"measurement_complete":false,"measurement_error":error}),
+        );
+        details.insert("offline-mode".to_owned(), detail);
+    }
     if selected_rows.contains(&63) {
         details.insert(
             "nondeterministic-field-report".to_owned(),
@@ -2275,7 +3300,10 @@ async fn run_inner(
         json!({
             "measurement_complete": (!selected_rows.contains(&43) || row43_evaluation.measurement_complete)
                 && (!selected_rows.contains(&45) || row45_evaluation.measurement_complete)
-                && (!selected_rows.contains(&46) || row46_evaluation.measurement_complete),
+                && (!selected_rows.contains(&46) || row46_evaluation.measurement_complete)
+                && (!selected_rows.contains(&47) || row47_evaluation.measurement_complete)
+                && (!selected_rows.contains(&48) || row48_evaluation.measurement_complete)
+                && (!selected_rows.contains(&60) || row60_evaluation.measurement_complete),
             "latency_class": if selected_rows.contains(&43) && row43_evaluation.measurement_complete {
                 resource_summary.latency_class.clone()
             } else {
@@ -2383,9 +3411,42 @@ async fn run_inner(
             });
             turns
         },
-        stream_chunks: Vec::new(),
-        filesystem_snapshots: Vec::new(),
-        egress_attempts: Vec::new(),
+        stream_chunks: {
+            let mut chunks = row48_trials
+                .as_ref()
+                .map_or_else(Vec::new, |trials| trials.stream_chunks.clone());
+            if let Some(trials) = &row59_trials {
+                chunks.extend(trials.stream_chunks.clone());
+            }
+            chunks.sort_by(|left, right| {
+                (left.repetition, &left.case, &left.actor, left.ordinal).cmp(&(
+                    right.repetition,
+                    &right.case,
+                    &right.actor,
+                    right.ordinal,
+                ))
+            });
+            chunks
+        },
+        filesystem_snapshots: {
+            let mut snapshots = row47_trials
+                .as_ref()
+                .map_or_else(Vec::new, |trials| trials.filesystem_snapshots.clone());
+            if let Some(trials) = &row61_trials {
+                snapshots.extend(trials.filesystem_snapshots.clone());
+            }
+            snapshots.sort_by(|left, right| {
+                (left.repetition, &left.boundary, &left.path_under_profile).cmp(&(
+                    right.repetition,
+                    &right.boundary,
+                    &right.path_under_profile,
+                ))
+            });
+            snapshots
+        },
+        egress_attempts: row62_trials
+            .as_ref()
+            .map_or_else(Vec::new, |trials| trials.egress_attempts.clone()),
     };
     crate::results::persist_report(&persistence, &report, options.junit, false)?;
     println!("{}", render_resource_summary(&report.resource_summary));
@@ -2609,6 +3670,49 @@ async fn start_model(
     }
 }
 
+async fn start_streaming_model(
+    engine: Arc<FakeModelEngine>,
+    base_url_env: &str,
+) -> Result<(ModelServer, BTreeMap<String, String>)> {
+    let address = SocketAddr::from(([127, 0, 0, 1], 0));
+    match FakeModelServer::bind(address, Arc::clone(&engine)).await {
+        Ok(server) => {
+            let base_url = server.base_url();
+            Ok((
+                ModelServer::Tcp(server),
+                BTreeMap::from([(base_url_env.to_owned(), base_url)]),
+            ))
+        }
+        Err(AhrbError::Io(error))
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || is_transient_bind_error(&error) =>
+        {
+            match start_unix_model(Arc::clone(&engine)).await {
+                Ok(started) => Ok(started),
+                Err(unix_error) => {
+                    let server = FakeModelPreconnectedServer::pair(engine).map_err(|pair_error| {
+                        AhrbError::Protocol(format!(
+                            "streaming fake-model HTTP is unavailable: TCP={error}; Unix={unix_error}; preconnected={pair_error}"
+                        ))
+                    })?;
+                    let peer_fd = server.peer_fd();
+                    Ok((
+                        ModelServer::Preconnected(server),
+                        BTreeMap::from([
+                            (
+                                base_url_env.to_owned(),
+                                "http://ahrb-preconnected.invalid".to_owned(),
+                            ),
+                            ("AHRB_MOCK_PROVIDER_FD".to_owned(), peer_fd.to_string()),
+                        ]),
+                    ))
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn start_mailbox_model(
     engine: Arc<FakeModelEngine>,
 ) -> Result<(ModelServer, BTreeMap<String, String>)> {
@@ -2786,6 +3890,11 @@ fn make_driver_with_timeout(
         queue: optional(&manifest.next_input.queue),
         release_checkpoint: optional(&manifest.concurrency.release),
         spawn_agent: optional(&manifest.agents.spawn),
+        agent_child_id_pointer: manifest.agents.child_id_pointer.clone(),
+        agent_status: optional(&manifest.agents.status),
+        agent_status_result_pointer: manifest.agents.status_result_pointer.clone(),
+        agent_collect: optional(&manifest.agents.collect),
+        agent_collect_events_pointer: manifest.agents.collect_events_pointer.clone(),
         cancel: optional(&manifest.agents.cancel),
         close: optional(&manifest.sessions.close_delete),
         shutdown: optional(&manifest.daemon.shutdown),
@@ -2888,7 +3997,14 @@ fn build_workflow(
     let mut responses = Vec::new();
     let mut actors_by_row = BTreeMap::new();
     for row in rows {
-        let count = if *row == 26 { 8 } else { 1 };
+        let count = match *row {
+            26 => 8,
+            60 | 61 => match profile {
+                Profile::Quick => 1,
+                Profile::Cert => 3,
+            },
+            _ => 1,
+        };
         let mut row_actors = Vec::new();
         for index in 0..count {
             let actor = if count == 1 {
@@ -3040,6 +4156,1369 @@ fn build_workflow(
         },
         actors_by_row,
     ))
+}
+
+fn retry_budget_workflow(profile_root: &Path, profile: Profile) -> Workflow {
+    let scenario = "ahrb-row58-retry-budget".to_owned();
+    let statuses = match profile {
+        Profile::Quick => vec![429_u16],
+        Profile::Cert => vec![429_u16, 500_u16],
+    };
+    let mut actors = BTreeMap::new();
+    let mut responses = Vec::new();
+    for status in statuses {
+        for repetition in 1..=3_u32 {
+            let actor = format!("r58-s{status}-r{repetition}");
+            actors.insert(
+                actor.clone(),
+                Actor {
+                    id: actor.clone(),
+                    parent: None,
+                    prompt: format!(
+                        "AHRB sustained status {status} retry budget repetition {repetition} {}",
+                        route_marker(&scenario, &actor, "start")
+                    ),
+                    workspace: profile_root
+                        .join("workspaces")
+                        .join(&actor)
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+            );
+            responses.push(ScriptedResponse {
+                scenario: scenario.clone(),
+                actor,
+                checkpoint: "start".to_owned(),
+                request_hash: String::new(),
+                response: success_value(),
+                fault: Some(Fault::SustainedHttpStatus {
+                    status,
+                    body: format!("{{\"error\":\"sustained-{status}\"}}"),
+                }),
+                barrier: None,
+            });
+        }
+    }
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario,
+        actors,
+        barriers: BTreeMap::new(),
+        responses,
+    }
+}
+
+async fn calibrate_retry_timer(status: u16, requested_ms: u64) -> Vec<RetryTimerCalibration> {
+    let mut samples = Vec::with_capacity(20);
+    for index in 1..=20_u32 {
+        let started_ns = monotonic_timestamp_ns();
+        tokio::time::sleep(Duration::from_millis(requested_ms)).await;
+        let finished_ns = monotonic_timestamp_ns();
+        let actual_ms = finished_ns.saturating_sub(started_ns) as f64 / 1_000_000.0;
+        samples.push(RetryTimerCalibration {
+            status,
+            index,
+            requested_ms,
+            actual_ms,
+            absolute_error_ms: (actual_ms - requested_ms as f64).abs(),
+        });
+    }
+    samples
+}
+
+fn row56_case_label(case: ChildFailureCase) -> &'static str {
+    match case {
+        ChildFailureCase::Crash => "crash",
+        ChildFailureCase::Hang => "hang",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn row56_record_events(
+    collected: &mut BTreeMap<String, NormalizedEvent>,
+    events: Vec<NormalizedEvent>,
+    role: &str,
+    case: ChildFailureCase,
+    parent_operation_start_ns: u64,
+    receipt_start_ns: u64,
+    receipt_end_ns: u64,
+) {
+    for mut event in events {
+        let receipt = json!({
+            "role": role,
+            "case": row56_case_label(case),
+            "parent_operation_start_ns": parent_operation_start_ns,
+            "receipt_start_ns": receipt_start_ns,
+            "receipt_end_ns": receipt_end_ns,
+        });
+        if let Some(payload) = event.payload.as_object_mut() {
+            payload.insert("_ahrb_row56_receipt".to_owned(), receipt);
+        } else {
+            let payload = std::mem::replace(&mut event.payload, Value::Null);
+            event.payload = json!({
+                "source_payload": payload,
+                "_ahrb_row56_receipt": receipt,
+            });
+        }
+        collected.entry(event.id.clone()).or_insert(event);
+    }
+}
+
+async fn row56_child_residue_count(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    baseline: &BTreeSet<crate::process::ProcIdentity>,
+    grace: Duration,
+) -> Result<u32> {
+    let started = Instant::now();
+    loop {
+        let tree = sampler.discover(roots)?;
+        if !baseline
+            .iter()
+            .all(|identity| tree.members.contains_key(identity))
+        {
+            return Err(AhrbError::Protocol(
+                "row-56 parent controller identity disappeared during child residue audit"
+                    .to_owned(),
+            ));
+        }
+        let residue = tree
+            .members
+            .keys()
+            .filter(|identity| !baseline.contains(identity))
+            .count();
+        if residue == 0 || started.elapsed() >= grace {
+            return Ok(u32::try_from(residue).map_or(u32::MAX, |value| value));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn row56_status_observation(
+    status: &Value,
+    repetition: u32,
+    case: ChildFailureCase,
+    receipt_start_ns: u64,
+    receipt_end_ns: u64,
+) -> Result<(String, Value)> {
+    let events = status.as_array().ok_or_else(|| {
+        AhrbError::Protocol(
+            "row-56 declared agent.status result locator did not select an event array".to_owned(),
+        )
+    })?;
+    let bytes = serde_json::to_vec(status)?;
+    let fingerprint = format!("{:x}", Sha256::digest(bytes));
+    let terminal_count = events.iter().filter(|event| {
+        event
+            .get("event")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "terminal-success"
+                        | "terminal-failure"
+                        | "terminal-cancelled"
+                        | "terminal-timeout"
+                )
+            })
+    });
+    Ok((
+        fingerprint.clone(),
+        json!({
+            "repetition": repetition,
+            "case": row56_case_label(case),
+            "receipt_start_ns": receipt_start_ns,
+            "receipt_end_ns": receipt_end_ns,
+            "event_count": events.len(),
+            "terminal_count": terminal_count.count(),
+            "result_sha256": fingerprint,
+        }),
+    ))
+}
+
+async fn collect_child_failure_case(
+    driver: &mut HarnessDriver,
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    repetition: u32,
+    case: ChildFailureCase,
+    turn_timeout_ms: u64,
+    close_sessions: bool,
+) -> Result<(ChildFailureTrial, Vec<NormalizedEvent>, Vec<Value>)> {
+    let label = row56_case_label(case);
+    let parent = driver
+        .create_session(&format!("ahrb-row56-{label}-parent-r{repetition}"))
+        .await?;
+    let baseline_tree = sampler.discover(roots)?;
+    if baseline_tree.members.is_empty() {
+        return Err(AhrbError::Protocol(
+            "row-56 could not resolve the parent controller owned tree".to_owned(),
+        ));
+    }
+    let baseline = baseline_tree
+        .members
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let parent_operation_start_ns = monotonic_timestamp_ns();
+    let outer_deadline_ms = turn_timeout_ms.saturating_add(2_000);
+    let outer_deadline_ns = parent_operation_start_ns
+        .checked_add(outer_deadline_ms.saturating_mul(1_000_000))
+        .ok_or_else(|| AhrbError::Validation("row-56 outer deadline overflow".to_owned()))?;
+    let spawn_remaining =
+        Duration::from_nanos(outer_deadline_ns.saturating_sub(monotonic_timestamp_ns()));
+    let child = tokio::time::timeout(
+        spawn_remaining,
+        driver.spawn_agent(&parent, &format!("ahrb-row56-{label}-r{repetition}"), None),
+    )
+    .await
+    .map_err(|_| {
+        AhrbError::Timeout(format!(
+            "row-56 {label} agent.spawn exceeded the parent-start outer deadline"
+        ))
+    })??;
+    let mut child_events = BTreeMap::new();
+    let mut parent_events = BTreeMap::new();
+    let mut status_observations = Vec::new();
+    let mut last_status_fingerprint = None;
+    let mut child_failure_received_ns = None;
+    let mut child_response_headers_ns = None;
+    let mut parent_terminal_received_ns = None;
+    let mut parent_after = None;
+    let mut outer_kill_used = false;
+
+    loop {
+        let now_ns = monotonic_timestamp_ns();
+        if now_ns >= outer_deadline_ns {
+            outer_kill_used = true;
+            break;
+        }
+        let remaining = Duration::from_nanos(outer_deadline_ns.saturating_sub(now_ns));
+        let poll = tokio::time::timeout(remaining, async {
+            let status_start_ns = monotonic_timestamp_ns();
+            let status = driver.agent_status(&child).await?;
+            let status_end_ns = monotonic_timestamp_ns();
+            let child_start_ns = monotonic_timestamp_ns();
+            let child_suffix = driver.agent_collect(&child).await?;
+            let child_end_ns = monotonic_timestamp_ns();
+            let parent_start_ns = monotonic_timestamp_ns();
+            let parent_suffix = driver.attach(&parent, parent_after).await?;
+            let parent_end_ns = monotonic_timestamp_ns();
+            Ok::<_, AhrbError>((
+                status,
+                status_start_ns,
+                status_end_ns,
+                child_suffix,
+                child_start_ns,
+                child_end_ns,
+                parent_suffix,
+                parent_start_ns,
+                parent_end_ns,
+            ))
+        })
+        .await;
+        let (
+            status,
+            status_start_ns,
+            status_end_ns,
+            child_suffix,
+            child_start_ns,
+            child_end_ns,
+            parent_suffix,
+            parent_start_ns,
+            parent_end_ns,
+        ) = match poll {
+            Ok(result) => result?,
+            Err(_) => {
+                outer_kill_used = true;
+                break;
+            }
+        };
+        let (fingerprint, observation) =
+            row56_status_observation(&status, repetition, case, status_start_ns, status_end_ns)?;
+        if last_status_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+            status_observations.push(observation);
+            last_status_fingerprint = Some(fingerprint);
+        }
+        if child_failure_received_ns.is_none()
+            && child_suffix.iter().any(|event| {
+                case == ChildFailureCase::Crash
+                    && event.event == EventVocab::TerminalFailure
+                    && event.payload.get("checkpoint").and_then(Value::as_str)
+                        == Some("row56-crash")
+            })
+        {
+            child_failure_received_ns = Some(child_end_ns);
+        }
+        if child_response_headers_ns.is_none()
+            && child_suffix.iter().any(|event| {
+                case == ChildFailureCase::Hang
+                    && event.event == EventVocab::ModelResponse
+                    && event.payload.get("checkpoint").and_then(Value::as_str) == Some("row56-hang")
+                    && event
+                        .payload
+                        .get("response_headers")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        {
+            child_response_headers_ns = Some(child_end_ns);
+        }
+        row56_record_events(
+            &mut child_events,
+            child_suffix,
+            "child",
+            case,
+            parent_operation_start_ns,
+            child_start_ns,
+            child_end_ns,
+        );
+        if parent_terminal_received_ns.is_none()
+            && parent_suffix.iter().any(|event| is_terminal(&event.event))
+        {
+            parent_terminal_received_ns = Some(parent_end_ns);
+        }
+        parent_after = parent_suffix
+            .iter()
+            .map(|event| Cursor(event.cursor))
+            .max()
+            .or(parent_after);
+        row56_record_events(
+            &mut parent_events,
+            parent_suffix,
+            "parent",
+            case,
+            parent_operation_start_ns,
+            parent_start_ns,
+            parent_end_ns,
+        );
+        let child_terminal = child_events.values().any(|event| is_terminal(&event.event));
+        if parent_terminal_received_ns.is_some() && child_terminal {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    if outer_kill_used {
+        let cancel_grace = Duration::from_millis(500);
+        let _ = tokio::time::timeout(cancel_grace, driver.cancel(&child)).await;
+        let _ = tokio::time::timeout(cancel_grace, driver.cancel(&parent)).await;
+        parent_terminal_received_ns = Some(monotonic_timestamp_ns());
+    }
+    let accepted_spawns = parent_events
+        .values()
+        .filter(|event| {
+            event.event == EventVocab::TurnAccepted
+                && event.payload.get("operation").and_then(Value::as_str) == Some("agent.spawn")
+                && event
+                    .payload
+                    .get("child_session_id")
+                    .and_then(Value::as_str)
+                    == Some(child.0.as_str())
+        })
+        .count();
+    if accepted_spawns != 1 {
+        return Err(AhrbError::Protocol(format!(
+            "row-56 {label} observed {accepted_spawns} accepted parent spawn boundaries"
+        )));
+    }
+    let parent_failure_terminals = parent_events
+        .values()
+        .filter(|event| match case {
+            ChildFailureCase::Crash => event.event == EventVocab::TerminalFailure,
+            ChildFailureCase::Hang => matches!(
+                event.event,
+                EventVocab::TerminalFailure | EventVocab::TerminalCancelled
+            ),
+        })
+        .count();
+    let child_failure_terminals = child_events
+        .values()
+        .filter(|event| is_terminal(&event.event))
+        .count();
+    let child_cancelled = child_events
+        .values()
+        .any(|event| event.event == EventVocab::TerminalCancelled);
+    let success_contradiction = parent_events
+        .values()
+        .chain(child_events.values())
+        .any(|event| event.event == EventVocab::TerminalSuccess);
+    let child_residue_count =
+        row56_child_residue_count(sampler, roots, &baseline, Duration::from_millis(2_000)).await?;
+    let parent_terminal_received_ns = parent_terminal_received_ns.ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "row-56 {label} omitted the parent terminal receipt boundary"
+        ))
+    })?;
+    let mut events = parent_events
+        .into_values()
+        .chain(child_events.into_values())
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        (&left.session_id, left.cursor, &left.id).cmp(&(&right.session_id, right.cursor, &right.id))
+    });
+    if close_sessions {
+        driver.close(&child).await?;
+        driver.close(&parent).await?;
+    }
+    Ok((
+        ChildFailureTrial {
+            repetition,
+            case,
+            parent_operation_start_ns,
+            child_failure_received_ns,
+            child_response_headers_ns,
+            parent_terminal_received_ns,
+            parent_failure_terminals: u32::try_from(parent_failure_terminals)
+                .map_or(u32::MAX, |value| value),
+            child_failure_terminals: u32::try_from(child_failure_terminals)
+                .map_or(u32::MAX, |value| value),
+            child_cancelled,
+            success_contradiction,
+            child_residue_count,
+            outer_kill_used,
+        },
+        events,
+        status_observations,
+    ))
+}
+
+fn child_failure_workflow(profile_root: &Path) -> Workflow {
+    let scenario = "ahrb-row56-child-failure".to_owned();
+    let actor_name = "row56-provider-probe".to_owned();
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor_name.clone(),
+            Actor {
+                id: actor_name.clone(),
+                parent: None,
+                prompt: format!(
+                    "AHRB row 56 provider probe {}",
+                    route_marker(&scenario, &actor_name, "start")
+                ),
+                workspace: profile_root
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![ScriptedResponse {
+            scenario,
+            actor: actor_name,
+            checkpoint: "start".to_owned(),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: None,
+            barrier: None,
+        }],
+    }
+}
+
+async fn collect_child_failure_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<ChildFailureTrials> {
+    let profile_root = run_profile_root.join("derived-row56");
+    prepare_profile(manifest, &profile_root)
+        .map_err(|error| AhrbError::Protocol(format!("prepare row-56 profile: {error}")))?;
+    let workflow = child_failure_workflow(&profile_root);
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let (server, model_environment) = start_model(
+        Arc::clone(&engine),
+        &workflow,
+        &profile_root,
+        false,
+        &manifest.fake_model.base_url_env,
+    )
+    .await?;
+    let mut variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+    ]);
+    let credential = format!("ahrb-{}-row56-{}", &manifest_hash[..16], std::process::id());
+    let mut environment = isolated_environment(manifest, &variables)?;
+    environment.extend(model_environment);
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        credential.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_TURN_TIMEOUT_MS".to_owned(),
+        manifest.resources.turn_timeout_ms.to_string(),
+    );
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    variables.insert("credential".to_owned(), credential);
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(manifest, &variables, &profile_root)?;
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let mut driver = make_driver_with_timeout(
+        manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+        Duration::from_millis(manifest.resources.turn_timeout_ms.saturating_add(2_000)),
+    )?;
+    driver.start().await?;
+    driver.await_readiness().await?;
+    let mut sampler = platform_sampler();
+    let roots = verified_process_roots(
+        manifest,
+        sampler.as_mut(),
+        driver.owned_pids(),
+        driver.daemon_pid(),
+    )?;
+    if roots.is_empty() {
+        return Err(AhrbError::Protocol(
+            "row-56 declared native delegation but exposed no owned controller root".to_owned(),
+        ));
+    }
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let mut collected = ChildFailureTrials {
+        events: Vec::new(),
+        evidence: Vec::new(),
+        status_observations: Vec::new(),
+    };
+    for repetition in 1..=repetitions {
+        for case in [ChildFailureCase::Crash, ChildFailureCase::Hang] {
+            let (trial, events, statuses) = collect_child_failure_case(
+                &mut driver,
+                sampler.as_mut(),
+                &roots,
+                repetition,
+                case,
+                manifest.resources.turn_timeout_ms,
+                manifest.transport.kind == TransportKind::Exec
+                    || !manifest.sessions.close_delete.is_empty(),
+            )
+            .await?;
+            collected.evidence.push(trial);
+            collected.events.extend(events);
+            collected.status_observations.extend(statuses);
+        }
+    }
+    driver.shutdown().await?;
+    server.shutdown().await?;
+    Ok(collected)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalMatrixCase {
+    Sigterm,
+    Sigint2,
+    Sighup,
+    StdinEof,
+}
+
+impl SignalMatrixCase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sigterm => "sigterm",
+            Self::Sigint2 => "sigint2",
+            Self::Sighup => "sighup",
+            Self::StdinEof => "stdin-eof",
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_signal(self) -> Option<i32> {
+        match self {
+            Self::Sigterm => Some(libc::SIGTERM),
+            Self::Sigint2 => Some(libc::SIGINT),
+            Self::Sighup => Some(libc::SIGHUP),
+            Self::StdinEof => None,
+        }
+    }
+}
+
+fn signal_matrix_workflow(
+    profile_root: &Path,
+    case: SignalMatrixCase,
+    repetition: u32,
+) -> Workflow {
+    let scenario = "ahrb-row57-signal-matrix".to_owned();
+    let actor_name = format!("r57-{}-r{repetition}", case.label());
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor_name.clone(),
+            Actor {
+                id: actor_name.clone(),
+                parent: None,
+                prompt: format!(
+                    "AHRB row 57 held turn {}",
+                    route_marker(&scenario, &actor_name, "start")
+                ),
+                workspace: profile_root
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![ScriptedResponse {
+            scenario,
+            actor: actor_name,
+            checkpoint: "start".to_owned(),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: Some(Fault::Stall),
+            barrier: None,
+        }],
+    }
+}
+
+fn signal_target_identity(
+    tree: &ProcessTree,
+    roots: &[u32],
+) -> Result<crate::process::ProcIdentity> {
+    roots
+        .iter()
+        .find_map(|pid| {
+            tree.members
+                .keys()
+                .copied()
+                .find(|identity| identity.pid == *pid)
+        })
+        .ok_or_else(|| {
+            AhrbError::Protocol(
+                "row-57 could not resolve a stable owned signal target identity".to_owned(),
+            )
+        })
+}
+
+fn read_signal_matrix_journal(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+    session: &crate::driver::SessionId,
+) -> Result<Vec<NormalizedEvent>> {
+    if manifest.events.path.trim().is_empty() {
+        return Err(AhrbError::Protocol(
+            "row-57 durable event journal path is absent".to_owned(),
+        ));
+    }
+    let mut rendered_variables = variables.clone();
+    rendered_variables.insert("session_id".to_owned(), session.0.clone());
+    let rendered = crate::manifest::render_template(&manifest.events.path, &rendered_variables)?;
+    let canonical_profile = profile_root.canonicalize()?;
+    let canonical_journal = Path::new(&rendered).canonicalize()?;
+    if !canonical_journal.starts_with(&canonical_profile) || !canonical_journal.is_file() {
+        return Err(AhrbError::Protocol(format!(
+            "row-57 journal {} is not a regular file inside {}",
+            canonical_journal.display(),
+            canonical_profile.display()
+        )));
+    }
+    let bytes = std::fs::read(&canonical_journal)?;
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err(AhrbError::Protocol(format!(
+            "row-57 durable journal {} has no complete committed tail",
+            canonical_journal.display()
+        )));
+    }
+    let mut events = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let event: NormalizedEvent = serde_json::from_slice(line).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "row-57 durable journal {} is not normalized event JSONL: {error}",
+                canonical_journal.display()
+            ))
+        })?;
+        if event.session_id == session.0 {
+            events.push(event);
+        }
+    }
+    events.sort_by(|left, right| (left.cursor, &left.id).cmp(&(right.cursor, &right.id)));
+    Ok(events)
+}
+
+async fn wait_for_signal_fixture_hold(
+    driver: &mut HarnessDriver,
+    engine: &Arc<FakeModelEngine>,
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    session: &crate::driver::SessionId,
+    actor: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let tree = sampler.discover(roots)?;
+        if tree.members.is_empty() {
+            return Err(AhrbError::Protocol(
+                "row-57 owned harness tree exited before signal delivery".to_owned(),
+            ));
+        }
+        let events = driver.attach(session, None).await?;
+        if events.iter().any(|event| is_terminal(&event.event)) {
+            return Err(AhrbError::Protocol(
+                "row-57 held turn terminalized before signal delivery".to_owned(),
+            ));
+        }
+        let provider_received = engine
+            .request_records()
+            .await
+            .iter()
+            .any(|record| record.request.actor == actor);
+        if provider_received {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(AhrbError::Timeout(
+                "row-57 held turn did not reach the provider".to_owned(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_signal_process_exit(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    per_invocation: bool,
+    deadline: Instant,
+) -> Result<ClientExit> {
+    loop {
+        let state = if per_invocation {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    AhrbError::Timeout(
+                        "row-57 harness did not exit before the applicable outer deadline"
+                            .to_owned(),
+                    )
+                })?;
+            let _ = tokio::time::timeout(remaining, driver.attach(session, None))
+                .await
+                .map_err(|_| {
+                    AhrbError::Timeout(
+                        "row-57 exit attach exceeded the applicable outer deadline".to_owned(),
+                    )
+                })??;
+            driver.client_exit(session)
+        } else {
+            driver.harness_exit()?
+        };
+        if matches!(state, ClientExit::Exited(_)) {
+            return Ok(state);
+        }
+        if matches!(state, ClientExit::NotApplicable) {
+            return Err(AhrbError::Protocol(
+                "row-57 driver omitted the actual process exit boundary".to_owned(),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(AhrbError::Timeout(
+                "row-57 harness did not exit before the applicable outer deadline".to_owned(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_signal_terminal_receipt(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+    session: &crate::driver::SessionId,
+    deadline: Instant,
+) -> Result<(Vec<NormalizedEvent>, u64)> {
+    loop {
+        let events = read_signal_matrix_journal(manifest, variables, profile_root, session)?;
+        let receipt_ns = monotonic_timestamp_ns();
+        if events.iter().any(|event| is_terminal(&event.event)) {
+            return Ok((events, receipt_ns));
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                AhrbError::Timeout(
+                    "row-57 durable terminal was not received before the applicable outer deadline"
+                        .to_owned(),
+                )
+            })?;
+        tokio::time::sleep(Duration::from_millis(2).min(remaining)).await;
+    }
+}
+
+async fn signal_matrix_residue_count(sampler: &mut dyn Sampler, roots: &[u32]) -> Result<u32> {
+    let started = Instant::now();
+    loop {
+        let count = sampler.discover(roots)?.members.len();
+        if count == 0 || started.elapsed() >= Duration::from_millis(2_000) {
+            return Ok(u32::try_from(count).map_or(u32::MAX, |value| value));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn annotate_signal_matrix_events(
+    events: &mut [NormalizedEvent],
+    case: SignalMatrixCase,
+    origin_ns: u64,
+    terminal_receipt_ns: u64,
+) {
+    for event in events {
+        let receipt = json!({
+            "signal": case.label(),
+            "origin_ns": origin_ns,
+            "terminal_receipt_ns": terminal_receipt_ns,
+        });
+        if let Some(payload) = event.payload.as_object_mut() {
+            payload.insert("_ahrb_row57_receipt".to_owned(), receipt);
+        } else {
+            let payload = std::mem::replace(&mut event.payload, Value::Null);
+            event.payload = json!({
+                "source_payload": payload,
+                "_ahrb_row57_receipt": receipt,
+            });
+        }
+    }
+}
+
+async fn collect_signal_matrix_case(
+    manifest: &Manifest,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+    repetition: u32,
+    case: SignalMatrixCase,
+) -> Result<(
+    SignalCaseTrial,
+    Vec<NormalizedEvent>,
+    Vec<crate::fake_model::ModelRequestRecord>,
+)> {
+    let profile_root = run_profile_root
+        .join("derived-row57")
+        .join(format!("{}-r{repetition}", case.label()));
+    prepare_profile(manifest, &profile_root)
+        .map_err(|error| AhrbError::Protocol(format!("prepare row-57 profile: {error}")))?;
+    let workflow = signal_matrix_workflow(&profile_root, case, repetition);
+    let actor = workflow
+        .actors
+        .keys()
+        .next()
+        .cloned()
+        .ok_or_else(|| AhrbError::Protocol("row-57 workflow has no actor".to_owned()))?;
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let (server, model_environment) = start_model(
+        Arc::clone(&engine),
+        &workflow,
+        &profile_root,
+        false,
+        &manifest.fake_model.base_url_env,
+    )
+    .await?;
+    let mut variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+    ]);
+    let credential = format!(
+        "ahrb-{}-row57-{}-r{repetition}",
+        &manifest_hash[..16],
+        case.label()
+    );
+    let mut environment = isolated_environment(manifest, &variables)?;
+    environment.extend(model_environment);
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        credential.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .map_or_else(String::new, Clone::clone),
+    );
+    variables.insert("credential".to_owned(), credential);
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(manifest, &variables, &profile_root)?;
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let outer_deadline = outer_turn_timeout(manifest);
+    let mut driver = make_driver_with_timeout(
+        manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+        outer_deadline,
+    )?;
+    let collected = async {
+        driver.start().await?;
+        driver.await_readiness().await?;
+        let session = driver.create_session(&actor).await?;
+        let prompt = workflow
+            .actors
+            .get(&actor)
+            .map(|actor| actor.prompt.as_str())
+            .ok_or_else(|| AhrbError::Protocol("row-57 actor disappeared".to_owned()))?;
+        driver
+            .submit(
+                &session,
+                prompt,
+                &format!("row57-{}-r{repetition}", case.label()),
+            )
+            .await?;
+        if manifest.transport.kind == TransportKind::Exec {
+            driver.release_invocations().await?;
+        }
+        let mut sampler = platform_sampler();
+        let roots = verified_process_roots(
+            manifest,
+            sampler.as_mut(),
+            driver.owned_pids(),
+            driver.daemon_pid(),
+        )?;
+        wait_for_signal_fixture_hold(
+            &mut driver,
+            &engine,
+            sampler.as_mut(),
+            &roots,
+            &session,
+            &actor,
+            outer_deadline,
+        )
+        .await?;
+        let owned_tree = sampler.discover(&roots)?;
+        let target = signal_target_identity(&owned_tree, &roots)?;
+        #[cfg(unix)]
+        let (origin_ns, deadline, early_terminal_receipt) = if let Some(signal) = case.unix_signal() {
+            crate::process::deliver_registered_tree_signal(target, signal)?;
+            let origin = monotonic_timestamp_ns();
+            let deadline = Instant::now() + outer_deadline;
+            let early_terminal_receipt = if case == SignalMatrixCase::Sigint2 {
+                let second_delivery_at = Instant::now() + Duration::from_millis(250);
+                loop {
+                    let events =
+                        read_signal_matrix_journal(manifest, &variables, &profile_root, &session)?;
+                    let receipt_ns = monotonic_timestamp_ns();
+                    if events.iter().any(|event| is_terminal(&event.event)) {
+                        break Some((events, receipt_ns));
+                    }
+                    let now = Instant::now();
+                    if now >= second_delivery_at {
+                        if crate::process::registered_tree_is_live(target)? {
+                            crate::process::deliver_registered_tree_signal(target, signal)?;
+                        }
+                        break None;
+                    }
+                    let remaining = deadline.checked_duration_since(now).ok_or_else(|| {
+                        AhrbError::Timeout(
+                            "row-57 durable terminal was not received before the applicable outer deadline"
+                                .to_owned(),
+                        )
+                    })?;
+                    tokio::time::sleep(
+                        Duration::from_millis(2)
+                            .min(second_delivery_at.saturating_duration_since(now))
+                            .min(remaining),
+                    )
+                    .await;
+                }
+            } else {
+                None
+            };
+            (origin, deadline, early_terminal_receipt)
+        } else {
+            driver.close_stdin().await?;
+            (
+                monotonic_timestamp_ns(),
+                Instant::now() + outer_deadline,
+                None,
+            )
+        };
+        #[cfg(not(unix))]
+        let (origin_ns, deadline, early_terminal_receipt) = if case == SignalMatrixCase::StdinEof {
+            driver.close_stdin().await?;
+            (
+                monotonic_timestamp_ns(),
+                Instant::now() + outer_deadline,
+                None,
+            )
+        } else {
+            return Err(AhrbError::Unsupported(
+                "row-57 Unix signal delivery is unavailable".to_owned(),
+            ));
+        };
+        let (first_terminal_events, terminal_ns) = match early_terminal_receipt {
+            Some(receipt) => receipt,
+            None => {
+                wait_for_signal_terminal_receipt(
+                    manifest,
+                    &variables,
+                    &profile_root,
+                    &session,
+                    deadline,
+                )
+                .await?
+            }
+        };
+        let exit = wait_for_signal_process_exit(
+            &mut driver,
+            &session,
+            manifest.transport.kind == TransportKind::Exec,
+            deadline,
+        )
+        .await?;
+        let mut events = read_signal_matrix_journal(manifest, &variables, &profile_root, &session)?;
+        if first_terminal_events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count()
+            != 1
+        {
+            return Err(AhrbError::Protocol(format!(
+                "row-57 {} first durable terminal receipt was not singular",
+                case.label()
+            )));
+        }
+        let terminals = events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .collect::<Vec<_>>();
+        if terminals.is_empty() {
+            return Err(AhrbError::Protocol(format!(
+                "row-57 {} durable journal omitted the structured terminal boundary",
+                case.label()
+            )));
+        }
+        let terminal_type = terminals
+            .last()
+            .map(|event| match event.event {
+                EventVocab::TerminalFailure => "failure",
+                EventVocab::TerminalCancelled => "cancelled",
+                EventVocab::TerminalSuccess => "success",
+                EventVocab::TerminalTimeout => "timeout",
+                _ => "other",
+            })
+            .map(str::to_owned);
+        let terminal_count = u32::try_from(terminals.len()).map_or(u32::MAX, |value| value);
+        drop(terminals);
+        let residue_processes = signal_matrix_residue_count(sampler.as_mut(), &roots).await?;
+        annotate_signal_matrix_events(&mut events, case, origin_ns, terminal_ns);
+        let requests = engine.request_records().await;
+        let (exit_code, exit_was_signal) = match exit {
+            ClientExit::Exited(code) => (code, code.is_none()),
+            ClientExit::Running | ClientExit::NotApplicable => {
+                return Err(AhrbError::Protocol(
+                    "row-57 process exit boundary disappeared".to_owned(),
+                ));
+            }
+        };
+        Ok((
+            SignalCaseTrial {
+                repetition,
+                case: case.label().to_owned(),
+                applicable: true,
+                not_applicable_reason: None,
+                delivery_succeeded: Some(true),
+                ownership_resolved: Some(true),
+                origin_ns: Some(origin_ns),
+                terminal_ns: Some(terminal_ns),
+                terminal_type,
+                terminal_count: Some(terminal_count),
+                exit_code,
+                exit_was_signal: Some(exit_was_signal),
+                residue_processes: Some(residue_processes),
+            },
+            events,
+            requests,
+        ))
+    }
+    .await;
+    if collected.is_err() {
+        let _ = driver.shutdown().await;
+    }
+    drop(driver);
+    let shutdown = server.shutdown().await;
+    match (collected, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn collect_signal_matrix_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<SignalMatrixTrials> {
+    let applicable_outer_ms = u64::try_from(outer_turn_timeout(manifest).as_millis())
+        .map_err(|_| AhrbError::Validation("row-57 outer deadline overflow".to_owned()))?;
+    if manifest.daemon.grace_ms.saturating_add(250) >= applicable_outer_ms {
+        return Err(AhrbError::Validation(
+            "row-57 daemon grace plus 250ms tolerance must be below its outer deadline".to_owned(),
+        ));
+    }
+    let prompt_uses_stdin = manifest.input.prompt_uses_stdin.ok_or_else(|| {
+        AhrbError::Validation("row-57 typed input.prompt_uses_stdin is absent".to_owned())
+    })?;
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let mut collected = SignalMatrixTrials {
+        events: Vec::new(),
+        evidence: Vec::new(),
+        requests: Vec::new(),
+    };
+    for repetition in 1..=repetitions {
+        for case in [
+            SignalMatrixCase::Sigterm,
+            SignalMatrixCase::Sigint2,
+            SignalMatrixCase::Sighup,
+            SignalMatrixCase::StdinEof,
+        ] {
+            let eof_applicable =
+                manifest.transport.kind == TransportKind::StdinRpc || prompt_uses_stdin;
+            if case == SignalMatrixCase::StdinEof && !eof_applicable {
+                collected.evidence.push(SignalCaseTrial {
+                    repetition,
+                    case: case.label().to_owned(),
+                    applicable: false,
+                    not_applicable_reason: Some(
+                        "typed prompt input is false and the non-stdin transport launches with /dev/null stdin"
+                            .to_owned(),
+                    ),
+                    delivery_succeeded: None,
+                    ownership_resolved: None,
+                    origin_ns: None,
+                    terminal_ns: None,
+                    terminal_type: None,
+                    terminal_count: None,
+                    exit_code: None,
+                    exit_was_signal: None,
+                    residue_processes: None,
+                });
+                continue;
+            }
+            let (trial, events, requests) = collect_signal_matrix_case(
+                manifest,
+                run_profile_root,
+                manifest_hash,
+                repetition,
+                case,
+            )
+            .await?;
+            collected.evidence.push(trial);
+            collected.events.extend(events);
+            collected.requests.extend(requests);
+        }
+    }
+    Ok(collected)
+}
+
+async fn collect_retry_budget_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<RetryBudgetTrials> {
+    let _max_attempts = manifest.resources.retry_max_attempts.ok_or_else(|| {
+        AhrbError::Validation("retry-budget requires retry_max_attempts".to_owned())
+    })?;
+    let base_delay_ms = manifest.resources.retry_base_delay_ms.ok_or_else(|| {
+        AhrbError::Validation("retry-budget requires retry_base_delay_ms".to_owned())
+    })?;
+    let max_delay_ms = manifest.resources.retry_max_delay_ms.ok_or_else(|| {
+        AhrbError::Validation("retry-budget requires retry_max_delay_ms".to_owned())
+    })?;
+    let profile_root = run_profile_root.join("derived-row58");
+    prepare_profile(manifest, &profile_root)?;
+    let workflow = retry_budget_workflow(&profile_root, profile);
+    workflow.validate()?;
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let (server, model_environment) = start_model(
+        Arc::clone(&engine),
+        &workflow,
+        &profile_root,
+        false,
+        &manifest.fake_model.base_url_env,
+    )
+    .await?;
+    let mut variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+    ]);
+    let credential = format!("ahrb-retry-{}", &manifest_hash[..16]);
+    let mut environment = isolated_environment(manifest, &variables)?;
+    environment.extend(model_environment);
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        credential.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    variables.insert("credential".to_owned(), credential);
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(manifest, &variables, &profile_root)?;
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let mut driver = make_driver_with_timeout(
+        manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+        outer_turn_timeout(manifest),
+    )?;
+    driver.start().await?;
+    driver.await_readiness().await?;
+
+    let statuses = match profile {
+        Profile::Quick => vec![429_u16],
+        Profile::Cert => vec![429_u16, 500_u16],
+    };
+    let calibration_requested_ms = base_delay_ms.min(100);
+    let post_terminal_requested_ms = max_delay_ms.saturating_add(250).max(1_000);
+    let mut calibrations = Vec::new();
+    let mut trials = Vec::new();
+    let mut all_events = Vec::new();
+    for status in statuses {
+        calibrations.extend(calibrate_retry_timer(status, calibration_requested_ms).await);
+        for repetition in 1..=3_u32 {
+            let actor_name = format!("r58-s{status}-r{repetition}");
+            let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+                AhrbError::Protocol(format!("retry-budget actor {actor_name:?} disappeared"))
+            })?;
+            let session = driver
+                .create_session(&format!("{}:{actor_name}", workflow.scenario))
+                .await?;
+            driver
+                .submit(
+                    &session,
+                    &actor.prompt,
+                    &format!("row-58-s{status}-r{repetition}"),
+                )
+                .await?;
+            let mut events =
+                collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(manifest))
+                    .await?;
+            let terminal_received_ns = monotonic_timestamp_ns();
+            let requests_at_terminal = engine
+                .request_records()
+                .await
+                .iter()
+                .filter(|record| record.request.actor == actor_name)
+                .count() as u64;
+            let after = events.iter().map(|event| Cursor(event.cursor)).max();
+            let observation_started_ns = monotonic_timestamp_ns();
+            tokio::time::sleep(Duration::from_millis(post_terminal_requested_ms)).await;
+            let observation_finished_ns = monotonic_timestamp_ns();
+            let later = driver.attach(&session, after).await?;
+            let effects_after_terminal = later
+                .iter()
+                .filter(|event| event.event == EventVocab::ToolResult)
+                .count() as u64;
+            events.extend(later);
+            let requests_after_observation = engine
+                .request_records()
+                .await
+                .iter()
+                .filter(|record| record.request.actor == actor_name)
+                .count() as u64;
+            let post_terminal_actual_ms =
+                observation_finished_ns.saturating_sub(observation_started_ns) as f64 / 1_000_000.0;
+            all_events.extend(events.clone());
+            trials.push(RetryTrialEvidence {
+                status,
+                repetition,
+                actor: actor_name,
+                terminal_received_ns,
+                events,
+                post_terminal_requested_ms,
+                post_terminal_actual_ms,
+                requests_at_terminal,
+                requests_after_observation,
+                effects_after_terminal,
+            });
+            if manifest.transport.kind == TransportKind::Exec
+                || !manifest.sessions.close_delete.is_empty()
+            {
+                driver.close(&session).await?;
+            }
+        }
+    }
+    driver.shutdown().await?;
+    server.shutdown().await?;
+    let requests = engine.request_records().await;
+    Ok(RetryBudgetTrials {
+        events: all_events,
+        requests,
+        calibrations,
+        trials,
+    })
 }
 
 fn model_efficiency_workflow(profile_root: &Path, repetition: u32, turns: u32) -> Workflow {
@@ -3408,8 +5887,7 @@ async fn collect_model_request_efficiency_trials(
             "base_url".to_owned(),
             environment
                 .get(&manifest.fake_model.base_url_env)
-                .cloned()
-                .unwrap_or_default(),
+                .map_or_else(String::new, Clone::clone),
         );
         variables.insert("credential".to_owned(), credential);
         variables.insert("model".to_owned(), manifest.fake_model.model.clone());
@@ -4855,6 +7333,721 @@ async fn collect_determinism_trials(
     })
 }
 
+#[derive(Clone, Debug)]
+struct Row47FileState {
+    device_id: u64,
+    inode_or_file_id: u64,
+    size_bytes: u64,
+    sha256: String,
+}
+
+fn disk_io_workflow(profile_root: &Path, repetition: u32, turns: u32) -> Workflow {
+    let scenario = format!("ahrb-row47-r{repetition}");
+    let actor_name = format!("r47-r{repetition}");
+    let mut responses = Vec::with_capacity(turns as usize);
+    for turn in 1..=turns {
+        responses.push(ScriptedResponse {
+            scenario: scenario.clone(),
+            actor: actor_name.clone(),
+            checkpoint: format!("turn-{turn:03}"),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: None,
+            barrier: None,
+        });
+    }
+    let actor = Actor {
+        id: actor_name.clone(),
+        parent: None,
+        prompt: format!(
+            "AHRB disk IO tiny journaled turn 1 {}",
+            route_marker(&scenario, &actor_name, "turn-001")
+        ),
+        workspace: profile_root
+            .join("workspace")
+            .to_string_lossy()
+            .into_owned(),
+    };
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario,
+        actors: BTreeMap::from([(actor_name, actor)]),
+        barriers: BTreeMap::new(),
+        responses,
+    }
+}
+
+fn row47_render_paths(
+    templates: impl IntoIterator<Item = (String, &'static str)>,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<Vec<(PathBuf, &'static str)>> {
+    let mut rendered = BTreeMap::new();
+    for (template, category) in templates {
+        if template.trim().is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(crate::manifest::render_template(&template, variables)?);
+        if !path.starts_with(profile_root) {
+            return Err(AhrbError::Validation(format!(
+                "row-47 declared path {} escapes fresh profile {}",
+                path.display(),
+                profile_root.display()
+            )));
+        }
+        rendered.entry(path).or_insert(category);
+    }
+    Ok(rendered.into_iter().collect())
+}
+
+fn row47_hash_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn row47_snapshot_file(
+    path: &Path,
+    profile_root: &Path,
+    repetition: u32,
+    boundary: &str,
+    category: &str,
+    raw: &mut Vec<FilesystemSnapshot>,
+) -> Result<Option<Row47FileState>> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !before.file_type().is_file() {
+        return Err(AhrbError::Protocol(format!(
+            "row-47 snapshot path {} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(unix)]
+    let before_identity = (before.dev(), before.ino());
+    #[cfg(not(unix))]
+    let before_identity = (0_u64, 0_u64);
+    let digest = row47_hash_file(path)?;
+    let after = std::fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    let after_identity = (after.dev(), after.ino());
+    #[cfg(not(unix))]
+    let after_identity = (0_u64, 0_u64);
+    if !after.file_type().is_file()
+        || before_identity != after_identity
+        || before.len() != after.len()
+    {
+        return Err(AhrbError::Protocol(format!(
+            "row-47 snapshot path {} changed identity or size during capture",
+            path.display()
+        )));
+    }
+    let relative = path.strip_prefix(profile_root).map_err(|_| {
+        AhrbError::Validation(format!(
+            "row-47 snapshot path {} is outside {}",
+            path.display(),
+            profile_root.display()
+        ))
+    })?;
+    let state = Row47FileState {
+        device_id: before_identity.0,
+        inode_or_file_id: before_identity.1,
+        size_bytes: before.len(),
+        sha256: digest,
+    };
+    raw.push(FilesystemSnapshot {
+        repetition,
+        boundary: boundary.to_owned(),
+        category: category.to_owned(),
+        path_under_profile: relative.to_string_lossy().into_owned(),
+        device_id: state.device_id,
+        inode_or_file_id: state.inode_or_file_id,
+        size_bytes: state.size_bytes,
+        sha256: state.sha256.clone(),
+    });
+    Ok(Some(state))
+}
+
+fn row47_snapshot_paths(
+    paths: &[(PathBuf, &'static str)],
+    profile_root: &Path,
+    repetition: u32,
+    boundary: &str,
+    raw: &mut Vec<FilesystemSnapshot>,
+) -> Result<BTreeMap<PathBuf, Option<Row47FileState>>> {
+    paths
+        .iter()
+        .map(|(path, category)| {
+            row47_snapshot_file(path, profile_root, repetition, boundary, category, raw)
+                .map(|snapshot| (path.clone(), snapshot))
+        })
+        .collect()
+}
+
+fn row47_file_growth(before: Option<&Row47FileState>, after: Option<&Row47FileState>) -> u64 {
+    match (before, after) {
+        (Some(before), Some(after))
+            if before.device_id == after.device_id
+                && before.inode_or_file_id == after.inode_or_file_id =>
+        {
+            after.size_bytes.saturating_sub(before.size_bytes)
+        }
+        _ => 0,
+    }
+}
+
+fn row47_recursive_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let mut entries =
+            std::fs::read_dir(&directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                files.push(path);
+            } else if file_type.is_symlink() {
+                return Err(AhrbError::Protocol(format!(
+                    "row-47 isolated-root audit found symlink {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn row47_looks_like_log(path: &Path) -> bool {
+    if path.extension().and_then(|value| value.to_str()) == Some("log") {
+        return true;
+    }
+    path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        value == "log" || value == "logs" || value.ends_with(".log") || value.contains(".log.")
+    })
+}
+
+fn row47_verify_no_log(
+    profile_root: &Path,
+    repetition: u32,
+    journal_paths: &BTreeSet<PathBuf>,
+    raw: &mut Vec<FilesystemSnapshot>,
+) -> Result<()> {
+    let boundary = format!("row47-r{repetition}-verified-no-log-audit");
+    for path in row47_recursive_regular_files(profile_root)? {
+        let _snapshot = row47_snapshot_file(
+            &path,
+            profile_root,
+            repetition,
+            &boundary,
+            "isolated-root-audit",
+            raw,
+        )?;
+        if !journal_paths.contains(&path) && row47_looks_like_log(&path) {
+            return Err(AhrbError::Protocol(format!(
+                "resources.log_paths=[] contradicted by isolated-root log artifact {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn row47_terminal_record_count(path: &Path, manifest: &Manifest) -> Result<u64> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let records = match manifest.events.framing.as_str() {
+        "jsonl" | "json-seq" => {
+            let mut records = Vec::new();
+            for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+                if line.last() != Some(&b'\n') {
+                    // The writer can be between bytes while this out-of-band
+                    // observer polls. A complete final record is required
+                    // before it can establish the structured boundary.
+                    break;
+                }
+                let line = &line[..line.len().saturating_sub(1)];
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                records.push(serde_json::from_slice::<Value>(line).map_err(|error| {
+                    AhrbError::Protocol(format!(
+                        "row-47 event journal {} contains an invalid complete record: {error}",
+                        path.display()
+                    ))
+                })?);
+            }
+            records
+        }
+        "json" => {
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                Vec::new()
+            } else {
+                let value: Value = serde_json::from_slice(&bytes)?;
+                match value {
+                    Value::Array(records) => records,
+                    record => vec![record],
+                }
+            }
+        }
+        other => {
+            return Err(AhrbError::Validation(format!(
+                "row-47 pre-reap terminal observation requires jsonl, json-seq, or json framing, not {other:?}"
+            )));
+        }
+    };
+    let terminal_rules = manifest.events.rules.iter().filter(|rule| {
+        matches!(
+            rule.event.as_str(),
+            "terminal-success" | "terminal-failure" | "terminal-cancelled" | "terminal-timeout"
+        )
+    });
+    let terminal_rules = terminal_rules.collect::<Vec<_>>();
+    let mut count = 0_u64;
+    for record in records {
+        let event_type = (!manifest.events.type_pointer.is_empty())
+            .then(|| record.pointer(&manifest.events.type_pointer))
+            .flatten()
+            .and_then(Value::as_str)
+            .or_else(|| record.get("type").and_then(Value::as_str))
+            .or_else(|| record.get("event").and_then(Value::as_str));
+        if terminal_rules
+            .iter()
+            .any(|rule| event_type == Some(rule.matches.as_str()) && rule_matches(&record, rule))
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+async fn row47_wait_for_pre_reap_terminal(
+    path: &Path,
+    manifest: &Manifest,
+    previous_count: u64,
+    deadline: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if row47_terminal_record_count(path, manifest)? > previous_count {
+            return Ok(());
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "row-47 event journal {} did not expose a new structured terminal before the per-invocation deadline",
+                path.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+async fn collect_disk_io_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<DiskIoTrials> {
+    let log_evidence = match manifest.resources.log_paths.as_ref() {
+        None => LogEvidenceKind::Omitted,
+        Some(paths) if paths.is_empty() => LogEvidenceKind::VerifiedNoLog,
+        Some(_) => LogEvidenceKind::DeclaredPaths,
+    };
+    if log_evidence == LogEvidenceKind::Omitted {
+        return Ok(DiskIoTrials {
+            events: Vec::new(),
+            requests: Vec::new(),
+            turns: Vec::new(),
+            counter_snapshots: Vec::new(),
+            filesystem_snapshots: Vec::new(),
+            log_evidence,
+        });
+    }
+    let repetitions = match profile {
+        Profile::Quick => 3_u32,
+        Profile::Cert => 7_u32,
+    };
+    let turns_per_repetition = match profile {
+        Profile::Quick => 20_u32,
+        Profile::Cert => 100_u32,
+    };
+    let per_invocation = per_invocation_topology(manifest);
+    let mut trials = DiskIoTrials {
+        events: Vec::new(),
+        requests: Vec::new(),
+        turns: Vec::new(),
+        counter_snapshots: Vec::new(),
+        filesystem_snapshots: Vec::new(),
+        log_evidence,
+    };
+    for repetition in 1..=repetitions {
+        let profile_root = run_profile_root.join(format!("derived-row47-r{repetition}"));
+        prepare_profile(manifest, &profile_root).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "prepare row-47 repetition {repetition} fresh profile: {error}"
+            ))
+        })?;
+        let workflow = disk_io_workflow(&profile_root, repetition, turns_per_repetition);
+        let actor_name = format!("r47-r{repetition}");
+        let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+            AhrbError::Protocol(format!("row-47 repetition {repetition} actor disappeared"))
+        })?;
+        let engine = Arc::new(FakeModelEngine::with_request_roles(
+            &workflow,
+            &manifest.model_roles,
+            &manifest.request_role_rules,
+        )?);
+        let (server, model_environment) = start_model(
+            Arc::clone(&engine),
+            &workflow,
+            &profile_root,
+            false,
+            &manifest.fake_model.base_url_env,
+        )
+        .await?;
+        let mut variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("endpoint".to_owned(), String::new()),
+        ]);
+        let credential = format!(
+            "ahrb-{}-row47-r{repetition}-{}",
+            &manifest_hash[..16],
+            std::process::id()
+        );
+        let mut environment = isolated_environment(manifest, &variables)?;
+        environment.extend(model_environment);
+        environment.insert(
+            manifest.fake_model.credential_env.clone(),
+            credential.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_MODEL".to_owned(),
+            manifest.fake_model.model.clone(),
+        );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential);
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &profile_root)?;
+        let command = if manifest.transport.kind == TransportKind::Exec {
+            manifest.transport.command.clone()
+        } else {
+            render_argv(&manifest.transport.command, &variables)?
+        };
+        let mut driver = make_driver_with_timeout(
+            manifest,
+            &command,
+            &environment,
+            &variables,
+            &profile_root,
+            false,
+            outer_turn_timeout(manifest),
+        )?;
+        driver.start().await?;
+        driver.await_readiness().await?;
+        let mut sampler = platform_sampler();
+        let daemon_roots = if per_invocation {
+            Vec::new()
+        } else {
+            verified_process_roots(
+                manifest,
+                sampler.as_mut(),
+                driver.owned_pids(),
+                driver.daemon_pid(),
+            )?
+        };
+        let session = driver
+            .create_session(&format!("{}:row47", workflow.scenario))
+            .await?;
+        let mut path_variables = variables.clone();
+        path_variables.insert("session_id".to_owned(), session.0.clone());
+        let pre_reap_event_path = if per_invocation {
+            if manifest.events.source != "journal-file" || manifest.events.path.trim().is_empty() {
+                return Err(AhrbError::Protocol(
+                    "row-47 per-invocation disk accounting requires a file-backed structured terminal boundary before reap"
+                        .to_owned(),
+                ));
+            }
+            let mut paths = row47_render_paths(
+                [(manifest.events.path.clone(), "journal")],
+                &path_variables,
+                &profile_root,
+            )?;
+            paths.pop().map(|(path, _)| path).ok_or_else(|| {
+                AhrbError::Protocol(
+                    "row-47 per-invocation event journal path rendered empty".to_owned(),
+                )
+            })?
+        } else {
+            PathBuf::new()
+        };
+        let mut journal_templates = Vec::new();
+        if !manifest.events.path.trim().is_empty() {
+            journal_templates.push((manifest.events.path.clone(), "journal"));
+        }
+        journal_templates.extend(
+            manifest
+                .resources
+                .journal_paths
+                .iter()
+                .flatten()
+                .cloned()
+                .map(|path| (path, "journal")),
+        );
+        let journal_paths = row47_render_paths(journal_templates, &path_variables, &profile_root)?;
+        let log_templates = manifest
+            .resources
+            .log_paths
+            .iter()
+            .flatten()
+            .cloned()
+            .map(|path| (path, "log"));
+        let log_paths = row47_render_paths(log_templates, &path_variables, &profile_root)?;
+        let all_paths = journal_paths
+            .iter()
+            .chain(log_paths.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let journal_path_set = journal_paths
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut tracker = TreeDiskTracker::default();
+        if !per_invocation {
+            let tree = sampler.discover(&daemon_roots)?;
+            let observation = sampler.disk_counters(&tree)?;
+            let _initial = tracker.observe(&observation)?;
+        }
+        let mut after = None;
+        for turn in 1..=turns_per_repetition {
+            let before_boundary = format!("row47-r{repetition}-t{turn:03}-before");
+            let after_boundary = format!("row47-r{repetition}-t{turn:03}-after");
+            let before_files = row47_snapshot_paths(
+                &all_paths,
+                &profile_root,
+                repetition,
+                &before_boundary,
+                &mut trials.filesystem_snapshots,
+            )?;
+            let before_disk = tracker.snapshot();
+            let prompt = if turn == 1 {
+                actor.prompt.clone()
+            } else {
+                format!(
+                    "AHRB disk IO tiny journaled turn {turn} {}",
+                    route_marker(&workflow.scenario, &actor_name, &format!("turn-{turn:03}"))
+                )
+            };
+            let previous_boundary_count = driver.completed_turn_boundaries().len();
+            let previous_terminal_count = if per_invocation {
+                row47_terminal_record_count(&pre_reap_event_path, manifest)?
+            } else {
+                0
+            };
+            driver
+                .submit(
+                    &session,
+                    &prompt,
+                    &format!("row-47-r{repetition}-turn-{turn:03}"),
+                )
+                .await?;
+            let invocation_roots = if per_invocation {
+                let roots = driver.session_pids(&session);
+                if roots.is_empty() {
+                    return Err(AhrbError::Protocol(format!(
+                        "row-47 repetition {repetition} turn {turn} exposed no process root"
+                    )));
+                }
+                let tree = sampler.discover(&roots)?;
+                let observation = sampler.disk_counters(&tree)?;
+                let _live = tracker.observe(&observation)?;
+                roots
+            } else {
+                Vec::new()
+            };
+            if per_invocation {
+                row47_wait_for_pre_reap_terminal(
+                    &pre_reap_event_path,
+                    manifest,
+                    previous_terminal_count,
+                    outer_turn_timeout(manifest),
+                )
+                .await?;
+                let terminal_tree = sampler.discover(&invocation_roots)?;
+                if terminal_tree.members.is_empty() {
+                    return Err(AhrbError::Protocol(format!(
+                        "row-47 repetition {repetition} turn {turn} process exited before the terminal-before-reap disk sample"
+                    )));
+                }
+                let terminal_observation = sampler.disk_counters(&terminal_tree)?;
+                let _terminal_live = tracker.observe(&terminal_observation)?;
+                for identity in terminal_tree.members.keys().copied() {
+                    tracker.note_structured_terminal(identity)?;
+                    if let Some(write_bytes) = terminal_observation
+                        .write_bytes_by_identity
+                        .get(&identity)
+                        .copied()
+                    {
+                        tracker.record_final_sample_before_reap(identity, write_bytes)?;
+                        tracker.retire_after_final_sample(identity)?;
+                    }
+                }
+            }
+            let suffix = collect_session_terminal_with_poll(
+                &mut driver,
+                &session,
+                after,
+                outer_turn_timeout(manifest),
+                Duration::from_millis(2),
+            )
+            .await?;
+            if suffix
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .count()
+                != 1
+            {
+                return Err(AhrbError::Protocol(format!(
+                    "row-47 repetition {repetition} turn {turn} did not terminalize exactly once"
+                )));
+            }
+            after = suffix
+                .iter()
+                .map(|event| Cursor(event.cursor))
+                .max()
+                .or(after);
+            trials.events.extend(suffix);
+            if !per_invocation {
+                let tree = sampler.discover(&daemon_roots)?;
+                let observation = sampler.disk_counters(&tree)?;
+                let _after = tracker.observe(&observation)?;
+            }
+            let after_disk = tracker.snapshot();
+            let after_files = row47_snapshot_paths(
+                &all_paths,
+                &profile_root,
+                repetition,
+                &after_boundary,
+                &mut trials.filesystem_snapshots,
+            )?;
+            let journal_growth_bytes = journal_paths.iter().fold(0_u64, |total, (path, _)| {
+                total.saturating_add(row47_file_growth(
+                    before_files.get(path).and_then(Option::as_ref),
+                    after_files.get(path).and_then(Option::as_ref),
+                ))
+            });
+            let log_growth_bytes = (log_evidence == LogEvidenceKind::DeclaredPaths).then(|| {
+                log_paths.iter().fold(0_u64, |total, (path, _)| {
+                    total.saturating_add(row47_file_growth(
+                        before_files.get(path).and_then(Option::as_ref),
+                        after_files.get(path).and_then(Option::as_ref),
+                    ))
+                })
+            });
+            let disk_write_delta = before_disk
+                .cumulative_write_bytes
+                .zip(after_disk.cumulative_write_bytes)
+                .and_then(|(before, after)| after.checked_sub(before));
+            let disk_write_bytes = disk_write_delta.map_or(0, |value| value);
+            let retired_accounting_complete = after_disk.identities.iter().all(|identity| {
+                !matches!(
+                    identity.status,
+                    DiskIdentityStatus::CounterUnavailable
+                        | DiskIdentityStatus::MissingWithoutRetirementEvidence
+                        | DiskIdentityStatus::TerminalAwaitingFinalSample
+                )
+            });
+            trials.turns.push(DiskTurnEvidence {
+                repetition,
+                turn,
+                disk_write_bytes,
+                journal_growth_bytes,
+                log_growth_bytes,
+                counter_complete: before_disk.counter_complete && after_disk.counter_complete,
+                file_identity_complete: true,
+                retired_accounting_complete,
+            });
+            trials.counter_snapshots.push(json!({
+                "repetition": repetition,
+                "turn": turn,
+                "before": before_disk,
+                "after": after_disk,
+            }));
+            if per_invocation {
+                let _boundary = await_completed_turn_boundary(
+                    &mut driver,
+                    &session,
+                    after,
+                    previous_boundary_count,
+                    outer_turn_timeout(manifest),
+                )
+                .await?;
+            }
+        }
+        if manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty()
+        {
+            driver.close(&session).await?;
+        }
+        driver.shutdown().await?;
+        server.shutdown().await?;
+        if log_evidence == LogEvidenceKind::VerifiedNoLog {
+            row47_verify_no_log(
+                &profile_root,
+                repetition,
+                &journal_path_set,
+                &mut trials.filesystem_snapshots,
+            )?;
+        }
+        trials.requests.extend(engine.request_records().await);
+    }
+    trials.requests.sort_by(|left, right| {
+        (
+            &left.request.scenario,
+            &left.request.actor,
+            left.semantic_ordinal,
+            &left.request.checkpoint,
+            left.attempt,
+        )
+            .cmp(&(
+                &right.request.scenario,
+                &right.request.actor,
+                right.semantic_ordinal,
+                &right.request.checkpoint,
+                right.attempt,
+            ))
+    });
+    Ok(trials)
+}
+
 async fn collect_memory_time_integral_trials(
     manifest: &Manifest,
     profile: Profile,
@@ -5206,6 +8399,2704 @@ async fn collect_memory_time_integral_trials(
     })
 }
 
+struct StreamingCaseResult {
+    actor: String,
+    response_headers_ns: u64,
+    terminal_ns: Option<u64>,
+    outer_kill_used: bool,
+    outer_kill_ns: Option<u64>,
+    cpu_ns: u64,
+    cpu_samples: Vec<ModelWaitCpuSample>,
+    frames: Vec<crate::fake_model::ModelFrameObservation>,
+    events: Vec<NormalizedEvent>,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+}
+
+fn streaming_workflow(
+    row: u8,
+    case: &str,
+    profile_root: &Path,
+    repetition: u32,
+    count: u32,
+) -> Workflow {
+    let scenario = format!("ahrb-row{row}-{case}-r{repetition}");
+    let actor = format!("r{row}-{case}-r{repetition}");
+    let fault = if case == "stall" {
+        Fault::Stall
+    } else {
+        Fault::Trickle {
+            cadence_ms: 1_000,
+            count,
+        }
+    };
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor.clone(),
+            Actor {
+                id: actor.clone(),
+                parent: None,
+                prompt: format!(
+                    "AHRB row {row} {case} trial {}",
+                    route_marker(&scenario, &actor, "start")
+                ),
+                workspace: profile_root
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![ScriptedResponse {
+            scenario,
+            actor,
+            checkpoint: "start".to_owned(),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: Some(fault),
+            barrier: None,
+        }],
+    }
+}
+
+async fn wait_for_response_headers(
+    engine: &FakeModelEngine,
+    actor: &str,
+    deadline: Duration,
+) -> Result<crate::fake_model::ModelRequestRecord> {
+    let started = Instant::now();
+    loop {
+        if let Some(record) = engine.request_records().await.into_iter().find(|record| {
+            record.request.actor == actor
+                && record.request.checkpoint == "start"
+                && record.response_headers_ns.is_some()
+        }) {
+            return Ok(record);
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "streaming provider did not publish response headers for {actor}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+struct PacedFrameWait<'a> {
+    engine: &'a FakeModelEngine,
+    actor: &'a str,
+    expected_count: u32,
+    response_headers_ns: u64,
+    outer_deadline_ms: u64,
+    sampler: Option<&'a mut Box<dyn Sampler>>,
+    roots: &'a [u32],
+    cpu_samples: &'a mut Vec<ModelWaitCpuSample>,
+}
+
+async fn wait_for_paced_frames(
+    mut wait: PacedFrameWait<'_>,
+) -> Result<Vec<crate::fake_model::ModelFrameObservation>> {
+    let deadline_ns = wait
+        .response_headers_ns
+        .checked_add(wait.outer_deadline_ms.saturating_mul(1_000_000))
+        .ok_or_else(|| AhrbError::Validation("streaming row deadline overflow".to_owned()))?;
+    let mut next_cpu_sample = Instant::now();
+    loop {
+        let frames = wait
+            .engine
+            .frame_observations()?
+            .into_iter()
+            .filter(|frame| frame.actor == wait.actor)
+            .collect::<Vec<_>>();
+        if frames.len() == wait.expected_count as usize {
+            if let Some(sampler) = wait.sampler.as_deref_mut() {
+                wait.cpu_samples
+                    .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
+            }
+            return Ok(frames);
+        }
+        if frames.len() > wait.expected_count as usize {
+            return Err(AhrbError::Protocol(format!(
+                "streaming provider yielded {} paced frames for {}; expected {}",
+                frames.len(),
+                wait.actor,
+                wait.expected_count
+            )));
+        }
+        if monotonic_timestamp_ns() >= deadline_ns {
+            return Err(AhrbError::Timeout(format!(
+                "streaming provider yielded {} of {} paced frames for {}",
+                frames.len(),
+                wait.expected_count,
+                wait.actor
+            )));
+        }
+        if let Some(sampler) = wait.sampler.as_deref_mut()
+            && Instant::now() >= next_cpu_sample
+        {
+            wait.cpu_samples
+                .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
+            next_cpu_sample = Instant::now() + Duration::from_millis(100);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn sample_streaming_cpu(sampler: &mut dyn Sampler, roots: &[u32]) -> Result<ModelWaitCpuSample> {
+    if roots.is_empty() {
+        return Err(AhrbError::Protocol(
+            "streaming row exposed no owned process root".to_owned(),
+        ));
+    }
+    let sample_started_ns = monotonic_timestamp_ns();
+    let tree = sampler.discover(roots)?;
+    let cpu_ns = sampler.sample(&tree, "model-wait")?.cpu_ns;
+    let sample_finished_ns = monotonic_timestamp_ns();
+    Ok(ModelWaitCpuSample {
+        sample_started_ns,
+        sample_finished_ns,
+        cpu_ns,
+    })
+}
+
+async fn cleanup_streaming_outer_kill(
+    driver: &mut HarnessDriver,
+    roots: &[u32],
+    grace: Duration,
+) -> Result<()> {
+    if roots.is_empty() {
+        return Err(AhrbError::Protocol(
+            "streaming outer deadline has no verified owned root to kill".to_owned(),
+        ));
+    }
+    let mut sampler = platform_sampler();
+    let tree = sampler.discover(roots)?;
+    signal_owned_tree(&tree)?;
+    match tokio::time::timeout(grace, driver.reap_after_external_kill()).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(AhrbError::Timeout(
+                "streaming outer-kill launcher reap exceeded grace".to_owned(),
+            ));
+        }
+    }
+    if !await_owned_tree_empty(sampler.as_mut(), roots, grace).await? {
+        return Err(AhrbError::Protocol(
+            "streaming outer-kill left owned-tree residue".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn remaining_row_deadline(response_headers_ns: u64, outer_deadline_ms: u64) -> Result<Duration> {
+    let deadline_ns = response_headers_ns
+        .checked_add(outer_deadline_ms.saturating_mul(1_000_000))
+        .ok_or_else(|| AhrbError::Validation("streaming row deadline overflow".to_owned()))?;
+    let now_ns = monotonic_timestamp_ns();
+    if now_ns >= deadline_ns {
+        return Err(AhrbError::Timeout(
+            "streaming row-local outer deadline elapsed".to_owned(),
+        ));
+    }
+    Ok(Duration::from_nanos(deadline_ns - now_ns))
+}
+
+fn workspace_fault_workflow(
+    profile_root: &Path,
+    repetition: u32,
+    manifest: &Manifest,
+) -> Result<Workflow> {
+    let scenario = format!("ahrb-row61-r{repetition}");
+    let actor_name = format!("r61-workspace-r{repetition}");
+    let terminal = route_marker(&scenario, &actor_name, "terminal");
+    let call = mapped_tool_call(
+        manifest,
+        "write",
+        format!("call-workspace-fault-r{repetition}"),
+        json!({
+            "path":"row-61-denied.txt",
+            "content":format!("must-not-be-written{terminal}")
+        }),
+    )?;
+    Ok(Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor_name.clone(),
+            Actor {
+                id: actor_name.clone(),
+                parent: None,
+                prompt: format!(
+                    "AHRB workspace fault repetition {repetition} {}",
+                    route_marker(&scenario, &actor_name, "start")
+                ),
+                workspace: profile_root
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![
+            ScriptedResponse {
+                scenario: scenario.clone(),
+                actor: actor_name.clone(),
+                checkpoint: "start".to_owned(),
+                request_hash: String::new(),
+                response: json!({"tool_calls":[call]}),
+                fault: None,
+                barrier: None,
+            },
+            ScriptedResponse {
+                scenario,
+                actor: actor_name,
+                checkpoint: "terminal".to_owned(),
+                request_hash: String::new(),
+                response: json!({"text":"{\"status\":\"FAILURE\",\"category\":\"workspace\"}"}),
+                fault: None,
+                barrier: None,
+            },
+        ],
+    })
+}
+
+#[cfg(unix)]
+fn set_directory_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(mode);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_directory_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Err(AhrbError::Unsupported(
+        "read-only workspace fixture requires Unix mode bits".to_owned(),
+    ))
+}
+
+fn workspace_result_errno(
+    events: &[NormalizedEvent],
+    expected_call_id: &str,
+    expected_path: &str,
+) -> Result<i32> {
+    let calls = events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolCall)
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolResult)
+        .collect::<Vec<_>>();
+    if calls.len() != 1 || results.len() != 1 {
+        return Err(AhrbError::Protocol(format!(
+            "row-61 expected exactly one correlated call/result for {expected_call_id}; observed {}/{}",
+            calls.len(),
+            results.len()
+        )));
+    }
+    for event in [calls[0], results[0]] {
+        if event.payload.get("call_id").and_then(Value::as_str) != Some(expected_call_id)
+            || event.payload.get("name").and_then(Value::as_str) != Some("write_fixture")
+            || event
+                .payload
+                .pointer("/arguments/path")
+                .and_then(Value::as_str)
+                != Some(expected_path)
+        {
+            return Err(AhrbError::Protocol(
+                "row-61 correlated fixture name or target path did not match the scripted write"
+                    .to_owned(),
+            ));
+        }
+    }
+    let result = results[0];
+    let ordinary = result.payload.get("result").ok_or_else(|| {
+        AhrbError::Protocol(
+            "row-61 correlated result omitted its ordinary result object".to_owned(),
+        )
+    })?;
+    if ordinary.get("path").and_then(Value::as_str) != Some(expected_path)
+        || ordinary.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(AhrbError::Protocol(
+            "row-61 ordinary result path/status contradicted the denied write".to_owned(),
+        ));
+    }
+    let errno = ordinary
+        .get("write_errno")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| {
+            AhrbError::Protocol("row-61 ordinary result omitted write_errno".to_owned())
+        })?;
+    if let Some(native) = result.payload.get("native_result") {
+        let native_errno = native
+            .get("write_errno")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        if native.get("path").and_then(Value::as_str) != Some(expected_path)
+            || native_errno != Some(errno)
+        {
+            return Err(AhrbError::Protocol(
+                "row-61 normalized and native structured results disagreed".to_owned(),
+            ));
+        }
+    }
+    Ok(errno)
+}
+
+fn workspace_result_claimed_success(events: &[NormalizedEvent]) -> bool {
+    events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolResult)
+        .any(|event| {
+            event.payload.pointer("/result/ok").and_then(Value::as_bool) == Some(true)
+                || event
+                    .payload
+                    .pointer("/native_result/ok")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+}
+
+async fn collect_large_output_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<LargeOutputTrials> {
+    const PRODUCED_BYTES: u64 = 10_485_760;
+    let marker = manifest.capture.truncation_marker.as_ref().ok_or_else(|| {
+        AhrbError::Validation(
+            "row-60 requires capture.truncation_marker with named fields".to_owned(),
+        )
+    })?;
+    let marker_regex = regex::Regex::new(&marker.regex).map_err(|error| {
+        AhrbError::Validation(format!(
+            "row-60 truncation marker regex is invalid: {error}"
+        ))
+    })?;
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let per_invocation = per_invocation_topology(manifest);
+    let mut collected = LargeOutputTrials {
+        events: Vec::new(),
+        requests: Vec::new(),
+        evidence: Vec::new(),
+    };
+
+    for repetition in 1..=repetitions {
+        let profile_root = run_profile_root.join(format!("derived-row60-r{repetition}"));
+        prepare_profile(manifest, &profile_root).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "prepare row-60 repetition {repetition} fresh profile: {error}"
+            ))
+        })?;
+        let (workflow, actor_name, barrier_name) =
+            large_output_workflow(&profile_root, repetition, manifest)?;
+        let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "row-60 repetition {repetition} actor {actor_name:?} disappeared"
+            ))
+        })?;
+        let engine = Arc::new(FakeModelEngine::with_request_roles(
+            &workflow,
+            &manifest.model_roles,
+            &manifest.request_role_rules,
+        )?);
+        let (server, model_environment) = start_model(
+            Arc::clone(&engine),
+            &workflow,
+            &profile_root,
+            false,
+            &manifest.fake_model.base_url_env,
+        )
+        .await?;
+        let mut variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("endpoint".to_owned(), String::new()),
+        ]);
+        let credential = format!(
+            "ahrb-{}-row60-r{repetition}-{}",
+            &manifest_hash[..16],
+            std::process::id()
+        );
+        let mut environment = isolated_environment(manifest, &variables)?;
+        environment.extend(model_environment);
+        environment.insert(
+            manifest.fake_model.credential_env.clone(),
+            credential.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_MODEL".to_owned(),
+            manifest.fake_model.model.clone(),
+        );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential);
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &profile_root)?;
+        let command = if manifest.transport.kind == TransportKind::Exec {
+            manifest.transport.command.clone()
+        } else {
+            render_argv(&manifest.transport.command, &variables)?
+        };
+        let deadline = outer_turn_timeout(manifest);
+        // A journal record wraps the bounded model-visible result in JSONL
+        // metadata. That protocol envelope is not AHRB artifact capture, so
+        // parse it with a separately bounded fixed overhead while preserving
+        // the declared capture limit in row-60 evidence and metrics.
+        let mut driver_manifest = manifest.clone();
+        if per_invocation {
+            driver_manifest.capture.max_bytes = manifest
+                .resources
+                .max_output_bytes
+                .saturating_add(64 * 1024);
+        }
+        let mut driver = make_driver_with_timeout(
+            &driver_manifest,
+            &command,
+            &environment,
+            &variables,
+            &profile_root,
+            false,
+            deadline,
+        )?;
+        driver.start().await?;
+        driver.await_readiness().await?;
+        let mut sampler = platform_sampler();
+        let daemon_roots = if per_invocation {
+            Vec::new()
+        } else {
+            verified_process_roots(
+                manifest,
+                sampler.as_mut(),
+                driver.owned_pids(),
+                driver.daemon_pid(),
+            )?
+        };
+        let session = driver
+            .create_session(&format!("{}:{actor_name}", workflow.scenario))
+            .await?;
+        let baseline_bytes = if per_invocation {
+            if !driver.session_pids(&session).is_empty() || !driver.owned_pids().is_empty() {
+                return Err(AhrbError::Protocol(format!(
+                    "row-60 repetition {repetition} per-invocation topology was not at verified zero-process idle"
+                )));
+            }
+            0_u64
+        } else {
+            let samples = baseline_samples(sampler.as_mut(), &daemon_roots, profile).await?;
+            median_effective_sample_bytes(&samples).ok_or_else(|| {
+                AhrbError::Protocol(format!(
+                    "row-60 repetition {repetition} daemon warm-idle baseline was empty"
+                ))
+            })?
+        };
+        driver
+            .submit(&session, &actor.prompt, &format!("row-60-r{repetition}"))
+            .await?;
+        tokio::time::timeout(deadline, engine.barriers().wait_until_ready(&barrier_name))
+            .await
+            .map_err(|_| {
+                AhrbError::Timeout(format!(
+                    "row-60 repetition {repetition} did not reach its pre-tool provider barrier"
+                ))
+            })??;
+        let roots = if per_invocation {
+            let roots = driver.session_pids(&session);
+            if roots.is_empty() {
+                return Err(AhrbError::Protocol(format!(
+                    "row-60 repetition {repetition} exposed no active invocation root"
+                )));
+            }
+            roots
+        } else {
+            daemon_roots.clone()
+        };
+        let initial_memory = await_large_output_memory_sample(
+            sampler.as_mut(),
+            &roots,
+            deadline.min(Duration::from_secs(1)),
+        )
+        .await?;
+        engine.barriers().release(&barrier_name).await?;
+        let (events, peak_bytes) = collect_large_output_terminal_with_memory(
+            &mut driver,
+            &session,
+            sampler.as_mut(),
+            &roots,
+            deadline,
+            initial_memory,
+        )
+        .await?;
+        let terminal_success = events
+            .iter()
+            .filter(|event| event.event == EventVocab::TerminalSuccess)
+            .count()
+            == 1
+            && events
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .count()
+                == 1;
+        let oom = if per_invocation {
+            !matches!(
+                driver.client_exit(&session),
+                crate::driver::ClientExit::Exited(Some(0))
+            )
+        } else {
+            sampler.discover(&roots)?.members.is_empty()
+        };
+        let requests = engine.request_records().await;
+        let trial = build_large_output_trial(
+            repetition,
+            manifest,
+            &actor_name,
+            &events,
+            &requests,
+            &marker_regex,
+            baseline_bytes,
+            peak_bytes,
+            terminal_success,
+            oom,
+            &variables,
+            deadline,
+            PRODUCED_BYTES,
+        )
+        .await?;
+        if manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty()
+        {
+            driver.close(&session).await?;
+        }
+        driver.shutdown().await?;
+        server.shutdown().await?;
+        collected.events.extend(events);
+        collected.requests.extend(requests);
+        collected.evidence.push(trial);
+    }
+    Ok(collected)
+}
+
+fn large_output_workflow(
+    profile_root: &Path,
+    repetition: u32,
+    manifest: &Manifest,
+) -> Result<(Workflow, String, String)> {
+    let scenario = format!("ahrb-row60-r{repetition}");
+    let actor_name = format!("r60-r{repetition}");
+    let barrier_name = format!("row60-r{repetition}-pre-tool");
+    let actor = Actor {
+        id: actor_name.clone(),
+        parent: None,
+        prompt: format!(
+            "AHRB large tool output {}",
+            route_marker(&scenario, &actor_name, "start")
+        ),
+        workspace: profile_root
+            .join("workspace")
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let mut responses = scripted_row(60, &scenario, &actor_name, manifest)?;
+    let first = responses.first_mut().ok_or_else(|| {
+        AhrbError::Protocol("row-60 workflow omitted its tool-call response".to_owned())
+    })?;
+    first.barrier = Some(barrier_name.clone());
+    Ok((
+        Workflow {
+            version: WORKFLOW_SCHEMA_VERSION,
+            scenario,
+            actors: BTreeMap::from([(actor_name.clone(), actor)]),
+            barriers: BTreeMap::from([(
+                barrier_name.clone(),
+                Barrier {
+                    name: barrier_name.clone(),
+                    actors: vec![actor_name.clone()],
+                    checkpoint: "start".to_owned(),
+                },
+            )]),
+            responses,
+        },
+        actor_name,
+        barrier_name,
+    ))
+}
+
+fn median_effective_sample_bytes(samples: &[Sample]) -> Option<u64> {
+    let mut values = samples
+        .iter()
+        .map(effective_sample_bytes)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[middle])
+    } else {
+        Some(values[middle - 1].saturating_add(values[middle]) / 2)
+    }
+}
+
+fn sample_large_output_memory(sampler: &mut dyn Sampler, roots: &[u32]) -> Result<u64> {
+    let tree = sampler.discover(roots)?;
+    if tree.members.is_empty() {
+        return Err(AhrbError::Protocol(
+            "row-60 memory sample resolved an empty owned tree".to_owned(),
+        ));
+    }
+    let sample = sampler.sample(&tree, "large-tool-output")?;
+    Ok(effective_sample_bytes(&sample))
+}
+
+async fn await_large_output_memory_sample(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    deadline: Duration,
+) -> Result<u64> {
+    let started = Instant::now();
+    loop {
+        match sample_large_output_memory(sampler, roots) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if started.elapsed() >= deadline => return Err(error),
+            Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+        }
+    }
+}
+
+async fn collect_large_output_terminal_with_memory(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    deadline: Duration,
+    mut peak_bytes: u64,
+) -> Result<(Vec<NormalizedEvent>, u64)> {
+    let started = Instant::now();
+    loop {
+        if let Ok(bytes) = sample_large_output_memory(sampler, roots) {
+            peak_bytes = peak_bytes.max(bytes);
+        }
+        let events = driver.attach(session, None).await?;
+        if events.iter().any(|event| is_terminal(&event.event)) {
+            return Ok((events, peak_bytes));
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "row-60 session {} did not terminalize",
+                session.0
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+#[derive(Debug)]
+struct LargeOutputMarkerObservation {
+    truncated: bool,
+    original_bytes: u64,
+    payload_bytes: u64,
+    actual_payload_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct ToolResultCandidate {
+    call_id: String,
+    content: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_large_output_trial(
+    repetition: u32,
+    manifest: &Manifest,
+    actor: &str,
+    events: &[NormalizedEvent],
+    requests: &[crate::fake_model::ModelRequestRecord],
+    marker_regex: &regex::Regex,
+    baseline_bytes: u64,
+    peak_bytes: u64,
+    terminal_success: bool,
+    oom: bool,
+    variables: &BTreeMap<String, String>,
+    deadline: Duration,
+    expected_produced_bytes: u64,
+) -> Result<LargeOutputTrial> {
+    let call_ids = events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolCall)
+        .filter_map(|event| event.payload.get("call_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    if call_ids.len() != 1 {
+        return Err(AhrbError::Protocol(format!(
+            "row-60 repetition {repetition} observed {} tool-call IDs; expected one",
+            call_ids.len()
+        )));
+    }
+    let call_id = call_ids[0].to_owned();
+    let results = events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolResult)
+        .collect::<Vec<_>>();
+    if results.len() != 1 {
+        return Err(AhrbError::Protocol(format!(
+            "row-60 repetition {repetition} observed {} tool results; expected one",
+            results.len()
+        )));
+    }
+    let result = results[0];
+    let result_call_id = result
+        .payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "row-60 repetition {repetition} tool result omitted call_id"
+            ))
+        })?
+        .to_owned();
+    let event_result = result.payload.get("result").ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "row-60 repetition {repetition} tool result omitted result content"
+        ))
+    })?;
+    // Native-fixture adapters may retain a richer normalized event envelope
+    // while passing only the worker's result to the next model request.
+    let model_visible_event_result = if let Some(value) = result
+        .payload
+        .get("native_result")
+        .or_else(|| event_result.get("native"))
+    {
+        value
+    } else {
+        event_result
+    };
+    let event_encoded = serde_json::to_string(model_visible_event_result)?;
+    let next = requests
+        .iter()
+        .find(|record| {
+            record.request.actor == actor
+                && record.request.checkpoint == "terminal"
+                && record.accepted
+        })
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "row-60 repetition {repetition} lacks the next accepted model request"
+            ))
+        })?;
+    let candidates = tool_result_candidates(&next.request.canonical)?;
+    let correlated = candidates
+        .iter()
+        .find(|candidate| candidate.call_id == result_call_id);
+    let encoded = if let Some(candidate) = correlated {
+        candidate.content.as_str()
+    } else {
+        event_encoded.as_str()
+    };
+    let marker = parse_large_output_marker(marker_regex, encoded)?;
+    let fixture = collect_large_output_fixture_evidence(
+        manifest,
+        variables,
+        expected_produced_bytes,
+        deadline,
+    )
+    .await?;
+    let result_in_next_request = correlated.is_some_and(|candidate| {
+        candidate.call_id == call_id
+            && candidate.call_id == result_call_id
+            && candidate.content == event_encoded
+    });
+    let encoded_bytes = u64::try_from(encoded.len()).map_err(|_| {
+        AhrbError::Protocol("row-60 model-visible content length overflowed u64".to_owned())
+    })?;
+    Ok(LargeOutputTrial {
+        repetition,
+        produced_bytes: fixture.produced_bytes,
+        model_visible_bytes: marker.actual_payload_bytes,
+        model_visible_encoded_bytes: encoded_bytes,
+        harness_output_limit_bytes: u64::try_from(manifest.resources.max_output_bytes).map_err(
+            |_| AhrbError::Protocol("row-60 harness output limit overflowed u64".to_owned()),
+        )?,
+        evidence_captured_bytes: fixture.captured_bytes,
+        evidence_capture_limit_bytes: u64::try_from(manifest.capture.max_bytes).map_err(|_| {
+            AhrbError::Protocol("row-60 evidence capture limit overflowed u64".to_owned())
+        })?,
+        truncated: marker.truncated,
+        marker_original_bytes: marker.original_bytes,
+        marker_payload_bytes: marker.payload_bytes,
+        marker_sha256: marker.sha256,
+        external_sha256: fixture.sha256,
+        call_id,
+        result_call_id,
+        result_in_next_request,
+        peak_rss_delta_mib: peak_bytes.saturating_sub(baseline_bytes) as f64 / 1_048_576.0,
+        terminal_success,
+        oom,
+    })
+}
+
+fn tool_result_candidates(canonical: &Value) -> Result<Vec<ToolResultCandidate>> {
+    fn visit(value: &Value, output: &mut Vec<ToolResultCandidate>) -> Result<()> {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    visit(item, output)?;
+                }
+            }
+            Value::Object(object) => {
+                let candidate = object
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .zip(object.get("content"))
+                    .or_else(|| {
+                        object
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .filter(|kind| *kind == "function_call_output")
+                            .and_then(|_| object.get("call_id").and_then(Value::as_str))
+                            .zip(object.get("output"))
+                    })
+                    .or_else(|| {
+                        object
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .filter(|kind| *kind == "tool_result")
+                            .and_then(|_| object.get("tool_use_id").and_then(Value::as_str))
+                            .zip(object.get("content"))
+                    });
+                if let Some((call_id, content)) = candidate {
+                    output.push(ToolResultCandidate {
+                        call_id: call_id.to_owned(),
+                        content: normalized_tool_result_content(content)?,
+                    });
+                    return Ok(());
+                }
+                for child in object.values() {
+                    visit(child, output)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut output = Vec::new();
+    visit(canonical, &mut output)?;
+    Ok(output)
+}
+
+fn normalized_tool_result_content(value: &Value) -> Result<String> {
+    match value {
+        Value::String(content) => Ok(content.clone()),
+        Value::Array(blocks)
+            if blocks.iter().all(|block| {
+                block.get("text").and_then(Value::as_str).is_some() || block.as_str().is_some()
+            }) =>
+        {
+            Ok(blocks
+                .iter()
+                .filter_map(|block| {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| block.as_str())
+                })
+                .collect::<String>())
+        }
+        _ => Ok(serde_json::to_string(value)?),
+    }
+}
+
+fn parse_large_output_marker(
+    marker_regex: &regex::Regex,
+    encoded: &str,
+) -> Result<LargeOutputMarkerObservation> {
+    let decoded = match serde_json::from_str::<String>(encoded) {
+        Ok(content) => content,
+        Err(_) => encoded.to_owned(),
+    };
+    let captures = marker_regex.captures(&decoded).ok_or_else(|| {
+        AhrbError::Protocol("row-60 model-visible result lacks its declared marker".to_owned())
+    })?;
+    let marker_match = captures.get(0).ok_or_else(|| {
+        AhrbError::Protocol("row-60 marker regex returned no complete match".to_owned())
+    })?;
+    if marker_match.end() != decoded.len() {
+        return Err(AhrbError::Protocol(
+            "row-60 marker is not the exact final content suffix".to_owned(),
+        ));
+    }
+    let payload = decoded
+        .get(..marker_match.start())
+        .and_then(|prefix| prefix.strip_suffix('\n'))
+        .ok_or_else(|| {
+            AhrbError::Protocol(
+                "row-60 marker lacks its exact retained-payload separator".to_owned(),
+            )
+        })?;
+    let named = |name: &str| {
+        captures
+            .name(name)
+            .map(|value| value.as_str())
+            .ok_or_else(|| {
+                AhrbError::Protocol(format!("row-60 marker omitted named capture {name:?}"))
+            })
+    };
+    Ok(LargeOutputMarkerObservation {
+        truncated: named("truncated")? == "true",
+        original_bytes: named("original_bytes")?.parse::<u64>().map_err(|_| {
+            AhrbError::Protocol("row-60 marker original_bytes is invalid".to_owned())
+        })?,
+        payload_bytes: named("payload_bytes")?.parse::<u64>().map_err(|_| {
+            AhrbError::Protocol("row-60 marker payload_bytes is invalid".to_owned())
+        })?,
+        actual_payload_bytes: u64::try_from(payload.len()).map_err(|_| {
+            AhrbError::Protocol("row-60 retained payload length overflowed u64".to_owned())
+        })?,
+        sha256: named("sha256")?.to_owned(),
+    })
+}
+
+#[derive(Debug)]
+struct LargeOutputFixtureEvidence {
+    produced_bytes: u64,
+    captured_bytes: u64,
+    sha256: String,
+}
+
+async fn collect_large_output_fixture_evidence(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    bytes: u64,
+    deadline: Duration,
+) -> Result<LargeOutputFixtureEvidence> {
+    let template = manifest.tools.fixtures.get("large_output").ok_or_else(|| {
+        AhrbError::Validation("row-60 requires tools.fixtures.large_output".to_owned())
+    })?;
+    let mut fixture_variables = variables.clone();
+    fixture_variables.insert("bytes".to_owned(), bytes.to_string());
+    fixture_variables.insert("ahrb_fixture".to_owned(), fixture_program()?);
+    fixture_variables.insert("workspace".to_owned(), ".".to_owned());
+    let rendered = template
+        .iter()
+        .map(|argument| crate::manifest::render_template(argument, &fixture_variables))
+        .collect::<Result<Vec<_>>>()?;
+    let argv = resolve_local_program(&rendered)?;
+    let (program, arguments) = argv.split_first().ok_or_else(|| {
+        AhrbError::Validation("row-60 large-output fixture command is empty".to_owned())
+    })?;
+    let mut child = tokio::process::Command::new(program)
+        .args(arguments)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AhrbError::Protocol("row-60 fixture stdout pipe disappeared".to_owned()))?;
+    let started = Instant::now();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut produced_bytes = 0_u64;
+    let mut digest = Sha256::new();
+    let capture_limit = manifest.capture.max_bytes;
+    let mut retained = Vec::with_capacity(capture_limit.min(64 * 1024));
+    loop {
+        let remaining = deadline.checked_sub(started.elapsed()).ok_or_else(|| {
+            AhrbError::Timeout("row-60 external fixture stream exceeded its deadline".to_owned())
+        })?;
+        let count = tokio::time::timeout(remaining, stdout.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                AhrbError::Timeout(
+                    "row-60 external fixture stream exceeded its deadline".to_owned(),
+                )
+            })??;
+        if count == 0 {
+            break;
+        }
+        produced_bytes = produced_bytes.saturating_add(u64::try_from(count).map_err(|_| {
+            AhrbError::Protocol("row-60 fixture read length overflowed u64".to_owned())
+        })?);
+        digest.update(&buffer[..count]);
+        if retained.len() < capture_limit {
+            let remaining_capture = capture_limit.saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..count.min(remaining_capture)]);
+        }
+    }
+    let remaining = deadline.checked_sub(started.elapsed()).ok_or_else(|| {
+        AhrbError::Timeout("row-60 external fixture exit exceeded its deadline".to_owned())
+    })?;
+    let status = tokio::time::timeout(remaining, child.wait())
+        .await
+        .map_err(|_| {
+            AhrbError::Timeout("row-60 external fixture exit exceeded its deadline".to_owned())
+        })??;
+    if !status.success() {
+        return Err(AhrbError::Protocol(format!(
+            "row-60 external fixture exited with {status}"
+        )));
+    }
+    Ok(LargeOutputFixtureEvidence {
+        produced_bytes,
+        captured_bytes: u64::try_from(retained.len()).map_err(|_| {
+            AhrbError::Protocol("row-60 retained capture length overflowed u64".to_owned())
+        })?,
+        sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+#[cfg(test)]
+mod row60_collector_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_correlated_openai_tool_result_without_losing_json_encoding() -> Result<()> {
+        let result = Value::String(
+            "abc\nTRUNCATED truncated=true original=10485760 payload=3 sha256=415b6d9db784e1d225cdf51aada0316c4c78c1b925a7fe59d45d78404a02668c"
+                .to_owned(),
+        );
+        let encoded = serde_json::to_string(&result)?;
+        let canonical = json!({
+            "messages": [{
+                "role": "tool",
+                "tool_call_id": "call-large-output",
+                "content": encoded,
+            }]
+        });
+        let candidates = tool_result_candidates(&canonical)?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].call_id, "call-large-output");
+        assert_eq!(candidates[0].content, serde_json::to_string(&result)?);
+        Ok(())
+    }
+
+    #[test]
+    fn marker_parser_cross_checks_actual_retained_payload_bytes() -> Result<()> {
+        let regex = regex::Regex::new(
+            r"TRUNCATED truncated=(?P<truncated>true) original=(?P<original_bytes>[0-9]+) payload=(?P<payload_bytes>[0-9]+) sha256=(?P<sha256>[0-9a-f]{64})",
+        )
+        .map_err(|error| AhrbError::Validation(error.to_string()))?;
+        let raw = "abc\nTRUNCATED truncated=true original=10485760 payload=3 sha256=415b6d9db784e1d225cdf51aada0316c4c78c1b925a7fe59d45d78404a02668c";
+        let encoded = serde_json::to_string(raw)?;
+        let marker = parse_large_output_marker(&regex, &encoded)?;
+        assert!(marker.truncated);
+        assert_eq!(marker.original_bytes, 10_485_760);
+        assert_eq!(marker.payload_bytes, 3);
+        assert_eq!(marker.actual_payload_bytes, 3);
+        let trailing = serde_json::to_string(&format!("{raw}trailing"))?;
+        assert!(parse_large_output_marker(&regex, &trailing).is_err());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct Row61TreeSnapshot {
+    root: String,
+    exists: bool,
+    entries: Vec<Row61SnapshotEntry>,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+struct Row61SnapshotEntry {
+    kind: String,
+    path: String,
+    size_bytes: Option<u64>,
+    sha256: Option<String>,
+    target: Option<String>,
+}
+
+fn row61_tree_snapshot(root: &Path) -> Result<Row61TreeSnapshot> {
+    const MAX_ENTRIES: usize = 100_000;
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let entries = vec![Row61SnapshotEntry {
+                kind: "absent".to_owned(),
+                path: ".".to_owned(),
+                size_bytes: None,
+                sha256: None,
+                target: None,
+            }];
+            let encoded = serde_json::to_vec(&entries)?;
+            return Ok(Row61TreeSnapshot {
+                root: root.to_string_lossy().into_owned(),
+                exists: false,
+                entries,
+                sha256: format!("{:x}", Sha256::digest(encoded)),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(AhrbError::Protocol(format!(
+            "row-61 snapshot root {} is not a directory",
+            root.display()
+        )));
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = vec![Row61SnapshotEntry {
+        kind: "directory".to_owned(),
+        path: ".".to_owned(),
+        size_bytes: None,
+        sha256: None,
+        target: None,
+    }];
+    while let Some(directory) = pending.pop() {
+        let mut children =
+            std::fs::read_dir(&directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        children.sort_by_key(std::fs::DirEntry::path);
+        for child in children {
+            if entries.len() >= MAX_ENTRIES {
+                return Err(AhrbError::Protocol(format!(
+                    "row-61 snapshot root {} exceeds {MAX_ENTRIES} entries",
+                    root.display()
+                )));
+            }
+            let path = child.path();
+            let relative = path.strip_prefix(root).map_err(|_| {
+                AhrbError::Protocol(format!(
+                    "row-61 snapshot entry {} escaped root {}",
+                    path.display(),
+                    root.display()
+                ))
+            })?;
+            let relative = relative.to_string_lossy();
+            let file_type = child.file_type()?;
+            if file_type.is_dir() {
+                entries.push(Row61SnapshotEntry {
+                    kind: "directory".to_owned(),
+                    path: relative.into_owned(),
+                    size_bytes: None,
+                    sha256: None,
+                    target: None,
+                });
+                pending.push(path);
+            } else if file_type.is_file() {
+                let metadata = child.metadata()?;
+                entries.push(Row61SnapshotEntry {
+                    kind: "file".to_owned(),
+                    path: relative.into_owned(),
+                    size_bytes: Some(metadata.len()),
+                    sha256: Some(row47_hash_file(&path)?),
+                    target: None,
+                });
+            } else if file_type.is_symlink() {
+                entries.push(Row61SnapshotEntry {
+                    kind: "symlink".to_owned(),
+                    path: relative.into_owned(),
+                    size_bytes: None,
+                    sha256: None,
+                    target: Some(std::fs::read_link(&path)?.to_string_lossy().into_owned()),
+                });
+            } else {
+                entries.push(Row61SnapshotEntry {
+                    kind: "other".to_owned(),
+                    path: relative.into_owned(),
+                    size_bytes: None,
+                    sha256: None,
+                    target: None,
+                });
+            }
+        }
+    }
+    entries.sort();
+    let encoded = serde_json::to_vec(&entries)?;
+    Ok(Row61TreeSnapshot {
+        root: root.to_string_lossy().into_owned(),
+        exists: true,
+        entries,
+        sha256: format!("{:x}", Sha256::digest(encoded)),
+    })
+}
+
+fn row61_unexpected_profile_changes(
+    before: &Row61TreeSnapshot,
+    after: &Row61TreeSnapshot,
+    allowed_roots: &[PathBuf],
+) -> u32 {
+    let before = before.entries.iter().cloned().collect::<BTreeSet<_>>();
+    let after = after.entries.iter().cloned().collect::<BTreeSet<_>>();
+    let unexpected = before
+        .symmetric_difference(&after)
+        .filter(|entry| {
+            let path = Path::new(&entry.path);
+            !allowed_roots
+                .iter()
+                .any(|allowed| path == allowed || path.starts_with(allowed))
+        })
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    u32::try_from(unexpected.len()).map_or(u32::MAX, |value| value)
+}
+
+fn row61_allowed_profile_write_roots(
+    environment: &BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for name in ["XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR"] {
+        if let Some(value) = environment.get(name) {
+            let path = Path::new(value);
+            let relative = path.strip_prefix(profile_root).map_err(|_| {
+                AhrbError::Validation(format!(
+                    "row-61 writable state root {name}={} is outside {}",
+                    path.display(),
+                    profile_root.display()
+                ))
+            })?;
+            roots.push(relative.to_path_buf());
+        }
+    }
+    // These are AHRB-owned transport evidence roots, not actor workspaces.
+    roots.push(PathBuf::from("logs"));
+    roots.push(PathBuf::from("ahrb-exec-sessions"));
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn row61_forbidden_roots(manifest: &Manifest) -> Result<Vec<PathBuf>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        AhrbError::Validation("row-61 cannot resolve forbidden roots without HOME".to_owned())
+    })?;
+    manifest
+        .isolation
+        .forbidden_roots
+        .iter()
+        .map(|declared| {
+            if declared == "~" {
+                Ok(home.clone())
+            } else if let Some(relative) = declared.strip_prefix("~/") {
+                Ok(home.join(relative))
+            } else {
+                let path = PathBuf::from(declared);
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    Err(AhrbError::Validation(format!(
+                        "row-61 forbidden root must be absolute or home-relative: {declared}"
+                    )))
+                }
+            }
+        })
+        .collect()
+}
+
+fn row61_snapshot_set(roots: &[PathBuf]) -> Result<(String, Value)> {
+    let snapshots = roots
+        .iter()
+        .map(|root| row61_tree_snapshot(root))
+        .collect::<Result<Vec<_>>>()?;
+    let encoded = serde_json::to_vec(&snapshots)?;
+    Ok((
+        format!("{:x}", Sha256::digest(&encoded)),
+        serde_json::to_value(snapshots)?,
+    ))
+}
+
+fn row61_write_snapshot_ledger(
+    profile_root: &Path,
+    repetition: u32,
+    name: &str,
+    value: &Value,
+    raw: &mut Vec<FilesystemSnapshot>,
+) -> Result<()> {
+    let directory = profile_root.join("row61-snapshot-evidence");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{name}.json"));
+    std::fs::write(&path, serde_json::to_vec(value)?)?;
+    row47_snapshot_file(
+        &path,
+        profile_root,
+        repetition,
+        name,
+        "workspace-fault-snapshot-ledger",
+        raw,
+    )?
+    .ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "row-61 snapshot ledger {} disappeared",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod row61_collector_tests {
+    use super::*;
+
+    fn event(cursor: u64, event: EventVocab, payload: Value) -> NormalizedEvent {
+        NormalizedEvent {
+            id: format!("row61-test-{cursor}"),
+            cursor,
+            session_id: "row61-session".to_owned(),
+            actor: "row61-actor".to_owned(),
+            event,
+            payload,
+        }
+    }
+
+    #[test]
+    fn workspace_errno_requires_one_exactly_correlated_ordinary_result() -> Result<()> {
+        let call_id = "call-workspace-fault-r1";
+        let call = event(
+            1,
+            EventVocab::ToolCall,
+            json!({
+                "call_id":call_id,
+                "name":"write_fixture",
+                "arguments":{"path":"row-61-denied.txt"}
+            }),
+        );
+        let result = event(
+            2,
+            EventVocab::ToolResult,
+            json!({
+                "call_id":call_id,
+                "name":"write_fixture",
+                "arguments":{"path":"row-61-denied.txt"},
+                "result":{"ok":false,"path":"row-61-denied.txt","write_errno":libc::EACCES}
+            }),
+        );
+        assert_eq!(
+            workspace_result_errno(
+                &[call.clone(), result.clone()],
+                call_id,
+                "row-61-denied.txt"
+            )?,
+            libc::EACCES
+        );
+        let unrelated = event(
+            3,
+            EventVocab::ToolResult,
+            json!({
+                "call_id":"other",
+                "name":"write_fixture",
+                "arguments":{"path":"other"},
+                "result":{"ok":false,"path":"other","write_errno":libc::EACCES}
+            }),
+        );
+        assert!(
+            workspace_result_errno(&[call, result, unrelated], call_id, "row-61-denied.txt")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_snapshot_diff_counts_only_changes_outside_state_roots() {
+        let root = Row61SnapshotEntry {
+            kind: "directory".to_owned(),
+            path: ".".to_owned(),
+            size_bytes: None,
+            sha256: None,
+            target: None,
+        };
+        let state = Row61SnapshotEntry {
+            kind: "file".to_owned(),
+            path: "state/session.json".to_owned(),
+            size_bytes: Some(1),
+            sha256: Some("a".repeat(64)),
+            target: None,
+        };
+        let outside = Row61SnapshotEntry {
+            kind: "file".to_owned(),
+            path: "home/unexpected".to_owned(),
+            size_bytes: Some(1),
+            sha256: Some("b".repeat(64)),
+            target: None,
+        };
+        let before = Row61TreeSnapshot {
+            root: "profile".to_owned(),
+            exists: true,
+            entries: vec![root.clone()],
+            sha256: "0".repeat(64),
+        };
+        let allowed_after = Row61TreeSnapshot {
+            root: "profile".to_owned(),
+            exists: true,
+            entries: vec![root.clone(), state.clone()],
+            sha256: "1".repeat(64),
+        };
+        assert_eq!(
+            row61_unexpected_profile_changes(&before, &allowed_after, &[PathBuf::from("state")]),
+            0
+        );
+        let unexpected_after = Row61TreeSnapshot {
+            entries: vec![root, state, outside],
+            ..allowed_after
+        };
+        assert_eq!(
+            row61_unexpected_profile_changes(&before, &unexpected_after, &[PathBuf::from("state")]),
+            1
+        );
+    }
+}
+
+async fn collect_workspace_fault_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<WorkspaceFaultTrials> {
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let mut all_events = Vec::new();
+    let mut all_requests = Vec::new();
+    let mut evidence = Vec::new();
+    let mut filesystem_snapshots = Vec::new();
+    for repetition in 1..=repetitions {
+        let profile_root = run_profile_root.join(format!("derived-row61-r{repetition}"));
+        prepare_profile(manifest, &profile_root)?;
+        let workflow = workspace_fault_workflow(&profile_root, repetition, manifest)?;
+        workflow.validate()?;
+        let actor_name = format!("r61-workspace-r{repetition}");
+        let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+            AhrbError::Protocol(format!("row-61 repetition {repetition} actor disappeared"))
+        })?;
+        let engine = Arc::new(FakeModelEngine::with_request_roles(
+            &workflow,
+            &manifest.model_roles,
+            &manifest.request_role_rules,
+        )?);
+        let (server, model_environment) = start_model(
+            Arc::clone(&engine),
+            &workflow,
+            &profile_root,
+            false,
+            &manifest.fake_model.base_url_env,
+        )
+        .await?;
+        let mut variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("endpoint".to_owned(), String::new()),
+        ]);
+        let credential = format!(
+            "ahrb-{}-row61-r{repetition}-{}",
+            &manifest_hash[..16],
+            std::process::id()
+        );
+        let mut environment = isolated_environment(manifest, &variables)?;
+        environment.extend(model_environment);
+        environment.insert(
+            manifest.fake_model.credential_env.clone(),
+            credential.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_MODEL".to_owned(),
+            manifest.fake_model.model.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_TURN_TIMEOUT_MS".to_owned(),
+            manifest.resources.turn_timeout_ms.to_string(),
+        );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential);
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &profile_root)?;
+        // Prove the fault before the harness is launched. Both daemon and
+        // per-invocation mocks receive this exact actor workspace.
+        let workspace = profile_root.join("workspace-fault-root");
+        std::fs::create_dir_all(&workspace)?;
+        set_directory_mode(&workspace, 0o555)?;
+        let target = workspace.join("row-61-denied.txt");
+        let target_existed_before = std::fs::symlink_metadata(&target).is_ok();
+        if target_existed_before {
+            set_directory_mode(&workspace, 0o700)?;
+            return Err(AhrbError::Protocol(format!(
+                "row-61 repetition {repetition} target existed before the control boundary"
+            )));
+        }
+        let control_errno = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(file) => {
+                drop(file);
+                let _ = std::fs::remove_file(&target);
+                set_directory_mode(&workspace, 0o700)?;
+                return Err(AhrbError::Protocol(format!(
+                    "row-61 repetition {repetition} read-only chmod control was ineffective"
+                )));
+            }
+            Err(error) => error.raw_os_error(),
+        };
+        if !matches!(control_errno, Some(errno) if matches!(errno, libc::EACCES | libc::EROFS | libc::ENOSPC))
+        {
+            set_directory_mode(&workspace, 0o700)?;
+            return Err(AhrbError::Protocol(format!(
+                "row-61 repetition {repetition} control returned unrelated errno {control_errno:?}"
+            )));
+        }
+        let workspace_before = row61_tree_snapshot(&workspace)?;
+        let profile_before = row61_tree_snapshot(&profile_root)?;
+        let forbidden_roots = row61_forbidden_roots(manifest)?;
+        let (forbidden_before_sha256, forbidden_before) = row61_snapshot_set(&forbidden_roots)?;
+        let allowed_profile_write_roots =
+            row61_allowed_profile_write_roots(&environment, &profile_root)?;
+        environment.insert(
+            "AHRB_MOCK_WORKSPACE_OVERRIDE".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        );
+        let command = if manifest.transport.kind == TransportKind::Exec {
+            manifest.transport.command.clone()
+        } else {
+            render_argv(&manifest.transport.command, &variables)?
+        };
+        let per_invocation = per_invocation_topology(manifest);
+        let mut driver = make_driver_with_timeout(
+            manifest,
+            &command,
+            &environment,
+            &variables,
+            &profile_root,
+            per_invocation,
+            outer_turn_timeout(manifest),
+        )?;
+        driver.start().await?;
+        driver.await_readiness().await?;
+        let session = driver
+            .create_session(&format!("{}:row61", workflow.scenario))
+            .await?;
+        let state_evidence_path = if per_invocation {
+            profile_root
+                .join("ahrb-exec-sessions")
+                .join(&session.0)
+                .join("session.json")
+        } else {
+            profile_root
+                .join("state")
+                .join("sessions")
+                .join(&session.0)
+                .join("journal.jsonl")
+        };
+        let _ = row47_snapshot_file(
+            &state_evidence_path,
+            &profile_root,
+            repetition,
+            "workspace-fault-before",
+            "workspace-fault-state",
+            &mut filesystem_snapshots,
+        )?;
+        let operation_start_ns = monotonic_timestamp_ns();
+        driver
+            .submit(&session, &actor.prompt, &format!("row-61-r{repetition}"))
+            .await?;
+        let roots = if per_invocation {
+            let roots = driver.session_pids(&session);
+            if roots.is_empty() {
+                set_directory_mode(&workspace, 0o700)?;
+                return Err(AhrbError::Protocol(format!(
+                    "row-61 repetition {repetition} exposed no owned invocation root"
+                )));
+            }
+            driver.release_invocations().await?;
+            roots
+        } else {
+            let mut ownership_sampler = platform_sampler();
+            verified_process_roots(
+                manifest,
+                ownership_sampler.as_mut(),
+                driver.owned_pids(),
+                driver.daemon_pid(),
+            )?
+        };
+        let events_result =
+            collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(manifest))
+                .await;
+        let terminal_received_ns = monotonic_timestamp_ns();
+        let (events, hung, crashed) = match events_result {
+            Ok(events) => (events, false, false),
+            Err(AhrbError::Timeout(_)) => (Vec::new(), true, false),
+            Err(error) => {
+                let exit = if per_invocation {
+                    driver.client_exit(&session)
+                } else {
+                    driver.harness_exit()?
+                };
+                if matches!(exit, ClientExit::Exited(_)) {
+                    (Vec::new(), false, true)
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+        let target_written = std::fs::symlink_metadata(&target).is_ok();
+        let workspace_after = row61_tree_snapshot(&workspace)?;
+        set_directory_mode(&workspace, 0o700)?;
+        let expected_call_id = format!("call-workspace-fault-r{repetition}");
+        let write_errno = if crashed || hung {
+            None
+        } else {
+            Some(workspace_result_errno(
+                &events,
+                &expected_call_id,
+                "row-61-denied.txt",
+            )?)
+        };
+        let success_contradiction = workspace_result_claimed_success(&events)
+            || events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalSuccess);
+        let terminal_count = events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count();
+        let failure_count = events
+            .iter()
+            .filter(|event| event.event == EventVocab::TerminalFailure)
+            .count();
+        let _ = row47_snapshot_file(
+            &state_evidence_path,
+            &profile_root,
+            repetition,
+            "workspace-fault-after",
+            "workspace-fault-state",
+            &mut filesystem_snapshots,
+        )?;
+        if (manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty())
+            && let Err(error) = driver.close(&session).await
+            && !crashed
+            && !hung
+        {
+            return Err(error);
+        }
+        if let Err(error) = driver.shutdown().await
+            && !crashed
+            && !hung
+        {
+            return Err(error);
+        }
+        let mut sampler = platform_sampler();
+        let cleared = if roots.is_empty() {
+            false
+        } else {
+            await_owned_tree_empty(sampler.as_mut(), &roots, Duration::from_secs(2)).await?
+        };
+        let residue_processes = if cleared {
+            0_u32
+        } else {
+            u32::try_from(sampler.discover(&roots)?.members.len()).map_err(|_| {
+                AhrbError::Protocol("row-61 residue count does not fit u32".to_owned())
+            })?
+        };
+        server.shutdown().await?;
+        let profile_after = row61_tree_snapshot(&profile_root)?;
+        let (forbidden_after_sha256, forbidden_after) = row61_snapshot_set(&forbidden_roots)?;
+        let outside_writes = row61_unexpected_profile_changes(
+            &profile_before,
+            &profile_after,
+            &allowed_profile_write_roots,
+        )
+        .saturating_add(u32::from(
+            workspace_before.sha256 != workspace_after.sha256
+                || forbidden_before_sha256 != forbidden_after_sha256
+                || target_written,
+        ));
+        let ledgers = [
+            (
+                "workspace-fault-workspace-before",
+                serde_json::to_value(&workspace_before)?,
+            ),
+            (
+                "workspace-fault-workspace-after",
+                serde_json::to_value(&workspace_after)?,
+            ),
+            (
+                "workspace-fault-profile-before",
+                serde_json::to_value(&profile_before)?,
+            ),
+            (
+                "workspace-fault-profile-after",
+                serde_json::to_value(&profile_after)?,
+            ),
+            ("workspace-fault-forbidden-before", forbidden_before),
+            ("workspace-fault-forbidden-after", forbidden_after),
+        ];
+        for (name, ledger) in ledgers {
+            row61_write_snapshot_ledger(
+                &profile_root,
+                repetition,
+                name,
+                &ledger,
+                &mut filesystem_snapshots,
+            )?;
+        }
+        all_requests.extend(engine.request_records().await);
+        all_events.extend(events.clone());
+        evidence.push(WorkspaceFaultTrial {
+            repetition,
+            kind: "read-only-directory".to_owned(),
+            write_errno,
+            control_write_errno: control_errno,
+            structured_failure: failure_count == 1 && !success_contradiction,
+            terminal_count: u32::try_from(terminal_count).map_err(|_| {
+                AhrbError::Protocol("row-61 terminal count does not fit u32".to_owned())
+            })?,
+            terminal_ms: terminal_received_ns.saturating_sub(operation_start_ns) as f64
+                / 1_000_000.0,
+            outside_writes,
+            residue_processes,
+            target_written,
+            target_existed_before,
+            snapshot_complete: true,
+            workspace_snapshot_before_sha256: workspace_before.sha256,
+            workspace_snapshot_after_sha256: workspace_after.sha256,
+            profile_snapshot_before_sha256: profile_before.sha256,
+            profile_snapshot_after_sha256: profile_after.sha256,
+            forbidden_snapshot_before_sha256: forbidden_before_sha256,
+            forbidden_snapshot_after_sha256: forbidden_after_sha256,
+            success_contradiction,
+            crashed,
+            hung,
+        });
+    }
+    Ok(WorkspaceFaultTrials {
+        events: all_events,
+        requests: all_requests,
+        evidence,
+        filesystem_snapshots,
+    })
+}
+
+fn offline_mode_workflow(
+    profile_root: &Path,
+    repetition: u32,
+    manifest: &Manifest,
+) -> Result<Workflow> {
+    let scenario = format!("ahrb-row62-r{repetition}");
+    let actor_name = format!("r62-offline-r{repetition}");
+    let terminal = route_marker(&scenario, &actor_name, "terminal");
+    let call = mapped_tool_call(
+        manifest,
+        "write",
+        format!("call-offline-r{repetition}"),
+        json!({
+            "path":"row-62-provider-only.txt",
+            "content":format!("provider-only{terminal}")
+        }),
+    )?;
+    Ok(Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor_name.clone(),
+            Actor {
+                id: actor_name.clone(),
+                parent: None,
+                prompt: format!(
+                    "AHRB offline provider-only tool turn {}",
+                    route_marker(&scenario, &actor_name, "start")
+                ),
+                workspace: profile_root
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![
+            ScriptedResponse {
+                scenario: scenario.clone(),
+                actor: actor_name.clone(),
+                checkpoint: "start".to_owned(),
+                request_hash: String::new(),
+                response: json!({"tool_calls":[call]}),
+                fault: None,
+                barrier: None,
+            },
+            ScriptedResponse {
+                scenario,
+                actor: actor_name,
+                checkpoint: "terminal".to_owned(),
+                request_hash: String::new(),
+                response: success_value(),
+                fault: None,
+                barrier: None,
+            },
+        ],
+    })
+}
+
+const ROW62_FORBIDDEN_ADDRESS: &str = "203.0.113.1:9";
+const ROW62_OWNED_BOUNDARY: &str = "reference-mock-loopback-connector-v1";
+
+struct ReviewedOwnedEgressBoundary {
+    confinement_identity: String,
+    ledger_path: PathBuf,
+    nonce: String,
+}
+
+fn reference_mock_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    let parent = current
+        .parent()
+        .ok_or_else(|| AhrbError::Protocol("AHRB executable has no parent directory".to_owned()))?;
+    let mut candidates = vec![parent.join("ahrb-mock-harness")];
+    if parent.file_name().and_then(|name| name.to_str()) == Some("deps")
+        && let Some(target_directory) = parent.parent()
+    {
+        candidates.push(target_directory.join("ahrb-mock-harness"));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(std::fs::canonicalize(candidate)?);
+        }
+    }
+    Err(AhrbError::Protocol(
+        "reviewed reference mock executable is not installed beside AHRB".to_owned(),
+    ))
+}
+
+fn reviewed_owned_egress_boundary(
+    manifest: &Manifest,
+    command: &[String],
+    profile_root: &Path,
+    manifest_hash: &str,
+    repetition: u32,
+) -> Result<ReviewedOwnedEgressBoundary> {
+    if !matches!(
+        manifest.identity.id.as_str(),
+        "ahrb-mock" | "ahrb-mock-exec"
+    ) || !matches!(
+        manifest.transport.kind,
+        TransportKind::Exec | TransportKind::StdinRpc
+    ) {
+        return Err(AhrbError::Protocol(
+            "reviewed same-confinement OS guard is unavailable and this adapter is not the owned reference mock"
+                .to_owned(),
+        ));
+    }
+    let resolved = resolve_local_program(command)?;
+    let program = resolved
+        .first()
+        .ok_or_else(|| AhrbError::Validation("row-62 harness command is empty".to_owned()))?;
+    let actual = std::fs::canonicalize(program).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "resolve row-62 harness executable {program:?}: {error}"
+        ))
+    })?;
+    let expected = reference_mock_executable()?;
+    if actual != expected {
+        return Err(AhrbError::Protocol(format!(
+            "row-62 owned boundary requires reviewed reference mock {}, resolved {}",
+            expected.display(),
+            actual.display()
+        )));
+    }
+    let executable_sha256 = row47_hash_file(&actual)?;
+    let nonce = format!(
+        "{:x}",
+        Sha256::digest(
+            format!("row62-owned-egress-v1:{manifest_hash}:{executable_sha256}:{repetition}")
+                .as_bytes()
+        )
+    );
+    Ok(ReviewedOwnedEgressBoundary {
+        confinement_identity: format!("owned-reference-mock-v1:sha256:{executable_sha256}"),
+        ledger_path: profile_root.join("owned-egress.jsonl"),
+        nonce,
+    })
+}
+
+fn read_owned_egress_ledger(path: &Path) -> Result<Vec<OwnedEgressLedgerRecord>> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "read row-62 owned egress ledger {}: {error}",
+            path.display()
+        ))
+    })?;
+    if bytes.last() != Some(&b'\n') {
+        return Err(AhrbError::Protocol(
+            "row-62 owned egress ledger has a torn final record".to_owned(),
+        ));
+    }
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice(line).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "row-62 owned egress ledger contains invalid JSON: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn verify_owned_egress_records<'a>(
+    records: &'a [OwnedEgressLedgerRecord],
+    boundary: &ReviewedOwnedEgressBoundary,
+    owned_root_pids: &BTreeSet<u32>,
+    provider_requests: u64,
+) -> Result<&'a OwnedEgressLedgerRecord> {
+    if records.is_empty() {
+        return Err(AhrbError::Protocol(
+            "row-62 owned egress ledger is empty".to_owned(),
+        ));
+    }
+    for (index, record) in records.iter().enumerate() {
+        let expected_sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        if record.schema != 1
+            || record.sequence != expected_sequence
+            || record.nonce != boundary.nonce
+            || record.boundary != ROW62_OWNED_BOUNDARY
+            || !owned_root_pids.contains(&record.pid)
+        {
+            return Err(AhrbError::Protocol(
+                "row-62 owned egress ledger is not bound to the challenged owned process"
+                    .to_owned(),
+            ));
+        }
+    }
+    let provider_records = records
+        .iter()
+        .filter(|record| record.category == "provider")
+        .collect::<Vec<_>>();
+    if u64::try_from(provider_records.len()).ok() != Some(provider_requests)
+        || provider_records.iter().any(|record| {
+            !record.allowed
+                || !matches!(
+                    record.outcome.as_str(),
+                    "connected-loopback" | "connected-local-ipc"
+                )
+        })
+    {
+        return Err(AhrbError::Protocol(
+            "row-62 provider observations did not traverse the owned boundary".to_owned(),
+        ));
+    }
+    let control_records = records
+        .iter()
+        .filter(|record| record.category == "control-probe")
+        .collect::<Vec<_>>();
+    if control_records.len() != 1
+        || records
+            .iter()
+            .any(|record| !matches!(record.category.as_str(), "provider" | "control-probe"))
+    {
+        return Err(AhrbError::Protocol(
+            "row-62 owned boundary emitted an incomplete attempt audit".to_owned(),
+        ));
+    }
+    let control = control_records.first().copied().ok_or_else(|| {
+        AhrbError::Protocol("row-62 owned boundary omitted its control record".to_owned())
+    })?;
+    if control.destination != ROW62_FORBIDDEN_ADDRESS
+        || control.allowed
+        || control.outcome != "blocked-permission-denied"
+    {
+        return Err(AhrbError::Protocol(
+            "row-62 public control connect was not refused by the owned boundary".to_owned(),
+        ));
+    }
+    Ok(control)
+}
+
+#[cfg(test)]
+mod owned_egress_record_tests {
+    use super::*;
+
+    fn boundary() -> ReviewedOwnedEgressBoundary {
+        ReviewedOwnedEgressBoundary {
+            confinement_identity: "owned-reference-mock-v1:sha256:test".to_owned(),
+            ledger_path: PathBuf::from("owned-egress.jsonl"),
+            nonce: "b".repeat(64),
+        }
+    }
+
+    fn records() -> Vec<OwnedEgressLedgerRecord> {
+        vec![
+            OwnedEgressLedgerRecord {
+                schema: 1,
+                sequence: 1,
+                nonce: "b".repeat(64),
+                pid: 42,
+                boundary: ROW62_OWNED_BOUNDARY.to_owned(),
+                destination: ROW62_FORBIDDEN_ADDRESS.to_owned(),
+                category: "control-probe".to_owned(),
+                allowed: false,
+                outcome: "blocked-permission-denied".to_owned(),
+            },
+            OwnedEgressLedgerRecord {
+                schema: 1,
+                sequence: 2,
+                nonce: "b".repeat(64),
+                pid: 42,
+                boundary: ROW62_OWNED_BOUNDARY.to_owned(),
+                destination: "127.0.0.1:1234".to_owned(),
+                category: "provider".to_owned(),
+                allowed: true,
+                outcome: "connected-loopback".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn owned_egress_oracle_accepts_challenged_root_and_provider_records() -> Result<()> {
+        let records = records();
+        let control = verify_owned_egress_records(&records, &boundary(), &BTreeSet::from([42]), 1)?;
+        assert_eq!(control.category, "control-probe");
+        Ok(())
+    }
+
+    #[test]
+    fn owned_egress_oracle_rejects_ledger_from_outside_owned_root() {
+        let records = records();
+        let error = verify_owned_egress_records(&records, &boundary(), &BTreeSet::from([99]), 1)
+            .expect_err("foreign PID must not satisfy owned confinement");
+        assert!(error.to_string().contains("owned process"));
+    }
+}
+
+async fn collect_offline_mode_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<OfflineModeTrials> {
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 3_u32,
+    };
+    let mut trials = OfflineModeTrials {
+        events: Vec::new(),
+        requests: Vec::new(),
+        evidence: Vec::new(),
+        egress_attempts: Vec::new(),
+    };
+    for repetition in 1..=repetitions {
+        let profile_root = run_profile_root.join(format!("derived-row62-r{repetition}"));
+        prepare_profile(manifest, &profile_root)?;
+        let workflow = offline_mode_workflow(&profile_root, repetition, manifest)?;
+        workflow.validate()?;
+        let actor_name = format!("r62-offline-r{repetition}");
+        let actor = workflow.actors.get(&actor_name).ok_or_else(|| {
+            AhrbError::Protocol(format!("row-62 repetition {repetition} actor disappeared"))
+        })?;
+        let engine = Arc::new(FakeModelEngine::with_request_roles(
+            &workflow,
+            &manifest.model_roles,
+            &manifest.request_role_rules,
+        )?);
+        let (server, model_environment) = start_model(
+            Arc::clone(&engine),
+            &workflow,
+            &profile_root,
+            false,
+            &manifest.fake_model.base_url_env,
+        )
+        .await?;
+        let mut variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("endpoint".to_owned(), String::new()),
+        ]);
+        let credential = format!(
+            "ahrb-{}-row62-r{repetition}-{}",
+            &manifest_hash[..16],
+            std::process::id()
+        );
+        let mut environment = isolated_environment(manifest, &variables)?;
+        environment.extend(model_environment);
+        environment.insert(
+            manifest.fake_model.credential_env.clone(),
+            credential.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_MODEL".to_owned(),
+            manifest.fake_model.model.clone(),
+        );
+        variables.insert(
+            "base_url".to_owned(),
+            environment
+                .get(&manifest.fake_model.base_url_env)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        variables.insert("credential".to_owned(), credential);
+        variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+        write_generated_files(manifest, &variables, &profile_root)?;
+        let command = if manifest.transport.kind == TransportKind::Exec {
+            manifest.transport.command.clone()
+        } else {
+            render_argv(&manifest.transport.command, &variables)?
+        };
+        let boundary = reviewed_owned_egress_boundary(
+            manifest,
+            &command,
+            &profile_root,
+            manifest_hash,
+            repetition,
+        )?;
+        environment.insert(
+            "AHRB_MOCK_OWNED_EGRESS_LEDGER".to_owned(),
+            boundary.ledger_path.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            "AHRB_MOCK_OWNED_EGRESS_NONCE".to_owned(),
+            boundary.nonce.clone(),
+        );
+        environment.insert(
+            "AHRB_MOCK_OWNED_EGRESS_FORBIDDEN".to_owned(),
+            ROW62_FORBIDDEN_ADDRESS.to_owned(),
+        );
+        let per_invocation = per_invocation_topology(manifest);
+        let mut driver = make_driver_with_timeout(
+            manifest,
+            &command,
+            &environment,
+            &variables,
+            &profile_root,
+            per_invocation,
+            outer_turn_timeout(manifest),
+        )?;
+        driver.start().await?;
+        driver.await_readiness().await?;
+        let session = driver
+            .create_session(&format!("{}:row62", workflow.scenario))
+            .await?;
+        driver
+            .submit(&session, &actor.prompt, &format!("row-62-r{repetition}"))
+            .await?;
+        let owned_roots = if per_invocation {
+            let roots = driver.session_pids(&session);
+            if roots.is_empty() {
+                return Err(AhrbError::Protocol(format!(
+                    "row-62 repetition {repetition} exposed no owned invocation root"
+                )));
+            }
+            driver.release_invocations().await?;
+            roots
+        } else {
+            let mut ownership_sampler = platform_sampler();
+            verified_process_roots(
+                manifest,
+                ownership_sampler.as_mut(),
+                driver.owned_pids(),
+                driver.daemon_pid(),
+            )?
+        };
+        let owned_root_pids = owned_roots.into_iter().collect::<BTreeSet<_>>();
+        let events =
+            collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(manifest))
+                .await?;
+        let requests = engine.request_records().await;
+        let provider_requests = u64::try_from(
+            requests
+                .iter()
+                .filter(|record| record.request.actor == actor_name)
+                .count(),
+        )
+        .map_err(|_| AhrbError::Protocol("row-62 provider request count overflow".to_owned()))?;
+        let terminal_success = events
+            .iter()
+            .filter(|event| event.event == EventVocab::TerminalSuccess)
+            .count()
+            == 1
+            && events
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .count()
+                == 1;
+        let ledger_records = read_owned_egress_ledger(&boundary.ledger_path)?;
+        let probe = verify_owned_egress_records(
+            &ledger_records,
+            &boundary,
+            &owned_root_pids,
+            provider_requests,
+        )?;
+        let identity = boundary.confinement_identity.clone();
+        let attempt = OfflineAttempt {
+            repetition,
+            destination: probe.destination.clone(),
+            category: "control-probe".to_owned(),
+            outcome: probe.outcome.clone(),
+            allowed: false,
+            confinement_identity: identity.clone(),
+        };
+        trials.egress_attempts.push(EgressAttempt {
+            repetition,
+            monotonic_ns: monotonic_timestamp_ns(),
+            destination: probe.destination.clone(),
+            category: "control-probe".to_owned(),
+            allowed: false,
+            outcome: attempt.outcome.clone(),
+            enforcement: "reviewed reference-mock owned loopback connector".to_owned(),
+            confinement_identity: identity.clone(),
+        });
+        trials.evidence.push(OfflineTrial {
+            repetition,
+            provider_requests,
+            terminal_success,
+            control_probe_blocked: true,
+            harness_confinement_identity: identity.clone(),
+            probe_confinement_identity: identity,
+            egress_enforcement: "reviewed reference-mock owned loopback connector".to_owned(),
+            attempts: vec![attempt],
+        });
+        if manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty()
+        {
+            driver.close(&session).await?;
+        }
+        driver.shutdown().await?;
+        server.shutdown().await?;
+        trials.events.extend(events);
+        trials.requests.extend(requests);
+    }
+    Ok(trials)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_streaming_case(
+    manifest: &Manifest,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+    row: u8,
+    case: &str,
+    repetition: u32,
+    count: u32,
+    outer_deadline_ms: u64,
+    measure_cpu: bool,
+) -> Result<StreamingCaseResult> {
+    let profile_root = run_profile_root.join(format!("derived-row{row}-{case}-r{repetition}"));
+    prepare_profile(manifest, &profile_root).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "prepare row-{row} {case} repetition {repetition} fresh profile: {error}"
+        ))
+    })?;
+    let workflow = streaming_workflow(row, case, &profile_root, repetition, count);
+    let actor_name = format!("r{row}-{case}-r{repetition}");
+    let actor = workflow
+        .actors
+        .get(&actor_name)
+        .ok_or_else(|| AhrbError::Protocol(format!("row-{row} {case} actor disappeared")))?;
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let (server, model_environment) =
+        start_streaming_model(Arc::clone(&engine), &manifest.fake_model.base_url_env).await?;
+    let mut variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+    ]);
+    let credential = format!(
+        "ahrb-{}-row{row}-{case}-r{repetition}-{}",
+        &manifest_hash[..16],
+        std::process::id()
+    );
+    let mut environment = isolated_environment(manifest, &variables)?;
+    environment.extend(model_environment);
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        credential.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    variables.insert("credential".to_owned(), credential);
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(manifest, &variables, &profile_root)?;
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let row_deadline = Duration::from_millis(outer_deadline_ms);
+    let per_invocation = per_invocation_topology(manifest);
+    // Per-invocation drivers start their process timeout at launch, before the
+    // provider header boundary that defines these rows. Keep that internal I/O
+    // guard strictly outside the row-local clock; `remaining_row_deadline`
+    // below enforces the exact header-anchored outer deadline.
+    let transport_deadline =
+        Duration::from_millis(outer_deadline_ms.saturating_add(manifest.resources.turn_timeout_ms));
+    let mut driver = make_driver_with_timeout(
+        manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        measure_cpu && per_invocation,
+        transport_deadline,
+    )?;
+    driver.start().await?;
+    driver.await_readiness().await?;
+    let session = driver
+        .create_session(&format!("{}:row{row}-{case}", workflow.scenario))
+        .await?;
+    let mut sampler = measure_cpu.then(platform_sampler);
+    let mut cpu_samples = Vec::new();
+    let mut roots = if per_invocation {
+        Vec::new()
+    } else {
+        let mut roots = driver.owned_pids();
+        if let Some(pid) = driver.daemon_pid() {
+            roots.push(pid);
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    };
+    if let Some(sampler) = sampler.as_deref_mut()
+        && !per_invocation
+    {
+        cpu_samples.push(sample_streaming_cpu(sampler, &roots)?);
+    }
+    driver
+        .submit(
+            &session,
+            &actor.prompt,
+            &format!("row-{row}-{case}-r{repetition}"),
+        )
+        .await?;
+    if per_invocation {
+        roots = driver.session_pids(&session);
+        if let Some(sampler) = sampler.as_deref_mut() {
+            cpu_samples.push(sample_streaming_cpu(sampler, &roots)?);
+            // Release only after the pre-header CPU point is durable, proving
+            // that the header boundary cannot precede the left bracket.
+            driver.release_invocations().await?;
+        }
+    }
+    let header_record = wait_for_response_headers(&engine, &actor_name, row_deadline).await?;
+    let response_headers_ns = header_record
+        .response_headers_ns
+        .ok_or_else(|| AhrbError::Protocol("provider header boundary disappeared".to_owned()))?;
+    if let Some(sampler) = sampler.as_deref_mut() {
+        cpu_samples.push(sample_streaming_cpu(sampler, &roots)?);
+    }
+    let frames = if case == "stall" {
+        Vec::new()
+    } else {
+        wait_for_paced_frames(PacedFrameWait {
+            engine: &engine,
+            actor: &actor_name,
+            expected_count: count,
+            response_headers_ns,
+            outer_deadline_ms,
+            sampler: sampler.as_mut(),
+            roots: &roots,
+            cpu_samples: &mut cpu_samples,
+        })
+        .await?
+    };
+    let cpu_ns = if measure_cpu {
+        let final_frame_yield_ns = frames
+            .last()
+            .map(|frame| frame.frame_yielded_ns)
+            .ok_or_else(|| AhrbError::Protocol("model-wait final frame disappeared".to_owned()))?;
+        interpolated_model_wait_cpu_ns(&cpu_samples, response_headers_ns, final_frame_yield_ns)
+            .map_err(AhrbError::Protocol)?
+    } else {
+        0
+    };
+    let terminal_result = match remaining_row_deadline(response_headers_ns, outer_deadline_ms) {
+        Ok(remaining) => {
+            collect_session_terminal_with_poll(
+                &mut driver,
+                &session,
+                None,
+                remaining,
+                Duration::from_millis(2),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let (events, terminal_ns, outer_kill_used, outer_kill_ns) = match terminal_result {
+        Ok(events) => {
+            let terminal_ns = monotonic_timestamp_ns();
+            if manifest.transport.kind == TransportKind::Exec
+                || !manifest.sessions.close_delete.is_empty()
+            {
+                driver.close(&session).await?;
+            }
+            driver.shutdown().await?;
+            (events, Some(terminal_ns), false, None)
+        }
+        Err(AhrbError::Timeout(_)) => {
+            let outer_kill_ns = monotonic_timestamp_ns();
+            cleanup_streaming_outer_kill(
+                &mut driver,
+                &roots,
+                Duration::from_millis(manifest.daemon.grace_ms.max(500)),
+            )
+            .await?;
+            (Vec::new(), None, true, Some(outer_kill_ns))
+        }
+        Err(error) => return Err(error),
+    };
+    server.shutdown().await?;
+    let requests = engine.request_records().await;
+    Ok(StreamingCaseResult {
+        actor: actor_name,
+        response_headers_ns,
+        terminal_ns,
+        outer_kill_used,
+        outer_kill_ns,
+        cpu_ns,
+        cpu_samples,
+        frames,
+        events,
+        requests,
+    })
+}
+
+fn streaming_chunks(
+    repetition: u32,
+    case: &str,
+    actor: &str,
+    frames: &[crate::fake_model::ModelFrameObservation],
+) -> Vec<StreamChunkObservation> {
+    frames
+        .iter()
+        .map(|frame| StreamChunkObservation {
+            repetition,
+            actor: actor.to_owned(),
+            case: case.to_owned(),
+            ordinal: frame.ordinal,
+            scheduled_ns: frame.scheduled_ns,
+            frame_yielded_ns: frame.frame_yielded_ns,
+            bytes: frame.bytes,
+        })
+        .collect()
+}
+
+async fn collect_model_wait_cpu_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<ModelWaitCpuTrials> {
+    let repetitions = ResourceTimingPlan::for_profile(ResourceProfile::from(profile)).repetitions;
+    let count = match profile {
+        Profile::Quick => 5_u32,
+        Profile::Cert => 20_u32,
+    };
+    let outer_deadline_ms = u64::from(count)
+        .saturating_mul(1_000)
+        .saturating_add(manifest.resources.idle_timeout_ms)
+        .saturating_add(3_000);
+    let mut trials = ModelWaitCpuTrials {
+        events: Vec::new(),
+        requests: Vec::new(),
+        evidence: Vec::new(),
+        stream_chunks: Vec::new(),
+    };
+    for repetition in 1..=repetitions {
+        let trial = collect_streaming_case(
+            manifest,
+            run_profile_root,
+            manifest_hash,
+            48,
+            "model-wait",
+            repetition,
+            count,
+            outer_deadline_ms,
+            true,
+        )
+        .await?;
+        let success_terminals = trial
+            .events
+            .iter()
+            .filter(|event| event.event == EventVocab::TerminalSuccess)
+            .count() as u32;
+        let terminal_count = trial
+            .events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count() as u32;
+        trials.stream_chunks.extend(streaming_chunks(
+            repetition,
+            "model-wait",
+            &trial.actor,
+            &trial.frames,
+        ));
+        trials.evidence.push(ModelWaitCpuTrialEvidence {
+            repetition,
+            response_headers_ns: trial.response_headers_ns,
+            terminal_ns: trial.terminal_ns,
+            cpu_ns: trial.cpu_ns,
+            cpu_samples: trial.cpu_samples,
+            frames: trial.frames,
+            terminal_count,
+            success_terminals,
+            outer_kill_used: trial.outer_kill_used,
+            outer_kill_ns: trial.outer_kill_ns,
+            outer_deadline_ms,
+        });
+        trials.events.extend(trial.events);
+        trials.requests.extend(trial.requests);
+    }
+    Ok(trials)
+}
+
+async fn collect_slow_stream_stall_trials(
+    manifest: &Manifest,
+    profile: Profile,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<SlowStreamStallTrials> {
+    if manifest.resources.idle_timeout_ms < 1_250 {
+        return Err(AhrbError::Validation(format!(
+            "row-59 requires idle_timeout_ms>=1250; got {}",
+            manifest.resources.idle_timeout_ms
+        )));
+    }
+    let repetitions = ResourceTimingPlan::for_profile(ResourceProfile::from(profile)).repetitions;
+    let count = match profile {
+        Profile::Quick => 5_u32,
+        Profile::Cert => 20_u32,
+    };
+    let slow_outer_deadline_ms = u64::from(count)
+        .saturating_mul(1_000)
+        .saturating_add(manifest.resources.idle_timeout_ms)
+        .saturating_add(3_000);
+    let stall_outer_deadline_ms = manifest.resources.idle_timeout_ms.saturating_add(3_000);
+    let mut trials = SlowStreamStallTrials {
+        events: Vec::new(),
+        requests: Vec::new(),
+        evidence: Vec::new(),
+        stream_chunks: Vec::new(),
+    };
+    for repetition in 1..=repetitions {
+        let slow = collect_streaming_case(
+            manifest,
+            run_profile_root,
+            manifest_hash,
+            59,
+            "slow",
+            repetition,
+            count,
+            slow_outer_deadline_ms,
+            false,
+        )
+        .await?;
+        let stall = collect_streaming_case(
+            manifest,
+            run_profile_root,
+            manifest_hash,
+            59,
+            "stall",
+            repetition,
+            0,
+            stall_outer_deadline_ms,
+            false,
+        )
+        .await?;
+        let slow_success_terminals = slow
+            .events
+            .iter()
+            .filter(|event| event.event == EventVocab::TerminalSuccess)
+            .count() as u32;
+        let slow_terminal_count = slow
+            .events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count() as u32;
+        let slow_idle_timeout_fired = slow.events.iter().any(|event| {
+            event.event == EventVocab::TerminalTimeout
+                || event.event == EventVocab::TerminalFailure
+                    && event.payload.get("category").and_then(Value::as_str) == Some("idle-timeout")
+        });
+        let stall_terminal_count = stall
+            .events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .count() as u32;
+        let stall_failure_terminals = stall
+            .events
+            .iter()
+            .filter(|event| {
+                event.event == EventVocab::TerminalTimeout
+                    || event.event == EventVocab::TerminalFailure
+                        && event.payload.get("category").and_then(Value::as_str)
+                            == Some("idle-timeout")
+            })
+            .count() as u32;
+        trials.stream_chunks.extend(streaming_chunks(
+            repetition,
+            "slow",
+            &slow.actor,
+            &slow.frames,
+        ));
+        trials.evidence.push(SlowStreamStallTrialEvidence {
+            repetition,
+            slow_response_headers_ns: slow.response_headers_ns,
+            slow_terminal_ns: slow.terminal_ns,
+            slow_frames: slow.frames,
+            slow_terminal_count,
+            slow_success_terminals,
+            slow_idle_timeout_fired,
+            slow_outer_kill_used: slow.outer_kill_used,
+            slow_outer_kill_ns: slow.outer_kill_ns,
+            slow_outer_deadline_ms,
+            stall_response_headers_ns: stall.response_headers_ns,
+            stall_terminal_ns: stall.terminal_ns,
+            stall_bytes_yielded: stall.frames.iter().map(|frame| frame.bytes).sum(),
+            stall_terminal_count,
+            stall_failure_terminals,
+            stall_outer_kill_used: stall.outer_kill_used,
+            stall_outer_kill_ns: stall.outer_kill_ns,
+            stall_outer_deadline_ms,
+        });
+        trials.events.extend(slow.events);
+        trials.events.extend(stall.events);
+        trials.requests.extend(slow.requests);
+        trials.requests.extend(stall.requests);
+    }
+    Ok(trials)
+}
+
 fn add_resource_workflow(
     scenario: &str,
     profile_root: &Path,
@@ -5444,8 +11335,14 @@ fn mapped_tool_call(
         ("workspace".to_owned(), ".".to_owned()),
     ]);
     for (key, value) in object {
-        if let Some(value) = value.as_str() {
-            variables.insert(key.clone(), value.to_owned());
+        let rendered = match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        };
+        if let Some(value) = rendered {
+            variables.insert(key.clone(), value);
         }
     }
     let argv = template
@@ -5619,6 +11516,34 @@ fn scripted_row(
                 response("terminal", success_value(), None),
             ]
         }
+        60 => {
+            let call = mapped_tool_call(
+                manifest,
+                "large_output",
+                "call-large-output".to_owned(),
+                json!({"bytes":10_485_760_u64,"route":terminal}),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[call]}), None),
+                response("terminal", success_value(), None),
+            ]
+        }
+        61 => {
+            let call = mapped_tool_call(
+                manifest,
+                "write",
+                "call-workspace-fault".to_owned(),
+                json!({"path":"row-61-denied.txt","content":format!("must-not-be-written{terminal}")}),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[call]}), None),
+                response(
+                    "terminal",
+                    json!({"text":"{\"status\":\"FAILURE\",\"category\":\"workspace\"}"}),
+                    None,
+                ),
+            ]
+        }
         _ => vec![response("start", success_value(), None)],
     };
     Ok(scripts)
@@ -5753,17 +11678,63 @@ async fn collect_session_terminal_with_poll(
 ) -> Result<Vec<NormalizedEvent>> {
     let started = Instant::now();
     loop {
-        let events = driver.attach(session, after).await?;
+        let remaining = deadline.checked_sub(started.elapsed()).ok_or_else(|| {
+            AhrbError::Timeout(format!("session {} did not terminalize", session.0))
+        })?;
+        let events = tokio::time::timeout(remaining, driver.attach(session, after))
+            .await
+            .map_err(|_| {
+                AhrbError::Timeout(format!(
+                    "session {} attach exceeded its terminal deadline",
+                    session.0
+                ))
+            })??;
         if events.iter().any(|event| is_terminal(&event.event)) {
             return Ok(events);
         }
-        if started.elapsed() >= deadline {
-            return Err(AhrbError::Timeout(format!(
-                "exec session {} did not terminalize",
-                session.0
-            )));
+        let remaining = deadline.checked_sub(started.elapsed()).ok_or_else(|| {
+            AhrbError::Timeout(format!("session {} did not terminalize", session.0))
+        })?;
+        tokio::time::sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod terminal_deadline_tests {
+    use super::*;
+    use crate::driver::{DriverFuture, SessionId, TransportRequest, TransportResponse};
+
+    struct BlockingAttachTransport;
+
+    impl Transport for BlockingAttachTransport {
+        fn start(&mut self) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
         }
-        tokio::time::sleep(poll_interval).await;
+
+        fn request(&mut self, _request: TransportRequest) -> DriverFuture<'_, TransportResponse> {
+            Box::pin(std::future::pending())
+        }
+
+        fn stop(&mut self) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_collector_bounds_an_inflight_attach_by_the_absolute_deadline() {
+        let mut driver: HarnessDriver = Box::new(GenericDriver::new(BlockingAttachTransport));
+        let session = SessionId("blocked-attach".to_owned());
+        let started = Instant::now();
+        let result = collect_session_terminal_with_poll(
+            &mut driver,
+            &session,
+            None,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(result, Err(AhrbError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }
 
@@ -5888,6 +11859,15 @@ fn evaluate_rows(
     let row44 = derived.process_hygiene;
     let row45 = derived.time_to_first_model_request;
     let row46 = derived.memory_time_integral;
+    let row48 = derived.model_wait_cpu;
+    let row56 = derived.child_failure_propagation;
+    let row57 = derived.signal_matrix;
+    let row59 = derived.slow_stream_vs_stall;
+    let row60 = derived.large_tool_output;
+    let row61 = derived.workspace_fault;
+    let row62 = derived.offline_mode;
+    let row47 = derived.disk_io_per_turn;
+    let row58 = derived.retry_budget;
     let row63 = derived.nondeterministic_fields;
     let row64 = derived.cross_run_reproducibility;
     selected
@@ -6132,6 +12112,328 @@ fn evaluate_rows(
                             row46.cpu_per_turn_p50_ms,
                             row46.cpu_per_turn_p95_ms,
                             row46.cpu_class,
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 47 {
+                if !row47.measurement_complete {
+                    let measurement_error = match row47.measurement_error.clone() {
+                        Some(error) => error,
+                        None => "disk-io-per-turn evidence is incomplete".to_owned(),
+                    };
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(measurement_error),
+                    );
+                }
+                let disk_metric = |name: &str| {
+                    row47.resource_values.get(name).copied().map_or(0.0, |value| value)
+                };
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row47.reference_envelope_pass,
+                        detail: format!(
+                            "disk p50={:.0} bytes/turn, p95={:.0}, max={:.0}, journal={:.0}, log={}, slope={:.3} bytes/turn^2, complete={}, unbounded={}",
+                            disk_metric("disk_write_bytes_per_turn_p50"),
+                            disk_metric("disk_write_bytes_per_turn_p95"),
+                            disk_metric("disk_write_bytes_per_turn_max"),
+                            disk_metric("session_journal_growth_bytes_per_turn"),
+                            row47.log_growth_bytes_per_turn.map_or_else(
+                                || "verified-no-log".to_owned(),
+                                |value| format!("{value:.0}"),
+                            ),
+                            disk_metric("disk_write_growth_slope_bytes_per_turn2"),
+                            row47.disk_io_counter_complete,
+                            row47.unbounded_disk_growth,
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 56 {
+                if !row56.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row56.measurement_error.clone().unwrap_or_else(|| {
+                            "child-failure-propagation evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row56.passed,
+                        detail: format!(
+                            "crash terminal={:.3}ms, hang terminal={:.3}ms, parent failures={:.0}/{:.0}, hang deadlines={:.0}, child terminals={:.0}, residue={:.0}, outer kills={:.0}",
+                            row56.metrics["child_failure_propagation.crash_parent_terminal_ms"],
+                            row56.metrics["child_failure_propagation.hang_parent_terminal_ms"],
+                            row56.metrics["child_failure_propagation.crash_parent_failure_terminals"],
+                            row56.metrics["child_failure_propagation.hang_parent_failure_terminals"],
+                            row56.metrics["child_failure_propagation.hang_deadline_fired"],
+                            row56.metrics["child_failure_propagation.child_terminal_count"],
+                            row56.metrics["child_failure_propagation.child_residue_count"],
+                            row56.metrics["child_failure_propagation.outer_kill_used"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 57 {
+                if !row57.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row57.measurement_error.clone().unwrap_or_else(|| {
+                            "signal-matrix evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row57.passed,
+                        detail: format!(
+                            "applicable={:.0}, passed={:.0}, SIGTERM={:.3}ms, SIGINTx2={:.3}ms, SIGHUP={:.3}ms, stdin-EOF={}",
+                            row57.metrics["signal_matrix.applicable_cases"],
+                            row57.metrics["signal_matrix.passed_cases"],
+                            row57.metrics["signal_matrix.sigterm_terminal_ms"],
+                            row57.metrics["signal_matrix.sigint2_terminal_ms"],
+                            row57.metrics["signal_matrix.sighup_terminal_ms"],
+                            row57
+                                .metrics
+                                .get("signal_matrix.stdin_eof_terminal_ms")
+                                .map_or_else(|| "not-applicable".to_owned(), |value| format!("{value:.3}ms")),
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 58 {
+                if !row58.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row58.measurement_error.clone().unwrap_or_else(|| {
+                            "retry-budget evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row58.reference_envelope_pass,
+                        detail: format!(
+                            "max requests={:.0}/{:.0}, elapsed={:.3}/{:.3}ms, jittered={}, failure terminals={:.0}, effects={:.0}",
+                            row58.metrics["retry_budget.requests_total"],
+                            row58.metrics["retry_budget.declared_max_requests"],
+                            row58.metrics["retry_budget.elapsed_ms"],
+                            row58.metrics["retry_budget.declared_worst_case_ms"],
+                            row58.metrics["retry_budget.backoff_jittered"],
+                            row58.metrics["retry_budget.failure_terminals"],
+                            row58.metrics["retry_budget.committed_effects"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 48 {
+                if !row48.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row48.measurement_error.clone().unwrap_or_else(|| {
+                            "model-wait-cpu evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row48.passed,
+                        detail: format!(
+                            "CPU p50={:.3}ms, wall p50={:.3}ms, max one-core ratio={:.6}, bytes={:.0}, max gap={:.3}ms",
+                            row48.cpu_p50_ms,
+                            row48.wall_p50_ms,
+                            row48.one_core_max_ratio,
+                            row48.metrics["model_wait_cpu.bytes_yielded"],
+                            row48.metrics["model_wait_cpu.max_inter_frame_ms"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 59 {
+                if !row59.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row59.measurement_error.clone().unwrap_or_else(|| {
+                            "slow-stream-vs-stall evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row59.passed,
+                        detail: format!(
+                            "slow bytes={:.0}, max gap={:.3}ms, slow successes={:.0}, idle fires={:.0}; stall bytes={:.0}, max timeout={:.3}ms, failures={:.0}, outer kills={:.0}",
+                            row59.metrics["slow_stream_vs_stall.slow_bytes_yielded"],
+                            row59.metrics["slow_stream_vs_stall.slow_max_inter_frame_ms"],
+                            row59.metrics["slow_stream_vs_stall.slow_terminal_success"],
+                            row59.metrics["slow_stream_vs_stall.slow_idle_timeout_fired"],
+                            row59.metrics["slow_stream_vs_stall.stall_bytes_yielded"],
+                            row59.metrics["slow_stream_vs_stall.stall_own_timeout_ms"],
+                            row59.metrics["slow_stream_vs_stall.stall_structured_failure"],
+                            row59.metrics["slow_stream_vs_stall.stall_outer_kill_used"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 60 {
+                if !row60.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row60.measurement_error.clone().unwrap_or_else(|| {
+                            "large-tool-output evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row60.passed,
+                        detail: format!(
+                            "produced={:.0}, visible={:.0}/{:.0}, truncated={:.0}, terminal={:.0}, correlated={:.0}, peak delta={:.3} MiB",
+                            row60.metrics["large_tool_output.produced_bytes"],
+                            row60.metrics["large_tool_output.model_visible_encoded_bytes"],
+                            row60.metrics["large_tool_output.harness_output_limit_bytes"],
+                            row60.metrics["large_tool_output.truncated"],
+                            row60.metrics["large_tool_output.terminal_success"],
+                            row60.metrics["large_tool_output.tool_result_correlated"],
+                            row60.peak_rss_delta_mib.map_or(0.0, |value| value),
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 61 {
+                if !row61.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row61.measurement_error.clone().unwrap_or_else(|| {
+                            "workspace-fault evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row61.passed,
+                        detail: format!(
+                            "structured failures={:.0}, terminals={:.0}, max terminal={:.3}ms, outside writes={:.0}, residue={:.0}",
+                            row61.metrics["workspace_fault.structured_failure"],
+                            row61.metrics["workspace_fault.terminal_count"],
+                            row61.metrics["workspace_fault.terminal_ms"],
+                            row61.metrics["workspace_fault.outside_writes"],
+                            row61.metrics["workspace_fault.residue_processes"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 62 {
+                if !row62.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row62.measurement_error.clone().unwrap_or_else(|| {
+                            "egress enforcement unavailable".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row62.passed,
+                        detail: format!(
+                            "provider requests={:.0}, blocked auxiliary attempts={:.0}, successful non-provider connections={:.0}, offline success={:.0}, control probe blocked={:.0}",
+                            row62.metrics["offline_mode.provider_requests"],
+                            row62.metrics["offline_mode.blocked_egress_attempts"],
+                            row62.metrics["offline_mode.successful_non_provider_connections"],
+                            row62.metrics["offline_mode.offline_run_success"],
+                            row62.metrics["offline_mode.control_probe_blocked"],
                         ),
                     }],
                     None,

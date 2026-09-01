@@ -443,6 +443,7 @@ const RESOURCE_FIELDS: &[&str] = &[
     "idle_rss_mib",
     "latency_last_first_decile_ratio",
     "latency_slope_ms_per_100_turns",
+    "large_tool_output_peak_rss_delta_mib",
     "log_growth_bytes_per_turn",
     "mean_rss_mib",
     "median_rss_mib",
@@ -557,6 +558,7 @@ fn resource_field_id(field: &str) -> Option<&'static str> {
         "model_wait_cpu_p50_ms"
         | "model_wait_wall_p50_ms"
         | "model_wait_cpu_one_core_max_ratio" => Some("model-wait-cpu"),
+        "large_tool_output_peak_rss_delta_mib" => Some("large-tool-output"),
         "latency_slope_ms_per_100_turns" | "latency_last_first_decile_ratio" => {
             Some("latency-vs-turn-index")
         }
@@ -632,6 +634,8 @@ mod tests {
             profile: profile.to_owned(),
             os: os.to_owned(),
             topology: topology.to_owned(),
+            resource_summary: crate::results::IndexedResourceSummary::default(),
+            metrics: BTreeMap::new(),
             manifest_sha256: "manifest".to_owned(),
             workflow_sha256: "workflow".to_owned(),
             ahrb_revision: "revision".to_owned(),

@@ -126,6 +126,10 @@ fn capability_resolution_treats_missing_operations_as_unsupported() {
         capability_for_row(&original, 18).as_classify_value(),
         Some(true)
     );
+    assert_eq!(
+        capability_for_row(&original, 56),
+        CapabilityStatus::Supported
+    );
 
     let mut undeclared = original.clone();
     undeclared.capabilities.optional.remove("native_delegation");
@@ -148,6 +152,20 @@ fn capability_resolution_treats_missing_operations_as_unsupported() {
         capability_for_row(&missing_surface, 18).as_classify_value(),
         Some(false)
     );
+
+    let mut missing_locator = manifest();
+    missing_locator.agents.collect_events_pointer.clear();
+    assert!(matches!(
+        capability_for_row(&missing_locator, 56),
+        CapabilityStatus::Unsupported(_)
+    ));
+
+    let exec = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+        .expect("mock-exec manifest");
+    assert!(matches!(
+        capability_for_row(&exec, 56),
+        CapabilityStatus::Unsupported(_)
+    ));
 }
 
 #[test]
@@ -246,4 +264,20 @@ fn every_empty_special_operation_surface_is_unsupported() {
             "row {row} did not capability-gate its empty operation"
         );
     }
+}
+
+#[test]
+fn signal_matrix_requires_only_the_typed_stdin_declaration() {
+    let daemon = manifest();
+    assert_eq!(capability_for_row(&daemon, 57), CapabilityStatus::Supported);
+    let exec = ahrb::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+        .expect("mock-exec manifest");
+    assert_eq!(capability_for_row(&exec, 57), CapabilityStatus::Supported);
+
+    let mut missing = daemon;
+    missing.input.prompt_uses_stdin = None;
+    assert!(matches!(
+        capability_for_row(&missing, 57),
+        CapabilityStatus::Absent(_)
+    ));
 }

@@ -54,7 +54,7 @@ forbidden_roots = ["~/.ahrb-mock"]
 
 [daemon]
 persistent = true
-start = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4"]
+start = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200"]
 pid_locator = "{{profile}}/state/daemon.pid"
 shutdown = ["harness.shutdown"]
 grace_ms = 2000
@@ -73,7 +73,7 @@ timeout_ms = 10000
 
 [transport]
 kind = "stdin-rpc"
-command = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4"]
+command = ["target/debug/ahrb-mock-harness", "serve", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200"]
 endpoint = ""
 timeout_ms = 30000
 
@@ -99,6 +99,8 @@ status = ["session.attach"]
 cancel = ["session.cancel"]
 collect = ["session.attach"]
 child_id_pointer = "/session_id"
+status_result_pointer = "/events"
+collect_events_pointer = "/events"
 
 [concurrency]
 topology = "shared-daemon-sessions"
@@ -112,6 +114,7 @@ write = "write_fixture"
 read = "read_fixture"
 fail = "fail_fixture"
 barrier = "barrier"
+large_output = "large_output"
 
 [tools.bindings]
 path = "path"
@@ -124,6 +127,7 @@ write = ["write_fixture"]
 read = ["read_fixture"]
 fail = ["fail_fixture"]
 barrier = ["barrier"]
+large_output = ["target/debug/ahrb-fixture", "emit", "--bytes", "{{bytes}}"]
 
 [events]
 source = "journal"
@@ -172,8 +176,16 @@ executable_names = ["ahrb-mock-harness"]
 
 [resources]
 turn_timeout_ms = 10000
-idle_timeout_ms = 1000
+idle_timeout_ms = 2500
 max_output_bytes = 1048576
+retry_max_attempts = 3
+retry_base_delay_ms = 100
+retry_max_delay_ms = 200
+log_paths = []
+journal_paths = []
+
+[input]
+prompt_uses_stdin = true
 
 [hooks]
 acceptance = ["target/debug/ahrb-mock-harness", "hook", "--path", "{{profile}}/state/hooks.jsonl"]
@@ -186,6 +198,9 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["AHRB_MOCK_API_KEY"]
 max_bytes = 1048576
+
+[capture.truncation_marker]
+regex = 'TRUNCATED truncated=(?P<truncated>true) original=(?P<original_bytes>[0-9]+) payload=(?P<payload_bytes>[0-9]+) sha256=(?P<sha256>[0-9a-f]{64})'
 
 [capabilities.required]
 headless = "reference harness never reads interactive input"

@@ -111,6 +111,8 @@ fn diff_latest_reads_mixed_legacy_and_v2_index_lines() {
         profile: "quick".to_owned(),
         os: std::env::consts::OS.to_owned(),
         topology: "persistent-daemon".to_owned(),
+        resource_summary: ahrb::results::IndexedResourceSummary::default(),
+        metrics: std::collections::BTreeMap::new(),
         manifest_sha256: "manifest".to_owned(),
         workflow_sha256: "workflows".to_owned(),
         ahrb_revision: "revision".to_owned(),

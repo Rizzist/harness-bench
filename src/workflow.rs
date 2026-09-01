@@ -233,6 +233,16 @@ pub enum Fault {
         /// Exact response body.
         body: String,
     },
+    /// Return the same retryable HTTP status on every physical attempt.
+    ///
+    /// This is distinct from the v1 one-shot status fixture so row 58 can
+    /// prove exhaustion of a documented retry budget without changing row 11.
+    SustainedHttpStatus {
+        /// Retryable status code (429 or 500).
+        status: u16,
+        /// Exact response body.
+        body: String,
+    },
     /// Close after a deterministic byte prefix.
     MidStreamDisconnect {
         /// Number of body bytes emitted before close.
@@ -240,6 +250,13 @@ pub enum Fault {
     },
     /// Accept the request and emit no bytes until externally stopped.
     Stall,
+    /// Emit a fixed number of one-byte frames at an anchored cadence.
+    Trickle {
+        /// Milliseconds between scheduled one-byte frames.
+        cadence_ms: u64,
+        /// Number of one-byte frames to emit.
+        count: u32,
+    },
     /// Fragment a streaming response at exact byte offsets.
     Fragment {
         /// Strictly increasing byte offsets.
@@ -259,6 +276,9 @@ impl Fault {
             Self::HttpStatus { status, .. } if !(100..=599).contains(status) => {
                 Err(validation(format!("invalid HTTP fault status {status}")))
             }
+            Self::SustainedHttpStatus { status, .. } if !matches!(status, 429 | 500) => Err(
+                validation(format!("invalid sustained HTTP fault status {status}")),
+            ),
             Self::Fragment { boundaries } => {
                 let mut previous = 0;
                 for boundary in boundaries {
@@ -274,6 +294,9 @@ impl Fault {
             Self::RepeatFrame { copies } if *copies == 0 => {
                 Err(validation("repeat-frame copies must be nonzero"))
             }
+            Self::Trickle { cadence_ms, count } if *cadence_ms == 0 || *count == 0 => Err(
+                validation("trickle cadence-ms and count must both be nonzero"),
+            ),
             _ => Ok(()),
         }
     }
@@ -734,6 +757,68 @@ mod tests {
             marker.encode()
         );
         assert_eq!(RouteMarker::extract(&text)?, Some(marker));
+        Ok(())
+    }
+
+    #[test]
+    fn trickle_fault_round_trips_and_rejects_zero_parameters() -> Result<()> {
+        let fault = Fault::Trickle {
+            cadence_ms: 1_000,
+            count: 20,
+        };
+        let encoded = serde_json::to_value(&fault)?;
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "kind": "trickle",
+                "cadence_ms": 1_000,
+                "count": 20
+            })
+        );
+        assert_eq!(serde_json::from_value::<Fault>(encoded)?, fault);
+        fault.validate()?;
+        assert!(
+            Fault::Trickle {
+                cadence_ms: 0,
+                count: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Fault::Trickle {
+                cadence_ms: 1,
+                count: 0
+            }
+            .validate()
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sustained_http_status_fault_accepts_only_retryable_fixture_statuses() -> Result<()> {
+        for status in [429, 500] {
+            let fault = Fault::SustainedHttpStatus {
+                status,
+                body: "retry later".to_owned(),
+            };
+            let encoded = serde_json::to_value(&fault)?;
+            assert_eq!(
+                encoded.get("kind").and_then(Value::as_str),
+                Some("sustained-http-status")
+            );
+            assert_eq!(serde_json::from_value::<Fault>(encoded)?, fault);
+            fault.validate()?;
+        }
+        assert!(
+            Fault::SustainedHttpStatus {
+                status: 503,
+                body: "unavailable".to_owned(),
+            }
+            .validate()
+            .is_err()
+        );
         Ok(())
     }
 

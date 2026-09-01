@@ -452,7 +452,11 @@ pub fn certify(
                         TopologyFamily::PerInvocation
                     )
                 );
+            let shared_facet_rows_pass = facet.label != "native-delegation"
+                || result_for_row(results, 56)
+                    .is_some_and(|result| matches!(result.outcome, TestOutcome::Pass));
             topology_applies
+                && shared_facet_rows_pass
                 && result_for_row(results, facet.row)
                     .is_some_and(|result| matches!(result.outcome, TestOutcome::Pass))
                 && crate::scenarios::all()

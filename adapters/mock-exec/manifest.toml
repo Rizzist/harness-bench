@@ -37,14 +37,14 @@ persistent = false
 
 [transport]
 kind = "exec"
-command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
-timeout_ms = 10000
+command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+timeout_ms = 30000
 
 [sessions]
 create = []
 submit = []
 attach = []
-resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "1000", "--session-memory-mib", "4", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
 close_delete = []
 list = []
 id_pointer = "/session_id"
@@ -59,7 +59,11 @@ max_agents = 8
 fanout_mode = "client"
 release = ["target/debug/ahrb-mock-harness", "release-checkpoint", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}", "--release-token", "{{release_token}}"]
 
-[tools]
+[tools.aliases]
+large_output = "large_output"
+
+[tools.fixtures]
+large_output = ["target/debug/ahrb-fixture", "emit", "--bytes", "{{bytes}}"]
 
 [events]
 source = "journal-file"
@@ -125,8 +129,16 @@ executable_names = ["ahrb-mock-harness"]
 
 [resources]
 turn_timeout_ms = 10000
-idle_timeout_ms = 1000
+idle_timeout_ms = 2500
 max_output_bytes = 1048576
+retry_max_attempts = 3
+retry_base_delay_ms = 100
+retry_max_delay_ms = 200
+log_paths = []
+journal_paths = []
+
+[input]
+prompt_uses_stdin = false
 
 [hooks]
 [cleanup]
@@ -135,6 +147,9 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["AHRB_MOCK_API_KEY"]
 max_bytes = 1048576
+
+[capture.truncation_marker]
+regex = 'TRUNCATED truncated=(?P<truncated>true) original=(?P<original_bytes>[0-9]+) payload=(?P<payload_bytes>[0-9]+) sha256=(?P<sha256>[0-9a-f]{64})'
 
 [capabilities.required]
 headless = "fresh process with closed stdin"

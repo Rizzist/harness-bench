@@ -19,9 +19,11 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 #[cfg(unix)]
+use std::os::fd::{AsRawFd as _, RawFd};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -198,12 +200,40 @@ pub struct ModelRequestRecord {
     pub side_channel_kind: Option<String>,
     /// HTTP response status when known at the provider boundary.
     pub response_status: Option<u16>,
+    /// Monotonic boundary immediately before the provider returns response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers_ns: Option<u64>,
     /// Monotonic first response-frame yield boundary when observed.
     pub response_first_frame_yield_ns: Option<u64>,
     /// Monotonic last response-frame yield boundary when observed.
     pub response_last_frame_yield_ns: Option<u64>,
     /// Final physical-attempt total, repeated on every attempt record.
     pub semantic_attempts_total: u64,
+}
+
+/// One out-of-band fake-provider body-frame observation.
+///
+/// The scheduled boundary is anchored to the response-header boundary. The
+/// yielded boundary is captured immediately before returning the frame to
+/// Hyper; neither field claims kernel-write or peer-read timing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelFrameObservation {
+    /// Scenario route marker.
+    pub scenario: String,
+    /// Actor route marker.
+    pub actor: String,
+    /// Accepted checkpoint.
+    pub checkpoint: String,
+    /// One-based physical request attempt.
+    pub attempt: u64,
+    /// One-based frame ordinal within this response.
+    pub ordinal: u32,
+    /// Anchored monotonic scheduled boundary.
+    pub scheduled_ns: u64,
+    /// Monotonic `Body::poll_frame` yield boundary.
+    pub frame_yielded_ns: u64,
+    /// Payload bytes in this frame.
+    pub bytes: u64,
 }
 
 /// Complete row-42 aggregation and reference-envelope decision.
@@ -596,6 +626,8 @@ fn median_f64(values: &[f64]) -> f64 {
 
 type RequestRecordKey = (String, String, String, String, String);
 type SemanticRequestKey = (String, String, String, u64);
+type FrameBoundaryKey = (String, String, String, u64);
+type FrameBoundaryMap = BTreeMap<FrameBoundaryKey, (u64, u64)>;
 
 /// State for deterministic transition validation, barriers, and idempotent retries.
 #[derive(Debug)]
@@ -603,6 +635,8 @@ pub struct FakeModelEngine {
     machine: WorkflowMachine,
     barriers: BarrierCoordinator,
     requests: Mutex<BTreeMap<RequestRecordKey, Vec<ModelRequestRecord>>>,
+    frame_observations: Arc<StdMutex<Vec<ModelFrameObservation>>>,
+    frame_boundaries: Arc<StdMutex<FrameBoundaryMap>>,
     attempt_sequences: Mutex<BTreeMap<SemanticRequestKey, u64>>,
     request_role_rules: Vec<RequestRoleRule>,
     semantic_ordinals: BTreeMap<(String, String, String), u64>,
@@ -648,6 +682,8 @@ impl FakeModelEngine {
             machine: WorkflowMachine::new(workflow)?,
             barriers: BarrierCoordinator::new(workflow)?,
             requests: Mutex::new(BTreeMap::new()),
+            frame_observations: Arc::new(StdMutex::new(Vec::new())),
+            frame_boundaries: Arc::new(StdMutex::new(BTreeMap::new())),
             attempt_sequences: Mutex::new(BTreeMap::new()),
             request_role_rules,
             semantic_ordinals,
@@ -714,6 +750,7 @@ impl FakeModelEngine {
                 role: "unclassified".to_owned(),
                 side_channel_kind: Some("unknown-side-channel".to_owned()),
                 response_status: None,
+                response_headers_ns: None,
                 response_first_frame_yield_ns: None,
                 response_last_frame_yield_ns: None,
                 semantic_attempts_total: attempt,
@@ -792,6 +829,11 @@ impl FakeModelEngine {
     /// Return deterministic request evidence sorted independently of arrival order.
     pub async fn request_records(&self) -> Vec<ModelRequestRecord> {
         let records = self.requests.lock().await;
+        let frame_boundaries = self
+            .frame_boundaries
+            .lock()
+            .map(|boundaries| boundaries.clone())
+            .unwrap_or_default();
         let mut output = Vec::new();
         for attempts in records.values() {
             for record in attempts {
@@ -831,6 +873,15 @@ impl FakeModelEngine {
             },
         );
         for record in &mut output {
+            if let Some((first, last)) = frame_boundaries.get(&(
+                record.request.scenario.clone(),
+                record.request.actor.clone(),
+                record.request.checkpoint.clone(),
+                record.attempt,
+            )) {
+                record.response_first_frame_yield_ns = Some(*first);
+                record.response_last_frame_yield_ns = Some(*last);
+            }
             let key = (
                 record.request.scenario.clone(),
                 record.request.actor.clone(),
@@ -842,6 +893,46 @@ impl FakeModelEngine {
             record.semantic_attempts_total = total;
         }
         output
+    }
+
+    /// Return a stable snapshot of out-of-band provider frame-yield evidence.
+    ///
+    /// The synchronous lock is held only while cloning the short observation
+    /// vector. This permits `Body::poll_frame` to record a boundary without
+    /// blocking on an async task or instrumenting the harness data path.
+    pub fn frame_observations(&self) -> Result<Vec<ModelFrameObservation>> {
+        let observations = self.frame_observations.lock().map_err(|_| {
+            AhrbError::Protocol("fake-model frame observation lock was poisoned".to_owned())
+        })?;
+        let mut output = observations.clone();
+        output.sort_by(|left, right| {
+            (
+                &left.scenario,
+                &left.actor,
+                &left.checkpoint,
+                left.attempt,
+                left.ordinal,
+            )
+                .cmp(&(
+                    &right.scenario,
+                    &right.actor,
+                    &right.checkpoint,
+                    right.attempt,
+                    right.ordinal,
+                ))
+        });
+        Ok(output)
+    }
+
+    fn frame_observation_sink(&self, response: &ModelResponse) -> FrameObservationSink {
+        FrameObservationSink {
+            observations: Arc::clone(&self.frame_observations),
+            boundaries: Arc::clone(&self.frame_boundaries),
+            scenario: response.scenario.clone(),
+            actor: response.actor.clone(),
+            checkpoint: response.checkpoint.clone(),
+            attempt: response.attempt,
+        }
     }
 
     async fn mark_request_accepted(
@@ -894,7 +985,8 @@ impl FakeModelEngine {
         Ok(None)
     }
 
-    async fn mark_response_status(&self, response: &ModelResponse, status: u16) -> Result<()> {
+    async fn mark_response_status(&self, response: &ModelResponse, status: u16) -> Result<u64> {
+        let headers_ns = monotonic_timestamp_ns();
         let key = (
             response.scenario.clone(),
             response.actor.clone(),
@@ -913,7 +1005,8 @@ impl FakeModelEngine {
             ));
         };
         record.response_status = Some(status);
-        Ok(())
+        record.response_headers_ns = Some(headers_ns);
+        Ok(headers_ns)
     }
 
     async fn mark_response_frame_yield(
@@ -1461,6 +1554,76 @@ pub struct FakeModelUnixServer {
     engine: Arc<FakeModelEngine>,
 }
 
+/// One preconnected HTTP/1 fake-provider transport for hosts that deny bind(2).
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct FakeModelPreconnectedServer {
+    peer: std::os::unix::net::UnixStream,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<()>>,
+}
+
+#[cfg(unix)]
+impl FakeModelPreconnectedServer {
+    /// Create a connected Unix stream pair, serving Hyper on the runner-owned end.
+    pub fn pair(engine: Arc<FakeModelEngine>) -> Result<Self> {
+        let (provider, peer) = std::os::unix::net::UnixStream::pair()?;
+        provider.set_nonblocking(true)?;
+        clear_close_on_exec(peer.as_raw_fd())?;
+        let provider = tokio::net::UnixStream::from_std(provider)?;
+        let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let service = service_fn(move |request| serve_request(request, Arc::clone(&engine)));
+            let connection =
+                http1::Builder::new().serve_connection(TokioIo::new(provider), service);
+            tokio::pin!(connection);
+            tokio::select! {
+                result = &mut connection => {
+                    if result.is_err() {
+                        // Scripted disconnect faults intentionally end a connection.
+                    }
+                }
+                _ = &mut shutdown_receiver => {}
+            }
+            Ok(())
+        });
+        Ok(Self {
+            peer,
+            shutdown: Some(shutdown_sender),
+            task,
+        })
+    }
+
+    /// Inheritable connected peer descriptor passed only to the reference mocks.
+    pub fn peer_fd(&self) -> RawFd {
+        self.peer.as_raw_fd()
+    }
+
+    /// Stop the one-connection provider task.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(sender) = self.shutdown.take() {
+            let _sent = sender.send(());
+        }
+        self.task.await.map_err(|error| {
+            AhrbError::Protocol(format!("preconnected fake-model task: {error}"))
+        })?
+    }
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(fd: RawFd) -> Result<()> {
+    // SAFETY: fd is owned by `peer` and F_GETFD does not mutate memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd remains owned and valid; F_SETFD updates only descriptor flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 /// Atomic raw HTTP envelope used when the host denies socket creation.
 ///
 /// This is an actual provider transport, not telemetry: the harness receives no model
@@ -1618,11 +1781,18 @@ async fn handle_provider_mailbox_request(
         .handle_observed(parsed, body_bytes, received_ns)
         .await?;
     let (status, body) = match &selected.fault {
-        Some(Fault::HttpStatus { status, body }) => (*status, body.as_bytes().to_vec()),
+        Some(Fault::HttpStatus { status, body } | Fault::SustainedHttpStatus { status, body }) => {
+            (*status, body.as_bytes().to_vec())
+        }
         Some(Fault::Stall) => std::future::pending::<(u16, Vec<u8>)>().await,
         Some(Fault::MidStreamDisconnect { .. }) => {
             return Err(AhrbError::Protocol(
                 "provider mailbox injected a mid-stream disconnect".to_owned(),
+            ));
+        }
+        Some(Fault::Trickle { .. }) => {
+            return Err(AhrbError::Protocol(
+                "provider mailbox cannot represent timed trickle frames".to_owned(),
             ));
         }
         None | Some(Fault::Fragment { .. }) | Some(Fault::RepeatFrame { .. }) => {
@@ -1630,7 +1800,7 @@ async fn handle_provider_mailbox_request(
             (rendered.status, rendered.body)
         }
     };
-    engine.mark_response_status(&selected, status).await?;
+    let _headers_ns = engine.mark_response_status(&selected, status).await?;
     engine
         .mark_response_frame_yield(&selected, monotonic_timestamp_ns())
         .await?;
@@ -1833,8 +2003,10 @@ async fn handle_http(
     let selected = engine
         .handle_observed(parsed, body_bytes, received_ns)
         .await?;
-    if let Some(Fault::HttpStatus { status, body }) = &selected.fault {
-        engine.mark_response_status(&selected, *status).await?;
+    if let Some(Fault::HttpStatus { status, body } | Fault::SustainedHttpStatus { status, body }) =
+        &selected.fault
+    {
+        let _headers_ns = engine.mark_response_status(&selected, *status).await?;
         return response_from_parts(
             *status,
             &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
@@ -1842,12 +2014,28 @@ async fn handle_http(
         );
     }
 
-    let rendered = frontend.render(&selected)?;
-    engine
+    let mut rendered = frontend.render(&selected)?;
+    if let Some(Fault::Trickle { count, .. }) = selected.fault.as_ref() {
+        rendered.body = trickle_success_body(*count)?;
+    }
+    let headers_ns = engine
         .mark_response_status(&selected, rendered.status)
         .await?;
-    let response_body = DeterministicBody::from_fault(rendered.body, selected.fault.as_ref())?;
+    let observation_sink = engine.frame_observation_sink(&selected);
+    let response_body = DeterministicBody::from_fault(
+        rendered.body,
+        selected.fault.as_ref(),
+        Some(observation_sink),
+        Some(headers_ns),
+    )?;
     response_from_parts(rendered.status, &rendered.headers, response_body)
+}
+
+fn trickle_success_body(count: u32) -> Result<Vec<u8>> {
+    const MARKER: &[u8] = b"AHRB-TRICKLE-SUCCESS";
+    let count = usize::try_from(count)
+        .map_err(|_| AhrbError::Protocol("trickle count does not fit usize".to_owned()))?;
+    Ok(MARKER.iter().copied().cycle().take(count).collect())
 }
 
 async fn collect_bounded(mut body: Incoming) -> Result<Vec<u8>> {
@@ -2870,9 +3058,10 @@ enum BodyState {
         emitted_error: bool,
     },
     Stall,
+    Trickle(TrickleBodyState),
 }
 
-/// HTTP body supporting deterministic fragmentation, disconnect, repetition, and stall.
+/// HTTP body supporting deterministic fragmentation, disconnect, repetition, stall, and trickle.
 #[derive(Debug)]
 struct DeterministicBody {
     state: BodyState,
@@ -2885,12 +3074,57 @@ impl DeterministicBody {
         }
     }
 
-    fn from_fault(bytes: Vec<u8>, fault: Option<&Fault>) -> Result<Self> {
+    fn from_fault(
+        bytes: Vec<u8>,
+        fault: Option<&Fault>,
+        observation_sink: Option<FrameObservationSink>,
+        response_headers_ns: Option<u64>,
+    ) -> Result<Self> {
         match fault {
-            None | Some(Fault::HttpStatus { .. }) => Ok(Self::full(Bytes::from(bytes))),
+            None | Some(Fault::HttpStatus { .. }) | Some(Fault::SustainedHttpStatus { .. }) => {
+                Ok(Self::full(Bytes::from(bytes)))
+            }
             Some(Fault::Stall) => Ok(Self {
                 state: BodyState::Stall,
             }),
+            Some(Fault::Trickle { cadence_ms, count }) => {
+                if *cadence_ms == 0 || *count == 0 {
+                    return Err(AhrbError::Protocol(
+                        "trickle cadence-ms and count must both be nonzero".to_owned(),
+                    ));
+                }
+                let count_usize = usize::try_from(*count).map_err(|_| {
+                    AhrbError::Protocol("trickle count does not fit usize".to_owned())
+                })?;
+                if count_usize != bytes.len() {
+                    return Err(AhrbError::Protocol(format!(
+                        "trickle response length {} does not equal declared frame count {count}",
+                        bytes.len()
+                    )));
+                }
+                let observation_sink = observation_sink.ok_or_else(|| {
+                    AhrbError::Protocol("trickle body lacks frame observation sink".to_owned())
+                })?;
+                let origin_instant = response_headers_ns.map(|headers_ns| {
+                    let observed_after_headers_ns = monotonic_timestamp_ns();
+                    let elapsed =
+                        Duration::from_nanos(observed_after_headers_ns.saturating_sub(headers_ns));
+                    let now = tokio::time::Instant::now();
+                    now.checked_sub(elapsed).unwrap_or(now)
+                });
+                Ok(Self {
+                    state: BodyState::Trickle(TrickleBodyState {
+                        payload: Bytes::from(bytes),
+                        cadence_ms: *cadence_ms,
+                        count: *count,
+                        next_ordinal: 1,
+                        origin_instant,
+                        origin_ns: response_headers_ns,
+                        sleep: None,
+                        observation_sink,
+                    }),
+                })
+            }
             Some(Fault::MidStreamDisconnect { after_bytes }) => {
                 if *after_bytes > bytes.len() {
                     return Err(AhrbError::Protocol(format!(
@@ -2946,7 +3180,7 @@ impl Body for DeterministicBody {
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
+        context: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
         match &mut self.state {
             BodyState::Frames(frames) => {
@@ -2969,6 +3203,7 @@ impl Body for DeterministicBody {
                 Poll::Ready(None)
             }
             BodyState::Stall => Poll::Pending,
+            BodyState::Trickle(trickle) => trickle.poll_frame(context),
         }
     }
 
@@ -2981,6 +3216,7 @@ impl Body for DeterministicBody {
                     emitted_error: true
                 }
             )
+            || matches!(&self.state, BodyState::Trickle(trickle) if trickle.is_end_stream())
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -2990,8 +3226,177 @@ impl Body for DeterministicBody {
                 .iter()
                 .fold(0_u64, |sum, frame| sum.saturating_add(frame.len() as u64));
             hint.set_exact(total);
+        } else if let BodyState::Trickle(trickle) = &self.state {
+            hint.set_exact(trickle.remaining_bytes());
         }
         hint
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FrameObservationSink {
+    observations: Arc<StdMutex<Vec<ModelFrameObservation>>>,
+    boundaries: Arc<StdMutex<FrameBoundaryMap>>,
+    scenario: String,
+    actor: String,
+    checkpoint: String,
+    attempt: u64,
+}
+
+impl FrameObservationSink {
+    fn record(
+        &self,
+        ordinal: u32,
+        scheduled_ns: u64,
+        frame_yielded_ns: u64,
+        bytes: u64,
+    ) -> std::io::Result<()> {
+        let mut observations = self
+            .observations
+            .lock()
+            .map_err(|_| std::io::Error::other("fake-model frame observation lock was poisoned"))?;
+        observations.push(ModelFrameObservation {
+            scenario: self.scenario.clone(),
+            actor: self.actor.clone(),
+            checkpoint: self.checkpoint.clone(),
+            attempt: self.attempt,
+            ordinal,
+            scheduled_ns,
+            frame_yielded_ns,
+            bytes,
+        });
+        drop(observations);
+        let key = (
+            self.scenario.clone(),
+            self.actor.clone(),
+            self.checkpoint.clone(),
+            self.attempt,
+        );
+        let mut boundaries = self
+            .boundaries
+            .lock()
+            .map_err(|_| std::io::Error::other("fake-model frame boundary lock was poisoned"))?;
+        boundaries
+            .entry(key)
+            .and_modify(|boundary| boundary.1 = frame_yielded_ns)
+            .or_insert((frame_yielded_ns, frame_yielded_ns));
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct TrickleBodyState {
+    payload: Bytes,
+    cadence_ms: u64,
+    count: u32,
+    next_ordinal: u64,
+    origin_instant: Option<tokio::time::Instant>,
+    origin_ns: Option<u64>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    observation_sink: FrameObservationSink,
+}
+
+impl TrickleBodyState {
+    fn poll_frame(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, std::io::Error>>> {
+        if self.next_ordinal > u64::from(self.count) {
+            return Poll::Ready(None);
+        }
+        if self.origin_instant.is_none() {
+            self.origin_ns = Some(monotonic_timestamp_ns());
+            self.origin_instant = Some(tokio::time::Instant::now());
+        }
+        if self.sleep.is_none() {
+            let deadline = match self.scheduled_instant(self.next_ordinal) {
+                Ok(deadline) => deadline,
+                Err(error) => return Poll::Ready(Some(Err(error))),
+            };
+            self.sleep = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        }
+        let Some(sleep) = self.sleep.as_mut() else {
+            return Poll::Ready(Some(Err(std::io::Error::other(
+                "trickle timer disappeared before polling",
+            ))));
+        };
+        if sleep.as_mut().poll(context).is_pending() {
+            return Poll::Pending;
+        }
+
+        let ordinal_u64 = self.next_ordinal;
+        let ordinal = match u32::try_from(ordinal_u64) {
+            Ok(ordinal) => ordinal,
+            Err(_) => {
+                return Poll::Ready(Some(Err(std::io::Error::other(
+                    "trickle ordinal does not fit u32",
+                ))));
+            }
+        };
+        let scheduled_ns = match self.scheduled_ns(ordinal_u64) {
+            Ok(scheduled_ns) => scheduled_ns,
+            Err(error) => return Poll::Ready(Some(Err(error))),
+        };
+        let index = match usize::try_from(ordinal_u64.saturating_sub(1)) {
+            Ok(index) => index,
+            Err(_) => {
+                return Poll::Ready(Some(Err(std::io::Error::other(
+                    "trickle ordinal does not fit usize",
+                ))));
+            }
+        };
+        let Some(byte) = self.payload.get(index).copied() else {
+            return Poll::Ready(Some(Err(std::io::Error::other(
+                "trickle payload ended before its declared count",
+            ))));
+        };
+        let frame_yielded_ns = monotonic_timestamp_ns();
+        if let Err(error) = self
+            .observation_sink
+            .record(ordinal, scheduled_ns, frame_yielded_ns, 1)
+        {
+            return Poll::Ready(Some(Err(error)));
+        }
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        self.sleep = None;
+        Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(&[byte])))))
+    }
+
+    fn scheduled_instant(&self, ordinal: u64) -> std::io::Result<tokio::time::Instant> {
+        let origin = self
+            .origin_instant
+            .ok_or_else(|| std::io::Error::other("trickle timer lacks its monotonic origin"))?;
+        let offset_ms = self
+            .cadence_ms
+            .checked_mul(ordinal)
+            .ok_or_else(|| std::io::Error::other("trickle timer offset overflow"))?;
+        origin
+            .checked_add(Duration::from_millis(offset_ms))
+            .ok_or_else(|| std::io::Error::other("trickle timer deadline overflow"))
+    }
+
+    fn scheduled_ns(&self, ordinal: u64) -> std::io::Result<u64> {
+        let origin_ns = self
+            .origin_ns
+            .ok_or_else(|| std::io::Error::other("trickle evidence lacks its monotonic origin"))?;
+        let offset_ns = self
+            .cadence_ms
+            .checked_mul(ordinal)
+            .and_then(|millis| millis.checked_mul(1_000_000))
+            .ok_or_else(|| std::io::Error::other("trickle evidence offset overflow"))?;
+        origin_ns
+            .checked_add(offset_ns)
+            .ok_or_else(|| std::io::Error::other("trickle scheduled boundary overflow"))
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        u64::from(self.count)
+            .saturating_add(1)
+            .saturating_sub(self.next_ordinal)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.next_ordinal > u64::from(self.count)
     }
 }
 
@@ -3082,6 +3487,96 @@ mod tests {
             retry: false,
             stream: true,
         }
+    }
+
+    #[tokio::test]
+    async fn trickle_body_wakes_on_anchored_schedule_and_records_each_frame_once() -> Result<()> {
+        use http_body_util::BodyExt as _;
+
+        let mut workflow = simple_workflow();
+        workflow.responses[0].fault = Some(Fault::Trickle {
+            cadence_ms: 10,
+            count: 3,
+        });
+        let engine = FakeModelEngine::new(&workflow)?;
+        let frontend = OpenAiChatFrontend;
+        let request = frontend.parse(frontend.path(), &BTreeMap::new(), &request_body())?;
+        let response = engine.handle(request).await?;
+        let response_headers_ns = monotonic_timestamp_ns();
+        let mut body = DeterministicBody::from_fault(
+            b"abc".to_vec(),
+            response.fault.as_ref(),
+            Some(engine.frame_observation_sink(&response)),
+            Some(response_headers_ns),
+        )?;
+        assert_eq!(body.size_hint().exact(), Some(3));
+
+        let mut yielded = Vec::new();
+        for expected in b"abc" {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .map_err(|_| AhrbError::Timeout("test trickle frame wake".to_owned()))?
+                .ok_or_else(|| {
+                    AhrbError::Protocol("test trickle ended before declared count".to_owned())
+                })??;
+            let data = frame.into_data().map_err(|_| {
+                AhrbError::Protocol("test trickle yielded a non-data frame".to_owned())
+            })?;
+            assert_eq!(data.as_ref(), &[*expected]);
+            yielded.push(data);
+            if yielded.len() == 1 {
+                // A delayed consumer must not shift later scheduled boundaries.
+                tokio::time::sleep(Duration::from_millis(35)).await;
+            }
+        }
+        assert!(body.frame().await.is_none());
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
+
+        let observations = engine.frame_observations()?;
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(observations.iter().all(|observation| {
+            observation.scenario == "routing"
+                && observation.actor == "root"
+                && observation.checkpoint == "start"
+                && observation.attempt == 1
+                && observation.bytes == 1
+                && observation.frame_yielded_ns >= observation.scheduled_ns
+        }));
+        assert_eq!(
+            observations[0].scheduled_ns,
+            response_headers_ns.saturating_add(10_000_000)
+        );
+        let records = engine.request_records().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].response_first_frame_yield_ns,
+            Some(observations[0].frame_yielded_ns)
+        );
+        assert_eq!(
+            records[0].response_last_frame_yield_ns,
+            Some(observations[2].frame_yielded_ns)
+        );
+        assert_eq!(
+            observations[1]
+                .scheduled_ns
+                .saturating_sub(observations[0].scheduled_ns),
+            10_000_000
+        );
+        assert_eq!(
+            observations[2]
+                .scheduled_ns
+                .saturating_sub(observations[1].scheduled_ns),
+            10_000_000
+        );
+        Ok(())
     }
 
     fn sse_json_frames(body: &[u8]) -> Result<Vec<(Option<String>, Value)>> {
@@ -4007,6 +4502,7 @@ mod tests {
             role: role.to_owned(),
             side_channel_kind: side_kind.map(str::to_owned),
             response_status: Some(200),
+            response_headers_ns: Some(turn as u64),
             response_first_frame_yield_ns: None,
             response_last_frame_yield_ns: None,
             semantic_attempts_total: 1,

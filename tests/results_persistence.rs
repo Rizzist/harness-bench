@@ -54,6 +54,8 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
         "profile",
         "os",
         "topology",
+        "resource_summary",
+        "metrics",
         "manifest_sha256",
         "workflow_sha256",
         "ahrb_revision",

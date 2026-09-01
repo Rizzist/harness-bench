@@ -31,6 +31,11 @@ fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, Str
         .arg(output)
         .arg("--profile")
         .arg("quick")
+        // Keep this regression test scoped to the pre-Wave-2 matrix. Wave-2
+        // rows have focused evidence tests, and row 62 may correctly be an
+        // infrastructure ERROR when no reviewed OS egress guard is available.
+        .arg("--tests")
+        .arg("1-46,63-64")
         .arg("--junit")
         .output()
         .expect("execute AHRB against the per-invocation reference harness");

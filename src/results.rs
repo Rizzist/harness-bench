@@ -62,6 +62,42 @@ pub struct IndexedResourceSummary {
     pub wall_per_turn_ms: f64,
     /// Membership sampler CPU percentage.
     pub sampler_overhead_pct: f64,
+    /// Row-47 disk-write p50 in bytes per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_turn_p50: Option<f64>,
+    /// Row-47 disk-write p95 in bytes per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_turn_p95: Option<f64>,
+    /// Row-47 global maximum bytes written by one turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_turn_max: Option<f64>,
+    /// Row-47 median journal growth in bytes per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_journal_growth_bytes_per_turn: Option<f64>,
+    /// Row-47 nullable declared-log growth in bytes per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_growth_bytes_per_turn: Option<f64>,
+    /// Row-47 Theil-Sen disk-write growth slope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_write_growth_slope_bytes_per_turn2: Option<f64>,
+    /// Row-47 live/retired accounting completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_io_counter_complete: Option<bool>,
+    /// Row-47 unbounded-growth decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded_disk_growth: Option<bool>,
+    /// Row-48 median owned-tree CPU during model wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_wait_cpu_p50_ms: Option<f64>,
+    /// Row-48 median response-header through final-frame wall time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_wait_wall_p50_ms: Option<f64>,
+    /// Row-48 maximum CPU/wall ratio against one core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_wait_cpu_one_core_max_ratio: Option<f64>,
+    /// Row-60 maximum effective-memory delta above the topology baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_tool_output_peak_rss_delta_mib: Option<f64>,
 }
 
 /// One line in `results/index.jsonl`.
@@ -89,6 +125,12 @@ pub struct IndexEntry {
     pub os: String,
     /// Process-topology guard used by resource comparisons.
     pub topology: String,
+    /// Compact resource metrics copied from the immutable report.
+    #[serde(default)]
+    pub resource_summary: IndexedResourceSummary,
+    /// Exact row metric names copied from the immutable report for history queries.
+    #[serde(default)]
+    pub metrics: BTreeMap<String, f64>,
     /// Canonical manifest SHA-256.
     pub manifest_sha256: String,
     /// Canonical workflow-set SHA-256.
@@ -277,6 +319,33 @@ fn index_entry(
             .map(|badge| badge.os.clone())
             .unwrap_or_else(|| std::env::consts::OS.to_owned()),
         topology: report.resource_summary.topology.clone(),
+        resource_summary: IndexedResourceSummary {
+            peak_rss_mib: report.resource_summary.peak_rss_mib,
+            cpu_per_turn_ms: report.resource_summary.cpu_per_turn_ms,
+            wall_per_turn_ms: report.resource_summary.wall_per_turn_ms,
+            sampler_overhead_pct: report.resource_summary.sampler_overhead_pct,
+            disk_write_bytes_per_turn_p50: report.resource_summary.disk_write_bytes_per_turn_p50,
+            disk_write_bytes_per_turn_p95: report.resource_summary.disk_write_bytes_per_turn_p95,
+            disk_write_bytes_per_turn_max: report.resource_summary.disk_write_bytes_per_turn_max,
+            session_journal_growth_bytes_per_turn: report
+                .resource_summary
+                .session_journal_growth_bytes_per_turn,
+            log_growth_bytes_per_turn: report.resource_summary.log_growth_bytes_per_turn,
+            disk_write_growth_slope_bytes_per_turn2: report
+                .resource_summary
+                .disk_write_growth_slope_bytes_per_turn2,
+            disk_io_counter_complete: report.resource_summary.disk_io_counter_complete,
+            unbounded_disk_growth: report.resource_summary.unbounded_disk_growth,
+            model_wait_cpu_p50_ms: report.resource_summary.model_wait_cpu_p50_ms,
+            model_wait_wall_p50_ms: report.resource_summary.model_wait_wall_p50_ms,
+            model_wait_cpu_one_core_max_ratio: report
+                .resource_summary
+                .model_wait_cpu_one_core_max_ratio,
+            large_tool_output_peak_rss_delta_mib: report
+                .resource_summary
+                .large_tool_output_peak_rss_delta_mib,
+        },
+        metrics: report.metrics.clone(),
         manifest_sha256: report.fingerprint.manifest.clone(),
         workflow_sha256: report.fingerprint.workflows.clone(),
         ahrb_revision: report.fingerprint.ahrb_revision.clone(),
@@ -544,6 +613,8 @@ fn normalize_legacy_index(
         profile: legacy.profile,
         os,
         topology,
+        resource_summary: IndexedResourceSummary::default(),
+        metrics: BTreeMap::new(),
         manifest_sha256: legacy.manifest_hash,
         workflow_sha256: "legacy-unavailable".to_owned(),
         ahrb_revision: legacy.ahrb_revision,
@@ -562,6 +633,7 @@ fn normalize_legacy_index(
         entry
             .workflow_sha256
             .clone_from(&report.fingerprint.workflows);
+        entry.metrics.clone_from(&report.metrics);
         entry
             .ahrb_revision
             .clone_from(&report.fingerprint.ahrb_revision);
