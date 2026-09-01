@@ -887,6 +887,9 @@ pub fn evaluate_per_invocation_resources(
         .as_ref()
         .and_then(|value| value.scaling_exponent_alpha)
         .unwrap_or(f64::INFINITY);
+    let alpha_flat = sweep_metrics
+        .as_ref()
+        .is_some_and(|value| value.scaling_curve_within_noise_floor);
     let maximum_width = timing.sweep_widths.last().copied().unwrap_or(0);
     rows.push(classify(
         26,
@@ -916,8 +919,12 @@ pub fn evaluate_per_invocation_resources(
         Some(true),
         &[check(
             "process-scaling-alpha",
-            alpha <= envelope.maximum_scaling_exponent,
-            format!("alpha={alpha:.6}"),
+            alpha_flat || alpha <= envelope.maximum_scaling_exponent,
+            if alpha_flat {
+                "alpha=n/a: every width added <4 MiB (flat within sampling noise)".to_owned()
+            } else {
+                format!("alpha={alpha:.6}")
+            },
         )],
         incomplete.or(sweep_error),
     ));
@@ -1928,19 +1935,31 @@ impl<'a> Analysis<'a> {
         );
 
         let alpha = metrics.scaling_exponent_alpha;
+        let alpha_flat = metrics.scaling_curve_within_noise_floor;
         let marginal_curve_ok = adjacent_marginals_stable(&metrics);
         self.insert_checks(
             27,
             vec![
                 check(
                     "scaling-alpha",
-                    alpha.is_some_and(|value| value <= self.envelope.maximum_scaling_exponent),
-                    format!("alpha={alpha:?}"),
+                    alpha_flat
+                        || alpha
+                            .is_some_and(|value| value <= self.envelope.maximum_scaling_exponent),
+                    if alpha_flat {
+                        "alpha=n/a: every width added <4 MiB (flat within sampling noise)"
+                            .to_owned()
+                    } else {
+                        format!("alpha={alpha:?}")
+                    },
                 ),
                 check(
                     "adjacent-marginals",
-                    marginal_curve_ok,
-                    "no adjacent marginal exceeds twice the preceding median".to_owned(),
+                    alpha_flat || marginal_curve_ok,
+                    if alpha_flat {
+                        "n/a: marginals are below the 4 MiB noise floor (flat curve)".to_owned()
+                    } else {
+                        "no adjacent marginal exceeds twice the preceding median".to_owned()
+                    },
                 ),
             ],
         );
@@ -2425,11 +2444,17 @@ impl<'a> Analysis<'a> {
             .iter()
             .filter_map(|metrics| metrics.headline_beta_mib_per_agent)
             .collect();
-        let alpha: Vec<f64> = repetitions
+        // Repetitions whose curve is flat within the noise floor carry no
+        // exponent by design; only fitted repetitions must all report one.
+        let fitted: Vec<_> = repetitions
+            .iter()
+            .filter(|metrics| !metrics.scaling_curve_within_noise_floor)
+            .collect();
+        let alpha: Vec<f64> = fitted
             .iter()
             .filter_map(|metrics| metrics.scaling_exponent_alpha)
             .collect();
-        if alpha.len() != repetitions.len() {
+        if alpha.len() != fitted.len() {
             return Err(AhrbError::Validation(
                 "scaling alpha requires a strictly positive active delta at every width and repetition"
                     .to_owned(),
@@ -2445,7 +2470,9 @@ impl<'a> Analysis<'a> {
             .collect();
         record_distribution(&mut self.metrics, "parallel_beta_bytes_per_agent", &beta);
         record_distribution(&mut self.metrics, "parallel_beta_mib_per_agent", &beta_mib);
-        record_distribution(&mut self.metrics, "parallel_scaling_exponent", &alpha);
+        if !alpha.is_empty() {
+            record_distribution(&mut self.metrics, "parallel_scaling_exponent", &alpha);
+        }
         record_distribution(&mut self.metrics, "maximum_cold_peak_bytes", &cold_peaks);
         record_distribution(
             &mut self.metrics,

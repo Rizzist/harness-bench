@@ -51,9 +51,15 @@ HAIDER_RUN_DAEMON_IDLE_TTL_MS = "600000"
 persistent = true
 start = ["haider", "status", "--json"]
 launcher_exits = true
+# The bench account MUST carry a stored credential: a custom endpoint with no
+# active credential is auto-hermetic by contract (client-contract-v1.md §20,
+# verified on 0.0.967: fs_write is redirected to ~/.haider/lockdown/<hash>/ and
+# process_exec is never offered; explicit `provider set --full` cannot lift it).
+# `--api-key-env` keeps the credential out of argv; the fake model's own
+# credential env is what the harness would send anyway.
 initialize = [
   "haider", "account", "add", "ahrb",
-  "--base-url", "{{base_url}}", "--no-auth", "--api-family", "openai",
+  "--base-url", "{{base_url}}", "--api-key-env", "OPENAI_API_KEY", "--api-family", "openai",
   "--response-open-timeout", "2s", "--chunk-idle-timeout", "2s",
   "--semantic-progress-timeout", "2s", "--json"
 ]
@@ -104,11 +110,14 @@ max_agents = 32
 fanout_mode = "thin-client-session-fanout"
 
 [tools.aliases]
-write = "process_exec"
-read = "process_exec"
-fail = "process_exec"
+write = ["process_exec", "fs_write"]
+read = ["process_exec", "fs_read"]
+fail = ["process_exec", "fs_read"]
 
 [tools.bindings]
+"fs_write.path" = "path"
+"fs_write.content" = "content"
+"fs_read.path" = "path"
 "process_exec.command" = "command"
 
 [tools.fixtures]
@@ -147,9 +156,13 @@ match_fields = { "/payload/state" = "thinking" }
 event = "model-request"
 payload_pointer = "/payload"
 
+# The tool call is mapped from the `started` item (status=in_progress, carries
+# call_id/name/args): verified on 0.0.967 the daemon journals `tool_result`
+# BEFORE the `completed` tool_call item, so mapping the completed item would
+# invert call/result order.
 [[events.rules]]
 matches = "item"
-match_fields = { "/payload/event" = "completed", "/payload/item/item" = "tool_call" }
+match_fields = { "/payload/event" = "started", "/payload/item/item" = "tool_call" }
 event = "tool-call"
 payload_pointer = "/payload/item"
 payload_bindings = { call_id = "/payload/item/call_id", name = "/payload/item/name", arguments = "/payload/item/args" }
@@ -171,40 +184,30 @@ matches = "agent_message"
 event = "model-response"
 payload_pointer = "/payload"
 
+# Terminals are keyed on the DURABLE `state` field. Verified on 0.0.967 ground
+# truth: the live carrier enriches the terminal run_state with `terminal_kind`
+# and `error_code`, but `run --replay` reproduces only `{"state": ...}`, so rules
+# keyed on terminal_kind make replay one event shorter than the live stream.
+# Durable states: done | errored | cancelled (a wall-clock timeout is journaled
+# as `cancelled`; the timeout distinction exists only on the live carrier).
+# `run_failed` is the human-facing error detail, not the typed terminal
+# (replay integrity asserts exactly one typed terminal), so it is left unmapped.
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/terminal_kind" = "success" }
+match_fields = { "/payload/state" = "done" }
 event = "terminal-success"
 payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/terminal_kind" = "failure" }
+match_fields = { "/payload/state" = "errored" }
 event = "terminal-failure"
 payload_pointer = "/payload"
 
 [[events.rules]]
 matches = "run_state"
-match_fields = { "/payload/terminal_kind" = "provider_error" }
-event = "terminal-failure"
-payload_pointer = "/payload"
-
-[[events.rules]]
-matches = "run_state"
-match_fields = { "/payload/terminal_kind" = "budget" }
-event = "terminal-failure"
-payload_pointer = "/payload"
-
-[[events.rules]]
-matches = "run_state"
-match_fields = { "/payload/terminal_kind" = "cancellation" }
+match_fields = { "/payload/state" = "cancelled" }
 event = "terminal-cancelled"
-payload_pointer = "/payload"
-
-[[events.rules]]
-matches = "run_state"
-match_fields = { "/payload/terminal_kind" = "timeout" }
-event = "terminal-timeout"
 payload_pointer = "/payload"
 
 [exit]

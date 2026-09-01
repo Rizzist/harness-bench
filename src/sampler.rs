@@ -493,6 +493,14 @@ pub struct PointMetrics {
     pub reclaim_ratio: f64,
 }
 
+/// Active delta below which a sweep width carries no fittable scaling signal.
+///
+/// A log-log exponent over deltas of a few hundred KiB is dominated by the
+/// baseline's own jitter (observed: a ~10 MiB daemon whose per-width baseline
+/// moved by more than its N=1 delta), so widths under this floor are reported
+/// as flat rather than fitted.
+pub const SCALING_NOISE_FLOOR_BYTES: u64 = 4 * 1_048_576;
+
 /// Parallel-agent scaling and reclaim metrics for a complete sweep.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SweepMetrics {
@@ -502,8 +510,13 @@ pub struct SweepMetrics {
     pub headline_beta_bytes_per_agent: Option<f64>,
     /// The same headline slope in MiB per agent.
     pub headline_beta_mib_per_agent: Option<f64>,
-    /// Log-log scaling exponent of active delta versus N.
+    /// Log-log scaling exponent of active delta versus N; `None` when the
+    /// curve is flat within the noise floor.
     pub scaling_exponent_alpha: Option<f64>,
+    /// True when every width's active delta stays under
+    /// [`SCALING_NOISE_FLOOR_BYTES`]: no exponent is fitted.
+    #[serde(default)]
+    pub scaling_curve_within_noise_floor: bool,
     /// Largest cold whole-tree peak in the sweep.
     pub maximum_cold_peak_bytes: u64,
     /// Largest workload whole-tree peak in the sweep.
@@ -583,12 +596,20 @@ impl SweepMetrics {
 
         let headline_beta_bytes_per_agent = theil_sen(&sorted);
         let headline_beta_mib_per_agent = headline_beta_bytes_per_agent.map(|value| value / MIB);
-        let scaling_exponent_alpha = scaling_exponent(&sorted);
+        let scaling_curve_within_noise_floor = sorted.iter().all(|point| {
+            point.steady_bytes.saturating_sub(point.baseline_bytes) < SCALING_NOISE_FLOOR_BYTES
+        });
+        let scaling_exponent_alpha = if scaling_curve_within_noise_floor {
+            None
+        } else {
+            scaling_exponent(&sorted)
+        };
         Ok(Self {
             points: derived,
             headline_beta_bytes_per_agent,
             headline_beta_mib_per_agent,
             scaling_exponent_alpha,
+            scaling_curve_within_noise_floor,
             maximum_cold_peak_bytes,
             maximum_workload_peak_bytes,
         })

@@ -919,10 +919,17 @@ async fn run_inner(
                 let roots = driver.session_pids(session);
                 driver.cancel(session).await?;
                 if manifest.transport.kind == TransportKind::Exec {
+                    // A persistent daemon is expected to outlive the cancelled
+                    // turn's thin client (verified: haider 0.0.967 lingers for its
+                    // idle TTL, re-parented to init). Cancel cleanup asks only that
+                    // the client subtree of THIS turn is gone, so exclude the
+                    // declared daemon root from the "settled" test.
+                    let excluded: Vec<u32> = driver.daemon_pid().into_iter().collect();
                     let process_cleared = !roots.is_empty()
-                        && await_owned_tree_empty(
+                        && await_owned_tree_settled(
                             platform_sampler.as_mut(),
                             &roots,
+                            &excluded,
                             Duration::from_millis(manifest.daemon.grace_ms.max(100)),
                         )
                         .await?;
@@ -1129,11 +1136,12 @@ async fn run_inner(
                     || !new_control.iter().all(control_response_succeeded)
                 {
                     return Err(AhrbError::Protocol(format!(
-                        "two resume attempts produced {} successful JSON control responses",
+                        "two resume attempts produced {} successful JSON control responses; responses: {}",
                         new_control
                             .iter()
                             .filter(|value| control_response_succeeded(value))
-                            .count()
+                            .count(),
+                        serde_json::to_string(new_control).unwrap_or_default()
                     )));
                 }
                 control_evidence.extend(new_control.iter().map(|response| {
@@ -1437,7 +1445,14 @@ async fn run_inner(
                                 "native recovery probe produced no JSON evidence".to_owned(),
                             )
                         })?;
-                        if !control_response_succeeded(response) {
+                        // The row-35 pre-crash turn ran to TERMINAL before the
+                        // owned tree was signalled, so a typed "nothing to
+                        // reconcile" answer (verified on haider 0.0.967:
+                        // error.code="no_recovery", "run_state is idle") is the
+                        // correct probe response; the durable replay and the
+                        // suffix validation below remain the arbiter.
+                        let no_recovery_window = typed_no_recovery_response(response);
+                        if !no_recovery_window && !control_response_succeeded(response) {
                             return Err(AhrbError::Protocol(format!(
                                 "native recovery probe reported failure: {response}"
                             )));
@@ -1445,6 +1460,7 @@ async fn run_inner(
                         control_evidence.push(json!({
                             "session_id": session.0,
                             "action": "recover-probe",
+                            "no_recovery_window": no_recovery_window,
                             "response": response
                         }));
                         let durable = recovered.replay_persisted(session, None).await?;
@@ -6225,15 +6241,27 @@ fn evaluate_rows(
                                 == Some("A")
                     });
                     let dependency = read_result.is_some_and(|event| {
-                        ["content", "stdout", "aggregated_output"]
-                            .iter()
-                            .any(|field| {
-                                event
-                                    .payload
-                                    .pointer(&format!("/result/{field}"))
-                                    .and_then(Value::as_str)
-                                    == Some("A")
-                            })
+                        // The read-back content may sit directly on the result, or
+                        // inside a harness exec record that wraps tool stdout
+                        // (verified: haider 0.0.967 surfaces it as `output` on the
+                        // structured record parsed into `preview_record`). Trim so
+                        // a trailing newline from the exec capture does not matter.
+                        [
+                            "/result/content",
+                            "/result/stdout",
+                            "/result/aggregated_output",
+                            "/result/output",
+                            "/result/preview_record/output",
+                        ]
+                        .iter()
+                        .any(|pointer| {
+                            event
+                                .payload
+                                .pointer(pointer)
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                == Some("A")
+                        })
                     });
                     let effect = fixture_effect_matches(profile_root, state, 3, "a.txt", "A");
                     (
@@ -8152,12 +8180,25 @@ async fn wait_one_terminal(
                 .ok_or_else(|| {
                     AhrbError::Protocol("long-horizon tool result omitted call_id".to_owned())
                 })?;
+            // Some harnesses (verified: haider 0.0.967) omit the tool name on the
+            // result envelope; correlate it from the matching tool-call event.
+            let correlated_name = events
+                .iter()
+                .filter(|candidate| candidate.event == EventVocab::ToolCall)
+                .find(|candidate| {
+                    candidate.payload.get("call_id").and_then(Value::as_str) == Some(call_id)
+                })
+                .and_then(|candidate| candidate.payload.get("name").and_then(Value::as_str));
             let name = event
                 .payload
                 .get("name")
                 .and_then(Value::as_str)
+                .or(correlated_name)
                 .ok_or_else(|| {
-                    AhrbError::Protocol("long-horizon tool result omitted name".to_owned())
+                    AhrbError::Protocol(
+                        "long-horizon tool result omitted name and no correlated call named it"
+                            .to_owned(),
+                    )
                 })?;
             observed_tool_results.insert(
                 event.cursor,
@@ -8327,9 +8368,25 @@ async fn await_owned_tree_empty(
     roots: &[u32],
     timeout: Duration,
 ) -> Result<bool> {
+    await_owned_tree_settled(sampler, roots, &[], timeout).await
+}
+
+/// Wait until the tree rooted at `roots` holds no member other than the
+/// `excluded` PIDs (e.g. a persistent daemon that is expected to linger).
+async fn await_owned_tree_settled(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    excluded: &[u32],
+    timeout: Duration,
+) -> Result<bool> {
     let started = Instant::now();
     loop {
-        if sampler.discover(roots)?.members.is_empty() {
+        let members = sampler.discover(roots)?.members;
+        let remaining = members
+            .keys()
+            .filter(|identity| !excluded.contains(&identity.pid))
+            .count();
+        if remaining == 0 {
             return Ok(true);
         }
         if started.elapsed() >= timeout {
@@ -8431,10 +8488,20 @@ fn validate_recovered_suffix(
         return Err("journal replay returned an empty suffix".to_owned());
     }
     if recovered.len() != expected.len() {
+        let describe = |events: &[&NormalizedEvent]| {
+            events
+                .iter()
+                .map(|event| format!("{:?}@{}", event.event, event.cursor))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let recovered_refs: Vec<&NormalizedEvent> = recovered.iter().collect();
         return Err(format!(
-            "journal replay length mismatch: expected {}, recovered {}",
+            "journal replay length mismatch: expected {} [{}], recovered {} [{}]",
             expected.len(),
-            recovered.len()
+            describe(&expected),
+            recovered.len(),
+            describe(&recovered_refs)
         ));
     }
     let mut ids = BTreeSet::new();
@@ -8466,14 +8533,19 @@ fn validate_recovered_suffix(
                     | EventVocab::TerminalTimeout
             ) && let Some(payload) = event.payload.as_object_mut()
             {
-                // These fields are added by the observing client at exit and
-                // are intentionally absent from the daemon-owned journal.
+                // These fields are added by the observing client at exit or by
+                // the live stream carrier and are intentionally absent from the
+                // daemon-owned journal (verified on haider 0.0.967: the durable
+                // terminal is `{"state": done|errored|cancelled}`; `terminal_kind`
+                // and `error_code` are derived on the jsonl carrier only).
                 for key in [
                     "client_turn_wall_ms",
                     "exit_code",
                     "status",
                     "category",
                     "failure_marker",
+                    "terminal_kind",
+                    "error_code",
                 ] {
                     payload.remove(key);
                 }
@@ -8487,6 +8559,18 @@ fn validate_recovered_suffix(
         expected_cursor = expected_cursor.saturating_add(1);
     }
     Ok(())
+}
+
+/// A structured "no crash window to reconcile" probe answer: `error.code ==
+/// "no_recovery"` without a success claim. Verified on haider 0.0.967
+/// (`haider.session_recovery.v1`, `completed:false`).
+fn typed_no_recovery_response(value: &Value) -> bool {
+    value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        == Some("no_recovery")
+        && value.get("completed").and_then(Value::as_bool) != Some(true)
 }
 
 fn control_response_succeeded(value: &Value) -> bool {
