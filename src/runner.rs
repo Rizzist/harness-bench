@@ -490,7 +490,7 @@ fn write_interrupted_report(
     let manifest_hash = crate::manifest::hash(manifest)?;
     let selected_rows: Vec<u8> = selected.iter().map(|definition| definition.row).collect();
     let progress = progress.snapshot()?;
-    let results: Vec<TestResult> = selected
+    let mut results: Vec<TestResult> = selected
         .iter()
         .map(|definition| TestResult {
             row: definition.row,
@@ -551,6 +551,7 @@ fn write_interrupted_report(
                 .unwrap_or(fallback)
         })
         .collect();
+    crate::report::record_capability_declarations(&mut results, manifest);
     let mut raw_events = Vec::new();
     for events in progress.events.values() {
         for event in events {
@@ -2088,6 +2089,7 @@ async fn run_inner(
             cross_run_reproducibility: &row64_evaluation,
         },
     );
+    crate::report::record_capability_declarations(&mut results, &manifest);
     if !state.lifecycle_notes.is_empty() {
         let note = format!("daemon lifecycle: {}", state.lifecycle_notes.join("; "));
         for result in results
@@ -4795,28 +4797,6 @@ async fn collect_determinism_trials(
         driver.shutdown().await?;
         server.shutdown().await?;
         let records = engine.request_records().await;
-        let primary_checkpoints = records
-            .iter()
-            .filter(|record| record.role == "primary")
-            .map(|record| {
-                (
-                    record.request.actor.as_str(),
-                    record.request.checkpoint.as_str(),
-                    record.semantic_ordinal,
-                    record.attempt,
-                )
-            })
-            .collect::<Vec<_>>();
-        let expected_checkpoints = vec![
-            ("d63-direct", "start", 1_u64, 1_u64),
-            ("d63-tool", "start", 1_u64, 1_u64),
-            ("d63-tool", "terminal", 2_u64, 1_u64),
-        ];
-        if primary_checkpoints != expected_checkpoints {
-            return Err(AhrbError::Protocol(format!(
-                "row-63 execution {execution} primary request sequence was {primary_checkpoints:?}, expected {expected_checkpoints:?}"
-            )));
-        }
         let mut socket_paths = Vec::new();
         let mut temporary_paths = Vec::new();
         for (key, value) in &model_environment {
@@ -4834,6 +4814,7 @@ async fn collect_determinism_trials(
         runs.push(DeterminismRun {
             run: execution,
             records: records.clone(),
+            request_collector_complete: true,
             normalization: NormalizationContext {
                 credential,
                 profile_paths: vec![profile_root.to_string_lossy().into_owned()],

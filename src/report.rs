@@ -1,6 +1,7 @@
 //! Human-readable, machine-readable, and raw-evidence reports.
 
 use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
+use crate::manifest::Manifest;
 use crate::process::{ProcIdentity, ProcOwnership, ProcessSample, Sample};
 use crate::sampler::cadence_quality;
 use crate::{AhrbError, Result};
@@ -274,6 +275,8 @@ struct NondeterministicFieldDetails {
     varying_fields: Vec<VaryingFieldDetail>,
     #[serde(default)]
     run_hashes: Vec<String>,
+    #[serde(default)]
+    collector_complete_by_run: BTreeMap<String, bool>,
 }
 
 #[allow(dead_code)]
@@ -295,6 +298,8 @@ struct CrossRunReproducibilityDetails {
     stream_sha256_by_run: BTreeMap<String, String>,
     #[serde(default)]
     first_difference: Option<Value>,
+    #[serde(default)]
+    collector_complete_by_run: BTreeMap<String, bool>,
 }
 
 #[allow(dead_code)]
@@ -713,6 +718,18 @@ pub struct Report {
     /// Raw same-confinement network enforcement evidence.
     #[serde(default)]
     pub egress_attempts: Vec<EgressAttempt>,
+}
+
+/// Persist the manifest declaration state needed to interpret optional-row
+/// transitions without parsing human-readable evidence.
+pub fn record_capability_declarations(results: &mut [TestResult], manifest: &Manifest) {
+    for result in results {
+        result.metadata.capability_declared =
+            result.metadata.capability.as_ref().map(|capability| {
+                manifest.capabilities.required.contains_key(capability)
+                    || manifest.capabilities.optional.contains_key(capability)
+            });
+    }
 }
 
 fn default_spec_version() -> u32 {

@@ -8,7 +8,7 @@ use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -221,7 +221,12 @@ pub fn persist_report(
         }
     }
     let completed_at = utc_timestamp(SystemTime::now())?;
-    append_index(&index_entry(persistence, report, completed_at)?)
+    let results_dir = persistence.results_dir.as_ref().ok_or_else(|| {
+        AhrbError::Protocol("saved result has no canonical results directory".to_owned())
+    })?;
+    let report_body = std::fs::read(results_dir.join("report.json"))?;
+    let report_sha256: [u8; 32] = Sha256::digest(report_body).into();
+    append_index(persistence, report, completed_at, &report_sha256)
 }
 
 fn copy_optional(source: &Path, destination: &Path) -> Result<()> {
@@ -242,12 +247,20 @@ fn index_entry(
     persistence: &RunPersistence,
     report: &Report,
     completed_at: String,
+    occurrence: u64,
+    report_sha256: &[u8; 32],
 ) -> Result<IndexEntry> {
     let results_dir = persistence.results_dir_field.clone().ok_or_else(|| {
         AhrbError::Protocol("saved result has no repository-relative path".to_owned())
     })?;
     let report_path = format!("{results_dir}/report.json");
-    let run_key = stable_run_key(&report.fingerprint.harness, &completed_at, &report_path);
+    let run_key = stable_run_key(
+        occurrence,
+        &report.fingerprint.harness,
+        &completed_at,
+        &report_path,
+        report_sha256,
+    );
     Ok(IndexEntry {
         schema: INDEX_SCHEMA,
         run_key,
@@ -270,13 +283,19 @@ fn index_entry(
     })
 }
 
-fn append_index(entry: &IndexEntry) -> Result<()> {
+fn append_index(
+    persistence: &RunPersistence,
+    report: &Report,
+    completed_at: String,
+    report_sha256: &[u8; 32],
+) -> Result<()> {
     let index = repository_root().join("results/index.jsonl");
     if let Some(parent) = index.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(index)?;
     #[cfg(unix)]
@@ -288,7 +307,21 @@ fn append_index(entry: &IndexEntry) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    let mut line = serde_json::to_vec(entry)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut existing = Vec::new();
+    file.read_to_end(&mut existing)?;
+    if !existing.is_empty() && existing.last() != Some(&b'\n') {
+        return Err(AhrbError::Protocol(
+            "results/index.jsonl does not end at a complete line".to_owned(),
+        ));
+    }
+    let prior_lines = existing.iter().filter(|byte| **byte == b'\n').count();
+    let occurrence = u64::try_from(prior_lines)
+        .map_err(|_| AhrbError::Protocol("results index line count exceeds u64".to_owned()))?
+        .checked_add(1)
+        .ok_or_else(|| AhrbError::Protocol("results index occurrence overflow".to_owned()))?;
+    let entry = index_entry(persistence, report, completed_at, occurrence, report_sha256)?;
+    let mut line = serde_json::to_vec(&entry)?;
     line.push(b'\n');
     let write_result = file.write_all(&line).and_then(|()| file.sync_data());
     #[cfg(unix)]
@@ -311,9 +344,15 @@ pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
     if !all {
         let mut latest: BTreeMap<String, IndexEntry> = BTreeMap::new();
         for entry in entries {
-            let should_replace = latest.get(&entry.harness).is_none_or(|existing| {
-                (&entry.completed_at, &entry.run_key) > (&existing.completed_at, &existing.run_key)
-            });
+            let entry_completed_at = utc_timestamp_seconds(&entry.completed_at)?;
+            let should_replace = match latest.get(&entry.harness) {
+                Some(existing) => {
+                    let existing_completed_at = utc_timestamp_seconds(&existing.completed_at)?;
+                    (entry_completed_at, &entry.run_key)
+                        > (existing_completed_at, &existing.run_key)
+                }
+                None => true,
+            };
             if should_replace {
                 latest.insert(entry.harness.clone(), entry);
             }
@@ -408,6 +447,12 @@ pub fn read_index() -> Result<Vec<IndexEntry>> {
             })?;
             normalize_legacy_index(legacy, line, line_index + 1)
         };
+        utc_timestamp_seconds(&entry.completed_at).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "invalid completed_at on results/index.jsonl line {}: {error}",
+                line_index + 1
+            ))
+        })?;
         entries.push(entry);
     }
     Ok(entries)
@@ -624,14 +669,24 @@ fn short_run_id(harness: &str, timestamp: &str) -> String {
     value[..8].to_owned()
 }
 
-fn stable_run_key(harness: &str, completed_at: &str, report_path: &str) -> String {
+fn stable_run_key(
+    occurrence: u64,
+    harness: &str,
+    completed_at: &str,
+    report_path: &str,
+    report_sha256: &[u8; 32],
+) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"ahrb-index-v2\0");
+    digest.update(b"ahrb-index-v2-occurrence\0");
+    digest.update(occurrence.to_le_bytes());
+    digest.update(b"\0");
     digest.update(harness.as_bytes());
     digest.update(b"\0");
     digest.update(completed_at.as_bytes());
     digest.update(b"\0");
     digest.update(report_path.as_bytes());
+    digest.update(b"\0");
+    digest.update(report_sha256);
     format!("run-{:x}", digest.finalize())
 }
 
@@ -659,6 +714,85 @@ fn utc_timestamp(now: SystemTime) -> Result<String> {
     Ok(format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
     ))
+}
+
+/// Parse the canonical index timestamp into Unix seconds for chronological
+/// comparison. Only `YYYY-MM-DDTHH:MM:SSZ` UTC timestamps are accepted.
+pub(crate) fn utc_timestamp_seconds(value: &str) -> Result<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err(AhrbError::Protocol(format!(
+            "timestamp {value:?} is not canonical YYYY-MM-DDTHH:MM:SSZ UTC"
+        )));
+    }
+    let year = timestamp_digits(bytes, 0, 4)?;
+    let month = timestamp_digits(bytes, 5, 7)?;
+    let day = timestamp_digits(bytes, 8, 10)?;
+    let hour = timestamp_digits(bytes, 11, 13)?;
+    let minute = timestamp_digits(bytes, 14, 16)?;
+    let second = timestamp_digits(bytes, 17, 19)?;
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(AhrbError::Protocol(format!(
+            "timestamp {value:?} contains an invalid UTC calendar value"
+        )));
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)
+        .and_then(|value| value.checked_add(hour * 3_600 + minute * 60 + second))
+        .ok_or_else(|| AhrbError::Protocol("timestamp exceeds u64 seconds".to_owned()))?;
+    u64::try_from(seconds)
+        .map_err(|_| AhrbError::Protocol("timestamp predates the Unix epoch".to_owned()))
+}
+
+fn timestamp_digits(bytes: &[u8], start: usize, end: usize) -> Result<i64> {
+    let digits = bytes.get(start..end).ok_or_else(|| {
+        AhrbError::Protocol("timestamp component is outside the input".to_owned())
+    })?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return Err(AhrbError::Protocol(
+            "timestamp components must contain only ASCII digits".to_owned(),
+        ));
+    }
+    let mut value = 0_i64;
+    for digit in digits {
+        value = value * 10 + i64::from(*digit - b'0');
+    }
+    Ok(value)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
@@ -714,6 +848,36 @@ mod tests {
             "2000-02-29T12:34:56Z"
         );
         Ok(())
+    }
+
+    #[test]
+    fn canonical_utc_timestamps_parse_to_numeric_order_keys() -> Result<()> {
+        assert_eq!(utc_timestamp_seconds("1970-01-01T00:00:00Z")?, 0);
+        assert_eq!(utc_timestamp_seconds("2000-02-29T12:34:56Z")?, 951_827_696);
+        assert!(utc_timestamp_seconds("2026-09-01T00:00:00.000Z").is_err());
+        assert!(utc_timestamp_seconds("2026-02-29T00:00:00Z").is_err());
+        assert!(utc_timestamp_seconds("2026-09-01T00:00:60Z").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn run_key_is_unique_for_same_second_path_and_report_body() {
+        let report_sha256 = [7_u8; 32];
+        let first = stable_run_key(
+            1,
+            "mock",
+            "2026-09-01T00:00:00Z",
+            "results/mock/report.json",
+            &report_sha256,
+        );
+        let second = stable_run_key(
+            2,
+            "mock",
+            "2026-09-01T00:00:00Z",
+            "results/mock/report.json",
+            &report_sha256,
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

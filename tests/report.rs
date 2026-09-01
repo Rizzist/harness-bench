@@ -7,10 +7,34 @@ use ahrb::report::{
     ProcessHygieneCadenceSample, ProcessHygieneCheckpoint, ProcessHygieneEvidence,
     ProcessHygieneProcess, Report, ResourceSummary, TurnObservation, evaluate_memory_time_integral,
     evaluate_process_hygiene, evaluate_time_to_first_model_request, evaluate_turn_latency,
-    evaluate_turn_latency_repetitions, render_markdown, render_resource_summary,
-    summarize_resources,
+    evaluate_turn_latency_repetitions, record_capability_declarations, render_markdown,
+    render_resource_summary, summarize_resources,
 };
+use std::path::Path;
 use std::time::SystemTime;
+
+#[test]
+fn report_records_optional_capability_declaration_from_manifest() {
+    let mut manifest =
+        ahrb::manifest::load(Path::new("adapters/mock/manifest.toml")).expect("load mock manifest");
+    let mut results = vec![classify(
+        4,
+        "parallel-tools",
+        Pillar::Functionality,
+        Some(false),
+        &[],
+        None,
+    )];
+    record_capability_declarations(&mut results, &manifest);
+    assert_eq!(results[0].metadata.capability_declared, Some(true));
+
+    manifest
+        .capabilities
+        .optional
+        .remove("parallel_tool_execution");
+    record_capability_declarations(&mut results, &manifest);
+    assert_eq!(results[0].metadata.capability_declared, Some(false));
+}
 
 #[test]
 fn markdown_sorts_rows_and_names_outcomes() {
@@ -826,8 +850,8 @@ fn informational_fail_does_not_change_suite_exit_but_error_does() {
 }
 
 #[test]
-fn badge_v2_adds_latency_without_an_empty_facet_segment() {
-    let badge = Badge {
+fn badge_v2_adds_profile_and_latency_without_an_empty_facet_segment() {
+    let mut badge = Badge {
         spec_version: 2,
         os: "macos".to_owned(),
         topology: "client-process-fanout".to_owned(),
@@ -842,8 +866,13 @@ fn badge_v2_adds_latency_without_an_empty_facet_segment() {
     };
     assert_eq!(
         badge_label(&badge),
-        "Automation Ready v2 · macos · client-process-fanout · N8 · R96 · L500 · C50 · A82"
+        "Automation Ready v2 · macos · client-process-fanout · quick · N8 · R96 · L500 · C50 · A82"
     );
+    let quick = badge_label(&badge);
+    badge.profile = "cert".to_owned();
+    let cert = badge_label(&badge);
+    assert_ne!(quick, cert);
+    assert!(cert.contains(" · cert · "));
 }
 
 #[test]

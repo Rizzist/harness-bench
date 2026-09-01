@@ -105,11 +105,18 @@ fn resolve_operand(entries: &[IndexEntry], operand: &str) -> Result<IndexEntry> 
 }
 
 fn newest(entries: Vec<&IndexEntry>) -> Result<&IndexEntry> {
-    entries
-        .into_iter()
-        .max_by(|left, right| {
-            (&left.completed_at, &left.run_key).cmp(&(&right.completed_at, &right.run_key))
-        })
+    let mut latest: Option<(u64, &IndexEntry)> = None;
+    for entry in entries {
+        let completed_at = crate::results::utc_timestamp_seconds(&entry.completed_at)?;
+        let replace = latest.as_ref().is_none_or(|(latest_at, latest_entry)| {
+            (completed_at, &entry.run_key) > (*latest_at, &latest_entry.run_key)
+        });
+        if replace {
+            latest = Some((completed_at, entry));
+        }
+    }
+    latest
+        .map(|(_, entry)| entry)
         .ok_or_else(|| AhrbError::Protocol("no indexed run matched selector".to_owned()))
 }
 
@@ -124,17 +131,20 @@ fn resolve_latest_pair(entries: &[IndexEntry], harness: &str) -> Result<(IndexEn
         .filter(|entry| entry.harness == harness)
         .collect::<Vec<_>>();
     let right = newest(matching.clone())?;
-    let earlier = matching
-        .into_iter()
-        .filter(|entry| {
-            entry.run_key != right.run_key
-                && entry.os == right.os
-                && entry.topology == right.topology
-                && entry.profile == right.profile
-                && entry.report_schema == right.report_schema
-                && (&entry.completed_at, &entry.run_key) < (&right.completed_at, &right.run_key)
-        })
-        .collect::<Vec<_>>();
+    let right_completed_at = crate::results::utc_timestamp_seconds(&right.completed_at)?;
+    let mut earlier = Vec::new();
+    for entry in matching {
+        let entry_completed_at = crate::results::utc_timestamp_seconds(&entry.completed_at)?;
+        if entry.run_key != right.run_key
+            && entry.os == right.os
+            && entry.topology == right.topology
+            && entry.profile == right.profile
+            && entry.report_schema == right.report_schema
+            && (entry_completed_at, &entry.run_key) < (right_completed_at, &right.run_key)
+        {
+            earlier.push(entry);
+        }
+    }
     let left = newest(earlier).map_err(|_| {
         AhrbError::Protocol(format!(
             "fewer than two compatible indexed runs for harness {harness:?}"
@@ -205,8 +215,7 @@ fn build_document(
 ) -> Result<(DiffDocument, bool)> {
     let (rows, gating_regression) =
         compare_rows(&left_report.parsed.results, &right_report.parsed.results)?;
-    let comparable =
-        left.os == right.os && left.topology == right.topology && left.profile == right.profile;
+    let comparable = comparable_scope(&left, &right);
     let resource_summary_deltas =
         compare_resources(&left_report.raw, &right_report.raw, comparable);
     Ok((
@@ -370,17 +379,23 @@ fn row_change(
 }
 
 fn optional_capability_declared(result: &TestResult) -> Option<bool> {
-    let evidence = result.evidence.iter().find_map(|evidence| {
-        let detail = evidence.strip_prefix("capability: capability ")?;
-        if detail.ends_with(" is not declared by this architecture") {
-            Some(false)
-        } else if detail.ends_with(" is declared but its operation surface is absent") {
-            Some(true)
-        } else {
-            None
-        }
-    });
-    evidence.or_else(|| (!matches!(result.outcome, TestOutcome::Unsupported(_))).then_some(true))
+    result.metadata.capability_declared
+}
+
+fn comparable_scope(left: &IndexEntry, right: &IndexEntry) -> bool {
+    known_scope_value(&left.os)
+        && known_scope_value(&left.topology)
+        && known_scope_value(&left.profile)
+        && known_scope_value(&right.os)
+        && known_scope_value(&right.topology)
+        && known_scope_value(&right.profile)
+        && left.os == right.os
+        && left.topology == right.topology
+        && left.profile == right.profile
+}
+
+fn known_scope_value(value: &str) -> bool {
+    !value.is_empty() && value != "unknown"
 }
 
 fn informational_change(before: &str, after: &str) -> (&'static str, bool) {
@@ -599,6 +614,30 @@ mod tests {
         }
     }
 
+    fn with_declaration(mut result: TestResult, declared: bool) -> TestResult {
+        result.metadata.capability_declared = Some(declared);
+        result
+    }
+
+    fn index_entry(os: &str, topology: &str, profile: &str) -> IndexEntry {
+        IndexEntry {
+            schema: crate::results::INDEX_SCHEMA,
+            run_key: "run-test".to_owned(),
+            completed_at: "2026-09-01T00:00:00Z".to_owned(),
+            harness: "mock".to_owned(),
+            harness_version: "1".to_owned(),
+            report_path: "results/mock/report.json".to_owned(),
+            report_schema: 3,
+            spec_version: 2,
+            profile: profile.to_owned(),
+            os: os.to_owned(),
+            topology: topology.to_owned(),
+            manifest_sha256: "manifest".to_owned(),
+            workflow_sha256: "workflow".to_owned(),
+            ahrb_revision: "revision".to_owned(),
+        }
+    }
+
     #[test]
     fn informational_labels_are_normative_and_non_gating() -> Result<()> {
         let left = vec![result(42, "model-request-efficiency", TestOutcome::Pass)];
@@ -657,26 +696,32 @@ mod tests {
     #[test]
     fn optional_unsupported_distinguishes_removed_from_declared() -> Result<()> {
         let before = vec![result(4, "parallel-tools", TestOutcome::Pass)];
-        let mut undeclared = result(
-            4,
-            "parallel-tools",
-            TestOutcome::Unsupported("unavailable".to_owned()),
+        let mut undeclared = with_declaration(
+            result(
+                4,
+                "parallel-tools",
+                TestOutcome::Unsupported("unavailable".to_owned()),
+            ),
+            false,
         );
         undeclared.evidence.push(
-            "capability: capability parallel_tool_execution is not declared by this architecture"
+            "capability: capability parallel_tool_execution is declared but its operation surface is absent"
                 .to_owned(),
         );
         let (rows, regression) = compare_rows(&before, &[undeclared])?;
         assert_eq!(rows[0].change, "facet-removed");
         assert!(regression);
 
-        let mut declared = result(
-            4,
-            "parallel-tools",
-            TestOutcome::Unsupported("unavailable".to_owned()),
+        let mut declared = with_declaration(
+            result(
+                4,
+                "parallel-tools",
+                TestOutcome::Unsupported("unavailable".to_owned()),
+            ),
+            true,
         );
         declared.evidence.push(
-            "capability: capability parallel_tool_execution is declared but its operation surface is absent"
+            "capability: capability parallel_tool_execution is not declared by this architecture"
                 .to_owned(),
         );
         let (rows, regression) = compare_rows(&before, &[declared])?;
@@ -687,19 +732,25 @@ mod tests {
 
     #[test]
     fn newly_declared_optional_nonpass_has_total_neutral_change() -> Result<()> {
-        let mut before = result(
-            4,
-            "parallel-tools",
-            TestOutcome::Unsupported("undeclared".to_owned()),
+        let mut before = with_declaration(
+            result(
+                4,
+                "parallel-tools",
+                TestOutcome::Unsupported("undeclared".to_owned()),
+            ),
+            false,
         );
         before.evidence.push(
             "capability: capability parallel_tool_execution is not declared by this architecture"
                 .to_owned(),
         );
-        let mut after = result(
-            4,
-            "parallel-tools",
-            TestOutcome::Fail("declared behavior failed".to_owned()),
+        let mut after = with_declaration(
+            result(
+                4,
+                "parallel-tools",
+                TestOutcome::Fail("declared behavior failed".to_owned()),
+            ),
+            true,
         );
         after.evidence.push(
             "capability: capability parallel_tool_execution is declared but its operation surface is absent"
@@ -713,19 +764,25 @@ mod tests {
 
     #[test]
     fn optional_declaration_changes_are_visible_when_both_states_are_unsupported() -> Result<()> {
-        let mut undeclared = result(
-            4,
-            "parallel-tools",
-            TestOutcome::Unsupported("undeclared".to_owned()),
+        let mut undeclared = with_declaration(
+            result(
+                4,
+                "parallel-tools",
+                TestOutcome::Unsupported("undeclared".to_owned()),
+            ),
+            false,
         );
         undeclared.evidence.push(
             "capability: capability parallel_tool_execution is not declared by this architecture"
                 .to_owned(),
         );
-        let mut declared = result(
-            4,
-            "parallel-tools",
-            TestOutcome::Unsupported("declared surface absent".to_owned()),
+        let mut declared = with_declaration(
+            result(
+                4,
+                "parallel-tools",
+                TestOutcome::Unsupported("declared surface absent".to_owned()),
+            ),
+            true,
         );
         declared.evidence.push(
             "capability: capability parallel_tool_execution is declared but its operation surface is absent"
@@ -827,5 +884,19 @@ mod tests {
             numeric_field(&report, "memory_time_integral_mib_s_per_turn"),
             None
         );
+    }
+
+    #[test]
+    fn unknown_scope_dimensions_are_never_resource_comparable() {
+        let known = index_entry("macos", "client-process-fanout", "quick");
+        assert!(comparable_scope(&known, &known));
+        for unknown in [
+            index_entry("unknown", "client-process-fanout", "quick"),
+            index_entry("macos", "unknown", "quick"),
+            index_entry("macos", "client-process-fanout", "unknown"),
+        ] {
+            assert!(!comparable_scope(&unknown, &unknown));
+            assert!(!comparable_scope(&unknown, &known));
+        }
     }
 }

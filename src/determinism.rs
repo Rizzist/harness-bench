@@ -35,6 +35,9 @@ pub struct DeterminismRun {
     pub run: u32,
     /// Physical request attempts observed in this execution.
     pub records: Vec<ModelRequestRecord>,
+    /// Whether the external request collector completed and its ledger was
+    /// snapshotted after the execution terminalized.
+    pub request_collector_complete: bool,
     /// Exact AHRB-owned values for this execution.
     pub normalization: NormalizationContext,
 }
@@ -123,6 +126,12 @@ enum OwnedValueKind {
     ExecutionId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PointerPatternSegment {
+    Wildcard,
+    Literal(String),
+}
+
 const CHAT_CONTENT_POINTERS: &[&str] = &[
     "/messages/*/content",
     "/messages/*/content/*/text",
@@ -155,14 +164,74 @@ fn metadata_pointer(kind: OwnedValueKind) -> &'static str {
     }
 }
 
+fn decode_pointer_segment(segment: &str, pattern: bool) -> Result<String, String> {
+    let mut decoded = String::new();
+    let mut characters = segment.chars();
+    while let Some(character) = characters.next() {
+        if character == '~' {
+            match characters.next() {
+                Some('0') => decoded.push('~'),
+                Some('1') => decoded.push('/'),
+                Some('2') if pattern => decoded.push('*'),
+                Some(escape) => {
+                    return Err(format!("invalid pointer escape ~{escape}"));
+                }
+                None => return Err("trailing ~ in pointer segment".to_owned()),
+            }
+        } else if pattern && character == '*' {
+            return Err("literal * in a pointer pattern must be encoded as ~2".to_owned());
+        } else {
+            decoded.push(character);
+        }
+    }
+    Ok(decoded)
+}
+
+fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, String> {
+    if pointer.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(segments) = pointer.strip_prefix('/') else {
+        return Err("JSON pointer must be empty or begin with /".to_owned());
+    };
+    segments
+        .split('/')
+        .map(|segment| decode_pointer_segment(segment, false))
+        .collect()
+}
+
+fn parse_pointer_pattern(pattern: &str) -> Result<Vec<PointerPatternSegment>, String> {
+    if pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(segments) = pattern.strip_prefix('/') else {
+        return Err("pointer pattern must be empty or begin with /".to_owned());
+    };
+    segments
+        .split('/')
+        .map(|segment| {
+            if segment == "*" {
+                Ok(PointerPatternSegment::Wildcard)
+            } else {
+                decode_pointer_segment(segment, true).map(PointerPatternSegment::Literal)
+            }
+        })
+        .collect()
+}
+
 fn pointer_pattern_matches(pointer: &str, pattern: &str) -> bool {
-    let pointer = pointer.split('/').skip(1).collect::<Vec<_>>();
-    let pattern = pattern.split('/').skip(1).collect::<Vec<_>>();
-    pointer.len() == pattern.len()
+    let (Ok(pointer), Ok(pattern)) = (parse_json_pointer(pointer), parse_pointer_pattern(pattern))
+    else {
+        return false;
+    };
+    pointer.len() >= pattern.len()
         && pointer
             .iter()
             .zip(pattern)
-            .all(|(actual, expected)| expected == "*" || actual == &expected)
+            .all(|(actual, expected)| match expected {
+                PointerPatternSegment::Wildcard => true,
+                PointerPatternSegment::Literal(expected) => actual == &expected,
+            })
 }
 
 fn content_pointer_allowed(dialect: &str, pointer: &str) -> bool {
@@ -356,6 +425,12 @@ fn attempt_key_json(key: &SemanticAttemptKey) -> Value {
 fn comparable_requests(
     run: &DeterminismRun,
 ) -> Result<BTreeMap<SemanticRequestKey, ComparableRequest>, String> {
+    if !run.request_collector_complete {
+        return Err(format!(
+            "run {} request collector evidence is incomplete",
+            run.run
+        ));
+    }
     let mut requests = BTreeMap::new();
     for record in &run.records {
         let key = semantic_key(record);
@@ -390,28 +465,142 @@ fn json_type(value: Option<&Value>) -> &'static str {
     }
 }
 
-fn flatten_leaves(value: &Value) -> BTreeMap<String, Value> {
-    fn visit(value: &Value, pointer: &str, leaves: &mut BTreeMap<String, Value>) {
+#[derive(Clone, Debug)]
+struct ComparisonOccurrence {
+    pointer: String,
+    before: Option<Value>,
+    after: Option<Value>,
+}
+
+fn pure_array_reorder(before: &[Value], after: &[Value]) -> Result<bool, String> {
+    if before == after || before.len() != after.len() {
+        return Ok(false);
+    }
+    let mut before_elements = before
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| format!("serialize baseline array element: {error}"))?;
+    let mut after_elements = after
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| format!("serialize comparison array element: {error}"))?;
+    before_elements.sort();
+    after_elements.sort();
+    Ok(before_elements == after_elements)
+}
+
+fn comparison_occurrences(
+    before: &Value,
+    after: &Value,
+) -> Result<Vec<ComparisonOccurrence>, String> {
+    fn push_present_subtree(
+        value: &Value,
+        pointer: &str,
+        before: bool,
+        occurrences: &mut Vec<ComparisonOccurrence>,
+    ) {
         match value {
             Value::Array(items) if !items.is_empty() => {
                 for (index, item) in items.iter().enumerate() {
-                    visit(item, &format!("{pointer}/{index}"), leaves);
+                    push_present_subtree(item, &format!("{pointer}/{index}"), before, occurrences);
                 }
             }
             Value::Object(object) if !object.is_empty() => {
                 for (key, item) in object {
                     let escaped = key.replace('~', "~0").replace('/', "~1");
-                    visit(item, &format!("{pointer}/{escaped}"), leaves);
+                    push_present_subtree(
+                        item,
+                        &format!("{pointer}/{escaped}"),
+                        before,
+                        occurrences,
+                    );
                 }
             }
-            _ => {
-                leaves.insert(pointer.to_owned(), value.clone());
-            }
+            _ if before => occurrences.push(ComparisonOccurrence {
+                pointer: pointer.to_owned(),
+                before: Some(value.clone()),
+                after: None,
+            }),
+            _ => occurrences.push(ComparisonOccurrence {
+                pointer: pointer.to_owned(),
+                before: None,
+                after: Some(value.clone()),
+            }),
         }
     }
-    let mut leaves = BTreeMap::new();
-    visit(value, "", &mut leaves);
-    leaves
+
+    fn visit(
+        before: Option<&Value>,
+        after: Option<&Value>,
+        pointer: &str,
+        occurrences: &mut Vec<ComparisonOccurrence>,
+    ) -> Result<(), String> {
+        match (before, after) {
+            (Some(Value::Array(before)), Some(Value::Array(after))) => {
+                if pure_array_reorder(before, after)? {
+                    occurrences.push(ComparisonOccurrence {
+                        pointer: pointer.to_owned(),
+                        before: Some(Value::Array(before.clone())),
+                        after: Some(Value::Array(after.clone())),
+                    });
+                } else if before.is_empty() && after.is_empty() {
+                    occurrences.push(ComparisonOccurrence {
+                        pointer: pointer.to_owned(),
+                        before: Some(Value::Array(Vec::new())),
+                        after: Some(Value::Array(Vec::new())),
+                    });
+                } else {
+                    for index in 0..before.len().max(after.len()) {
+                        visit(
+                            before.get(index),
+                            after.get(index),
+                            &format!("{pointer}/{index}"),
+                            occurrences,
+                        )?;
+                    }
+                }
+            }
+            (Some(Value::Object(before)), Some(Value::Object(after))) => {
+                if before.is_empty() && after.is_empty() {
+                    occurrences.push(ComparisonOccurrence {
+                        pointer: pointer.to_owned(),
+                        before: Some(Value::Object(Map::new())),
+                        after: Some(Value::Object(Map::new())),
+                    });
+                } else {
+                    let keys = before
+                        .keys()
+                        .chain(after.keys())
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    for key in keys {
+                        let escaped = key.replace('~', "~0").replace('/', "~1");
+                        visit(
+                            before.get(&key),
+                            after.get(&key),
+                            &format!("{pointer}/{escaped}"),
+                            occurrences,
+                        )?;
+                    }
+                }
+            }
+            (Some(before), Some(after)) => occurrences.push(ComparisonOccurrence {
+                pointer: pointer.to_owned(),
+                before: Some(before.clone()),
+                after: Some(after.clone()),
+            }),
+            (Some(before), None) => push_present_subtree(before, pointer, true, occurrences),
+            (None, Some(after)) => push_present_subtree(after, pointer, false, occurrences),
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    let mut occurrences = Vec::new();
+    visit(Some(before), Some(after), "", &mut occurrences)?;
+    Ok(occurrences)
 }
 
 const CHAT_CRITICAL_ID_POINTERS: &[&str] = &[
@@ -508,7 +697,16 @@ fn attempt_multiplicity(
     Ok(multiplicity)
 }
 
-fn cross_run_incomplete(detail: String) -> CrossRunReproducibilityEvaluation {
+fn collector_complete_by_run(runs: &[DeterminismRun]) -> BTreeMap<String, bool> {
+    runs.iter()
+        .map(|run| (run.run.to_string(), run.request_collector_complete))
+        .collect()
+}
+
+fn cross_run_incomplete(
+    detail: String,
+    runs: &[DeterminismRun],
+) -> CrossRunReproducibilityEvaluation {
     CrossRunReproducibilityEvaluation {
         identical: false,
         request_stream_count: 0,
@@ -516,6 +714,7 @@ fn cross_run_incomplete(detail: String) -> CrossRunReproducibilityEvaluation {
         details: json!({
             "stream_sha256_by_run": {},
             "first_difference": null,
+            "collector_complete_by_run": collector_complete_by_run(runs),
         }),
         measurement_complete: false,
         measurement_error: Some(detail),
@@ -537,14 +736,35 @@ fn first_stream_difference(
     for key in attempt_keys {
         let before = baseline_attempts.get(&key).copied();
         let after = comparison_attempts.get(&key).copied();
-        if before != after {
-            return Some(json!({
-                "run": comparison_run,
-                "kind": "attempt-multiplicity",
-                "semantic_key": attempt_key_json(&key),
-                "baseline_attempts": before,
-                "comparison_attempts": after,
-            }));
+        match (before, after) {
+            (Some(_), None) => {
+                return Some(json!({
+                    "run": comparison_run,
+                    "kind": "missing-request",
+                    "semantic_key": attempt_key_json(&key),
+                    "baseline": "present",
+                    "comparison": "missing",
+                }));
+            }
+            (None, Some(_)) => {
+                return Some(json!({
+                    "run": comparison_run,
+                    "kind": "added-request",
+                    "semantic_key": attempt_key_json(&key),
+                    "baseline": "missing",
+                    "comparison": "present",
+                }));
+            }
+            (Some(before), Some(after)) if before != after => {
+                return Some(json!({
+                    "run": comparison_run,
+                    "kind": "attempt-multiplicity",
+                    "semantic_key": attempt_key_json(&key),
+                    "baseline_attempts": before,
+                    "comparison_attempts": after,
+                }));
+            }
+            _ => {}
         }
     }
     let keys = baseline
@@ -603,10 +823,13 @@ pub fn evaluate_cross_run_reproducibility(
             .enumerate()
             .any(|(index, run)| run.run != index as u32 + 1)
     {
-        return cross_run_incomplete(format!(
-            "expected ordered runs 1..={expected_runs}, observed {} run(s)",
-            runs.len()
-        ));
+        return cross_run_incomplete(
+            format!(
+                "expected ordered runs 1..={expected_runs}, observed {} run(s)",
+                runs.len()
+            ),
+            runs,
+        );
     }
     let mut normalized_runs = Vec::with_capacity(runs.len());
     let mut multiplicities = Vec::with_capacity(runs.len());
@@ -614,41 +837,34 @@ pub fn evaluate_cross_run_reproducibility(
     for run in runs {
         let requests = match comparable_requests(run) {
             Ok(requests) => requests,
-            Err(detail) => return cross_run_incomplete(detail),
+            Err(detail) => return cross_run_incomplete(detail, runs),
         };
-        if requests.is_empty() {
-            return cross_run_incomplete(format!(
-                "run {} has an empty normalized request stream",
-                run.run
-            ));
-        }
         let attempts = match attempt_multiplicity(&requests) {
             Ok(attempts) => attempts,
-            Err(detail) => return cross_run_incomplete(detail),
+            Err(detail) => return cross_run_incomplete(detail, runs),
         };
         let hash = match normalized_stream_sha256(&requests) {
             Ok(hash) => hash,
-            Err(detail) => return cross_run_incomplete(detail),
+            Err(detail) => return cross_run_incomplete(detail, runs),
         };
         hashes.insert(run.run.to_string(), hash);
         normalized_runs.push(requests);
         multiplicities.push(attempts);
     }
     let Some(baseline) = normalized_runs.first() else {
-        return cross_run_incomplete("cross-run-reproducibility has no baseline".to_owned());
+        return cross_run_incomplete("cross-run-reproducibility has no baseline".to_owned(), runs);
     };
     let Some(baseline_attempts) = multiplicities.first() else {
         return cross_run_incomplete(
             "cross-run-reproducibility has no baseline attempt map".to_owned(),
+            runs,
         );
     };
-    for (index, comparison_attempts) in multiplicities.iter().enumerate().skip(1) {
-        if comparison_attempts.keys().ne(baseline_attempts.keys()) {
-            return cross_run_incomplete(format!(
-                "run {} has missing or added semantic request evidence",
-                index + 1
-            ));
-        }
+    if normalized_runs.iter().all(BTreeMap::is_empty) {
+        return cross_run_incomplete(
+            "all complete runs have empty normalized request streams".to_owned(),
+            runs,
+        );
     }
     let mut first_difference = None;
     for (index, comparison) in normalized_runs.iter().enumerate().skip(1) {
@@ -684,20 +900,25 @@ pub fn evaluate_cross_run_reproducibility(
         details: json!({
             "stream_sha256_by_run": hashes,
             "first_difference": first_difference,
+            "collector_complete_by_run": collector_complete_by_run(runs),
         }),
         measurement_complete: true,
         measurement_error: None,
     }
 }
 
-fn incomplete(detail: String) -> NondeterministicFieldEvaluation {
+fn incomplete(detail: String, runs: &[DeterminismRun]) -> NondeterministicFieldEvaluation {
     NondeterministicFieldEvaluation {
         score: 0.0,
         comparable_leaf_occurrences: 0,
         varying_leaf_occurrences: 0,
         varying_pointer_count: 0,
         varying_critical_field_count: 0,
-        details: json!({"varying_fields": [], "run_hashes": []}),
+        details: json!({
+            "varying_fields": [],
+            "run_hashes": [],
+            "collector_complete_by_run": collector_complete_by_run(runs),
+        }),
         measurement_complete: false,
         reference_envelope_pass: false,
         measurement_error: Some(detail),
@@ -715,27 +936,33 @@ pub fn evaluate_nondeterministic_fields(
             .enumerate()
             .any(|(index, run)| run.run != index as u32 + 1)
     {
-        return incomplete(format!(
-            "expected ordered runs 1..={expected_runs}, observed {} run(s)",
-            runs.len()
-        ));
+        return incomplete(
+            format!(
+                "expected ordered runs 1..={expected_runs}, observed {} run(s)",
+                runs.len()
+            ),
+            runs,
+        );
     }
     let mut normalized_runs = Vec::with_capacity(runs.len());
     for run in runs {
         match comparable_requests(run) {
             Ok(requests) => normalized_runs.push(requests),
-            Err(detail) => return incomplete(detail),
+            Err(detail) => return incomplete(detail, runs),
         }
     }
     let mut run_hashes = Vec::with_capacity(normalized_runs.len());
     for requests in &normalized_runs {
         match normalized_stream_sha256(requests) {
             Ok(hash) => run_hashes.push(hash),
-            Err(detail) => return incomplete(detail),
+            Err(detail) => return incomplete(detail, runs),
         }
     }
     let Some(baseline) = normalized_runs.first() else {
-        return incomplete("nondeterministic-field-report has no baseline run".to_owned());
+        return incomplete(
+            "nondeterministic-field-report has no baseline run".to_owned(),
+            runs,
+        );
     };
     let mut comparable = 0_u64;
     let mut varying = 0_u64;
@@ -792,25 +1019,23 @@ pub fn evaluate_nondeterministic_fields(
                 field.dialects.extend(dialects);
                 continue;
             };
-            let before = flatten_leaves(&before_request.canonical);
-            let after = flatten_leaves(&after_request.canonical);
-            let pointers = before
-                .keys()
-                .chain(after.keys())
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            for pointer in pointers {
+            let occurrences =
+                match comparison_occurrences(&before_request.canonical, &after_request.canonical) {
+                    Ok(occurrences) => occurrences,
+                    Err(detail) => return incomplete(detail, runs),
+                };
+            for occurrence in occurrences {
                 comparable = comparable.saturating_add(1);
                 comparison_comparable = comparison_comparable.saturating_add(1);
-                let before_value = before.get(&pointer);
-                let after_value = after.get(&pointer);
+                let before_value = occurrence.before.as_ref();
+                let after_value = occurrence.after.as_ref();
                 if before_value == after_value {
                     continue;
                 }
                 varying = varying.saturating_add(1);
                 comparison_varying = comparison_varying.saturating_add(1);
-                let critical_pointer = is_critical_pointer(&dialects, &pointer);
-                let field = fields.entry(pointer).or_default();
+                let critical_pointer = is_critical_pointer(&dialects, &occurrence.pointer);
+                let field = fields.entry(occurrence.pointer).or_default();
                 field.occurrences = field.occurrences.saturating_add(1);
                 field.comparison_runs.insert(comparison_run);
                 field
@@ -822,9 +1047,12 @@ pub fn evaluate_nondeterministic_fields(
             }
         }
         if comparison_comparable == 0 {
-            return incomplete(format!(
-                "nondeterministic-field-report comparison run {comparison_run} has a zero comparable leaf denominator"
-            ));
+            return incomplete(
+                format!(
+                    "nondeterministic-field-report comparison run {comparison_run} has a zero comparable leaf denominator"
+                ),
+                runs,
+            );
         }
         let comparison_score = 1.0 - comparison_varying as f64 / comparison_comparable as f64;
         all_comparisons_pass &= comparison_score >= 0.99 && !comparison_has_critical_variation;
@@ -832,6 +1060,7 @@ pub fn evaluate_nondeterministic_fields(
     if comparable == 0 {
         return incomplete(
             "nondeterministic-field-report comparable leaf denominator is zero".to_owned(),
+            runs,
         );
     }
     let critical = fields
@@ -861,9 +1090,38 @@ pub fn evaluate_nondeterministic_fields(
         details: json!({
             "varying_fields": varying_fields,
             "run_hashes": run_hashes,
+            "collector_complete_by_run": collector_complete_by_run(runs),
         }),
         measurement_complete: true,
         reference_envelope_pass: all_comparisons_pass,
         measurement_error: None,
+    }
+}
+
+#[cfg(test)]
+mod pointer_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_is_one_segment_and_container_matching_is_prefix_based() {
+        assert!(pointer_pattern_matches(
+            "/messages/0/content/nested/value",
+            "/messages/*/content"
+        ));
+        assert!(!pointer_pattern_matches(
+            "/messages/0/wrapper/content",
+            "/messages/*/content"
+        ));
+        assert!(!pointer_pattern_matches(
+            "/messages/content",
+            "/messages/*/content"
+        ));
+    }
+
+    #[test]
+    fn pattern_parser_rejects_bad_escapes_and_supports_literal_star() {
+        assert!(parse_pointer_pattern("messages/*").is_err());
+        assert!(parse_pointer_pattern("/messages/~3").is_err());
+        assert!(pointer_pattern_matches("/metadata/*", "/metadata/~2"));
     }
 }

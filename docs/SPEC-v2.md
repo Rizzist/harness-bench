@@ -180,7 +180,7 @@ fixture starts is `ERROR` under the precedence table.
 | 60 | 1 quick / 3 cert trials. Byte/counter fields must agree in every trial; memory is the maximum trial delta. | Missing output-limit/marker declaration is `ABSENT`; incomplete byte or digest evidence is `ERROR`. |
 | 61 | 1 quick / 3 cert trials. Every faulted write trial passes; result counts are summed and terminal latency is the maximum. | If the AHRB control write proves chmod ineffective, the row is infrastructure `ERROR`, not harness `FAIL`. |
 | 62 | 1 quick / 3 cert trials. Every run and independent same-confinement probe passes; attempt counters are summed. | The only non-PASS outcome is infrastructure `ERROR`; never `FAIL`, `UNSUPPORTED`, `ABSENT`, or proxy-only proof. |
-| 63–64 | 2 quick / 7 cert executions. Run 1 is baseline; compare independently with every later run, sum comparable/varying occurrences, and require every comparison for row 64. | Missing run/request evidence or a zero denominator is `ERROR`; observed variation is informational `FAIL` for 63 and CORE `FAIL` for 64. |
+| 63–64 | 2 quick / 7 cert executions. Run 1 is baseline; compare independently with every later run, sum comparable/varying occurrences, and require every comparison for row 64. | Missing run or incomplete request-collector evidence, an invalid/duplicate attempt ledger, or a zero denominator is `ERROR`. After a run's collector is complete, an added/missing semantic request is observed variation: informational `FAIL` for 63 and CORE `FAIL` for 64. |
 | 65 | 1 verified trial per component in both profiles. Aggregate the three component scores arithmetically. | A wholly impossible provider-injection architecture is row `UNSUPPORTED` with score 0; partial, runnable but unverified components are informational `FAIL`, not a fabricated run. |
 | 66 | 3 quick / 7 cert independent token/cost/time cases. Cases pass per repetition; subscore is passed case kinds/3 only when each repetition of that kind passes. | Undeclared optional capability is `UNSUPPORTED` score 0; missing declared controls/tariff is `ABSENT`; absent stop/effect boundaries are `ERROR`. |
 | 67 | 3 quick / 7 cert complete usage runs. Each repetition must equal the exact fixture totals; headline values are per-repetition values (never sums across repetitions). | Undeclared optional capability is `UNSUPPORTED` score 0; missing declared pointer is `ABSENT`; missing event evidence is `ERROR`. |
@@ -238,7 +238,43 @@ fixture starts is `ERROR` under the precedence table.
 | Row / stable ID | Type, pillar, badge impact | Topology handling | Fixture and profile | Exact evidence | Oracle | Manifest and feasibility |
 |---|---|---|---|---|---|---|
 | **63 `nondeterministic-field-report`** | CHEAP; Functionality; INFORMATIONAL | Measured for both in fresh isolated executions. Compare each OS/topology/profile only to itself. | Identical direct-terminal plus one tool-call workflow. Quick 2 runs; cert 7. Run 1 is baseline; compare independently with each run 2..R. Pair and sort physical requests by the total semantic key `(scenario UTF-8 lexicographic, actor UTF-8 lexicographic, semantic_ordinal numeric, checkpoint UTF-8 lexicographic, attempt numeric)`, never hash, receipt time, or network order. Flatten paired canonical requests to JSON Pointer leaves, preserving array indices. Leaf additions/removals/type/value/array-order changes each count once. A wholly missing/added request contributes exactly one comparable and one varying occurrence at synthetic root pointer `""`; it therefore remains in the denominator rather than disappearing. | `metrics.nondeterministic_field_report.score`, `.comparable_leaf_occurrences`, `.varying_leaf_occurrences`, `.varying_pointer_count`, `.varying_critical_field_count`; `details.nondeterministic-field-report.varying_fields[]` is sorted by `(pointer, dialect)` and has exact `{pointer,occurrences,comparison_runs,before_types,after_types,dialects}`; `.run_hashes[]`. | Normalize **only string values** at this exact allowlist. Metadata exact pointers: `/metadata/ahrb_credential`, `/metadata/ahrb_profile_path`, `/metadata/ahrb_workspace_path`, `/metadata/ahrb_tmp_path`, `/metadata/ahrb_socket_path`, `/metadata/ahrb_run_marker`, `/metadata/ahrb_execution_id`. In dialect content, replace only exact AHRB-owned profile/workspace/tmp/socket/run-marker substrings at Chat `/messages/*/content`, `/messages/*/content/*/text`, `/messages/*/tool_calls/*/function/arguments`; Responses `/instructions`, `/input`, `/input/*/content`, `/input/*/content/*/text`, `/input/*/arguments`; Anthropic `/system`, `/system/*/text`, `/messages/*/content`, `/messages/*/content/*/text`, `/messages/*/content/*/input`. Each category has its own typed sentinel. No key, number, bool, null, array order, harness nonce/timestamp/session ID, credential outside its exact metadata pointer, or tool call/result ID is normalized. Score=`1-varying/comparable`; zero denominator is `ERROR`. Critical pointers are `/model`, `/messages`, `/input`, `/tools`, `/tool_choice` plus Chat `/messages/*/tool_calls/*/id`, `/messages/*/tool_call_id`, `/tool_calls/*/id`; Responses `/input/*/call_id`, `/input/*/id`, `/output/*/call_id`, `/output/*/id`; Anthropic `/messages/*/content/*/id`, `/messages/*/content/*/tool_use_id`. PASS envelope iff score `>=0.99` and critical variation count=0 in every comparison. | No new key. Canonical bodies and sorted object keys already exist in `ModelRequestRecord`; add stable semantic ordinals because the current BTreeMap key contains the varying hash and cannot align changed requests. `Report.metrics` cannot hold lists, hence typed `details`. |
-| **64 `cross-run-reproducibility`** | CHEAP; Functionality; **CORE** | Measured for both using the row-63 executions. Concurrent arrival order is ignored, but semantic order is not. | Same executions and exact pointer/type normalization allowlist as row 63. Sort by the complete key `(scenario,actor,semantic_ordinal,checkpoint,attempt)` with the comparison rules stated there. Serialize each full canonical request as an unsigned 64-bit big-endian byte length followed by canonical UTF-8 JSON bytes. Physical attempts remain separate ordered records. | `metrics.cross_run_reproducibility.identical`, `.request_stream_count`, `.attempt_count`; `details.cross-run-reproducibility.stream_sha256_by_run`, `.first_difference`. | PASS iff every run has equal semantic keys, equal contiguous attempt sets `1..=semantic_attempts_total`, and byte-identical normalized length-prefixed stream SHA-256. Missing/duplicate request evidence is `ERROR`; a complete differing stream is `FAIL`. Use full canonical bodies, **not** retry-identity canonicalization, because the latter intentionally removes delivery controls. | No new key. `canonicalize_json` and request logs make comparison cheap. `deterministic_run_id` is manifest+row based and repeats across identical runs, so evidence executions need a separate index occurrence key. |
+| **64 `cross-run-reproducibility`** | CHEAP; Functionality; **CORE** | Measured for both using the row-63 executions. Concurrent arrival order is ignored, but semantic order is not. | Same executions and exact pointer/type normalization allowlist as row 63. Sort by the complete key `(scenario,actor,semantic_ordinal,checkpoint,attempt)` with the comparison rules stated there. Serialize each full canonical request as an unsigned 64-bit big-endian byte length followed by canonical UTF-8 JSON bytes. Physical attempts remain separate ordered records. | `metrics.cross_run_reproducibility.identical`, `.request_stream_count`, `.attempt_count`; `details.cross-run-reproducibility.stream_sha256_by_run`, `.first_difference`, `.collector_complete_by_run`. | PASS iff every run has equal semantic keys, equal contiguous attempt sets `1..=semantic_attempts_total`, and byte-identical normalized length-prefixed stream SHA-256. An incomplete collector ledger, duplicate key, inconsistent total, or noncontiguous attempt set is `ERROR`; once each ledger is complete, a missing/added semantic request or any other differing stream is `FAIL`. Use full canonical bodies, **not** retry-identity canonicalization, because the latter intentionally removes delivery controls. | No new key. `canonicalize_json` and request logs make comparison cheap. `deterministic_run_id` is manifest+row based and repeats across identical runs, so evidence executions need a separate index occurrence key. |
+
+#### Row-63 normalization pointer-pattern grammar
+
+The dialect content allowlists above use a non-RFC JSON-pointer **pattern** grammar. It is
+normative for rows 63 and 64:
+
+```text
+pattern  = "" | "/" psegment *("/" psegment)
+psegment = "*" | literal
+literal  = *(unescaped | "~0" | "~1" | "~2")
+```
+
+`unescaped` is any Unicode scalar except `/`, `~`, or `*`. Pattern escapes decode as
+`~0` = `~`, `~1` = `/`, and the pattern-only extension `~2` = literal `*`; any other
+escape or a nonempty pattern without a leading `/` is invalid. The actual canonical JSON
+pointer uses RFC-6901 `~0`/`~1` escaping. A `*` psegment matches exactly one decoded object
+key or array-index segment—never zero segments, multiple segments, or part of a segment.
+A content pattern matches its named value and, when that value is an object or array,
+every descendant string leaf whose pointer has the matched segments as a prefix. Metadata
+pointers remain exact string-value pointers and do not acquire descendant matching. Only
+string values are ever normalized.
+
+Comparison walks objects by the sorted union of decoded keys and arrays positionally by
+zero-based index. There is one exception and therefore one array-reorder occurrence rule:
+if two arrays differ in order but have equal length and equal multisets of canonical JSON
+element bytes (including multiplicity), the pair contributes exactly one comparable and
+one varying occurrence at the array container pointer, with types `array`/`array`; no
+descendant occurrence is also emitted. All other array additions, removals, type changes,
+and value changes recurse positionally. This single container occurrence is included in
+the historically named `comparable_leaf_occurrences`/`varying_leaf_occurrences` counters.
+
+Each execution records `collector_complete_by_run[run]`. It becomes true only after the
+external provider collector has observed execution terminalization, shut down cleanly,
+and snapshotted its complete request ledger. A false/missing value is `ERROR`. Once true,
+absence or addition of a semantic request is measured behavior: row 63 contributes its
+single synthetic-root occurrence and row 64 produces `identical=false`/`FAIL`.
 
 ### F. Automation-interface ergonomics
 
@@ -287,9 +323,19 @@ badge then platform, and topology from badge or `"unknown"`. If its report is re
 the report's schema/spec/profile/topology/fingerprints override those defaults. Its
 stable key is `"legacy-" + sha256("ahrb-index-legacy-v1\\0" || little_endian_u64(one_based_line_number) || "\\0" || exact_raw_line)`.
 Malformed/unknown tagged lines are errors; migration never appends a replacement line.
-Schema-2 entries use `"run-" + sha256("ahrb-index-v2\\0" || harness || "\\0" || completed_at || "\\0" || report_path)`.
+While holding the exclusive index append lock, a writer allocates the one-based physical
+line ordinal `occurrence` (the number of existing newline-terminated lines plus one).
+Schema-2 entries use `"run-" + sha256("ahrb-index-v2-occurrence\\0" ||
+little_endian_u64(occurrence) || "\\0" || harness || "\\0" || completed_at || "\\0" ||
+report_path || "\\0" || sha256(exact persisted report.json bytes))`. The ordinal makes
+the key occurrence-unique even when two byte-identical reports finish in the same second;
+the report digest also binds the key to the persisted body.
 `completed_at` for new entries is captured only after the report bundle has been fully
-persisted; it is not the run-start timestamp.
+persisted; it is not the run-start timestamp. It is exactly 20 ASCII bytes in UTC Gregorian
+form `YYYY-MM-DDTHH:MM:SSZ`: four-digit year 1970–9999, zero-padded fields, literal `T`/`Z`,
+no offset or fractional seconds, and seconds 00–59. Readers reject a non-canonical or
+invalid calendar value. Selection compares parsed Unix seconds numerically, then compares
+`run_key` lexicographically only as the same-second tie-break.
 
 `run_key` is unique per completed occurrence; the deterministic report `run_id` is not,
 because identical manifest+row selections may repeat it. Resolution after `@` first
@@ -345,9 +391,11 @@ changes use this total table (before is left, after is right):
 Honest undeclared optional `UNSUPPORTED -> UNSUPPORTED` is neutral. Resource fields are
 sorted by exact name; old missing values are `null` with `change:"unavailable"`.
 Absolute and percentage deltas are emitted only when both numbers exist; zero baseline
-has `delta_pct:null`. Incompatible OS, topology, or **profile** reports still receive a
-row-state diff, but every resource delta is `not-comparable` and no ranking is emitted.
-Resource comparison never crosses quick/cert even for explicit selectors. Exit is 0
+has `delta_pct:null`. Incompatible or unknown OS, topology, or **profile** reports still
+receive a row-state diff, but every resource delta is `not-comparable` and no ranking is
+emitted. The empty string and exact migrated sentinel `"unknown"` are unknown; two unknown
+values never make a resource comparison eligible. Resource comparison never crosses
+quick/cert even for explicit selectors. Exit is 0
 with no gating regression, 1 with at least one gating regression, and 2 for
 resolution/schema/I/O errors.
 
@@ -381,7 +429,10 @@ declared optional rows 66–68/70 retain their passed-case score on a complete b
 `FAIL`; undeclared optional capability `UNSUPPORTED` is zero. A missing component never
 silently becomes zero. Any unavailable A prevents a v2 badge.
 
-L and C come from rows 43 and 46. R retains the exact v1 thresholds. Numeric mirror maps
+L and C come from rows 43 and 46. The topology-scoped marginal peak effective-memory input
+to R is measured in MiB, and its bounds are normative and inclusive: `R32` iff the input
+is `<=32`; `R96` iff it is `>32` and `<=96`; `R256` iff it is `>96` and `<=256`; otherwise
+`R256+`. Numeric mirror maps
 contain only f64 values; L/C strings and nullable A live in typed details/badge fields.
 All four are tied to the report's profile and printed OS/topology and MUST NOT be placed
 on a topology-, OS-, or profile-erasing leaderboard.
@@ -391,16 +442,17 @@ on a topology-, OS-, or profile-erasing leaderboard.
 The badge label is:
 
 ```text
-Automation Ready v2 · <os> · <topology> · N<width> · R<class> · L<class> · C<class> · A<0..100> · <facets>
+Automation Ready v2 · <os> · <topology> · <profile> · N<width> · R<class> · L<class> · C<class> · A<0..100> · <facets>
 ```
 
 Example:
 
 ```text
-Automation Ready v2 · macos · client-process-fanout · N8 · R96 · L500 · C50 · A82 · replay+crash+resume+budgets
+Automation Ready v2 · macos · client-process-fanout · quick · N8 · R96 · L500 · C50 · A82 · replay+crash+resume+budgets
 ```
 
-The v1 R classes remain `R32 | R96 | R256 | R256+`. L classes are
+The v1 R class names and the exact normative G2 bounds remain
+`R32 | R96 | R256 | R256+`. L classes are
 `L100 | L250 | L500 | L1000 | L1000+`; C classes are
 `C10 | C50 | C250 | C250+`. The A integer is defined by G2. If no facet passes, omit the
 final separator and facet segment rather than printing an empty suffix.
@@ -492,12 +544,18 @@ Each `results[]` object adds:
 ```text
 requirement: "core" | "optional-facet" | "informational"
 capability: string | null
+capability_declared: boolean | null         # optional facet declaration; null otherwise
 measurement_complete: boolean              # false requires outcome ERROR or ABSENT
 score: number | null                      # [0,1] when the row is graded
 reference_envelope_pass: boolean | null   # null for non-informational rows
 ```
 
-`evidence` remains a deterministically sorted list of human-readable references. Numeric
+For every schema-3 row whose `capability` is non-null, `capability_declared` is `true` iff
+that exact key occurs in manifest `capabilities.required` or `capabilities.optional`, and
+is `false` otherwise; it records declaration independently of whether the declared
+operation surface is usable. `hbench diff` uses only this structured field for OPTIONAL
+transition classification and never parses `evidence`. `evidence` remains a
+deterministically sorted list of human-readable references. Numeric
 machine comparisons use the exact `metrics`/`resource_summary` fields, not parsed prose.
 Booleans in the existing numeric `metrics` map are encoded as `0.0` or `1.0`; structured
 strings/lists belong in `details`.

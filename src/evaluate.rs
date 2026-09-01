@@ -63,6 +63,10 @@ pub struct TestResultMetadata {
     /// Optional capability key associated with the row.
     #[serde(default)]
     pub capability: Option<String>,
+    /// Whether the optional capability was declared by the manifest. This is
+    /// null for rows without an optional capability.
+    #[serde(default)]
+    pub capability_declared: Option<bool>,
     /// Whether the row produced all required observations.
     #[serde(default)]
     pub measurement_complete: bool,
@@ -83,6 +87,7 @@ impl Default for TestResultMetadata {
         Self {
             requirement: default_core_requirement(),
             capability: None,
+            capability_declared: None,
             measurement_complete: false,
             score: None,
             reference_envelope_pass: None,
@@ -118,6 +123,7 @@ impl TestResultMetadata {
         Self {
             requirement: requirement.to_owned(),
             capability,
+            capability_declared: None,
             measurement_complete,
             score: None,
             reference_envelope_pass,
@@ -431,16 +437,7 @@ pub fn certify(
     }
     // This class is meaningful only inside the topology printed on the badge.
     // AHRB deliberately has no topology-erasing leaderboard/ranking key.
-    let mib = marginal_bytes / (1024.0 * 1024.0);
-    let resource_class = if mib <= 32.0 {
-        "R32"
-    } else if mib <= 96.0 {
-        "R96"
-    } else if mib <= 256.0 {
-        "R256"
-    } else {
-        "R256+"
-    };
+    let resource_class = resource_class(marginal_bytes);
     let mut badge_facets = crate::scenarios::BADGE_FACETS.to_vec();
     badge_facets.sort_by_key(|facet| facet.order);
     let topology_family = certification_topology(manifest)?;
@@ -486,6 +483,19 @@ pub fn certify(
     })
 }
 
+fn resource_class(marginal_peak_bytes: f64) -> &'static str {
+    let peak_mib = marginal_peak_bytes / (1024.0 * 1024.0);
+    if peak_mib <= 32.0 {
+        "R32"
+    } else if peak_mib <= 96.0 {
+        "R96"
+    } else if peak_mib <= 256.0 {
+        "R256"
+    } else {
+        "R256+"
+    }
+}
+
 /// Return the process status for a completed report. Badge eligibility and
 /// process health are separate: only an observed FAIL or ERROR is nonzero.
 pub fn suite_exit_code(
@@ -519,9 +529,10 @@ pub fn badge_label(badge: &Badge) -> String {
         );
     }
     let mut label = format!(
-        "Automation Ready v2 · {} · {} · N{} · {} · {} · {} · A{}",
+        "Automation Ready v2 · {} · {} · {} · N{} · {} · {} · {} · A{}",
         badge.os,
         badge.topology,
+        badge.profile,
         badge.parallel_width,
         badge.resource_class,
         badge.latency_class,
@@ -608,5 +619,16 @@ mod automation_tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/mock/manifest.toml");
         let manifest = crate::manifest::load(&path).expect("mock manifest should load");
         assert!(!optional_rows_satisfied(&[], &manifest));
+    }
+
+    #[test]
+    fn resource_classes_use_inclusive_normative_mib_boundaries() {
+        let mib = 1024.0 * 1024.0;
+        assert_eq!(resource_class(32.0 * mib), "R32");
+        assert_eq!(resource_class(32.0 * mib + 1.0), "R96");
+        assert_eq!(resource_class(96.0 * mib), "R96");
+        assert_eq!(resource_class(96.0 * mib + 1.0), "R256");
+        assert_eq!(resource_class(256.0 * mib), "R256");
+        assert_eq!(resource_class(256.0 * mib + 1.0), "R256+");
     }
 }

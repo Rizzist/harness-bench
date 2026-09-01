@@ -44,6 +44,7 @@ fn run(run: u32, records: Vec<ModelRequestRecord>) -> DeterminismRun {
     DeterminismRun {
         run,
         records,
+        request_collector_complete: true,
         normalization: NormalizationContext::default(),
     }
 }
@@ -89,6 +90,32 @@ fn normalization_uses_exact_pointer_and_string_type_allowlist() {
         Some(&json!("/owned/profile-r1/workspace/a"))
     );
     assert_eq!(normalized.pointer("/credential"), Some(&json!("secret-r1")));
+}
+
+#[test]
+fn wildcard_matches_one_segment_and_container_patterns_reach_nested_strings() {
+    let context = NormalizationContext {
+        profile_paths: vec!["/owned/profile".to_owned()],
+        ..NormalizationContext::default()
+    };
+    let normalized = normalize_canonical_request(
+        "openai-chat-completions",
+        &json!({
+            "messages": [{
+                "content": {"nested": [{"value": "/owned/profile/allowed"}]},
+                "wrapper": {"content": "/owned/profile/not-allowed"}
+            }]
+        }),
+        &context,
+    );
+    assert_eq!(
+        normalized.pointer("/messages/0/content/nested/0/value"),
+        Some(&json!("<AHRB_PROFILE_PATH>/allowed"))
+    );
+    assert_eq!(
+        normalized.pointer("/messages/0/wrapper/content"),
+        Some(&json!("/owned/profile/not-allowed"))
+    );
 }
 
 #[test]
@@ -261,6 +288,44 @@ fn responses_call_and_result_ids_use_dialect_specific_critical_pointers() {
 }
 
 #[test]
+fn row63_counts_a_pure_array_reorder_once_at_the_container() {
+    let evaluation = evaluate_nondeterministic_fields(
+        &[
+            run(
+                1,
+                vec![record(
+                    "unknown-dialect",
+                    "direct",
+                    1,
+                    1,
+                    json!({"items":[{"id":"a","value":1},{"id":"b","value":2}]}),
+                )],
+            ),
+            run(
+                2,
+                vec![record(
+                    "unknown-dialect",
+                    "direct",
+                    1,
+                    1,
+                    json!({"items":[{"id":"b","value":2},{"id":"a","value":1}]}),
+                )],
+            ),
+        ],
+        2,
+    );
+    assert!(evaluation.measurement_complete);
+    assert_eq!(evaluation.comparable_leaf_occurrences, 1);
+    assert_eq!(evaluation.varying_leaf_occurrences, 1);
+    assert_eq!(evaluation.varying_pointer_count, 1);
+    assert_eq!(evaluation.details["varying_fields"][0]["pointer"], "/items");
+    assert_eq!(
+        evaluation.details["varying_fields"][0]["before_types"],
+        json!(["array"])
+    );
+}
+
+#[test]
 fn row64_uses_complete_semantic_order_not_record_arrival_order() {
     let first = record(
         "openai-chat-completions",
@@ -357,7 +422,7 @@ fn row64_requires_all_declared_physical_attempts() {
 }
 
 #[test]
-fn row64_treats_a_missing_request_as_incomplete_evidence() {
+fn row64_treats_a_missing_request_in_a_complete_run_as_failure_evidence() {
     let present = record(
         "openai-chat-completions",
         "direct",
@@ -376,13 +441,36 @@ fn row64_treats_a_missing_request_as_incomplete_evidence() {
         &[run(1, vec![present.clone(), second]), run(2, vec![present])],
         2,
     );
+    assert!(evaluation.measurement_complete);
+    assert!(!evaluation.identical);
+    assert!(evaluation.measurement_error.is_none());
+    assert_eq!(
+        evaluation.details["first_difference"]["kind"],
+        "missing-request"
+    );
+}
+
+#[test]
+fn row64_treats_missing_collector_evidence_as_error() {
+    let present = record(
+        "openai-chat-completions",
+        "direct",
+        1,
+        1,
+        json!({"messages":[{"role":"user","content":"same"}]}),
+    );
+    let mut incomplete = run(2, vec![present.clone()]);
+    incomplete.request_collector_complete = false;
+    let evaluation = evaluate_cross_run_reproducibility(&[run(1, vec![present]), incomplete], 2);
     assert!(!evaluation.measurement_complete);
+    assert!(!evaluation.identical);
     assert!(
         evaluation
             .measurement_error
             .as_deref()
-            .is_some_and(|detail| detail.contains("missing or added semantic request evidence"))
+            .is_some_and(|detail| detail.contains("request collector evidence is incomplete"))
     );
+    assert_eq!(evaluation.details["collector_complete_by_run"]["2"], false);
 }
 
 #[test]
