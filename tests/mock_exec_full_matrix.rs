@@ -31,11 +31,12 @@ fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, Str
         .arg(output)
         .arg("--profile")
         .arg("quick")
-        // Keep this regression test scoped to the pre-Wave-2 matrix. Wave-2
-        // rows have focused evidence tests, and row 62 may correctly be an
-        // infrastructure ERROR when no reviewed OS egress guard is available.
+        // Keep this regression test scoped around the established reference
+        // matrix plus Wave 4. Wave-2/3 rows have focused evidence tests, and
+        // row 62 may correctly be an infrastructure ERROR when no reviewed OS
+        // egress guard is available.
         .arg("--tests")
-        .arg("1-46,63-64")
+        .arg("1-46,63-72")
         .arg("--junit")
         .output()
         .expect("execute AHRB against the per-invocation reference harness");
@@ -301,7 +302,7 @@ fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() 
         Some(0),
         "reference per-invocation certification must exit zero"
     );
-    assert_eq!(report.results.len(), 48);
+    assert_eq!(report.results.len(), 56);
     let pass_count = report
         .results
         .iter()
@@ -314,7 +315,7 @@ fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() 
             matches!(result.outcome, TestOutcome::Unsupported(_)).then_some(result.row)
         })
         .collect::<Vec<_>>();
-    assert_eq!(pass_count, 42);
+    assert_eq!(pass_count, 50);
     assert_eq!(unsupported_rows, vec![4, 18, 31, 32, 33, 39]);
     assert!(
         report.results.iter().all(|result| {
@@ -323,7 +324,7 @@ fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() 
     );
     assert!(
         report.badge.is_none(),
-        "missing rows 65-72 make A unavailable"
+        "unselected Wave-2/3 CORE rows must keep this scoped run unbadged"
     );
     assert!(matches!(
         report.resource_summary.latency_class.as_deref(),
@@ -333,7 +334,7 @@ fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() 
         report.resource_summary.cpu_class.as_deref(),
         Some("C10" | "C50" | "C250")
     ));
-    assert!(report.details["automation-score"]["score"].is_null());
+    assert_eq!(report.details["automation-score"]["score"], 100);
     assert!(report.resource_summary.peak_rss_mib > 0.0);
     assert_eq!(report.resource_summary.profile, "quick");
     assert!(report.resource_metrics.values().all(|metric| {

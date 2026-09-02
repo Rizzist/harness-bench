@@ -23,6 +23,7 @@ use std::os::fd::{AsRawFd as _, RawFd};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -1602,15 +1603,40 @@ pub struct FakeModelServer {
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
     engine: Arc<FakeModelEngine>,
+    physical_requests: Arc<AtomicU64>,
+    credential_rejections: Arc<AtomicU64>,
 }
 
 impl FakeModelServer {
     /// Bind a loopback/local address and start serving all built-in protocol frontends.
     pub async fn bind(addr: SocketAddr, engine: Arc<FakeModelEngine>) -> Result<Self> {
+        Self::bind_with_credential_policy(addr, engine, None).await
+    }
+
+    /// Bind a fake provider that rejects every provider request whose API
+    /// credential does not exactly match `credential`. This is reserved for
+    /// row-65's active credential-carrier trap.
+    pub(crate) async fn bind_requiring_credential(
+        addr: SocketAddr,
+        engine: Arc<FakeModelEngine>,
+        credential: String,
+    ) -> Result<Self> {
+        Self::bind_with_credential_policy(addr, engine, Some(Arc::<str>::from(credential))).await
+    }
+
+    async fn bind_with_credential_policy(
+        addr: SocketAddr,
+        engine: Arc<FakeModelEngine>,
+        required_credential: Option<Arc<str>>,
+    ) -> Result<Self> {
         let listener = retry_transient_bind(|| TcpListener::bind(addr)).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let task_engine = Arc::clone(&engine);
+        let physical_requests = Arc::new(AtomicU64::new(0));
+        let credential_rejections = Arc::new(AtomicU64::new(0));
+        let task_physical_requests = Arc::clone(&physical_requests);
+        let task_credential_rejections = Arc::clone(&credential_rejections);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1618,9 +1644,19 @@ impl FakeModelServer {
                     accepted = listener.accept() => {
                         let (stream, _) = accepted?;
                         let connection_engine = Arc::clone(&task_engine);
+                        let connection_physical_requests = Arc::clone(&task_physical_requests);
+                        let connection_credential_rejections =
+                            Arc::clone(&task_credential_rejections);
+                        let connection_required_credential = required_credential.clone();
                         tokio::spawn(async move {
                             let service = service_fn(move |request| {
-                                serve_request(request, Arc::clone(&connection_engine))
+                                serve_counted_request(
+                                    request,
+                                    Arc::clone(&connection_engine),
+                                    Arc::clone(&connection_physical_requests),
+                                    Arc::clone(&connection_credential_rejections),
+                                    connection_required_credential.clone(),
+                                )
                             });
                             let result = http1::Builder::new()
                                 .serve_connection(TokioIo::new(stream), service)
@@ -1639,6 +1675,8 @@ impl FakeModelServer {
             shutdown: Some(shutdown_sender),
             task,
             engine,
+            physical_requests,
+            credential_rejections,
         })
     }
 
@@ -1655,6 +1693,18 @@ impl FakeModelServer {
     /// Shared engine, including barrier controls and request evidence.
     pub fn engine(&self) -> &Arc<FakeModelEngine> {
         &self.engine
+    }
+
+    /// Number of physical HTTP requests received by this listener, including
+    /// catalog probes, malformed requests, and authentication rejections.
+    pub(crate) fn physical_request_count(&self) -> u64 {
+        self.physical_requests.load(Ordering::Acquire)
+    }
+
+    /// Number of physical provider requests actively rejected by the row-65
+    /// credential policy.
+    pub(crate) fn credential_rejection_count(&self) -> u64 {
+        self.credential_rejections.load(Ordering::Acquire)
     }
 
     /// Gracefully stop accepting connections and wait for the listener task.
@@ -1788,14 +1838,39 @@ pub struct FakeModelMailboxServer {
     directory: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
+    physical_requests: Arc<AtomicU64>,
+    credential_rejections: Arc<AtomicU64>,
 }
 
 impl FakeModelMailboxServer {
     /// Create a fresh atomic-envelope provider transport.
     pub async fn bind(directory: PathBuf, engine: Arc<FakeModelEngine>) -> Result<Self> {
+        Self::bind_with_credential_policy(directory, engine, None).await
+    }
+
+    /// Create a mailbox provider that actively rejects every provider request
+    /// whose credential is not exactly `credential`.
+    pub(crate) async fn bind_requiring_credential(
+        directory: PathBuf,
+        engine: Arc<FakeModelEngine>,
+        credential: String,
+    ) -> Result<Self> {
+        Self::bind_with_credential_policy(directory, engine, Some(Arc::<str>::from(credential)))
+            .await
+    }
+
+    async fn bind_with_credential_policy(
+        directory: PathBuf,
+        engine: Arc<FakeModelEngine>,
+        required_credential: Option<Arc<str>>,
+    ) -> Result<Self> {
         tokio::fs::create_dir(&directory).await?;
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let task_directory = directory.clone();
+        let physical_requests = Arc::new(AtomicU64::new(0));
+        let credential_rejections = Arc::new(AtomicU64::new(0));
+        let task_physical_requests = Arc::clone(&physical_requests);
+        let task_credential_rejections = Arc::clone(&credential_rejections);
         let task = tokio::spawn(async move {
             let mut requests = tokio::task::JoinSet::new();
             loop {
@@ -1826,15 +1901,32 @@ impl FakeModelMailboxServer {
                             let received_ns = monotonic_timestamp_ns();
                             tokio::fs::remove_file(&claimed).await?;
                             let envelope: ProviderMailboxRequest = serde_json::from_slice(&bytes)?;
+                            task_physical_requests.fetch_add(1, Ordering::AcqRel);
+                            let rejected = required_credential.as_deref().is_some_and(|expected| {
+                                !provider_headers_use_credential(&envelope.headers, expected)
+                            });
+                            if rejected {
+                                task_credential_rejections.fetch_add(1, Ordering::AcqRel);
+                            }
                             let response_directory = task_directory.clone();
                             let response_engine = Arc::clone(&engine);
                             requests.spawn(async move {
-                                let response = handle_provider_mailbox_request(
-                                    &envelope,
-                                    received_ns,
-                                    response_engine,
-                                )
-                                .await;
+                                let response = if rejected {
+                                    Ok(ProviderMailboxResponse {
+                                        id: envelope.id.clone(),
+                                        status: 401,
+                                        body: b"{\"error\":{\"type\":\"authentication_error\"}}"
+                                            .to_vec(),
+                                        error: None,
+                                    })
+                                } else {
+                                    handle_provider_mailbox_request(
+                                        &envelope,
+                                        received_ns,
+                                        response_engine,
+                                    )
+                                    .await
+                                };
                                 let response = match response {
                                     Ok(response) => response,
                                     Err(error) => ProviderMailboxResponse {
@@ -1857,12 +1949,24 @@ impl FakeModelMailboxServer {
             directory,
             shutdown: Some(shutdown_sender),
             task,
+            physical_requests,
+            credential_rejections,
         })
     }
 
     /// Provider transport directory passed to the reference harness.
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Number of physical provider envelopes claimed before parsing.
+    pub(crate) fn physical_request_count(&self) -> u64 {
+        self.physical_requests.load(Ordering::Acquire)
+    }
+
+    /// Number of envelopes rejected by the active credential policy.
+    pub(crate) fn credential_rejection_count(&self) -> u64 {
+        self.credential_rejections.load(Ordering::Acquire)
     }
 
     /// Stop the sidecar and remove its fresh transport directory.
@@ -1876,6 +1980,20 @@ impl FakeModelMailboxServer {
         tokio::fs::remove_dir_all(&self.directory).await?;
         Ok(())
     }
+}
+
+fn provider_headers_use_credential(headers: &BTreeMap<String, String>, expected: &str) -> bool {
+    let value = headers.iter().find_map(|(name, value)| {
+        (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key"))
+            .then_some(value.as_str())
+    });
+    value.is_some_and(|value| {
+        value == expected
+            || value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                == Some(expected)
+    })
 }
 
 async fn handle_provider_mailbox_request(
@@ -2092,6 +2210,53 @@ async fn serve_request(
         Err(error) => diagnostic_response(&error),
     };
     Ok(response)
+}
+
+fn request_uses_credential(request: &Request<Incoming>, expected: &str) -> bool {
+    let authorization = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    let api_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok());
+    authorization.is_some_and(|value| {
+        value == expected
+            || value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                == Some(expected)
+    }) || api_key == Some(expected)
+}
+
+async fn serve_counted_request(
+    request: Request<Incoming>,
+    engine: Arc<FakeModelEngine>,
+    physical_requests: Arc<AtomicU64>,
+    credential_rejections: Arc<AtomicU64>,
+    required_credential: Option<Arc<str>>,
+) -> std::result::Result<Response<DeterministicBody>, Infallible> {
+    physical_requests.fetch_add(1, Ordering::AcqRel);
+    let provider_path = request.uri().path() != "/healthz";
+    let rejected = required_credential
+        .as_deref()
+        .is_some_and(|expected| provider_path && !request_uses_credential(&request, expected));
+    if rejected {
+        credential_rejections.fetch_add(1, Ordering::AcqRel);
+        let response = match response_from_parts(
+            401,
+            &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+            DeterministicBody::full(Bytes::from_static(
+                b"{\"error\":{\"type\":\"authentication_error\"}}",
+            )),
+        ) {
+            Ok(response) => response,
+            Err(error) => diagnostic_response(&error),
+        };
+        return Ok(response);
+    }
+    serve_request(request, engine).await
 }
 
 async fn handle_http(
@@ -2493,7 +2658,8 @@ fn render_chat_value(response: &ModelResponse) -> Result<Value> {
     } else {
         "tool_calls"
     };
-    let completion_tokens = nonzero_token_estimate(&Value::Object(message.clone()));
+    let estimated_output = nonzero_token_estimate(&Value::Object(message.clone()));
+    let (prompt_tokens, completion_tokens) = semantic_usage(&response.value, estimated_output)?;
     Ok(json!({
         "id": stable_id("chatcmpl", response),
         "object": "chat.completion",
@@ -2505,9 +2671,9 @@ fn render_chat_value(response: &ModelResponse) -> Result<Value> {
             "finish_reason": finish_reason
         }],
         "usage": {
-            "prompt_tokens": 1,
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": completion_tokens.saturating_add(1)
+            "total_tokens": completion_tokens.saturating_add(prompt_tokens)
         }
     }))
 }
@@ -2574,7 +2740,8 @@ fn render_responses_value(response: &ModelResponse) -> Result<Value> {
             "status": "completed"
         }));
     }
-    let output_tokens = nonzero_token_estimate(&Value::Array(output.clone()));
+    let estimated_output = nonzero_token_estimate(&Value::Array(output.clone()));
+    let (input_tokens, output_tokens) = semantic_usage(&response.value, estimated_output)?;
     Ok(json!({
         "id": stable_id("resp", response),
         "object": "response",
@@ -2583,9 +2750,9 @@ fn render_responses_value(response: &ModelResponse) -> Result<Value> {
         "model": response.model,
         "output": output,
         "usage": {
-            "input_tokens": 1,
+            "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": output_tokens.saturating_add(1)
+            "total_tokens": output_tokens.saturating_add(input_tokens)
         }
     }))
 }
@@ -2619,7 +2786,8 @@ fn render_anthropic_value(response: &ModelResponse) -> Result<Value> {
         };
         content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
     }
-    let output_tokens = nonzero_token_estimate(&Value::Array(content.clone()));
+    let estimated_output = nonzero_token_estimate(&Value::Array(content.clone()));
+    let (input_tokens, output_tokens) = semantic_usage(&response.value, estimated_output)?;
     Ok(json!({
         "id": stable_id("msg", response),
         "type": "message",
@@ -2628,8 +2796,30 @@ fn render_anthropic_value(response: &ModelResponse) -> Result<Value> {
         "content": content,
         "stop_reason": if tool_calls.is_empty() { "end_turn" } else { "tool_use" },
         "stop_sequence": null,
-        "usage": {"input_tokens": 1, "output_tokens": output_tokens}
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     }))
+}
+
+fn semantic_usage(value: &Value, default_output_tokens: u64) -> Result<(u64, u64)> {
+    let Some(usage) = value.get("_ahrb_usage") else {
+        return Ok((1, default_output_tokens));
+    };
+    let usage = usage
+        .as_object()
+        .ok_or_else(|| AhrbError::Protocol("semantic _ahrb_usage must be an object".to_owned()))?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AhrbError::Protocol("semantic _ahrb_usage.input_tokens must be u64".to_owned())
+        })?;
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AhrbError::Protocol("semantic _ahrb_usage.output_tokens must be u64".to_owned())
+        })?;
+    Ok((input_tokens, output_tokens))
 }
 
 fn semantic_parts(value: &Value) -> Result<(Option<String>, Vec<Value>)> {
@@ -3624,6 +3814,23 @@ mod tests {
     use crate::workflow::{Actor, Barrier};
     use std::cell::Cell;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn semantic_usage_overrides_dialect_token_estimates() -> Result<()> {
+        assert_eq!(
+            semantic_usage(
+                &json!({
+                    "text": "SUCCESS",
+                    "_ahrb_usage": {"input_tokens": 140, "output_tokens": 30}
+                }),
+                999,
+            )?,
+            (140, 30)
+        );
+        assert_eq!(semantic_usage(&json!({"text": "SUCCESS"}), 19)?, (1, 19));
+        assert!(semantic_usage(&json!({"_ahrb_usage": {"input_tokens": "bad"}}), 1).is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn transient_bind_errors_are_retried_but_permanent_errors_are_not() -> Result<()> {
@@ -4630,6 +4837,66 @@ mod tests {
         assert!(records[0].accepted);
         assert_ne!(records[0].request.credential_fingerprint, "absent");
         server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn credential_policy_actively_rejects_wrong_secret_and_counts_all_requests() -> Result<()>
+    {
+        let _listener_guard = LOCAL_SERVER_TEST_LOCK.lock().await;
+        let _process_guard = acquire_process_server_test_lock()?;
+        let engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);
+        let address = "127.0.0.1:0".parse().map_err(|error| {
+            AhrbError::Validation(format!("invalid test socket address: {error}"))
+        })?;
+        let bound = FakeModelServer::bind_requiring_credential(
+            address,
+            Arc::clone(&engine),
+            "credential-b".to_owned(),
+        )
+        .await;
+        let server = match bound {
+            Ok(server) => server,
+            Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut rejected_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+        let rejected_request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer credential-a\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+            server.local_addr()
+        );
+        rejected_stream
+            .write_all(rejected_request.as_bytes())
+            .await?;
+        let mut rejected_response = Vec::new();
+        rejected_stream.read_to_end(&mut rejected_response).await?;
+        assert!(rejected_response.starts_with(b"HTTP/1.1 401"));
+        assert_eq!(server.physical_request_count(), 1);
+        assert_eq!(server.credential_rejection_count(), 1);
+        assert!(engine.request_records().await.is_empty());
+
+        let mut accepted_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+        let body = request_body();
+        let accepted_head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer credential-b\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            server.local_addr(),
+            body.len()
+        );
+        accepted_stream.write_all(accepted_head.as_bytes()).await?;
+        accepted_stream.write_all(&body).await?;
+        let mut accepted_response = Vec::new();
+        accepted_stream.read_to_end(&mut accepted_response).await?;
+        assert!(accepted_response.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(server.physical_request_count(), 2);
+        assert_eq!(server.credential_rejection_count(), 1);
+        assert_eq!(engine.request_records().await.len(), 1);
+        server.shutdown().await?;
+        let rebound_engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);
+        let rebound = FakeModelServer::bind(address, rebound_engine).await?;
+        rebound.shutdown().await?;
         Ok(())
     }
 

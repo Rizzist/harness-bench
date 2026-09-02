@@ -27,6 +27,28 @@ fn external_reference_manifests_parse_and_validate() -> Result<()> {
 }
 
 #[test]
+fn wave4_target_manifests_parse_and_declare_typed_injection_surfaces() -> Result<()> {
+    for adapter in [
+        "codex",
+        "claude-code",
+        "opencode",
+        "pi",
+        "rick",
+        "haider-agent",
+        "mock",
+        "mock-exec",
+    ] {
+        let path = format!("adapters/{adapter}/manifest.toml");
+        let manifest = ahrb::manifest::load(Path::new(&path))?;
+        assert!(
+            manifest.capabilities.injection_surface.is_some(),
+            "{adapter} must declare the typed Wave-4 injection surface"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> Result<()> {
     for adapter in ["codex", "claude-code", "opencode", "pi", "rick"] {
         let path = format!("adapters/{adapter}/manifest.toml");

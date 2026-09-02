@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::manifest::EventMapping;
 use crate::{AhrbError, Result};
@@ -73,6 +74,8 @@ impl EventNormalizer {
         raw: &Value,
         mapping: &EventMapping,
     ) -> Result<Option<NormalizedEvent>> {
+        let receipt_start_ns = crate::fake_model::monotonic_timestamp_ns();
+        let receipt_wall_start_ns = wall_clock_ns()?;
         let event_type = (!mapping.type_pointer.is_empty())
             .then(|| raw.pointer(&mapping.type_pointer))
             .flatten()
@@ -125,6 +128,20 @@ impl EventNormalizer {
                 object.insert(field.clone(), value);
             }
         }
+        let receipt_end_ns = crate::fake_model::monotonic_timestamp_ns();
+        let receipt_wall_end_ns = wall_clock_ns()?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("_ahrb_source_raw".to_owned(), raw.clone());
+            object.insert(
+                "_ahrb_receipt".to_owned(),
+                serde_json::json!({
+                    "receipt_start_ns": receipt_start_ns,
+                    "receipt_end_ns": receipt_end_ns,
+                    "receipt_wall_start_ns": receipt_wall_start_ns,
+                    "receipt_wall_end_ns": receipt_wall_end_ns,
+                }),
+            );
+        }
         Ok(Some(NormalizedEvent {
             id,
             cursor,
@@ -134,6 +151,15 @@ impl EventNormalizer {
             payload,
         }))
     }
+}
+
+fn wall_clock_ns() -> Result<u64> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AhrbError::Protocol("system clock predates the Unix epoch".to_owned()))?
+        .as_nanos();
+    u64::try_from(nanos)
+        .map_err(|_| AhrbError::Protocol("system clock nanoseconds exceed u64".to_owned()))
 }
 
 /// Return whether a source record satisfies a rule's JSON-pointer predicates.

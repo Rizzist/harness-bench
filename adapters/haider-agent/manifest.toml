@@ -146,6 +146,10 @@ schema_version_pointer = "/schema_version"
 schema_versions = [1]
 warn_unmapped_payload_kinds = true
 
+[events.metadata]
+schema_version_pointer = "/schema_version"
+schema_version_value = "1"
+
 [[events.rules]]
 matches = "accepted"
 event = "turn-accepted"
@@ -232,8 +236,23 @@ paths = ["{{profile}}"]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
 
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "ahrb/{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "cli"
+argv = ["--base-url", "{{base_url}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "OPENAI_API_KEY"
+
 [capabilities.required]
 headless = "haider run --output jsonl is a noninteractive thin client over the resident daemon"
+tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native tool-result role"
 
 [capabilities.optional]
 sessions = "durable daemon sessions are listable with haider sessions --json --no-spawn"
@@ -249,3 +268,20 @@ durable_journal = "haider run --replay <run-id> replays the daemon-owned durable
 # item/direct agent-message and run_state/direct terminal alternatives are
 # mutually exclusive within one turn. AHRB intentionally preserves duplicate
 # normalized events rather than hiding a changed Haider emission contract.
+# TODO(orchestrator): reconcile the probed CLI with the Wave-4 assertion for
+# `--max-cost` and `--max-time`, including the exact time-unit syntax, then pin
+# a harness-visible 2/3 micro-USD tariff carrier.
+# TODO(orchestrator): capture the exact usage JSONL carrier, normalized event,
+# per-turn versus cumulative scope, and all five JSON pointers before declaring
+# usage_reporting.
+# TODO(orchestrator): pin public create/fork/delete operations, repeated-delete
+# semantics, and every lifecycle pointer before declaring session_ops_cli;
+# sessions/list/resume/recover alone are insufficient.
+# TODO(orchestrator): verify complete allow, filesystem-deny, and network-deny
+# argv before declaring headless_permission_model; `--allow-writes` and
+# `--allow-exec` alone do not prove denial granularity.
+# TODO(orchestrator): pin the exact mode-0600 account/auth credential file, or
+# revise SPEC-v2 rule 6 for env-only credentials, before declaring
+# secrets_hygiene_on_disk.
+# TODO(orchestrator): capture timestamp and exact usage metadata from the live
+# JSONL carrier; only `/schema_version = 1` is currently grounded.

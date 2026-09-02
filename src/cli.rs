@@ -366,8 +366,8 @@ mod tests {
         assert_eq!(parse_test_rows("40-45")?, vec![40, 41, 42, 43, 44, 45]);
         assert_eq!(parse_test_rows("44-46")?, vec![44, 45, 46]);
         assert_eq!(parse_test_rows("47")?, vec![47]);
-        assert_eq!(parse_test_rows("63-64")?, vec![63, 64]);
-        assert!(parse_test_rows("65").is_err());
+        assert_eq!(parse_test_rows("63-72")?, (63..=72).collect::<Vec<_>>());
+        assert!(parse_test_rows("73").is_err());
         Ok(())
     }
 

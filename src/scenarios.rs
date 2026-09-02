@@ -58,7 +58,7 @@ pub enum BadgeFacetScope {
 impl TestDefinition {
     /// Return this row's certification role from authoritative matrix metadata.
     pub fn requirement(self) -> RequirementKind {
-        if matches!(self.row, 42 | 43 | 45 | 46 | 47 | 63) {
+        if matches!(self.row, 42 | 43 | 45 | 46 | 47 | 63 | 65 | 69) {
             return RequirementKind::Informational;
         }
         OPTIONAL_FACETS
@@ -78,7 +78,7 @@ struct OptionalFacet {
     capability: &'static str,
 }
 
-const OPTIONAL_FACETS: [OptionalFacet; 7] = [
+const OPTIONAL_FACETS: [OptionalFacet; 11] = [
     OptionalFacet {
         row: 4,
         capability: "parallel_tool_execution",
@@ -106,6 +106,22 @@ const OPTIONAL_FACETS: [OptionalFacet; 7] = [
     OptionalFacet {
         row: 39,
         capability: "hooks",
+    },
+    OptionalFacet {
+        row: 66,
+        capability: "budget_enforcement",
+    },
+    OptionalFacet {
+        row: 67,
+        capability: "usage_reporting",
+    },
+    OptionalFacet {
+        row: 68,
+        capability: "session_ops_cli",
+    },
+    OptionalFacet {
+        row: 70,
+        capability: "headless_permission_model",
     },
 ];
 
@@ -159,6 +175,30 @@ pub const BADGE_FACETS: &[BadgeFacet] = &[
         order: 70,
         scope: BadgeFacetScope::All,
     },
+    BadgeFacet {
+        row: 66,
+        label: "budgets",
+        order: 80,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 67,
+        label: "usage",
+        order: 90,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 68,
+        label: "session-cli",
+        order: 100,
+        scope: BadgeFacetScope::All,
+    },
+    BadgeFacet {
+        row: 70,
+        label: "permissions",
+        order: 110,
+        scope: BadgeFacetScope::All,
+    },
 ];
 
 /// Return all matrix definitions in row order.
@@ -174,7 +214,7 @@ const AR: Pillar = Pillar::AutomationReadiness;
 /// Matrix rows that must pass early in the implementation and verification loop.
 pub const PRIORITIZED_ROWS: &[u8] = &[1, 2, 3, 9, 10, 12, 20, 26, 30, 35, 40];
 
-const TESTS: [TestDefinition; 64] = [
+const TESTS: [TestDefinition; 72] = [
     test(
         1,
         "routing",
@@ -687,6 +727,70 @@ const TESTS: [TestDefinition; 64] = [
         "normalized canonical request stream reproducibility",
         "equal semantic request count and attempt multiplicity with byte-identical normalized streams",
     ),
+    test(
+        65,
+        "injection-surface",
+        "Injection surface",
+        AR,
+        "verified provider, base-URL, and credential carrier scores",
+        "all three isolated trap trials verify with nonzero component scores and aggregate score >=0.50",
+    ),
+    test(
+        66,
+        "budget-enforcement",
+        "Budget enforcement",
+        AR,
+        "token, cost, and time stop boundaries with post-boundary overruns",
+        "every budget case stops at its exact boundary with one typed budget terminal and zero overruns",
+    ),
+    test(
+        67,
+        "usage-reporting",
+        "Usage reporting",
+        AR,
+        "machine-readable per-repetition token, cost, and turn totals",
+        "all five declared usage fields exactly match every fake-provider repetition with zero crosscheck errors",
+    ),
+    test(
+        68,
+        "session-ops-cli",
+        "Session operations CLI",
+        AR,
+        "create, list, resume, fork, and delete CLI lifecycle operations",
+        "every operation preserves a committed nonempty seed, identity, prefix, divergence, and delete semantics",
+    ),
+    test(
+        69,
+        "event-stream-completeness",
+        "Event stream completeness",
+        AR,
+        "tool IDs, result correlation, timestamps, usage, terminal typing, and schema version",
+        "at least four of six components pass including tool-call ID, correlated result, and terminal typing",
+    ),
+    test(
+        70,
+        "headless-permission-model",
+        "Headless permission model",
+        AR,
+        "permission granularity, prompt count, and allowed or denied effects",
+        "score >=0.50 with every allowed and denied trial effective, zero TTY prompts, and zero scope violations",
+    ),
+    test(
+        71,
+        "secrets-hygiene-on-disk",
+        "Secrets hygiene on disk",
+        AR,
+        "credential matches across captured streams and profile artifacts",
+        "nonempty exact carrier declarations and zero credential occurrences outside allowed private carrier files or argv",
+    ),
+    test(
+        72,
+        "tool-result-role-fidelity",
+        "Tool-result role fidelity",
+        TC,
+        "protocol-native successful and failed tool-result roles in subsequent requests",
+        "exactly two checks per repetition with one matching typed result and zero violations",
+    ),
 ];
 
 const fn test(
@@ -704,5 +808,78 @@ const fn test(
         pillar,
         metric,
         pass_criteria,
+    }
+}
+
+#[cfg(test)]
+mod wave4_tests {
+    use super::*;
+
+    #[test]
+    fn wave4_rows_have_exact_ids_and_roles() {
+        let expected = [
+            (65, "injection-surface", RequirementKind::Informational),
+            (
+                66,
+                "budget-enforcement",
+                RequirementKind::OptionalFacet {
+                    capability: "budget_enforcement",
+                },
+            ),
+            (
+                67,
+                "usage-reporting",
+                RequirementKind::OptionalFacet {
+                    capability: "usage_reporting",
+                },
+            ),
+            (
+                68,
+                "session-ops-cli",
+                RequirementKind::OptionalFacet {
+                    capability: "session_ops_cli",
+                },
+            ),
+            (
+                69,
+                "event-stream-completeness",
+                RequirementKind::Informational,
+            ),
+            (
+                70,
+                "headless-permission-model",
+                RequirementKind::OptionalFacet {
+                    capability: "headless_permission_model",
+                },
+            ),
+            (71, "secrets-hygiene-on-disk", RequirementKind::Core),
+            (72, "tool-result-role-fidelity", RequirementKind::Core),
+        ];
+        for (row, id, requirement) in expected {
+            let definition = all()
+                .iter()
+                .find(|definition| definition.row == row)
+                .expect("Wave-4 definition");
+            assert_eq!(definition.id, id);
+            assert_eq!(definition.requirement(), requirement);
+        }
+    }
+
+    #[test]
+    fn wave4_badge_facets_follow_all_v1_facets_in_normative_order() {
+        let suffix = BADGE_FACETS
+            .iter()
+            .filter(|facet| facet.row >= 65)
+            .map(|facet| (facet.row, facet.label, facet.order))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suffix,
+            vec![
+                (66, "budgets", 80),
+                (67, "usage", 90),
+                (68, "session-cli", 100),
+                (70, "permissions", 110),
+            ]
+        );
     }
 }

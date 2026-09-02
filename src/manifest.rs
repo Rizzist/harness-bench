@@ -56,6 +56,9 @@ pub struct Manifest {
     /// Evidence capture policy.
     #[serde(default)]
     pub capture: CapturePolicy,
+    /// Headless permission-control surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionConfig>,
     /// Declared required and optional capabilities.
     pub capabilities: Capabilities,
 }
@@ -373,6 +376,12 @@ pub struct SessionOps {
     /// List operation name or argv template.
     #[serde(default)]
     pub list: Vec<String>,
+    /// Fork-by-ID CLI argv template.
+    #[serde(default)]
+    pub fork: Vec<String>,
+    /// Delete-by-ID CLI argv template.
+    #[serde(default)]
+    pub delete: Vec<String>,
     /// Informational command/RPC used to observe a cohort settling. Resource
     /// certification never treats this process-global signal as its PASS fence.
     #[serde(default)]
@@ -383,6 +392,34 @@ pub struct SessionOps {
     /// JSON pointer used to learn a persistent run identifier.
     #[serde(default)]
     pub run_id_pointer: String,
+    /// JSON pointer used to extract the newly forked session ID.
+    #[serde(default)]
+    pub fork_id_pointer: String,
+    /// JSON pointer selecting the session array in list output.
+    #[serde(default)]
+    pub list_array_pointer: String,
+    /// JSON pointer selecting a session ID relative to each list item.
+    #[serde(default)]
+    pub list_item_id_pointer: String,
+    /// Contract for deleting an ID which is already absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_missing_semantics: Option<DeleteMissingSemantics>,
+    /// JSON pointer selecting a typed not-found result.
+    #[serde(default)]
+    pub not_found_pointer: String,
+    /// Expected value selected by `not_found_pointer`.
+    #[serde(default)]
+    pub not_found_value: String,
+}
+
+/// Result contract for a repeated session delete.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeleteMissingSemantics {
+    /// The CLI emits a typed not-found result.
+    TypedNotFound,
+    /// The CLI reports success when the ID is already absent.
+    IdempotentSuccess,
 }
 
 /// Operations for steer, subturn, and queued input.
@@ -590,10 +627,75 @@ pub struct EventMapping {
     /// Ordered normalization rules.
     #[serde(default)]
     pub rules: Vec<EventRule>,
+    /// Optional raw-event metadata locators used by Wave 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<EventMetadata>,
 }
 
 fn default_replay_mode() -> String {
     "lines".to_owned()
+}
+
+/// Raw-event metadata used for event completeness and usage reporting.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EventMetadata {
+    /// JSON pointer selecting the harness-provided timestamp.
+    #[serde(default)]
+    pub timestamp_pointer: String,
+    /// Declared timestamp representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_format: Option<TimestampFormat>,
+    /// JSON pointer selecting the harness event schema version.
+    #[serde(default)]
+    pub schema_version_pointer: String,
+    /// Exact expected schema version value.
+    #[serde(default)]
+    pub schema_version_value: String,
+    /// Normalized event vocabulary value carrying usage.
+    #[serde(default)]
+    pub usage_event: String,
+    /// Whether usage values describe one turn or the cumulative run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_scope: Option<UsageScope>,
+    /// JSON pointer selecting provider input-token usage.
+    #[serde(default)]
+    pub input_tokens_pointer: String,
+    /// JSON pointer selecting provider output-token usage.
+    #[serde(default)]
+    pub output_tokens_pointer: String,
+    /// JSON pointer selecting total-token usage.
+    #[serde(default)]
+    pub total_tokens_pointer: String,
+    /// JSON pointer selecting integer micro-USD cost.
+    #[serde(default)]
+    pub cost_microusd_pointer: String,
+    /// JSON pointer selecting completed semantic turns.
+    #[serde(default)]
+    pub turns_pointer: String,
+}
+
+/// Supported raw timestamp representations.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimestampFormat {
+    /// RFC 3339 wall-clock timestamp.
+    Rfc3339,
+    /// Milliseconds since the Unix epoch.
+    UnixMs,
+    /// Nanoseconds since the Unix epoch.
+    UnixNs,
+    /// Harness-local monotonic nanoseconds.
+    MonotonicNs,
+}
+
+/// Scope of one structured usage carrier.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UsageScope {
+    /// Values describe only the completed semantic turn.
+    Turn,
+    /// Values describe the run through the completed semantic turn.
+    CumulativeRun,
 }
 
 /// One table-driven event normalization rule.
@@ -671,6 +773,9 @@ pub struct ResourceControls {
     /// Harness context-window injection surface used by row 51.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowConfig>,
+    /// Harness-enforced token, cost, and time budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_controls: Option<BudgetControls>,
 }
 
 /// Typed context-window carrier declared by an adapter.
@@ -694,6 +799,68 @@ pub struct ContextWindowConfig {
     /// Non-root JSON pointer inside the generated configuration.
     #[serde(default)]
     pub json_pointer: String,
+}
+
+/// Public budget-control commands and harness-visible tariff carrier.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BudgetControls {
+    /// Complete token-budget argv/operation template.
+    #[serde(default)]
+    pub max_tokens: Vec<String>,
+    /// Complete cost-budget argv/operation template.
+    #[serde(default)]
+    pub max_cost: Vec<String>,
+    /// Complete time-budget argv/operation template.
+    #[serde(default)]
+    pub max_time: Vec<String>,
+    /// Harness-visible input/output price injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tariff: Option<TariffConfig>,
+}
+
+/// Harness-side tariff used by budget and usage certification.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TariffConfig {
+    /// Tariff injection surface.
+    pub surface: TariffSurface,
+    /// Input-token price in integer micro-USD.
+    #[serde(default)]
+    pub input_microusd_per_token: u64,
+    /// Output-token price in integer micro-USD.
+    #[serde(default)]
+    pub output_microusd_per_token: u64,
+    /// Input price environment variable.
+    #[serde(default)]
+    pub input_environment: String,
+    /// Output price environment variable.
+    #[serde(default)]
+    pub output_environment: String,
+    /// Direct tariff argv fragment.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Exact generated-file path carrying the tariff.
+    #[serde(default)]
+    pub generated_path: String,
+    /// Input-price destination within the generated configuration.
+    #[serde(default)]
+    pub input_json_pointer: String,
+    /// Output-price destination within the generated configuration.
+    #[serde(default)]
+    pub output_json_pointer: String,
+}
+
+/// Supported harness-side tariff injection surfaces.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TariffSurface {
+    /// Two distinct environment variables.
+    Environment,
+    /// One direct argv fragment.
+    Cli,
+    /// One generated private configuration file.
+    GeneratedConfig,
+    /// The harness architecture cannot receive a tariff.
+    Unsupported,
 }
 
 /// Acceptance and completion hook argv templates.
@@ -734,6 +901,9 @@ pub struct CapturePolicy {
     /// Structured marker used when model-visible tool output is truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_marker: Option<TruncationMarker>,
+    /// Exact generated files permitted to carry the injected credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_carrier_paths: Option<Vec<String>>,
 }
 
 /// Regex contract for a normalized, model-visible truncation marker.
@@ -752,6 +922,102 @@ pub struct Capabilities {
     /// Optional capability name to rationale.
     #[serde(default)]
     pub optional: BTreeMap<String, String>,
+    /// Typed provider, base-URL, and credential injection declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection_surface: Option<InjectionSurface>,
+}
+
+/// The three independently verified fake-model injection components.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InjectionSurface {
+    /// Provider/model selector injection.
+    pub provider: InjectionComponent,
+    /// Fake-provider base URL injection.
+    pub base_url: InjectionComponent,
+    /// Fake-provider credential injection.
+    pub credential: InjectionComponent,
+}
+
+/// One provider-binding injection carrier.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InjectionComponent {
+    /// Injection method.
+    pub method: InjectionMethod,
+    /// Environment variable used by the environment method.
+    #[serde(default)]
+    pub environment: String,
+    /// CLI fragment used by the CLI method.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Placement of the CLI fragment relative to the public command.
+    #[serde(default)]
+    pub argv_position: ArgvPosition,
+    /// Exact generated-file path used by the generated-config method.
+    #[serde(default)]
+    pub generated_path: String,
+    /// Destination within the generated configuration.
+    #[serde(default)]
+    pub json_pointer: String,
+}
+
+/// Provider-binding injection method.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InjectionMethod {
+    /// An environment variable read directly by the harness.
+    Environment,
+    /// A public CLI flag or positional argument.
+    Cli,
+    /// A generated private configuration file.
+    GeneratedConfig,
+    /// The component cannot be injected.
+    Impossible,
+}
+
+/// Placement of an injection argv fragment.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArgvPosition {
+    /// Insert immediately after the executable.
+    Prefix,
+    /// Append to the public command.
+    #[default]
+    Suffix,
+}
+
+/// Headless permission-control declarations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PermissionConfig {
+    /// Permission model exposed by the harness.
+    pub mode: PermissionMode,
+    /// Complete argv for the allowed workspace write trial.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Complete argv for the denied outside-workspace write trial.
+    #[serde(default)]
+    pub deny_filesystem: Vec<String>,
+    /// Complete argv for the denied network-connect trial.
+    #[serde(default)]
+    pub deny_network: Vec<String>,
+    /// Optional complete workspace/profile-scoped yolo argv.
+    #[serde(default)]
+    pub yolo: Vec<String>,
+}
+
+/// Granularity of a harness permission model.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionMode {
+    /// Per-operation allow-list plus filesystem/network sandboxing.
+    AllowListAndSandbox,
+    /// Per-operation allow-list without an independently declared sandbox.
+    AllowList,
+    /// Filesystem/network sandbox without per-operation allow-listing.
+    Sandbox,
+    /// Broad execution constrained to the isolated workspace/profile.
+    WorkspaceYolo,
+    /// No enforceable permission control beyond noninteractive operation.
+    None,
 }
 
 /// Load and parse a manifest from disk.
@@ -942,6 +1208,7 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
     }
     validate_wave_2_resources(manifest)?;
     validate_wave_3_resources(manifest)?;
+    validate_wave_4_declarations(manifest)?;
     if manifest.concurrency.max_agents == Some(0) {
         return Err(AhrbError::Validation(
             "concurrency.max_agents must be positive".to_owned(),
@@ -1467,6 +1734,539 @@ fn validate_wave_3_resources(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn validate_wave_4_declarations(manifest: &Manifest) -> Result<()> {
+    validate_injection_surface(manifest)?;
+    validate_budget_controls(manifest)?;
+    validate_event_metadata(manifest)?;
+    validate_session_cli(manifest)?;
+    validate_permissions(manifest)?;
+    validate_credential_carriers(manifest)?;
+    Ok(())
+}
+
+fn validate_injection_surface(manifest: &Manifest) -> Result<()> {
+    let Some(surface) = manifest.capabilities.injection_surface.as_ref() else {
+        return Ok(());
+    };
+    for (label, component, placeholder, credential) in [
+        ("provider", &surface.provider, "{{provider}}", false),
+        ("base_url", &surface.base_url, "{{base_url}}", false),
+        ("credential", &surface.credential, "{{credential}}", true),
+    ] {
+        let prefix = format!("capabilities.injection_surface.{label}");
+        if credential && component.method == InjectionMethod::Cli {
+            return Err(AhrbError::Validation(format!(
+                "{prefix}.method cannot be cli because credentials are forbidden in argv"
+            )));
+        }
+        let generated_fields_empty =
+            component.generated_path.is_empty() && component.json_pointer.is_empty();
+        match component.method {
+            InjectionMethod::Environment => {
+                if component.environment.trim().is_empty()
+                    || !component.argv.is_empty()
+                    || !generated_fields_empty
+                {
+                    return Err(AhrbError::Validation(format!(
+                        "{prefix} environment injection requires only a nonempty environment name"
+                    )));
+                }
+            }
+            InjectionMethod::Cli => {
+                if !component.environment.is_empty()
+                    || component.argv.is_empty()
+                    || placeholder_occurrences(&component.argv, placeholder) != 1
+                    || !generated_fields_empty
+                {
+                    return Err(AhrbError::Validation(format!(
+                        "{prefix} cli injection requires only argv with {placeholder} exactly once"
+                    )));
+                }
+            }
+            InjectionMethod::GeneratedConfig => {
+                if !component.environment.is_empty()
+                    || !component.argv.is_empty()
+                    || !profile_scoped_template(&component.generated_path)
+                    || !valid_json_pointer(&component.json_pointer)
+                    || generated_file(manifest, &component.generated_path).is_none()
+                {
+                    return Err(AhrbError::Validation(format!(
+                        "{prefix} generated-config injection requires an exact profile-contained generated file and a non-root JSON pointer"
+                    )));
+                }
+            }
+            InjectionMethod::Impossible => {
+                if !component.environment.is_empty()
+                    || !component.argv.is_empty()
+                    || !generated_fields_empty
+                {
+                    return Err(AhrbError::Validation(format!(
+                        "{prefix} impossible injection must not declare carrier fields"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_budget_controls(manifest: &Manifest) -> Result<()> {
+    let budget_declared = manifest
+        .capabilities
+        .optional
+        .contains_key("budget_enforcement");
+    let usage_declared = manifest
+        .capabilities
+        .optional
+        .contains_key("usage_reporting");
+    let controls = manifest.resources.budget_controls.as_ref();
+
+    if let Some(controls) = controls {
+        for (label, argv, placeholder) in [
+            (
+                "resources.budget_controls.max_tokens",
+                &controls.max_tokens,
+                "{{budget_tokens}}",
+            ),
+            (
+                "resources.budget_controls.max_cost",
+                &controls.max_cost,
+                "{{budget_cost_usd}}",
+            ),
+            (
+                "resources.budget_controls.max_time",
+                &controls.max_time,
+                "{{budget_time_ms}}",
+            ),
+        ] {
+            if !argv.is_empty() && placeholder_occurrences(argv, placeholder) != 1 {
+                return Err(AhrbError::Validation(format!(
+                    "{label} must contain {placeholder} exactly once"
+                )));
+            }
+        }
+        if let Some(tariff) = controls.tariff.as_ref() {
+            validate_tariff(manifest, tariff)?;
+        }
+    }
+
+    if budget_declared {
+        let Some(controls) = controls else {
+            return Err(AhrbError::Validation(
+                "budget_enforcement requires resources.budget_controls".to_owned(),
+            ));
+        };
+        for (label, argv, placeholder) in [
+            ("max_tokens", &controls.max_tokens, "{{budget_tokens}}"),
+            ("max_cost", &controls.max_cost, "{{budget_cost_usd}}"),
+            ("max_time", &controls.max_time, "{{budget_time_ms}}"),
+        ] {
+            if argv.is_empty() || placeholder_occurrences(argv, placeholder) != 1 {
+                return Err(AhrbError::Validation(format!(
+                    "budget_enforcement requires nonempty {label} with {placeholder} exactly once"
+                )));
+            }
+        }
+        let Some(tariff) = controls.tariff.as_ref() else {
+            return Err(AhrbError::Validation(
+                "budget_enforcement requires resources.budget_controls.tariff".to_owned(),
+            ));
+        };
+        validate_certification_tariff(tariff)?;
+    }
+
+    if usage_declared {
+        let Some(tariff) = controls.and_then(|controls| controls.tariff.as_ref()) else {
+            return Err(AhrbError::Validation(
+                "usage_reporting requires resources.budget_controls.tariff".to_owned(),
+            ));
+        };
+        if tariff.surface == TariffSurface::Unsupported {
+            return Err(AhrbError::Validation(
+                "usage_reporting requires a supported harness-side tariff".to_owned(),
+            ));
+        }
+        validate_certification_tariff(tariff)?;
+    }
+    Ok(())
+}
+
+fn validate_tariff(manifest: &Manifest, tariff: &TariffConfig) -> Result<()> {
+    let generated_fields_empty = tariff.generated_path.is_empty()
+        && tariff.input_json_pointer.is_empty()
+        && tariff.output_json_pointer.is_empty();
+    match tariff.surface {
+        TariffSurface::Environment => {
+            if tariff.input_environment.trim().is_empty()
+                || tariff.output_environment.trim().is_empty()
+                || tariff.input_environment == tariff.output_environment
+                || !tariff.argv.is_empty()
+                || !generated_fields_empty
+            {
+                return Err(AhrbError::Validation(
+                    "environment tariff requires only two distinct nonempty environment names"
+                        .to_owned(),
+                ));
+            }
+        }
+        TariffSurface::Cli => {
+            if !tariff.input_environment.is_empty()
+                || !tariff.output_environment.is_empty()
+                || tariff.argv.is_empty()
+                || placeholder_occurrences(&tariff.argv, "{{input_price_microusd_per_token}}") != 1
+                || placeholder_occurrences(&tariff.argv, "{{output_price_microusd_per_token}}") != 1
+                || !generated_fields_empty
+            {
+                return Err(AhrbError::Validation(
+                    "cli tariff requires only argv with both price placeholders exactly once"
+                        .to_owned(),
+                ));
+            }
+        }
+        TariffSurface::GeneratedConfig => {
+            if !tariff.input_environment.is_empty()
+                || !tariff.output_environment.is_empty()
+                || !tariff.argv.is_empty()
+                || !profile_scoped_template(&tariff.generated_path)
+                || !valid_json_pointer(&tariff.input_json_pointer)
+                || !valid_json_pointer(&tariff.output_json_pointer)
+                || generated_file(manifest, &tariff.generated_path).is_none()
+            {
+                return Err(AhrbError::Validation(
+                    "generated-config tariff requires an exact profile-contained generated file and two non-root JSON pointers"
+                        .to_owned(),
+                ));
+            }
+        }
+        TariffSurface::Unsupported => {
+            if !tariff.input_environment.is_empty()
+                || !tariff.output_environment.is_empty()
+                || !tariff.argv.is_empty()
+                || !generated_fields_empty
+            {
+                return Err(AhrbError::Validation(
+                    "unsupported tariff must not declare carrier fields".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_certification_tariff(tariff: &TariffConfig) -> Result<()> {
+    if tariff.input_microusd_per_token != 2 || tariff.output_microusd_per_token != 3 {
+        return Err(AhrbError::Validation(
+            "Wave-4 certification tariff must be exactly 2 input and 3 output micro-USD/token"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_event_metadata(manifest: &Manifest) -> Result<()> {
+    let metadata = manifest.events.metadata.as_ref();
+    if let Some(metadata) = metadata {
+        let has_timestamp_pointer = !metadata.timestamp_pointer.is_empty();
+        if has_timestamp_pointer != metadata.timestamp_format.is_some() {
+            return Err(AhrbError::Validation(
+                "events.metadata timestamp_pointer and timestamp_format must be declared together"
+                    .to_owned(),
+            ));
+        }
+        let has_schema_pointer = !metadata.schema_version_pointer.is_empty();
+        let has_schema_value = !metadata.schema_version_value.is_empty();
+        if has_schema_pointer != has_schema_value {
+            return Err(AhrbError::Validation(
+                "events.metadata schema_version_pointer and schema_version_value must be declared together"
+                    .to_owned(),
+            ));
+        }
+        for (label, pointer) in [
+            ("timestamp_pointer", &metadata.timestamp_pointer),
+            ("schema_version_pointer", &metadata.schema_version_pointer),
+            ("input_tokens_pointer", &metadata.input_tokens_pointer),
+            ("output_tokens_pointer", &metadata.output_tokens_pointer),
+            ("total_tokens_pointer", &metadata.total_tokens_pointer),
+            ("cost_microusd_pointer", &metadata.cost_microusd_pointer),
+            ("turns_pointer", &metadata.turns_pointer),
+        ] {
+            if !pointer.is_empty() && !valid_json_pointer(pointer) {
+                return Err(AhrbError::Validation(format!(
+                    "events.metadata.{label} {pointer:?} is not a non-root JSON pointer"
+                )));
+            }
+        }
+        if !metadata.usage_event.is_empty() && !normalized_event_name(&metadata.usage_event) {
+            return Err(AhrbError::Validation(format!(
+                "events.metadata.usage_event {:?} is not a normalized event vocabulary value",
+                metadata.usage_event
+            )));
+        }
+    }
+
+    if manifest
+        .capabilities
+        .optional
+        .contains_key("usage_reporting")
+    {
+        let Some(metadata) = metadata else {
+            return Err(AhrbError::Validation(
+                "usage_reporting requires events.metadata".to_owned(),
+            ));
+        };
+        if metadata.usage_event.is_empty()
+            || metadata.usage_scope.is_none()
+            || [
+                &metadata.input_tokens_pointer,
+                &metadata.output_tokens_pointer,
+                &metadata.total_tokens_pointer,
+                &metadata.cost_microusd_pointer,
+                &metadata.turns_pointer,
+            ]
+            .iter()
+            .any(|pointer| !valid_json_pointer(pointer))
+        {
+            return Err(AhrbError::Validation(
+                "usage_reporting requires a usage event, scope, and five non-root usage pointers"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_session_cli(manifest: &Manifest) -> Result<()> {
+    for (label, pointer) in [
+        (
+            "sessions.fork_id_pointer",
+            &manifest.sessions.fork_id_pointer,
+        ),
+        (
+            "sessions.list_array_pointer",
+            &manifest.sessions.list_array_pointer,
+        ),
+        (
+            "sessions.list_item_id_pointer",
+            &manifest.sessions.list_item_id_pointer,
+        ),
+        (
+            "sessions.not_found_pointer",
+            &manifest.sessions.not_found_pointer,
+        ),
+    ] {
+        if !pointer.is_empty() && !valid_json_pointer(pointer) {
+            return Err(AhrbError::Validation(format!(
+                "{label} {pointer:?} is not a non-root JSON pointer"
+            )));
+        }
+    }
+    if manifest.sessions.not_found_pointer.is_empty()
+        != manifest.sessions.not_found_value.is_empty()
+    {
+        return Err(AhrbError::Validation(
+            "sessions.not_found_pointer and not_found_value must be declared together".to_owned(),
+        ));
+    }
+
+    if manifest.transport.kind == TransportKind::Exec {
+        for (label, argv) in [
+            ("sessions.fork", &manifest.sessions.fork),
+            ("sessions.delete", &manifest.sessions.delete),
+        ] {
+            if !argv.is_empty() && placeholder_occurrences(argv, "{{session_id}}") != 1 {
+                return Err(AhrbError::Validation(format!(
+                    "{label} for exec transport must contain {{{{session_id}}}} exactly once"
+                )));
+            }
+        }
+    }
+
+    if !manifest
+        .capabilities
+        .optional
+        .contains_key("session_ops_cli")
+    {
+        return Ok(());
+    }
+    for (label, argv) in [
+        ("create", &manifest.sessions.create),
+        ("list", &manifest.sessions.list),
+        ("resume", &manifest.sessions.resume),
+        ("fork", &manifest.sessions.fork),
+        ("delete", &manifest.sessions.delete),
+    ] {
+        if argv.is_empty() {
+            return Err(AhrbError::Validation(format!(
+                "session_ops_cli requires nonempty sessions.{label}"
+            )));
+        }
+    }
+    for (label, pointer) in [
+        ("id_pointer", &manifest.sessions.id_pointer),
+        ("fork_id_pointer", &manifest.sessions.fork_id_pointer),
+        ("list_array_pointer", &manifest.sessions.list_array_pointer),
+        (
+            "list_item_id_pointer",
+            &manifest.sessions.list_item_id_pointer,
+        ),
+    ] {
+        if !valid_json_pointer(pointer) {
+            return Err(AhrbError::Validation(format!(
+                "session_ops_cli requires non-root sessions.{label}"
+            )));
+        }
+    }
+    let Some(semantics) = manifest.sessions.delete_missing_semantics else {
+        return Err(AhrbError::Validation(
+            "session_ops_cli requires sessions.delete_missing_semantics".to_owned(),
+        ));
+    };
+    if semantics == DeleteMissingSemantics::TypedNotFound
+        && (!valid_json_pointer(&manifest.sessions.not_found_pointer)
+            || manifest.sessions.not_found_value.is_empty())
+    {
+        return Err(AhrbError::Validation(
+            "typed-not-found delete semantics require sessions.not_found_pointer and not_found_value"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_permissions(manifest: &Manifest) -> Result<()> {
+    let permissions = manifest.permissions.as_ref();
+    if let Some(permissions) = permissions {
+        if !permissions.yolo.is_empty()
+            && placeholder_occurrences(&permissions.yolo, "{{workspace}}")
+                + placeholder_occurrences(&permissions.yolo, "{{profile}}")
+                == 0
+        {
+            return Err(AhrbError::Validation(
+                "permissions.yolo must be workspace/profile scoped".to_owned(),
+            ));
+        }
+    }
+    if !manifest
+        .capabilities
+        .optional
+        .contains_key("headless_permission_model")
+    {
+        return Ok(());
+    }
+    let Some(permissions) = permissions else {
+        return Err(AhrbError::Validation(
+            "headless_permission_model requires permissions".to_owned(),
+        ));
+    };
+    if permissions.mode == PermissionMode::None {
+        return Err(AhrbError::Validation(
+            "headless_permission_model requires a non-none permissions mode".to_owned(),
+        ));
+    }
+    for (label, argv, placeholders) in [
+        ("allow", &permissions.allow, &["{{workspace}}"] as &[&str]),
+        (
+            "deny_filesystem",
+            &permissions.deny_filesystem,
+            &["{{outside_path}}"] as &[&str],
+        ),
+        (
+            "deny_network",
+            &permissions.deny_network,
+            &["{{blocked_host}}", "{{blocked_port}}"] as &[&str],
+        ),
+    ] {
+        if argv.is_empty()
+            || placeholders
+                .iter()
+                .any(|placeholder| placeholder_occurrences(argv, placeholder) != 1)
+        {
+            return Err(AhrbError::Validation(format!(
+                "headless_permission_model requires permissions.{label} with each required placeholder exactly once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_carriers(manifest: &Manifest) -> Result<()> {
+    let paths = manifest.capture.credential_carrier_paths.as_ref();
+    if let Some(paths) = paths {
+        let mut unique = std::collections::BTreeSet::new();
+        for path in paths {
+            if !profile_scoped_template(path) {
+                return Err(AhrbError::Validation(format!(
+                    "capture.credential_carrier_paths entry {path:?} must be lexically contained under {{{{profile}}}}"
+                )));
+            }
+            if !unique.insert(normalized_profile_template(path)) {
+                return Err(AhrbError::Validation(format!(
+                    "capture.credential_carrier_paths contains duplicate path {path:?}"
+                )));
+            }
+            let Some(file) = generated_file(manifest, path) else {
+                return Err(AhrbError::Validation(format!(
+                    "credential carrier {path:?} must name an exact generated file"
+                )));
+            };
+            if file.mode != "0600" || !file.content.contains("{{credential}}") {
+                return Err(AhrbError::Validation(format!(
+                    "credential carrier {path:?} must be mode 0600 and contain {{{{credential}}}}"
+                )));
+            }
+        }
+    }
+    if manifest
+        .capabilities
+        .required
+        .contains_key("secrets_hygiene_on_disk")
+        && paths.is_none_or(Vec::is_empty)
+    {
+        return Err(AhrbError::Validation(
+            "secrets_hygiene_on_disk requires nonempty capture.credential_carrier_paths".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn generated_file<'a>(manifest: &'a Manifest, path: &str) -> Option<&'a GeneratedFile> {
+    manifest
+        .isolation
+        .generated_files
+        .iter()
+        .chain(manifest.fake_model.provider_templates.iter())
+        .find(|file| file.path == path)
+}
+
+fn placeholder_occurrences(argv: &[String], placeholder: &str) -> usize {
+    argv.iter()
+        .map(|argument| argument.match_indices(placeholder).count())
+        .sum()
+}
+
+fn valid_json_pointer(pointer: &str) -> bool {
+    pointer.starts_with('/') && pointer != "/"
+}
+
+fn normalized_event_name(name: &str) -> bool {
+    matches!(
+        name,
+        "turn-accepted"
+            | "model-request"
+            | "model-response"
+            | "tool-call"
+            | "tool-result"
+            | "agent-spawned"
+            | "barrier-reached"
+            | "input-accepted"
+            | "hook-completed"
+            | "terminal-success"
+            | "terminal-failure"
+            | "terminal-cancelled"
+            | "terminal-timeout"
+    )
+}
+
 fn validate_wave_2_capture_limits(manifest: &Manifest) -> Result<()> {
     const MAX_CAPTURE_BYTES: usize = 1_048_576;
     if !(1..=MAX_CAPTURE_BYTES).contains(&manifest.resources.max_output_bytes) {
@@ -1575,7 +2375,7 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
 }
 
 fn command_vectors(manifest: &Manifest) -> Vec<(&'static str, &[String])> {
-    vec![
+    let mut vectors: Vec<(&'static str, &[String])> = vec![
         (
             "availability.version_probe",
             &manifest.availability.version_probe,
@@ -1597,6 +2397,8 @@ fn command_vectors(manifest: &Manifest) -> Vec<(&'static str, &[String])> {
         ("sessions.recover_probe", &manifest.sessions.recover_probe),
         ("sessions.close_delete", &manifest.sessions.close_delete),
         ("sessions.list", &manifest.sessions.list),
+        ("sessions.fork", &manifest.sessions.fork),
+        ("sessions.delete", &manifest.sessions.delete),
         ("sessions.wait_ready", &manifest.sessions.wait_ready),
         ("next_input.steer", &manifest.next_input.steer),
         ("next_input.subturn", &manifest.next_input.subturn),
@@ -1609,7 +2411,60 @@ fn command_vectors(manifest: &Manifest) -> Vec<(&'static str, &[String])> {
         ("hooks.acceptance", &manifest.hooks.acceptance),
         ("hooks.completion", &manifest.hooks.completion),
         ("cleanup.command", &manifest.cleanup.command),
-    ]
+    ];
+    if let Some(surface) = &manifest.capabilities.injection_surface {
+        vectors.extend([
+            (
+                "capabilities.injection_surface.provider.argv",
+                surface.provider.argv.as_slice(),
+            ),
+            (
+                "capabilities.injection_surface.base_url.argv",
+                surface.base_url.argv.as_slice(),
+            ),
+            (
+                "capabilities.injection_surface.credential.argv",
+                surface.credential.argv.as_slice(),
+            ),
+        ]);
+    }
+    if let Some(controls) = &manifest.resources.budget_controls {
+        vectors.extend([
+            (
+                "resources.budget_controls.max_tokens",
+                controls.max_tokens.as_slice(),
+            ),
+            (
+                "resources.budget_controls.max_cost",
+                controls.max_cost.as_slice(),
+            ),
+            (
+                "resources.budget_controls.max_time",
+                controls.max_time.as_slice(),
+            ),
+        ]);
+        if let Some(tariff) = &controls.tariff {
+            vectors.push((
+                "resources.budget_controls.tariff.argv",
+                tariff.argv.as_slice(),
+            ));
+        }
+    }
+    if let Some(permissions) = &manifest.permissions {
+        vectors.extend([
+            ("permissions.allow", permissions.allow.as_slice()),
+            (
+                "permissions.deny_filesystem",
+                permissions.deny_filesystem.as_slice(),
+            ),
+            (
+                "permissions.deny_network",
+                permissions.deny_network.as_slice(),
+            ),
+            ("permissions.yolo", permissions.yolo.as_slice()),
+        ]);
+    }
+    vectors
 }
 
 /// Canonical SHA-256 of a parsed manifest.
@@ -1744,8 +2599,10 @@ fn resolve_executable(candidate: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod version_tests {
     use super::{
-        Manifest, RequestRoleRule, SideChannelKind, TruncationMarker, concise_version,
-        render_session_store_paths, validate,
+        ArgvPosition, BudgetControls, DeleteMissingSemantics, EventMetadata, InjectionComponent,
+        InjectionMethod, InjectionSurface, Manifest, PermissionConfig, PermissionMode,
+        RequestRoleRule, SideChannelKind, TariffConfig, TariffSurface, TimestampFormat,
+        TruncationMarker, UsageScope, concise_version, render_session_store_paths, validate,
     };
     use std::collections::BTreeMap;
 
@@ -1753,6 +2610,129 @@ mod version_tests {
         let mut manifest = super::load(std::path::Path::new("adapters/aider/manifest.toml"))
             .expect("load schema-1 reference manifest");
         manifest.identity.schema = 2;
+        manifest
+    }
+
+    fn wave_4_manifest() -> Manifest {
+        let mut manifest = super::load(std::path::Path::new("adapters/mock-exec/manifest.toml"))
+            .expect("load schema-2 reference manifest");
+        let generated = |pointer: &str| InjectionComponent {
+            method: InjectionMethod::GeneratedConfig,
+            environment: String::new(),
+            argv: Vec::new(),
+            argv_position: ArgvPosition::Suffix,
+            generated_path: "{{profile}}/config/provider.toml".to_owned(),
+            json_pointer: pointer.to_owned(),
+        };
+        manifest.capabilities.injection_surface = Some(InjectionSurface {
+            provider: generated("/model"),
+            base_url: generated("/base_url"),
+            credential: generated("/credential"),
+        });
+        manifest.resources.budget_controls = Some(BudgetControls {
+            max_tokens: vec![
+                "harness".to_owned(),
+                "--max-tokens".to_owned(),
+                "{{budget_tokens}}".to_owned(),
+            ],
+            max_cost: vec![
+                "harness".to_owned(),
+                "--max-cost".to_owned(),
+                "{{budget_cost_usd}}".to_owned(),
+            ],
+            max_time: vec![
+                "harness".to_owned(),
+                "--max-time".to_owned(),
+                "{{budget_time_ms}}".to_owned(),
+            ],
+            tariff: Some(TariffConfig {
+                surface: TariffSurface::Environment,
+                input_microusd_per_token: 2,
+                output_microusd_per_token: 3,
+                input_environment: "AHRB_INPUT_PRICE".to_owned(),
+                output_environment: "AHRB_OUTPUT_PRICE".to_owned(),
+                argv: Vec::new(),
+                generated_path: String::new(),
+                input_json_pointer: String::new(),
+                output_json_pointer: String::new(),
+            }),
+        });
+        manifest.events.metadata = Some(EventMetadata {
+            timestamp_pointer: "/timestamp".to_owned(),
+            timestamp_format: Some(TimestampFormat::UnixNs),
+            schema_version_pointer: "/schema_version".to_owned(),
+            schema_version_value: "1".to_owned(),
+            usage_event: "terminal-success".to_owned(),
+            usage_scope: Some(UsageScope::CumulativeRun),
+            input_tokens_pointer: "/usage/input_tokens".to_owned(),
+            output_tokens_pointer: "/usage/output_tokens".to_owned(),
+            total_tokens_pointer: "/usage/total_tokens".to_owned(),
+            cost_microusd_pointer: "/usage/cost_microusd".to_owned(),
+            turns_pointer: "/usage/turns".to_owned(),
+        });
+        manifest.sessions.create = vec!["harness".to_owned(), "session-create".to_owned()];
+        manifest.sessions.list = vec!["harness".to_owned(), "session-list".to_owned()];
+        manifest.sessions.fork = vec![
+            "harness".to_owned(),
+            "session-fork".to_owned(),
+            "{{session_id}}".to_owned(),
+        ];
+        manifest.sessions.delete = vec![
+            "harness".to_owned(),
+            "session-delete".to_owned(),
+            "{{session_id}}".to_owned(),
+        ];
+        manifest.sessions.fork_id_pointer = "/session_id".to_owned();
+        manifest.sessions.list_array_pointer = "/sessions".to_owned();
+        manifest.sessions.list_item_id_pointer = "/id".to_owned();
+        manifest.sessions.delete_missing_semantics = Some(DeleteMissingSemantics::TypedNotFound);
+        manifest.sessions.not_found_pointer = "/error/type".to_owned();
+        manifest.sessions.not_found_value = "not-found".to_owned();
+        manifest.permissions = Some(PermissionConfig {
+            mode: PermissionMode::AllowListAndSandbox,
+            allow: vec![
+                "harness".to_owned(),
+                "--allow".to_owned(),
+                "{{workspace}}".to_owned(),
+            ],
+            deny_filesystem: vec![
+                "harness".to_owned(),
+                "--deny".to_owned(),
+                "{{outside_path}}".to_owned(),
+            ],
+            deny_network: vec![
+                "harness".to_owned(),
+                "--deny-network".to_owned(),
+                "{{blocked_host}}:{{blocked_port}}".to_owned(),
+            ],
+            yolo: vec![
+                "harness".to_owned(),
+                "--yolo-workspace".to_owned(),
+                "{{workspace}}".to_owned(),
+            ],
+        });
+        manifest.capture.credential_carrier_paths =
+            Some(vec!["{{profile}}/config/provider.toml".to_owned()]);
+        manifest.capabilities.optional.insert(
+            "budget_enforcement".to_owned(),
+            "public budget controls".to_owned(),
+        );
+        manifest
+            .capabilities
+            .optional
+            .insert("usage_reporting".to_owned(), "structured usage".to_owned());
+        manifest.capabilities.optional.insert(
+            "session_ops_cli".to_owned(),
+            "public session CLI".to_owned(),
+        );
+        manifest.capabilities.optional.insert(
+            "headless_permission_model".to_owned(),
+            "scoped permission controls".to_owned(),
+        );
+        manifest.capabilities.required.insert(
+            "secrets_hygiene_on_disk".to_owned(),
+            "private credential carrier".to_owned(),
+        );
         manifest
     }
 
@@ -1824,6 +2804,257 @@ mod version_tests {
         assert_eq!(decoded.resources.log_paths, Some(Vec::new()));
         assert_eq!(decoded.resources.journal_paths, Some(Vec::new()));
         assert_eq!(decoded.input.prompt_uses_stdin, Some(false));
+    }
+
+    #[test]
+    fn wave_4_optional_blocks_preserve_schema_1_typed_absence() {
+        let manifest = super::load(std::path::Path::new("adapters/aider/manifest.toml"))
+            .expect("load schema-1 reference manifest");
+        assert!(manifest.capabilities.injection_surface.is_none());
+        assert!(manifest.resources.budget_controls.is_none());
+        assert!(manifest.events.metadata.is_none());
+        assert!(manifest.permissions.is_none());
+        assert!(manifest.capture.credential_carrier_paths.is_none());
+        assert!(manifest.sessions.fork.is_empty());
+        assert!(manifest.sessions.delete.is_empty());
+        assert!(manifest.sessions.delete_missing_semantics.is_none());
+
+        let absent = serde_json::to_value(&manifest).expect("serialize typed absence");
+        assert!(absent["capabilities"].get("injection_surface").is_none());
+        assert!(absent["resources"].get("budget_controls").is_none());
+        assert!(absent["events"].get("metadata").is_none());
+        assert!(absent.get("permissions").is_none());
+        assert!(absent["capture"].get("credential_carrier_paths").is_none());
+
+        let mut explicit = manifest;
+        explicit.capture.credential_carrier_paths = Some(Vec::new());
+        let encoded = toml::to_string(&explicit).expect("serialize explicit empty carriers");
+        let decoded: Manifest = toml::from_str(&encoded).expect("parse explicit empty carriers");
+        assert_eq!(decoded.capture.credential_carrier_paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn wave_4_complete_declarations_round_trip_and_validate() {
+        let manifest = wave_4_manifest();
+        validate(&manifest).expect("complete Wave-4 declarations are valid");
+        let encoded = toml::to_string(&manifest).expect("serialize Wave-4 manifest");
+        assert!(encoded.contains("[capabilities.injection_surface.provider]"));
+        assert!(encoded.contains("usage_scope = \"cumulative-run\""));
+        assert!(encoded.contains("delete_missing_semantics = \"typed-not-found\""));
+        let decoded: Manifest = toml::from_str(&encoded).expect("parse Wave-4 manifest");
+        validate(&decoded).expect("round-tripped Wave-4 manifest remains valid");
+    }
+
+    #[test]
+    fn injection_surface_enforces_exclusive_carriers_and_never_allows_credential_cli() {
+        let mut manifest = wave_4_manifest();
+        let surface = manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .expect("injection surface");
+        surface.provider = InjectionComponent {
+            method: InjectionMethod::Cli,
+            environment: String::new(),
+            argv: vec!["--model".to_owned(), "{{provider}}".to_owned()],
+            argv_position: ArgvPosition::Prefix,
+            generated_path: String::new(),
+            json_pointer: String::new(),
+        };
+        surface.base_url = InjectionComponent {
+            method: InjectionMethod::Environment,
+            environment: "AHRB_BASE_URL".to_owned(),
+            argv: Vec::new(),
+            argv_position: ArgvPosition::Suffix,
+            generated_path: String::new(),
+            json_pointer: String::new(),
+        };
+        validate(&manifest).expect("cli and environment injection carriers are valid");
+
+        manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .expect("injection surface")
+            .provider
+            .argv
+            .push("{{provider}}".to_owned());
+        let error = validate(&manifest).expect_err("duplicate provider placeholder");
+        assert!(error.to_string().contains("{{provider}} exactly once"));
+
+        let surface = manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .expect("injection surface");
+        surface.provider.argv.pop();
+        let credential = &mut surface.credential;
+        credential.method = InjectionMethod::Cli;
+        credential.argv = vec!["--api-key".to_owned(), "{{credential}}".to_owned()];
+        credential.generated_path.clear();
+        credential.json_pointer.clear();
+        let error = validate(&manifest).expect_err("credential CLI is always invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("credentials are forbidden in argv")
+        );
+    }
+
+    #[test]
+    fn budget_and_usage_capabilities_require_exact_controls_tariff_and_carrier_scope() {
+        let mut manifest = wave_4_manifest();
+        manifest
+            .resources
+            .budget_controls
+            .as_mut()
+            .expect("budget controls")
+            .max_cost
+            .clear();
+        let error = validate(&manifest).expect_err("missing declared cost control");
+        assert!(error.to_string().contains("nonempty max_cost"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .resources
+            .budget_controls
+            .as_mut()
+            .expect("budget controls")
+            .tariff
+            .as_mut()
+            .expect("tariff")
+            .output_microusd_per_token = 4;
+        let error = validate(&manifest).expect_err("wrong certification tariff");
+        assert!(error.to_string().contains("exactly 2 input and 3 output"));
+
+        let mut manifest = wave_4_manifest();
+        let tariff = manifest
+            .resources
+            .budget_controls
+            .as_mut()
+            .expect("budget controls")
+            .tariff
+            .as_mut()
+            .expect("tariff");
+        tariff.surface = TariffSurface::Unsupported;
+        tariff.input_environment.clear();
+        tariff.output_environment.clear();
+        let error = validate(&manifest).expect_err("usage cannot use unsupported tariff");
+        assert!(error.to_string().contains("supported harness-side tariff"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .usage_scope = None;
+        let error = validate(&manifest).expect_err("usage carrier scope is required");
+        assert!(error.to_string().contains("usage event, scope"));
+    }
+
+    #[test]
+    fn event_metadata_requires_complete_timestamp_schema_and_valid_usage_vocabulary() {
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .timestamp_format = None;
+        let error = validate(&manifest).expect_err("half timestamp declaration");
+        assert!(error.to_string().contains("declared together"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .schema_version_value
+            .clear();
+        let error = validate(&manifest).expect_err("half schema declaration");
+        assert!(error.to_string().contains("schema_version_pointer"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .usage_event = "finished-ish".to_owned();
+        let error = validate(&manifest).expect_err("unknown normalized usage carrier");
+        assert!(error.to_string().contains("normalized event vocabulary"));
+    }
+
+    #[test]
+    fn session_cli_requires_all_operations_locators_and_typed_delete_evidence() {
+        let mut manifest = wave_4_manifest();
+        manifest.sessions.fork.clear();
+        let error = validate(&manifest).expect_err("missing fork operation");
+        assert!(error.to_string().contains("sessions.fork"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.sessions.list_item_id_pointer = "/".to_owned();
+        let error = validate(&manifest).expect_err("root item pointer is ambiguous");
+        assert!(error.to_string().contains("non-root JSON pointer"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.sessions.not_found_pointer.clear();
+        manifest.sessions.not_found_value.clear();
+        let error = validate(&manifest).expect_err("typed not-found needs evidence");
+        assert!(error.to_string().contains("typed-not-found"));
+
+        manifest.sessions.delete_missing_semantics =
+            Some(DeleteMissingSemantics::IdempotentSuccess);
+        validate(&manifest).expect("idempotent success needs no not-found locator");
+    }
+
+    #[test]
+    fn permission_capability_requires_complete_scoped_commands() {
+        let mut manifest = wave_4_manifest();
+        manifest
+            .permissions
+            .as_mut()
+            .expect("permissions")
+            .deny_network = vec!["harness".to_owned(), "--deny-network".to_owned()];
+        let error = validate(&manifest).expect_err("network placeholders are required");
+        assert!(error.to_string().contains("deny_network"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.permissions.as_mut().expect("permissions").yolo =
+            vec!["harness".to_owned(), "--yolo".to_owned()];
+        let error = validate(&manifest).expect_err("unscoped yolo is invalid");
+        assert!(error.to_string().contains("workspace/profile scoped"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.permissions.as_mut().expect("permissions").mode = PermissionMode::None;
+        let error = validate(&manifest).expect_err("declared permission facet cannot be none");
+        assert!(error.to_string().contains("non-none"));
+    }
+
+    #[test]
+    fn secret_hygiene_requires_nonempty_exact_private_generated_carriers() {
+        let mut manifest = wave_4_manifest();
+        manifest.capture.credential_carrier_paths = Some(Vec::new());
+        let error = validate(&manifest).expect_err("empty carrier declaration is absent");
+        assert!(error.to_string().contains("requires nonempty"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.capture.credential_carrier_paths =
+            Some(vec!["{{profile}}/config/missing.toml".to_owned()]);
+        let error = validate(&manifest).expect_err("carrier must name a generated file");
+        assert!(error.to_string().contains("exact generated file"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.isolation.generated_files[0].mode = "0400".to_owned();
+        let error = validate(&manifest).expect_err("carrier mode must be exactly 0600");
+        assert!(error.to_string().contains("mode 0600"));
+
+        let mut manifest = wave_4_manifest();
+        manifest.isolation.generated_files[0].content = "model='{{model}}'".to_owned();
+        let error = validate(&manifest).expect_err("carrier must contain credential template");
+        assert!(error.to_string().contains("contain {{credential}}"));
     }
 
     #[test]

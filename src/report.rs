@@ -12,6 +12,66 @@ use std::fmt::Write as _;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+/// Exhaustive schema-3 top-level numeric metric keys introduced by Wave 4.
+///
+/// Structured strings, lists, and observation records belong in the matching
+/// `details.<row-id>` block and must not be synthesized into dynamic metrics.
+pub const WAVE4_METRIC_KEYS: &[&str] = &[
+    "injection_surface.provider_score",
+    "injection_surface.base_url_score",
+    "injection_surface.credential_score",
+    "injection_surface.score",
+    "injection_surface.verified_components",
+    "budget_enforcement.token_limit",
+    "budget_enforcement.token_observed",
+    "budget_enforcement.cost_limit_microusd",
+    "budget_enforcement.cost_observed_microusd",
+    "budget_enforcement.time_limit_ms",
+    "budget_enforcement.time_observed_ms",
+    "budget_enforcement.overrun_count",
+    "budget_enforcement.structured_failures",
+    "budget_enforcement.score",
+    "usage_reporting.input_tokens",
+    "usage_reporting.output_tokens",
+    "usage_reporting.total_tokens",
+    "usage_reporting.cost_microusd",
+    "usage_reporting.turns",
+    "usage_reporting.crosscheck_errors",
+    "usage_reporting.score",
+    "session_ops_cli.create_ok",
+    "session_ops_cli.list_ok",
+    "session_ops_cli.resume_ok",
+    "session_ops_cli.fork_ok",
+    "session_ops_cli.delete_ok",
+    "session_ops_cli.score",
+    "event_stream_completeness.tool_call_id",
+    "event_stream_completeness.correlated_result",
+    "event_stream_completeness.timestamps",
+    "event_stream_completeness.usage",
+    "event_stream_completeness.terminal_typing",
+    "event_stream_completeness.schema_version",
+    "event_stream_completeness.score",
+    "headless_permission_model.score",
+    "headless_permission_model.tty_prompts",
+    "headless_permission_model.allowed_effects",
+    "headless_permission_model.denied_filesystem_effects",
+    "headless_permission_model.denied_network_effects",
+    "headless_permission_model.scope_violations",
+    "secrets_hygiene_on_disk.files_scanned",
+    "secrets_hygiene_on_disk.bytes_scanned",
+    "secrets_hygiene_on_disk.stdout_matches",
+    "secrets_hygiene_on_disk.stderr_matches",
+    "secrets_hygiene_on_disk.journal_matches",
+    "secrets_hygiene_on_disk.session_matches",
+    "secrets_hygiene_on_disk.log_matches",
+    "secrets_hygiene_on_disk.declared_carrier_files",
+    "tool_result_role_fidelity.checks",
+    "tool_result_role_fidelity.violations",
+    "tool_result_role_fidelity.plain_user_text_violations",
+    "tool_result_role_fidelity.missing_results",
+    "tool_result_role_fidelity.duplicate_results",
+];
+
 /// One auditable recursive process-membership refresh boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MembershipSample {
@@ -166,6 +226,33 @@ impl<'de> Deserialize<'de> for ReportDetails {
                 }
                 "automation-score" => {
                     serde_json::from_value::<AutomationScoreDetails>(value.clone()).map(|_| ())
+                }
+                "injection-surface" => {
+                    serde_json::from_value::<InjectionSurfaceDetails>(value.clone()).map(|_| ())
+                }
+                "budget-enforcement" => {
+                    serde_json::from_value::<BudgetEnforcementDetails>(value.clone()).map(|_| ())
+                }
+                "usage-reporting" => {
+                    serde_json::from_value::<UsageReportingDetails>(value.clone()).map(|_| ())
+                }
+                "session-ops-cli" => {
+                    serde_json::from_value::<SessionOpsCliDetails>(value.clone()).map(|_| ())
+                }
+                "event-stream-completeness" => {
+                    serde_json::from_value::<EventStreamCompletenessDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "headless-permission-model" => {
+                    serde_json::from_value::<HeadlessPermissionModelDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "secrets-hygiene-on-disk" => {
+                    serde_json::from_value::<SecretsHygieneOnDiskDetails>(value.clone()).map(|_| ())
+                }
+                "tool-result-role-fidelity" => {
+                    serde_json::from_value::<ToolResultRoleFidelityDetails>(value.clone())
+                        .map(|_| ())
                 }
                 _ => Ok(()),
             };
@@ -445,6 +532,225 @@ struct AutomationScoreDetails {
     topology: String,
     comparison_scope: String,
     score: Option<u8>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct InjectionSurfaceDetails {
+    #[serde(default)]
+    verification_cases: Vec<InjectionVerificationCaseDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct InjectionVerificationCaseDetail {
+    component: String,
+    method: String,
+    carrier: String,
+    baseline_provider_requests: u64,
+    perturbed_provider_requests: u64,
+    expected_endpoint_reached: bool,
+    unexpected_endpoint_requests: u64,
+    credential_accepted: bool,
+    baseline_credential_rejected: bool,
+    secret_in_argv: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BudgetEnforcementDetails {
+    #[serde(default)]
+    cases: Vec<BudgetEnforcementCaseDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BudgetEnforcementCaseDetail {
+    repetition: u32,
+    case: String,
+    public_operation_start_ns: u64,
+    #[serde(default)]
+    usage_boundaries: Vec<BudgetUsageBoundaryDetail>,
+    tariff_delivered: bool,
+    terminal_receipt_ns: Option<u64>,
+    #[serde(default)]
+    effects: Vec<BudgetEffectDetail>,
+    outer_kill: bool,
+    #[serde(default)]
+    overrun_observations: Vec<BudgetOverrunObservationDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BudgetUsageBoundaryDetail {
+    semantic_request_id: String,
+    completed_ns: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cost_microusd: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BudgetEffectDetail {
+    effect_id: String,
+    committed_ns: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BudgetOverrunObservationDetail {
+    kind: String,
+    semantic_id: String,
+    observed_ns: u64,
+    stop_boundary_ns: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct UsageReportingDetails {
+    #[serde(default)]
+    source_pointers: BTreeMap<String, String>,
+    usage_event: String,
+    usage_scope: String,
+    #[serde(default)]
+    repetitions: Vec<UsageRepetitionDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct UsageRepetitionDetail {
+    repetition: u32,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cost_microusd: u64,
+    turns: u64,
+    #[serde(default)]
+    per_turn: Vec<UsageReadingDetail>,
+    #[serde(default)]
+    per_response: Vec<UsageReadingDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct UsageReadingDetail {
+    turn: u32,
+    response: Option<u32>,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cost_microusd: u64,
+    turns: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SessionOpsCliDetails {
+    #[serde(default)]
+    lifecycles: Vec<SessionOpsLifecycleDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SessionOpsLifecycleDetail {
+    repetition: u32,
+    original_id: String,
+    fork_id: String,
+    seed_call_id: String,
+    seed_result_digest: String,
+    committed_cursor: u64,
+    #[serde(default)]
+    original_history_hashes: Vec<String>,
+    #[serde(default)]
+    fork_history_hashes: Vec<String>,
+    #[serde(default)]
+    operation_results: Vec<SessionOperationResultDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SessionOperationResultDetail {
+    operation: String,
+    exit_code: Option<i32>,
+    terminal_type: String,
+    #[serde(default)]
+    extracted_ids: Vec<String>,
+    cursor: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct EventStreamCompletenessDetails {
+    #[serde(default)]
+    missing_components: Vec<String>,
+    #[serde(default)]
+    component_failures: Vec<EventComponentFailureDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct EventComponentFailureDetail {
+    repetition: u32,
+    component: String,
+    detail: String,
+    receipt_start_ns: u64,
+    receipt_end_ns: u64,
+    receipt_wall_start_ns: u64,
+    receipt_wall_end_ns: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct HeadlessPermissionModelDetails {
+    mode: String,
+    #[serde(default)]
+    cases: Vec<PermissionCaseDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct PermissionCaseDetail {
+    repetition: u32,
+    case: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    exit_code: i32,
+    terminal_type: String,
+    effect: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SecretsHygieneOnDiskDetails {
+    #[serde(default)]
+    matches: Vec<SecretMatchDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SecretMatchDetail {
+    category: String,
+    path: String,
+    offset: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ToolResultRoleFidelityDetails {
+    #[serde(default)]
+    observations: Vec<ToolResultRoleObservationDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ToolResultRoleObservationDetail {
+    repetition: u32,
+    dialect: String,
+    call_id: String,
+    semantic_role: String,
+    raw_pointer: String,
 }
 
 /// One externally observed semantic-turn interval on the shared monotonic clock.
@@ -3016,4 +3322,58 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod wave4_schema_tests {
+    use super::*;
+
+    #[test]
+    fn wave4_metric_schema_is_exact_and_has_no_dynamic_keys() {
+        assert_eq!(WAVE4_METRIC_KEYS.len(), 53);
+        let unique = WAVE4_METRIC_KEYS.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), WAVE4_METRIC_KEYS.len());
+        assert_eq!(
+            WAVE4_METRIC_KEYS.first().copied(),
+            Some("injection_surface.provider_score")
+        );
+        assert_eq!(
+            WAVE4_METRIC_KEYS.last().copied(),
+            Some("tool_result_role_fidelity.duplicate_results")
+        );
+    }
+
+    #[test]
+    fn wave4_known_detail_blocks_validate_nested_field_types() {
+        let valid = serde_json::json!({
+            "secrets-hygiene-on-disk": {
+                "matches": [{"category":"log", "path":"logs/run.jsonl", "offset":7}]
+            },
+            "tool-result-role-fidelity": {
+                "observations": [{
+                    "repetition":1,
+                    "dialect":"openai-chat-completions",
+                    "call_id":"call-1",
+                    "semantic_role":"tool",
+                    "raw_pointer":"/messages/2"
+                }]
+            }
+        });
+        serde_json::from_value::<ReportDetails>(valid).expect("valid Wave-4 details");
+
+        let invalid = serde_json::json!({
+            "tool-result-role-fidelity": {
+                "observations": [{
+                    "repetition":"one",
+                    "dialect":"openai-chat-completions",
+                    "call_id":"call-1",
+                    "semantic_role":"tool",
+                    "raw_pointer":"/messages/2"
+                }]
+            }
+        });
+        let error = serde_json::from_value::<ReportDetails>(invalid)
+            .expect_err("known Wave-4 detail field must retain its type");
+        assert!(error.to_string().contains("tool-result-role-fidelity"));
+    }
 }

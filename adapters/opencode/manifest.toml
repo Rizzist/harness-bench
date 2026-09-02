@@ -218,10 +218,36 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
+credential_carrier_paths = ["{{profile}}/config/opencode/opencode.json"]
+
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "ahrb/{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "generated-config"
+generated_path = "{{profile}}/config/opencode/opencode.json"
+json_pointer = "/provider/ahrb/options/baseURL"
+
+[capabilities.injection_surface.credential]
+method = "generated-config"
+generated_path = "{{profile}}/config/opencode/opencode.json"
+json_pointer = "/provider/ahrb/options/apiKey"
 
 [capabilities.required]
 headless = "opencode run --format json emits raw JSON events noninteractively"
 sessions = "OpenCode persists sessions under isolated XDG roots"
 resume = "opencode run --session continues the prior session in a fresh process"
+secrets_hygiene_on_disk = "the only permitted credential carrier is the generated private provider config"
+tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native tool-result role"
 
 [capabilities.optional]
+
+# TODO(orchestrator): pin public create/list/resume/fork/delete commands and
+# lifecycle pointers before declaring session_ops_cli; session export/import do
+# not satisfy the row-68 lifecycle.
+# TODO(orchestrator): pin all budget controls, tariff, usage event/scope/five
+# pointers, and permission denial commands before declaring rows 66, 67, or 70.
+# TODO(orchestrator): capture timestamp and schema-version fields from installed
+# 1.17.x JSON events before declaring those row-69 metadata components.

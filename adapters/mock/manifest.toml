@@ -49,8 +49,12 @@ XDG_RUNTIME_DIR = "{{profile}}/runtime"
 TMPDIR = "{{profile}}/tmp"
 
 [isolation]
-generated_files = []
 forbidden_roots = ["~/.ahrb-mock"]
+
+[[isolation.generated_files]]
+path = "{{profile}}/config/ahrb-mock/credential.json"
+content = '{"credential":"{{credential}}"}\n'
+mode = "0600"
 
 [daemon]
 persistent = true
@@ -137,6 +141,19 @@ framing = "jsonl"
 id_pointer = "/id"
 cursor_pointer = "/cursor"
 
+[events.metadata]
+timestamp_pointer = "/payload/timestamp_ns"
+timestamp_format = "monotonic-ns"
+schema_version_pointer = "/payload/schema_version"
+schema_version_value = "1"
+usage_event = "terminal-success"
+usage_scope = "turn"
+input_tokens_pointer = "/payload/usage/input_tokens"
+output_tokens_pointer = "/payload/usage/output_tokens"
+total_tokens_pointer = "/payload/usage/total_tokens"
+cost_microusd_pointer = "/payload/usage/cost_microusd"
+turns_pointer = "/payload/usage/turns"
+
 [[events.rules]]
 matches = "turn-accepted"
 event = "turn-accepted"
@@ -193,6 +210,18 @@ argv = []
 generated_path = ""
 json_pointer = ""
 
+[resources.budget_controls]
+max_tokens = ["target/debug/ahrb-mock-harness", "budget-trial", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "7000", "--max-tokens", "{{budget_tokens}}"]
+max_cost = ["target/debug/ahrb-mock-harness", "budget-trial", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "7000", "--max-cost", "{{budget_cost_usd}}"]
+max_time = ["target/debug/ahrb-mock-harness", "budget-trial", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "7000", "--max-time-ms", "{{budget_time_ms}}"]
+
+[resources.budget_controls.tariff]
+surface = "environment"
+input_microusd_per_token = 2
+output_microusd_per_token = 3
+input_environment = "AHRB_MOCK_INPUT_PRICE_MICROUSD"
+output_environment = "AHRB_MOCK_OUTPUT_PRICE_MICROUSD"
+
 [input]
 prompt_uses_stdin = true
 
@@ -207,9 +236,28 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["AHRB_MOCK_API_KEY"]
 max_bytes = 1048576
+credential_carrier_paths = ["{{profile}}/config/ahrb-mock/credential.json"]
 
 [capture.truncation_marker]
 regex = 'TRUNCATED truncated=(?P<truncated>true) original=(?P<original_bytes>[0-9]+) payload=(?P<payload_bytes>[0-9]+) sha256=(?P<sha256>[0-9a-f]{64})'
+
+[permissions]
+mode = "allow-list-and-sandbox"
+allow = ["target/debug/ahrb-mock-harness", "permission-trial", "--state-dir", "{{profile}}/state", "--case", "allow", "--workspace", "{{workspace}}"]
+deny_filesystem = ["target/debug/ahrb-mock-harness", "permission-trial", "--state-dir", "{{profile}}/state", "--case", "deny-filesystem", "--outside-path", "{{outside_path}}"]
+deny_network = ["target/debug/ahrb-mock-harness", "permission-trial", "--state-dir", "{{profile}}/state", "--case", "deny-network", "--blocked-host", "{{blocked_host}}", "--blocked-port", "{{blocked_port}}"]
+
+[capabilities.injection_surface.provider]
+method = "environment"
+environment = "AHRB_MOCK_MODEL"
+
+[capabilities.injection_surface.base_url]
+method = "environment"
+environment = "AHRB_MOCK_BASE_URL"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "AHRB_MOCK_API_KEY"
 
 [capabilities.required]
 headless = "reference harness never reads interactive input"
@@ -219,9 +267,14 @@ steer = "safe-boundary injected input"
 queue = "distinct queued turns"
 durable_journal = "append-only fsync-backed JSONL source of truth"
 context_limit_recovery = "deterministic compaction preserves instructions, goals, and exact tool correlations"
+secrets_hygiene_on_disk = "one exact generated private credential carrier is excluded; all artifacts are scanned"
+tool_result_role_fidelity = "Chat tool results use role=tool with exact call IDs"
 
 [capabilities.optional]
 parallel_tool_execution = "concurrent fixture calls expose durable reverse-release checkpoints"
 native_delegation = "agent.spawn creates stable child sessions"
 pre_tool_intervention = "session.subturn injects before the next model boundary"
 hooks = "argv hooks configured through JSON environment bindings"
+budget_enforcement = "public headless token/cost/time controls terminate with typed budget-exceeded JSON"
+usage_reporting = "terminal-success events carry exact per-turn token/cost/turn usage"
+headless_permission_model = "public allow-list and sandbox trials deny filesystem/network scope without prompting"

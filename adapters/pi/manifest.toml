@@ -181,8 +181,39 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
+credential_carrier_paths = [
+  "{{profile}}/home/.pi/agent/models.json",
+  "{{profile}}/home/.pi/agent/auth.json",
+]
+
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--provider", "ahrb", "--model", "{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "generated-config"
+generated_path = "{{profile}}/home/.pi/agent/models.json"
+json_pointer = "/providers/ahrb/baseUrl"
+
+[capabilities.injection_surface.credential]
+method = "generated-config"
+generated_path = "{{profile}}/home/.pi/agent/auth.json"
+json_pointer = "/ahrb/key"
 
 [capabilities.required]
 headless = "pi --print --mode json terminates without the TUI"
+secrets_hygiene_on_disk = "generated private models/auth files are the only permitted credential carriers"
+tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native tool-result role"
 
 [capabilities.optional]
+
+# TODO(orchestrator): verify an actual SSE turn through the generated custom
+# provider and pin one authoritative credential source; registration alone does
+# not prove the models.json/auth.json runtime carrier.
+# TODO(orchestrator): pin list/delete commands, repeated-delete semantics, and
+# all lifecycle pointers before declaring session_ops_cli; `--session`,
+# `--resume`, and `--fork` alone are insufficient.
+# TODO(orchestrator): pin budget controls, tariff, usage event/scope/five
+# pointers, permission denial commands, timestamps, and schema version before
+# declaring rows 66, 67, 69 metadata, or 70.

@@ -5,7 +5,7 @@
 //! timing, isolation, recovery, or resource measurements.
 
 use crate::evaluate::{Assertion, TestOutcome, TestResult, classify};
-use crate::manifest::{Manifest, TransportKind};
+use crate::manifest::{InjectionMethod, Manifest, TransportKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -169,6 +169,22 @@ pub enum RowEvidence {
     DurableJournal(ObservationSet),
     /// Row 41: profile and network isolation.
     ProfileNetworkIsolation(ObservationSet),
+    /// Row 65: provider/base-URL/credential injection ergonomics.
+    InjectionSurface(ObservationSet),
+    /// Row 66: harness-enforced token, cost, and time budgets.
+    BudgetEnforcement(ObservationSet),
+    /// Row 67: structured token, cost, and turn usage.
+    UsageReporting(ObservationSet),
+    /// Row 68: public CLI session lifecycle operations.
+    SessionOpsCli(ObservationSet),
+    /// Row 69: normalized event-stream completeness.
+    EventStreamCompleteness(ObservationSet),
+    /// Row 70: headless permission granularity and effects.
+    HeadlessPermissionModel(ObservationSet),
+    /// Row 71: credential hygiene across captured and on-disk artifacts.
+    SecretsHygieneOnDisk(ObservationSet),
+    /// Row 72: protocol-native tool-result role fidelity.
+    ToolResultRoleFidelity(ObservationSet),
 }
 
 impl RowEvidence {
@@ -216,6 +232,14 @@ impl RowEvidence {
             Self::Hooks(_) => 39,
             Self::DurableJournal(_) => 40,
             Self::ProfileNetworkIsolation(_) => 41,
+            Self::InjectionSurface(_) => 65,
+            Self::BudgetEnforcement(_) => 66,
+            Self::UsageReporting(_) => 67,
+            Self::SessionOpsCli(_) => 68,
+            Self::EventStreamCompleteness(_) => 69,
+            Self::HeadlessPermissionModel(_) => 70,
+            Self::SecretsHygieneOnDisk(_) => 71,
+            Self::ToolResultRoleFidelity(_) => 72,
         }
     }
 
@@ -261,7 +285,15 @@ impl RowEvidence {
             | Self::ResourceBounds(value)
             | Self::Hooks(value)
             | Self::DurableJournal(value)
-            | Self::ProfileNetworkIsolation(value) => value,
+            | Self::ProfileNetworkIsolation(value)
+            | Self::InjectionSurface(value)
+            | Self::BudgetEnforcement(value)
+            | Self::UsageReporting(value)
+            | Self::SessionOpsCli(value)
+            | Self::EventStreamCompleteness(value)
+            | Self::HeadlessPermissionModel(value)
+            | Self::SecretsHygieneOnDisk(value)
+            | Self::ToolResultRoleFidelity(value) => value,
         }
     }
 }
@@ -294,6 +326,9 @@ impl CapabilityStatus {
 
 /// Resolve a row's capability from declarations and concrete operation surfaces.
 pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
+    if let Some(status) = wave4_capability_for_row(manifest, row) {
+        return status;
+    }
     if !basic_session_surface(manifest) {
         return CapabilityStatus::Unsupported(
             "basic session create/submit/attach surface is absent for this architecture".to_owned(),
@@ -389,6 +424,90 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
         );
     }
     CapabilityStatus::Supported
+}
+
+fn wave4_capability_for_row(manifest: &Manifest, row: u8) -> Option<CapabilityStatus> {
+    match row {
+        65 => {
+            let Some(surface) = manifest.capabilities.injection_surface.as_ref() else {
+                return Some(CapabilityStatus::Unsupported(
+                    "typed injection surface is not declared".to_owned(),
+                ));
+            };
+            if matches!(surface.base_url.method, InjectionMethod::Impossible)
+                || matches!(surface.credential.method, InjectionMethod::Impossible)
+                || !basic_session_surface(manifest)
+            {
+                Some(CapabilityStatus::Unsupported(
+                    "base route/auth cannot support a fake-provider trial".to_owned(),
+                ))
+            } else {
+                Some(CapabilityStatus::Supported)
+            }
+        }
+        66 => Some(optional_wave4_capability(
+            manifest,
+            "budget_enforcement",
+            manifest.resources.budget_controls.is_some(),
+        )),
+        67 => Some(optional_wave4_capability(
+            manifest,
+            "usage_reporting",
+            manifest.events.metadata.is_some(),
+        )),
+        68 => Some(optional_wave4_capability(
+            manifest,
+            "session_ops_cli",
+            !manifest.sessions.create.is_empty()
+                && !manifest.sessions.list.is_empty()
+                && !manifest.sessions.resume.is_empty()
+                && !manifest.sessions.fork.is_empty()
+                && !manifest.sessions.delete.is_empty(),
+        )),
+        69 => Some(
+            if manifest.events.source.trim().is_empty()
+                || manifest.events.framing.trim().is_empty()
+                || manifest.events.rules.is_empty()
+            {
+                CapabilityStatus::Absent("machine-readable event stream is absent".to_owned())
+            } else {
+                CapabilityStatus::Supported
+            },
+        ),
+        70 => Some(optional_wave4_capability(
+            manifest,
+            "headless_permission_model",
+            manifest.permissions.is_some(),
+        )),
+        71 => Some(match manifest.capture.credential_carrier_paths.as_ref() {
+            Some(paths) if !paths.is_empty() => CapabilityStatus::Supported,
+            _ => CapabilityStatus::Absent(
+                "capture.credential_carrier_paths is omitted or empty".to_owned(),
+            ),
+        }),
+        72 => Some(CapabilityStatus::Supported),
+        _ => None,
+    }
+}
+
+fn optional_wave4_capability(
+    manifest: &Manifest,
+    key: &str,
+    operation_surface_present: bool,
+) -> CapabilityStatus {
+    let declared = manifest.capabilities.required.contains_key(key)
+        || manifest.capabilities.optional.contains_key(key);
+    if !declared {
+        CapabilityStatus::Unsupported(format!(
+            "capability {key} is not declared by this architecture"
+        ))
+    } else if !operation_surface_present || !basic_session_surface(manifest) {
+        CapabilityStatus::Absent(format!(
+            "declared capability {key} lacks its required operation surface"
+        ))
+    } else {
+        CapabilityStatus::Supported
+    }
 }
 
 fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
@@ -508,6 +627,11 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
         if let Some(detail) = capability_detail {
             result.evidence.push(format!("capability: {detail}"));
         }
+        if matches!(row, 65 | 66 | 67 | 68 | 70)
+            && matches!(result.outcome, TestOutcome::Unsupported(_))
+        {
+            result.metadata.score = Some(0.0);
+        }
         return result;
     }
     let Some(evidence) = evidence else {
@@ -534,14 +658,20 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
         );
     }
     let assertion = exact_assertion(row, evidence.observations());
-    classify(
+    let mut result = classify(
         row,
         definition.id,
         definition.pillar,
         Some(true),
         &[assertion],
         None,
-    )
+    );
+    if matches!(row, 65..=70) {
+        result.metadata.score = numeric_f64(evidence.observations(), "score")
+            .ok()
+            .filter(|score| (0.0..=1.0).contains(score));
+    }
+    result
 }
 
 /// Compatibility entry point for topology-relative report status evaluation.
@@ -554,6 +684,9 @@ pub fn suite_exit_code(
 }
 
 fn exact_assertion(row: u8, values: &ObservationSet) -> Assertion {
+    if matches!(row, 65..=72) {
+        return wave4_exact_assertion(row, values);
+    }
     let checks: Vec<Check<'_>> = match row {
         1 => vec![
             bt("all_roles_observed"),
@@ -838,6 +971,139 @@ fn exact_assertion(row: u8, values: &ObservationSet) -> Assertion {
     }
 }
 
+fn wave4_exact_assertion(row: u8, values: &ObservationSet) -> Assertion {
+    let evaluated = match row {
+        65 => {
+            let provider = numeric_f64(values, "provider_score");
+            let base_url = numeric_f64(values, "base_url_score");
+            let credential = numeric_f64(values, "credential_score");
+            let score = numeric_f64(values, "score");
+            let verified = numeric_u64(values, "verified_components");
+            match (provider, base_url, credential, score, verified) {
+                (Ok(provider), Ok(base_url), Ok(credential), Ok(score), Ok(3)) => Ok(provider
+                    > 0.0
+                    && base_url > 0.0
+                    && credential > 0.0
+                    && (0.50..=1.0).contains(&score)),
+                (provider, base_url, credential, score, verified) => Err(format!(
+                    "invalid injection evidence: provider={provider:?}, base_url={base_url:?}, credential={credential:?}, score={score:?}, verified_components={verified:?}"
+                )),
+            }
+        }
+        66 => wave4_budget_passes(values),
+        67 => wave4_usage_passes(values),
+        68 => wave4_session_cli_passes(values),
+        69 => wave4_event_stream_passes(values),
+        70 => wave4_permission_passes(values),
+        71 => wave4_secret_hygiene_passes(values),
+        72 => wave4_tool_role_passes(values),
+        _ => Err(format!("row {row} has no Wave-4 evaluator")),
+    };
+    let (passed, detail) = match evaluated {
+        Ok(true) => (true, "all row-specific criteria observed".to_owned()),
+        Ok(false) => (
+            false,
+            "complete evidence is outside the row oracle".to_owned(),
+        ),
+        Err(detail) => (false, detail),
+    };
+    Assertion {
+        name: format!("row-{row}-exact-criteria"),
+        passed,
+        detail,
+    }
+}
+
+fn wave4_budget_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    let repetitions = numeric_u64(values, "repetitions")?;
+    let score = numeric_f64(values, "score")?;
+    Ok(repetitions > 0
+        && score == 1.0
+        && numeric_u64(values, "case_kinds_passed")? == 3
+        && numeric_u64(values, "structured_failures")? == repetitions.saturating_mul(3)
+        && numeric_u64(values, "overrun_count")? == 0
+        && bool_value(values, "token_boundary_exact")?
+        && bool_value(values, "cost_boundary_exact")?
+        && bool_value(values, "time_boundary_exact")?
+        && !bool_value(values, "outer_kill")?)
+}
+
+fn wave4_usage_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    let score = numeric_f64(values, "score")?;
+    Ok(score == 1.0
+        && numeric_u64(values, "correct_fields")? == 5
+        && numeric_u64(values, "crosscheck_errors")? == 0
+        && bool_value(values, "all_repetitions_exact")?
+        && bool_value(values, "one_carrier_per_turn")?
+        && bool_value(values, "tool_turn_two_response_sum")?
+        && bool_value(values, "repetitions_identical")?)
+}
+
+fn wave4_session_cli_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    let score = numeric_f64(values, "score")?;
+    Ok(score == 1.0
+        && numeric_u64(values, "create_ok")? == 1
+        && numeric_u64(values, "list_ok")? == 1
+        && numeric_u64(values, "resume_ok")? == 1
+        && numeric_u64(values, "fork_ok")? == 1
+        && numeric_u64(values, "delete_ok")? == 1
+        && numeric_u64(values, "lifecycles")? > 0
+        && bool_value(values, "nonempty_committed_seed")?
+        && bool_value(values, "fork_prefix_exact")?
+        && bool_value(values, "divergence_isolated")?)
+}
+
+fn wave4_event_stream_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    let component = |name| numeric_u64(values, name).map(|value| value == 1);
+    let components = [
+        component("tool_call_id")?,
+        component("correlated_result")?,
+        component("timestamps")?,
+        component("usage")?,
+        component("terminal_typing")?,
+        component("schema_version")?,
+    ];
+    let score = numeric_f64(values, "score")?;
+    let expected_score = components.iter().filter(|value| **value).count() as f64 / 6.0;
+    Ok((score - expected_score).abs() <= f64::EPSILON
+        && crate::evaluate::event_stream_reference_envelope(components))
+}
+
+fn wave4_permission_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    Ok(crate::evaluate::headless_permission_model_passes(
+        numeric_f64(values, "score")?,
+        numeric_u64(values, "repetitions")?,
+        numeric_u64(values, "tty_prompts")?,
+        numeric_u64(values, "allowed_effects")?,
+        numeric_u64(values, "denied_filesystem_effects")?,
+        numeric_u64(values, "denied_network_effects")?,
+        numeric_u64(values, "scope_violations")?,
+    ))
+}
+
+fn wave4_secret_hygiene_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    Ok(numeric_u64(values, "files_scanned")? > 0
+        && numeric_u64(values, "bytes_scanned")? > 0
+        && numeric_u64(values, "declared_carrier_files")? > 0
+        && numeric_u64(values, "stdout_matches")? == 0
+        && numeric_u64(values, "stderr_matches")? == 0
+        && numeric_u64(values, "journal_matches")? == 0
+        && numeric_u64(values, "session_matches")? == 0
+        && numeric_u64(values, "log_matches")? == 0
+        && !bool_value(values, "credential_in_argv")?)
+}
+
+fn wave4_tool_role_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
+    Ok(crate::evaluate::tool_result_role_fidelity_passes(
+        numeric_u64(values, "repetitions")?,
+        numeric_u64(values, "checks")?,
+        numeric_u64(values, "violations")?,
+        numeric_u64(values, "plain_user_text_violations")?,
+        numeric_u64(values, "missing_results")?,
+        numeric_u64(values, "duplicate_results")?,
+    ))
+}
+
 enum Check<'a> {
     Bool(&'a str, bool),
     U64Equal(&'a str, u64),
@@ -883,6 +1149,14 @@ fn numeric_f64(values: &ObservationSet, name: &str) -> std::result::Result<f64, 
     match values.values.get(name) {
         Some(EvidenceValue::F64(value)) if value.is_finite() => Ok(*value),
         Some(value) => Err(format!("{name} is not finite f64: {value:?}")),
+        None => Err(format!("missing {name}")),
+    }
+}
+
+fn bool_value(values: &ObservationSet, name: &str) -> std::result::Result<bool, String> {
+    match values.values.get(name) {
+        Some(EvidenceValue::Bool(value)) => Ok(*value),
+        Some(value) => Err(format!("{name} is not bool: {value:?}")),
         None => Err(format!("missing {name}")),
     }
 }
@@ -935,4 +1209,66 @@ const fn fmin(name: &str, value: f64) -> Check<'_> {
 }
 const fn fmax(name: &str, value: f64) -> Check<'_> {
     Check::F64Max(name, value)
+}
+
+#[cfg(test)]
+mod wave4_tests {
+    use super::*;
+
+    #[test]
+    fn event_stream_oracle_uses_integer_four_of_six_and_hard_trio() {
+        let passing = ObservationSet::new()
+            .with_u64("tool_call_id", 1)
+            .with_u64("correlated_result", 1)
+            .with_u64("timestamps", 0)
+            .with_u64("usage", 0)
+            .with_u64("terminal_typing", 1)
+            .with_u64("schema_version", 1)
+            .with_f64("score", 4.0 / 6.0);
+        assert!(wave4_event_stream_passes(&passing).expect("complete evidence"));
+
+        let missing_hard_component = ObservationSet::new()
+            .with_u64("tool_call_id", 1)
+            .with_u64("correlated_result", 0)
+            .with_u64("timestamps", 1)
+            .with_u64("usage", 1)
+            .with_u64("terminal_typing", 1)
+            .with_u64("schema_version", 1)
+            .with_f64("score", 5.0 / 6.0);
+        assert!(!wave4_event_stream_passes(&missing_hard_component).expect("complete evidence"));
+    }
+
+    #[test]
+    fn permission_oracle_counts_every_trial() {
+        let exact = ObservationSet::new()
+            .with_f64("score", 0.75)
+            .with_u64("repetitions", 5)
+            .with_u64("tty_prompts", 0)
+            .with_u64("allowed_effects", 5)
+            .with_u64("denied_filesystem_effects", 5)
+            .with_u64("denied_network_effects", 5)
+            .with_u64("scope_violations", 0);
+        assert!(wave4_permission_passes(&exact).expect("complete evidence"));
+        let undercount = exact.clone().with_u64("denied_network_effects", 4);
+        assert!(!wave4_permission_passes(&undercount).expect("complete evidence"));
+    }
+
+    #[test]
+    fn tool_role_oracle_requires_exactly_two_checks_per_repetition() {
+        let exact = ObservationSet::new()
+            .with_u64("repetitions", 5)
+            .with_u64("checks", 10)
+            .with_u64("violations", 0)
+            .with_u64("plain_user_text_violations", 0)
+            .with_u64("missing_results", 0)
+            .with_u64("duplicate_results", 0);
+        assert!(wave4_tool_role_passes(&exact).expect("complete evidence"));
+        let vacuous = exact
+            .clone()
+            .with_u64("repetitions", 0)
+            .with_u64("checks", 0);
+        assert!(!wave4_tool_role_passes(&vacuous).expect("complete evidence"));
+        let undercount = exact.with_u64("checks", 9);
+        assert!(!wave4_tool_role_passes(&undercount).expect("complete evidence"));
+    }
 }

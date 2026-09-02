@@ -18,9 +18,10 @@ use crate::evaluate::{
 use crate::events::{EventVocab, NormalizedEvent, rule_matches};
 use crate::fake_model::{
     FakeModelEngine, FakeModelMailboxServer, FakeModelPreconnectedServer, FakeModelServer,
-    FakeModelUnixServer, is_transient_bind_error, monotonic_timestamp_ns,
+    FakeModelUnixServer, ProviderMailboxRequest, ProviderMailboxResponse, is_transient_bind_error,
+    monotonic_timestamp_ns,
 };
-use crate::manifest::{Manifest, TransportKind};
+use crate::manifest::{ArgvPosition, InjectionComponent, InjectionMethod, Manifest, TransportKind};
 use crate::mock_harness::OwnedEgressLedgerRecord;
 use crate::process::{
     DiskIdentityStatus, ProcessSample, ProcessTree, Sample, Sampler, TreeDiskTracker,
@@ -86,7 +87,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -336,6 +337,215 @@ struct RetryBudgetTrials {
     requests: Vec<crate::fake_model::ModelRequestRecord>,
     calibrations: Vec<RetryTimerCalibration>,
     trials: Vec<RetryTrialEvidence>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InjectionSurfaceEvaluation {
+    metrics: BTreeMap<String, f64>,
+    details: Value,
+    measurement_complete: bool,
+    measurement_error: Option<String>,
+    baseline_runnable: bool,
+    passed: bool,
+    score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct InjectionTrialEvidence {
+    component: &'static str,
+    method: InjectionMethod,
+    carrier: String,
+    baseline_provider_requests: u64,
+    perturbed_provider_requests: u64,
+    expected_endpoint_reached: bool,
+    unexpected_endpoint_requests: u64,
+    credential_accepted: bool,
+    baseline_credential_rejected: bool,
+    secret_in_argv: bool,
+    component_verified: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InjectionSurfaceTrials {
+    evaluation: InjectionSurfaceEvaluation,
+    requests: Vec<crate::fake_model::ModelRequestRecord>,
+}
+
+fn injection_method_score(method: InjectionMethod) -> f64 {
+    match method {
+        InjectionMethod::Environment => 1.0,
+        InjectionMethod::Cli => 0.75,
+        InjectionMethod::GeneratedConfig => 0.50,
+        InjectionMethod::Impossible => 0.0,
+    }
+}
+
+fn injection_method_label(method: InjectionMethod) -> &'static str {
+    match method {
+        InjectionMethod::Environment => "environment",
+        InjectionMethod::Cli => "cli",
+        InjectionMethod::GeneratedConfig => "generated-config",
+        InjectionMethod::Impossible => "impossible",
+    }
+}
+
+fn evaluate_injection_surface(
+    provider_method: InjectionMethod,
+    base_url_method: InjectionMethod,
+    credential_method: InjectionMethod,
+    baseline_runnable: bool,
+    trials: Vec<InjectionTrialEvidence>,
+) -> InjectionSurfaceEvaluation {
+    let component_score = |name: &str, method: InjectionMethod| {
+        trials
+            .iter()
+            .find(|trial| trial.component == name)
+            .filter(|trial| trial.component_verified)
+            .map_or(0.0, |_| injection_method_score(method))
+    };
+    let provider_score = component_score("provider", provider_method);
+    let base_url_score = component_score("base_url", base_url_method);
+    let credential_score = component_score("credential", credential_method);
+    let verified_components = trials
+        .iter()
+        .filter(|trial| trial.component_verified)
+        .count() as u64;
+    let score = (provider_score + base_url_score + credential_score) / 3.0;
+    let details = json!({
+        "verification_cases": trials
+            .iter()
+            .map(|trial| json!({
+                "component": trial.component,
+                "method": injection_method_label(trial.method),
+                "carrier": trial.carrier,
+                "baseline_provider_requests": trial.baseline_provider_requests,
+                "perturbed_provider_requests": trial.perturbed_provider_requests,
+                "expected_endpoint_reached": trial.expected_endpoint_reached,
+                "unexpected_endpoint_requests": trial.unexpected_endpoint_requests,
+                "credential_accepted": trial.credential_accepted,
+                "baseline_credential_rejected": trial.baseline_credential_rejected,
+                "secret_in_argv": trial.secret_in_argv,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let metrics = BTreeMap::from([
+        (
+            "injection_surface.provider_score".to_owned(),
+            provider_score,
+        ),
+        (
+            "injection_surface.base_url_score".to_owned(),
+            base_url_score,
+        ),
+        (
+            "injection_surface.credential_score".to_owned(),
+            credential_score,
+        ),
+        ("injection_surface.score".to_owned(), score),
+        (
+            "injection_surface.verified_components".to_owned(),
+            verified_components as f64,
+        ),
+    ]);
+    InjectionSurfaceEvaluation {
+        metrics,
+        details,
+        measurement_complete: true,
+        measurement_error: None,
+        baseline_runnable,
+        passed: baseline_runnable && verified_components == 3 && score >= 0.50,
+        score,
+    }
+}
+
+#[cfg(test)]
+mod injection_surface_tests {
+    use super::*;
+
+    fn evidence(
+        component: &'static str,
+        method: InjectionMethod,
+        verified: bool,
+    ) -> InjectionTrialEvidence {
+        InjectionTrialEvidence {
+            component,
+            method,
+            carrier: injection_method_label(method).to_owned(),
+            baseline_provider_requests: 1,
+            perturbed_provider_requests: u64::from(verified),
+            expected_endpoint_reached: verified,
+            unexpected_endpoint_requests: 0,
+            credential_accepted: verified,
+            baseline_credential_rejected: component == "credential" && verified,
+            secret_in_argv: false,
+            component_verified: verified,
+        }
+    }
+
+    #[test]
+    fn injection_surface_scores_only_behaviorally_verified_carriers() {
+        let evaluation = evaluate_injection_surface(
+            InjectionMethod::Environment,
+            InjectionMethod::Cli,
+            InjectionMethod::GeneratedConfig,
+            true,
+            vec![
+                evidence("provider", InjectionMethod::Environment, true),
+                evidence("base_url", InjectionMethod::Cli, true),
+                evidence("credential", InjectionMethod::GeneratedConfig, true),
+            ],
+        );
+        assert_eq!(evaluation.metrics["injection_surface.provider_score"], 1.0);
+        assert_eq!(evaluation.metrics["injection_surface.base_url_score"], 0.75);
+        assert_eq!(
+            evaluation.metrics["injection_surface.credential_score"],
+            0.50
+        );
+        assert_eq!(
+            evaluation.metrics["injection_surface.verified_components"],
+            3.0
+        );
+        assert_eq!(evaluation.score, 0.75);
+        assert!(evaluation.passed);
+    }
+
+    #[test]
+    fn injection_surface_unverified_component_scores_zero() {
+        let evaluation = evaluate_injection_surface(
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            true,
+            vec![
+                evidence("provider", InjectionMethod::Environment, true),
+                evidence("base_url", InjectionMethod::Environment, false),
+                evidence("credential", InjectionMethod::Environment, true),
+            ],
+        );
+        assert_eq!(evaluation.metrics["injection_surface.base_url_score"], 0.0);
+        assert_eq!(
+            evaluation.metrics["injection_surface.verified_components"],
+            2.0
+        );
+        assert!(!evaluation.passed);
+    }
+
+    #[test]
+    fn injection_surface_unrunnable_baseline_cannot_pass() {
+        let evaluation = evaluate_injection_surface(
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            false,
+            vec![
+                evidence("provider", InjectionMethod::Environment, true),
+                evidence("base_url", InjectionMethod::Environment, true),
+                evidence("credential", InjectionMethod::Environment, true),
+            ],
+        );
+        assert!(!evaluation.baseline_runnable);
+        assert!(!evaluation.passed);
+    }
 }
 
 /// Minimum scheduling error that row 58 treats as calibratable on a loaded
@@ -719,6 +929,13 @@ mod retry_timer_tolerance_tests {
 }
 
 struct DerivedRowEvaluations<'a> {
+    injection_surface: &'a InjectionSurfaceEvaluation,
+    budget_enforcement: &'a crate::wave4::Wave4Evaluation,
+    usage_reporting: &'a crate::wave4::Wave4Evaluation,
+    session_ops_cli: &'a crate::wave4::Wave4Evaluation,
+    event_stream_completeness: &'a crate::wave4::Wave4Evaluation,
+    headless_permissions: &'a crate::wave4::Wave4Evaluation,
+    secrets_hygiene: &'a SecretsHygieneEvaluation,
     model_request_efficiency: &'a crate::fake_model::ModelRequestEfficiencyEvaluation,
     turn_latency: &'a TurnLatencyEvaluation,
     latency_vs_turn_index: &'a LatencyVsTurnIndexEvaluation,
@@ -742,6 +959,1409 @@ struct DerivedRowEvaluations<'a> {
     offline_mode: &'a OfflineModeEvaluation,
     nondeterministic_fields: &'a NondeterministicFieldEvaluation,
     cross_run_reproducibility: &'a CrossRunReproducibilityEvaluation,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolResultRoleFidelityEvaluation {
+    metrics: BTreeMap<String, f64>,
+    details: Value,
+    measurement_complete: bool,
+    measurement_error: Option<String>,
+    passed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SecretsHygieneEvaluation {
+    metrics: BTreeMap<String, f64>,
+    details: Value,
+    measurement_complete: bool,
+    measurement_error: Option<String>,
+    passed: bool,
+}
+
+#[derive(Debug)]
+struct DirectCommandObservation {
+    argv: Vec<String>,
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    operation_start_ns: u64,
+    terminal_receipt_ns: Option<u64>,
+    terminal: Value,
+    outer_kill: bool,
+}
+
+async fn run_wave4_command(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+    deadline: Duration,
+    capture_limit: usize,
+) -> Result<DirectCommandObservation> {
+    let argv = resolve_local_program(argv)?;
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| AhrbError::Validation("Wave-4 direct command argv is empty".to_owned()))?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(arguments)
+        .env_clear()
+        .envs(environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let operation_start_ns = monotonic_timestamp_ns();
+    let child = command.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| AhrbError::Protocol("Wave-4 child has no process ID".to_owned()))?;
+    crate::process::register_child(&child)?;
+    let output = match tokio::time::timeout(deadline, child.wait_with_output()).await {
+        Ok(output) => output?,
+        Err(_) => {
+            crate::process::retire_process(pid)?;
+            return Ok(DirectCommandObservation {
+                argv,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                operation_start_ns,
+                terminal_receipt_ns: None,
+                terminal: Value::Null,
+                outer_kill: true,
+            });
+        }
+    };
+    crate::process::retire_process(pid)?;
+    if output.stdout.len() > capture_limit || output.stderr.len() > capture_limit {
+        return Err(AhrbError::Protocol(format!(
+            "Wave-4 direct command exceeded {capture_limit}-byte capture limit"
+        )));
+    }
+    let terminal = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+        .map(serde_json::from_slice)
+        .transpose()?
+        .unwrap_or(Value::Null);
+    let terminal_receipt_ns = monotonic_timestamp_ns();
+    Ok(DirectCommandObservation {
+        argv,
+        exit_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        operation_start_ns,
+        terminal_receipt_ns: Some(terminal_receipt_ns),
+        terminal,
+        outer_kill: false,
+    })
+}
+
+fn inject_tariff_environment(manifest: &Manifest, environment: &mut BTreeMap<String, String>) {
+    if let Some(tariff) = manifest
+        .resources
+        .budget_controls
+        .as_ref()
+        .and_then(|controls| controls.tariff.as_ref())
+        && tariff.surface == crate::manifest::TariffSurface::Environment
+    {
+        environment.insert(
+            tariff.input_environment.clone(),
+            tariff.input_microusd_per_token.to_string(),
+        );
+        environment.insert(
+            tariff.output_environment.clone(),
+            tariff.output_microusd_per_token.to_string(),
+        );
+    }
+}
+
+async fn collect_budget_enforcement(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+    engine: &FakeModelEngine,
+    profile: Profile,
+) -> Result<crate::wave4::Wave4Evaluation> {
+    let controls = manifest
+        .resources
+        .budget_controls
+        .as_ref()
+        .ok_or_else(|| AhrbError::Validation("row-66 budget controls are absent".to_owned()))?;
+    let (repetitions, token_limit, cost_limit, time_limit_ms) = match profile {
+        Profile::Quick => (3_u32, 128_u64, 1_000_u64, 2_000_u64),
+        Profile::Cert => (7_u32, 1_024_u64, 10_000_u64, 5_000_u64),
+    };
+    let mut environment = environment.clone();
+    inject_tariff_environment(manifest, &mut environment);
+    let mut cases = Vec::new();
+    let mut kind_passes = BTreeMap::from([("tokens", true), ("cost", true), ("time", true)]);
+    let mut structured_failures = 0_u64;
+    let mut overrun_count = 0_u64;
+    let mut token_observed = 0_u64;
+    let mut cost_observed = 0_u64;
+    let mut time_observed = 0_f64;
+    for repetition in 1..=repetitions {
+        for (kind, template) in [
+            ("tokens", &controls.max_tokens),
+            ("cost", &controls.max_cost),
+            ("time", &controls.max_time),
+        ] {
+            let mut command_variables = variables.clone();
+            command_variables.insert("budget_tokens".to_owned(), token_limit.to_string());
+            command_variables.insert(
+                "budget_cost_usd".to_owned(),
+                format!("{}.{:06}", cost_limit / 1_000_000, cost_limit % 1_000_000),
+            );
+            command_variables.insert("budget_time_ms".to_owned(), time_limit_ms.to_string());
+            let argv = render_argv(template, &command_variables)?;
+            let observation = run_wave4_command(
+                &argv,
+                &environment,
+                Duration::from_millis(time_limit_ms.saturating_add(5_000)),
+                manifest.capture.max_bytes,
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(1_000)).await;
+            let mut provider_records = engine
+                .request_records()
+                .await
+                .into_iter()
+                .filter(|record| {
+                    record.accepted
+                        && record.request.scenario == "ahrb-matrix-v1"
+                        && record.request.actor == format!("{kind}-r{repetition}")
+                })
+                .collect::<Vec<_>>();
+            provider_records.sort_by_key(|record| record.semantic_ordinal);
+            let fixture_cost = cost_limit.saturating_sub(25);
+            let fixture_cost_input = fixture_cost.saturating_sub(3) / 2;
+            let usage_boundaries = provider_records
+                .iter()
+                .map(|record| {
+                    let (input_tokens, output_tokens) = match (kind, record.request.checkpoint.as_str()) {
+                        ("tokens", "fixture") => (token_limit.saturating_sub(32), 16),
+                        ("tokens", "crossing") => (8, 16),
+                        ("cost", "fixture") => (fixture_cost_input, 1),
+                        ("cost", "crossing") => (10, 10),
+                        ("time", "crossing") => (1, 1),
+                        _ => (0, 0),
+                    };
+                    let total_tokens = input_tokens.saturating_add(output_tokens);
+                    let cost_microusd = input_tokens
+                        .saturating_mul(2)
+                        .saturating_add(output_tokens.saturating_mul(3));
+                    let semantic_request_id = record
+                        .request
+                        .canonical
+                        .pointer("/metadata/ahrb/request_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&record.canonical_hash)
+                        .to_owned();
+                    json!({
+                        "semantic_request_id": semantic_request_id,
+                        "completed_ns": record.response_last_frame_yield_ns.or(record.response_headers_ns).unwrap_or(0),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
+                        "cost_microusd": cost_microusd,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let terminal = &observation.terminal;
+            let terminal_typed =
+                terminal.get("terminal_type").and_then(Value::as_str) == Some("budget-exceeded");
+            let declared_output_overruns = terminal
+                .get("overrun_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            let crossing_id = provider_records
+                .iter()
+                .find(|record| record.request.checkpoint == "crossing")
+                .map(|record| record.canonical_hash.clone());
+            let stop_boundary_ns = if kind == "time" {
+                observation
+                    .operation_start_ns
+                    .saturating_add(time_limit_ms.saturating_mul(1_000_000))
+            } else {
+                provider_records
+                    .iter()
+                    .find(|record| record.request.checkpoint == "crossing")
+                    .and_then(|record| {
+                        record
+                            .response_last_frame_yield_ns
+                            .or(record.response_headers_ns)
+                    })
+                    .unwrap_or(0)
+            };
+            let mut seen_overruns = BTreeSet::new();
+            let overrun_observations = provider_records
+                .iter()
+                .filter_map(|record| {
+                    let completed_ns = record
+                        .response_last_frame_yield_ns
+                        .or(record.response_headers_ns)?;
+                    let semantic_id = record.canonical_hash.clone();
+                    (completed_ns > stop_boundary_ns
+                        && crossing_id.as_deref() != Some(semantic_id.as_str())
+                        && seen_overruns.insert(semantic_id.clone()))
+                    .then(|| {
+                        json!({
+                            "kind": "provider-request",
+                            "semantic_id": semantic_id,
+                            "observed_ns": completed_ns,
+                            "stop_boundary_ns": stop_boundary_ns,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let case_overruns = u64::try_from(overrun_observations.len()).unwrap_or(u64::MAX);
+            overrun_count = overrun_count.saturating_add(case_overruns);
+            structured_failures = structured_failures.saturating_add(u64::from(terminal_typed));
+            let case_pass = match kind {
+                "tokens" => {
+                    let observed = terminal.get("observed").and_then(Value::as_u64);
+                    token_observed = token_observed.max(observed.unwrap_or(0));
+                    observed == token_limit.checked_add(8)
+                        && terminal.get("limit").and_then(Value::as_u64) == Some(token_limit)
+                }
+                "cost" => {
+                    let observed = terminal.get("observed_microusd").and_then(Value::as_u64);
+                    cost_observed = cost_observed.max(observed.unwrap_or(0));
+                    observed == cost_limit.checked_add(25)
+                        && terminal.get("limit_microusd").and_then(Value::as_u64)
+                            == Some(cost_limit)
+                }
+                "time" => {
+                    let observed = terminal.get("observed_ms").and_then(Value::as_u64);
+                    let receipt_elapsed_ms =
+                        observation
+                            .terminal_receipt_ns
+                            .map_or(f64::INFINITY, |receipt| {
+                                receipt.saturating_sub(observation.operation_start_ns) as f64
+                                    / 1_000_000.0
+                            });
+                    time_observed = time_observed.max(receipt_elapsed_ms);
+                    let tolerance = 250_u64.max(time_limit_ms / 10);
+                    observed.is_some_and(|value| {
+                        value >= time_limit_ms && value <= time_limit_ms.saturating_add(tolerance)
+                    }) && receipt_elapsed_ms >= time_limit_ms as f64
+                        && receipt_elapsed_ms
+                            <= time_limit_ms.saturating_add(tolerance).saturating_add(250) as f64
+                }
+                _ => false,
+            } && terminal_typed
+                && observation.exit_code == Some(0)
+                && !observation.outer_kill
+                && declared_output_overruns == 0
+                && case_overruns == 0
+                && stop_boundary_ns > 0
+                && provider_records.len() == if kind == "time" { 1 } else { 2 };
+            if !case_pass && let Some(passed) = kind_passes.get_mut(kind) {
+                *passed = false;
+            }
+            cases.push(json!({
+                "repetition": repetition,
+                "case": kind,
+                "argv": observation.argv,
+                "public_operation_start_ns": observation.operation_start_ns,
+                "usage_boundaries": usage_boundaries,
+                "tariff_delivered": true,
+                "terminal_receipt_ns": observation.terminal_receipt_ns,
+                "terminal": terminal,
+                "effects": [],
+                "outer_kill": observation.outer_kill,
+                "overrun_observations": overrun_observations,
+                "stdout_bytes": observation.stdout.len(),
+                "stderr_bytes": observation.stderr.len(),
+                "passed": case_pass,
+            }));
+        }
+    }
+    let passed_kinds = kind_passes.values().filter(|passed| **passed).count() as u64;
+    let score = passed_kinds as f64 / 3.0;
+    let expected_structured = u64::from(repetitions).saturating_mul(3);
+    let passed = score == 1.0 && overrun_count == 0 && structured_failures == expected_structured;
+    Ok(crate::wave4::Wave4Evaluation {
+        metrics: BTreeMap::from([
+            (
+                "budget_enforcement.token_limit".to_owned(),
+                token_limit as f64,
+            ),
+            (
+                "budget_enforcement.token_observed".to_owned(),
+                token_observed as f64,
+            ),
+            (
+                "budget_enforcement.cost_limit_microusd".to_owned(),
+                cost_limit as f64,
+            ),
+            (
+                "budget_enforcement.cost_observed_microusd".to_owned(),
+                cost_observed as f64,
+            ),
+            (
+                "budget_enforcement.time_limit_ms".to_owned(),
+                time_limit_ms as f64,
+            ),
+            (
+                "budget_enforcement.time_observed_ms".to_owned(),
+                time_observed,
+            ),
+            (
+                "budget_enforcement.overrun_count".to_owned(),
+                overrun_count as f64,
+            ),
+            (
+                "budget_enforcement.structured_failures".to_owned(),
+                structured_failures as f64,
+            ),
+            ("budget_enforcement.score".to_owned(), score),
+        ]),
+        details: json!({"cases": cases, "kind_passes": kind_passes}),
+        measurement_complete: true,
+        measurement_error: None,
+        passed,
+    })
+}
+
+async fn collect_headless_permissions(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+    profile_root: &Path,
+    profile: Profile,
+) -> Result<crate::wave4::Wave4Evaluation> {
+    let permissions = manifest.permissions.as_ref().ok_or_else(|| {
+        AhrbError::Validation("row-70 permissions declaration is absent".to_owned())
+    })?;
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 5_u32,
+    };
+    let mut cases = Vec::new();
+    let mut tty_prompts = 0_u64;
+    let mut allowed_effects = 0_u64;
+    let mut denied_filesystem_effects = 0_u64;
+    let mut denied_network_effects = 0_u64;
+    let mut scope_violations = 0_u64;
+    for repetition in 1..=repetitions {
+        let workspace = profile_root.join(format!("wave4-permissions-r{repetition}"));
+        let outside_path = profile_root.join(format!("wave4-outside-r{repetition}.txt"));
+        let listener = match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => return Err(error.into()),
+        };
+        let blocked_port = listener
+            .as_ref()
+            .map(tokio::net::TcpListener::local_addr)
+            .transpose()?
+            .map_or(9, |address| address.port());
+        for (kind, template) in [
+            ("allow", &permissions.allow),
+            ("deny-filesystem", &permissions.deny_filesystem),
+            ("deny-network", &permissions.deny_network),
+        ] {
+            let mut command_variables = variables.clone();
+            command_variables.insert(
+                "workspace".to_owned(),
+                workspace.to_string_lossy().into_owned(),
+            );
+            command_variables.insert(
+                "outside_path".to_owned(),
+                outside_path.to_string_lossy().into_owned(),
+            );
+            command_variables.insert("blocked_host".to_owned(), "127.0.0.1".to_owned());
+            command_variables.insert("blocked_port".to_owned(), blocked_port.to_string());
+            let argv = render_argv(template, &command_variables)?;
+            let observation = run_wave4_command(
+                &argv,
+                environment,
+                Duration::from_secs(5),
+                manifest.capture.max_bytes,
+            )
+            .await?;
+            let combined = [observation.stdout.as_slice(), observation.stderr.as_slice()].concat();
+            let prompt = String::from_utf8_lossy(&combined).to_ascii_lowercase();
+            let prompted = observation.outer_kill
+                || ["press enter", "allow?", "approve?", "password:"]
+                    .iter()
+                    .any(|needle| prompt.contains(needle));
+            tty_prompts = tty_prompts.saturating_add(u64::from(prompted));
+            let terminal_type = observation
+                .terminal
+                .get("terminal_type")
+                .and_then(Value::as_str)
+                .unwrap_or("missing");
+            let effect = match kind {
+                "allow" => {
+                    workspace.join("ahrb-permission-allowed.txt").is_file()
+                        && terminal_type == "success"
+                }
+                "deny-filesystem" => !outside_path.exists() && terminal_type == "permission-denied",
+                "deny-network" => {
+                    let accepted = if let Some(listener) = &listener {
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                            .await
+                            .is_ok()
+                    } else {
+                        false
+                    };
+                    !accepted
+                        && terminal_type == "permission-denied"
+                        && observation
+                            .terminal
+                            .get("os_connect_attempted")
+                            .and_then(Value::as_bool)
+                            == Some(false)
+                }
+                _ => false,
+            };
+            match kind {
+                "allow" => allowed_effects = allowed_effects.saturating_add(u64::from(effect)),
+                "deny-filesystem" => {
+                    denied_filesystem_effects =
+                        denied_filesystem_effects.saturating_add(u64::from(effect));
+                }
+                "deny-network" => {
+                    denied_network_effects =
+                        denied_network_effects.saturating_add(u64::from(effect));
+                }
+                _ => {}
+            }
+            let scope_violation = observation
+                .terminal
+                .get("scope_violation")
+                .and_then(Value::as_bool)
+                == Some(true);
+            scope_violations = scope_violations.saturating_add(u64::from(scope_violation));
+            cases.push(json!({
+                "repetition": repetition,
+                "case": kind,
+                "argv": observation.argv,
+                "exit_code": observation.exit_code,
+                "terminal_type": terminal_type,
+                "effect": effect,
+            }));
+        }
+    }
+    let score = match permissions.mode {
+        crate::manifest::PermissionMode::AllowListAndSandbox => 1.0,
+        crate::manifest::PermissionMode::Sandbox => 0.75,
+        crate::manifest::PermissionMode::WorkspaceYolo => 0.50,
+        crate::manifest::PermissionMode::AllowList => 0.50,
+        crate::manifest::PermissionMode::None => 0.25,
+    };
+    let passed = crate::evaluate::headless_permission_model_passes(
+        score,
+        u64::from(repetitions),
+        tty_prompts,
+        allowed_effects,
+        denied_filesystem_effects,
+        denied_network_effects,
+        scope_violations,
+    );
+    Ok(crate::wave4::Wave4Evaluation {
+        metrics: BTreeMap::from([
+            ("headless_permission_model.score".to_owned(), score),
+            (
+                "headless_permission_model.tty_prompts".to_owned(),
+                tty_prompts as f64,
+            ),
+            (
+                "headless_permission_model.allowed_effects".to_owned(),
+                allowed_effects as f64,
+            ),
+            (
+                "headless_permission_model.denied_filesystem_effects".to_owned(),
+                denied_filesystem_effects as f64,
+            ),
+            (
+                "headless_permission_model.denied_network_effects".to_owned(),
+                denied_network_effects as f64,
+            ),
+            (
+                "headless_permission_model.scope_violations".to_owned(),
+                scope_violations as f64,
+            ),
+        ]),
+        details: json!({"mode": permissions.mode, "cases": cases, "repetitions": repetitions}),
+        measurement_complete: true,
+        measurement_error: None,
+        passed,
+    })
+}
+
+fn stdout_events(observation: &DirectCommandObservation) -> Result<Vec<NormalizedEvent>> {
+    observation
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+        .map(|line| serde_json::from_slice(line).map_err(AhrbError::from))
+        .collect()
+}
+
+fn string_array(value: &Value, pointer: &str) -> Option<Vec<String>> {
+    value
+        .pointer(pointer)?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+async fn collect_session_cli(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+    profile: Profile,
+) -> Result<crate::wave4::Wave4Evaluation> {
+    let repetitions = match profile {
+        Profile::Quick => 1_u32,
+        Profile::Cert => 5_u32,
+    };
+    if manifest.sessions.continue_turn.is_empty() {
+        return Err(AhrbError::Validation(
+            "session-ops-cli requires a public seed/continue command".to_owned(),
+        ));
+    }
+    let mut lifecycles = Vec::new();
+    let mut operation_all = BTreeMap::from([
+        ("create", true),
+        ("list", true),
+        ("resume", true),
+        ("fork", true),
+        ("delete", true),
+    ]);
+    for repetition in 1..=repetitions {
+        let seed_actor = format!("r68cli{repetition}-seed");
+        let original_actor = format!("r68cli{repetition}-original");
+        let fork_actor = format!("r68cli{repetition}-fork");
+        let mut operation_results = Vec::new();
+        let mut dynamic = variables.clone();
+        dynamic.insert("marker".to_owned(), seed_actor.clone());
+        let create_argv = render_argv(&manifest.sessions.create, &dynamic)?;
+        let create = run_wave4_command(
+            &create_argv,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let original_id = create
+            .terminal
+            .pointer(&manifest.sessions.id_pointer)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let create_ok = create.exit_code == Some(0) && !original_id.is_empty();
+        operation_results.push(json!({
+            "operation":"create","exit_code":create.exit_code,
+            "terminal_type":create.terminal.get("terminal_type"),
+            "extracted_ids":[original_id.clone()],"cursor":0
+        }));
+
+        dynamic.insert("session_id".to_owned(), original_id.clone());
+        dynamic.insert("marker".to_owned(), seed_actor.clone());
+        dynamic.insert("turn_key".to_owned(), format!("row68-seed-{repetition}"));
+        dynamic.insert(
+            "prompt".to_owned(),
+            format!(
+                "AHRB session CLI committed seed {}",
+                route_marker("ahrb-matrix-v1", &seed_actor, "start")
+            ),
+        );
+        dynamic.insert("workspace".to_owned(), ".".to_owned());
+        let seed_argv = render_argv(&manifest.sessions.continue_turn, &dynamic)?;
+        let seed = run_wave4_command(
+            &seed_argv,
+            environment,
+            Duration::from_millis(manifest.resources.turn_timeout_ms.saturating_add(2_000)),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let seed_events = stdout_events(&seed)?;
+        let seed_call = seed_events
+            .iter()
+            .find(|event| event.event == EventVocab::ToolCall);
+        let seed_result = seed_events
+            .iter()
+            .find(|event| event.event == EventVocab::ToolResult);
+        let seed_call_id = seed_call
+            .and_then(|event| event.payload.get("call_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let seed_result_digest = seed_result
+            .and_then(|event| event.payload.get("result"))
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .unwrap_or_default();
+        let committed_cursor = seed_events.last().map_or(0, |event| event.cursor);
+        let nonempty_seed = !seed_call_id.is_empty()
+            && !seed_result_digest.is_empty()
+            && committed_cursor > 0
+            && seed_events
+                .iter()
+                .any(|event| event.event == EventVocab::TerminalSuccess);
+        operation_results.push(json!({
+            "operation":"submit-seed","exit_code":seed.exit_code,
+            "terminal_type":"terminal-success","extracted_ids":[seed_call_id.clone()],
+            "cursor":committed_cursor
+        }));
+
+        let list_argv = render_argv(&manifest.sessions.list, &dynamic)?;
+        let listed = run_wave4_command(
+            &list_argv,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let listed_ids = listed
+            .terminal
+            .pointer(&manifest.sessions.list_array_pointer)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.pointer(&manifest.sessions.list_item_id_pointer)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let list_ok = listed_ids.iter().filter(|id| *id == &original_id).count() == 1;
+        operation_results.push(json!({
+            "operation":"list","exit_code":listed.exit_code,"terminal_type":"success",
+            "extracted_ids":listed_ids,"cursor":committed_cursor
+        }));
+
+        let resume_argv = render_argv(&manifest.sessions.resume, &dynamic)?;
+        let resumed = run_wave4_command(
+            &resume_argv,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let seed_history = string_array(&resumed.terminal, "/history_hashes").unwrap_or_default();
+        let resume_ok = resumed.exit_code == Some(0)
+            && resumed.terminal.get("session_id").and_then(Value::as_str)
+                == Some(original_id.as_str())
+            && resumed
+                .terminal
+                .get("committed_cursor")
+                .and_then(Value::as_u64)
+                == Some(committed_cursor)
+            && !seed_history.is_empty();
+        operation_results.push(json!({
+            "operation":"resume","exit_code":resumed.exit_code,"terminal_type":"success",
+            "extracted_ids":[original_id.clone()],"cursor":committed_cursor
+        }));
+
+        let fork_argv = render_argv(&manifest.sessions.fork, &dynamic)?;
+        let forked = run_wave4_command(
+            &fork_argv,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let fork_id = forked
+            .terminal
+            .pointer(&manifest.sessions.fork_id_pointer)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let fork_seed_history =
+            string_array(&forked.terminal, "/history_hashes").unwrap_or_default();
+        let fork_created = forked.exit_code == Some(0)
+            && !fork_id.is_empty()
+            && fork_id != original_id
+            && fork_seed_history == seed_history;
+        operation_results.push(json!({
+            "operation":"fork","exit_code":forked.exit_code,"terminal_type":"success",
+            "extracted_ids":[fork_id.clone()],"cursor":committed_cursor
+        }));
+
+        for (session_id, actor, key) in [
+            (&original_id, &original_actor, "original-divergence"),
+            (&fork_id, &fork_actor, "fork-divergence"),
+        ] {
+            dynamic.insert("session_id".to_owned(), session_id.clone());
+            dynamic.insert("turn_key".to_owned(), format!("row68-{key}-{repetition}"));
+            dynamic.insert(
+                "prompt".to_owned(),
+                format!(
+                    "AHRB session CLI {key} {}",
+                    route_marker("ahrb-matrix-v1", actor, "start")
+                ),
+            );
+            let argv = render_argv(&manifest.sessions.continue_turn, &dynamic)?;
+            let divergence = run_wave4_command(
+                &argv,
+                environment,
+                Duration::from_millis(manifest.resources.turn_timeout_ms.saturating_add(2_000)),
+                manifest.capture.max_bytes,
+            )
+            .await?;
+            operation_results.push(json!({
+                "operation":key,"exit_code":divergence.exit_code,
+                "terminal_type":"terminal-success","extracted_ids":[session_id],"cursor":null
+            }));
+        }
+
+        dynamic.insert("session_id".to_owned(), original_id.clone());
+        let original_after = run_wave4_command(
+            &render_argv(&manifest.sessions.resume, &dynamic)?,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        dynamic.insert("session_id".to_owned(), fork_id.clone());
+        let fork_after = run_wave4_command(
+            &render_argv(&manifest.sessions.resume, &dynamic)?,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let original_history =
+            string_array(&original_after.terminal, "/history_hashes").unwrap_or_default();
+        let fork_history =
+            string_array(&fork_after.terminal, "/history_hashes").unwrap_or_default();
+        let fork_prefix_exact = original_history.starts_with(&seed_history)
+            && fork_history.starts_with(&seed_history)
+            && original_history.len() > seed_history.len()
+            && fork_history.len() > seed_history.len();
+        let divergence_isolated = original_history != fork_history;
+
+        let mut delete_ok = true;
+        for session_id in [&original_id, &fork_id] {
+            dynamic.insert("session_id".to_owned(), session_id.clone());
+            let deleted = run_wave4_command(
+                &render_argv(&manifest.sessions.delete, &dynamic)?,
+                environment,
+                Duration::from_secs(5),
+                manifest.capture.max_bytes,
+            )
+            .await?;
+            delete_ok &= deleted.exit_code == Some(0)
+                && deleted.terminal.get("deleted").and_then(Value::as_bool) == Some(true);
+            operation_results.push(json!({
+                "operation":"delete","exit_code":deleted.exit_code,"terminal_type":"success",
+                "extracted_ids":[session_id],"cursor":null
+            }));
+        }
+        dynamic.insert("session_id".to_owned(), original_id.clone());
+        let repeated = run_wave4_command(
+            &render_argv(&manifest.sessions.delete, &dynamic)?,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        delete_ok &= repeated.exit_code == Some(0)
+            && repeated
+                .terminal
+                .get("already_absent")
+                .and_then(Value::as_bool)
+                == Some(true);
+        let list_after = run_wave4_command(
+            &render_argv(&manifest.sessions.list, &dynamic)?,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        let after_text = serde_json::to_string(&list_after.terminal)?;
+        delete_ok &= !after_text.contains(&original_id) && !after_text.contains(&fork_id);
+        let resume_deleted = run_wave4_command(
+            &render_argv(&manifest.sessions.resume, &dynamic)?,
+            environment,
+            Duration::from_secs(5),
+            manifest.capture.max_bytes,
+        )
+        .await?;
+        delete_ok &= resume_deleted.exit_code != Some(0)
+            && resume_deleted
+                .terminal
+                .get("not_found")
+                .and_then(Value::as_bool)
+                == Some(true);
+
+        let resume_all = resume_ok && nonempty_seed;
+        let fork_all = fork_created && fork_prefix_exact && divergence_isolated;
+        for (name, passed) in [
+            ("create", create_ok),
+            ("list", list_ok),
+            ("resume", resume_all),
+            ("fork", fork_all),
+            ("delete", delete_ok),
+        ] {
+            if !passed && let Some(all) = operation_all.get_mut(name) {
+                *all = false;
+            }
+        }
+        lifecycles.push(json!({
+            "repetition":repetition,"original_id":original_id,"fork_id":fork_id,
+            "seed_call_id":seed_call_id,"seed_result_digest":seed_result_digest,
+            "committed_cursor":committed_cursor,
+            "original_history_hashes":original_history,"fork_history_hashes":fork_history,
+            "operation_results":operation_results,
+            "nonempty_committed_seed":nonempty_seed,
+            "fork_prefix_exact":fork_prefix_exact,"divergence_isolated":divergence_isolated
+        }));
+    }
+    let booleans = ["create", "list", "resume", "fork", "delete"]
+        .map(|name| operation_all.get(name).copied().unwrap_or(false));
+    let score = booleans.iter().filter(|passed| **passed).count() as f64 / 5.0;
+    let metrics = BTreeMap::from([
+        (
+            "session_ops_cli.create_ok".to_owned(),
+            f64::from(booleans[0]),
+        ),
+        ("session_ops_cli.list_ok".to_owned(), f64::from(booleans[1])),
+        (
+            "session_ops_cli.resume_ok".to_owned(),
+            f64::from(booleans[2]),
+        ),
+        ("session_ops_cli.fork_ok".to_owned(), f64::from(booleans[3])),
+        (
+            "session_ops_cli.delete_ok".to_owned(),
+            f64::from(booleans[4]),
+        ),
+        ("session_ops_cli.score".to_owned(), score),
+    ]);
+    Ok(crate::wave4::Wave4Evaluation {
+        metrics,
+        details: json!({"lifecycles":lifecycles}),
+        measurement_complete: true,
+        measurement_error: None,
+        passed: score == 1.0,
+    })
+}
+
+fn base64_standard(bytes: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = Vec::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = u32::from(*chunk.get(1).unwrap_or(&0));
+        let third = u32::from(*chunk.get(2).unwrap_or(&0));
+        let bits = (first << 16) | (second << 8) | third;
+        output.push(ALPHABET[((bits >> 18) & 0x3f) as usize]);
+        output.push(ALPHABET[((bits >> 12) & 0x3f) as usize]);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[((bits >> 6) & 0x3f) as usize]
+        } else {
+            b'='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(bits & 0x3f) as usize]
+        } else {
+            b'='
+        });
+    }
+    output
+}
+
+fn credential_encodings(secret: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    let hex = secret
+        .iter()
+        .flat_map(|byte| format!("{byte:02x}").into_bytes())
+        .collect::<Vec<_>>();
+    let percent = secret
+        .iter()
+        .flat_map(|byte| format!("%{byte:02X}").into_bytes())
+        .collect::<Vec<_>>();
+    let mut encodings = vec![
+        ("exact", secret.to_vec()),
+        ("base64", base64_standard(secret)),
+        ("hex", hex),
+        ("percent", percent),
+    ];
+    encodings.sort_by_key(|(name, _)| *name);
+    encodings.dedup_by(|left, right| left.1 == right.1);
+    encodings
+}
+
+fn collect_profile_regular_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries = std::fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_profile_regular_files(&path, output)?;
+        } else if metadata.is_file() {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn byte_match_offsets(haystack: &[u8], needle: &[u8]) -> Vec<u64> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(offset, _)| u64::try_from(offset).unwrap_or(u64::MAX))
+        .collect()
+}
+
+fn path_is_within(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+}
+
+struct SecretsHygieneInputs<'a> {
+    profile_root: &'a Path,
+    credential: &'a str,
+    carrier_paths: &'a [PathBuf],
+    session_roots: &'a [PathBuf],
+    journal_roots: &'a [PathBuf],
+    expected_successes: u64,
+    expected_failures: u64,
+    events: &'a [NormalizedEvent],
+    credential_in_argv: bool,
+}
+
+fn evaluate_secrets_hygiene(inputs: SecretsHygieneInputs<'_>) -> SecretsHygieneEvaluation {
+    let SecretsHygieneInputs {
+        profile_root,
+        credential,
+        carrier_paths,
+        session_roots,
+        journal_roots,
+        expected_successes,
+        expected_failures,
+        events,
+        credential_in_argv,
+    } = inputs;
+    if carrier_paths.is_empty() {
+        return SecretsHygieneEvaluation {
+            details: json!({"matches": []}),
+            measurement_error: Some(
+                "capture.credential_carrier_paths is empty; row 71 declaration is ABSENT"
+                    .to_owned(),
+            ),
+            ..SecretsHygieneEvaluation::default()
+        };
+    }
+    let success_count = events
+        .iter()
+        .filter(|event| event.event == EventVocab::TerminalSuccess)
+        .count() as u64;
+    let failure_count = events
+        .iter()
+        .filter(|event| event.event == EventVocab::TerminalFailure)
+        .count() as u64;
+    if success_count != expected_successes || failure_count != expected_failures {
+        return SecretsHygieneEvaluation {
+            details: json!({
+                "matches": [],
+                "success_terminals": success_count,
+                "failure_terminals": failure_count,
+            }),
+            measurement_error: Some(format!(
+                "row 71 observed {success_count}/{failure_count} success/failure terminals; expected {expected_successes}/{expected_failures}"
+            )),
+            ..SecretsHygieneEvaluation::default()
+        };
+    }
+    let mut files = Vec::new();
+    if let Err(error) = collect_profile_regular_files(profile_root, &mut files) {
+        return SecretsHygieneEvaluation {
+            details: json!({"matches": []}),
+            measurement_error: Some(format!("profile scan failed: {error}")),
+            ..SecretsHygieneEvaluation::default()
+        };
+    }
+    files.sort();
+    files.dedup();
+    let carrier_set = carrier_paths.iter().cloned().collect::<BTreeSet<_>>();
+    let declared_carrier_files = files
+        .iter()
+        .filter(|path| carrier_set.contains(*path))
+        .count() as u64;
+    if declared_carrier_files != carrier_paths.len() as u64 {
+        return SecretsHygieneEvaluation {
+            details: json!({"matches": []}),
+            measurement_error: Some(format!(
+                "only {declared_carrier_files} of {} declared credential carrier files exist",
+                carrier_paths.len()
+            )),
+            ..SecretsHygieneEvaluation::default()
+        };
+    }
+    let encodings = credential_encodings(credential.as_bytes());
+    let mut files_scanned = 0_u64;
+    let mut bytes_scanned = 0_u64;
+    let mut category_matches = BTreeMap::from([
+        ("stdout", 0_u64),
+        ("stderr", 0_u64),
+        ("journal", 0_u64),
+        ("session", 0_u64),
+        ("log", 0_u64),
+    ]);
+    let mut matches = Vec::new();
+    for path in files {
+        if carrier_set.contains(&path) {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return SecretsHygieneEvaluation {
+                    details: json!({"matches": matches}),
+                    measurement_error: Some(format!(
+                        "could not read scanned artifact {}: {error}",
+                        path.display()
+                    )),
+                    ..SecretsHygieneEvaluation::default()
+                };
+            }
+        };
+        files_scanned = files_scanned.saturating_add(1);
+        bytes_scanned = bytes_scanned.saturating_add(bytes.len() as u64);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let category = if file_name.contains("stdout") {
+            "stdout"
+        } else if file_name.contains("stderr") {
+            "stderr"
+        } else if path_is_within(&path, journal_roots) || file_name.contains("journal") {
+            "journal"
+        } else if path_is_within(&path, session_roots) {
+            "session"
+        } else {
+            "log"
+        };
+        for (encoding, needle) in &encodings {
+            for offset in byte_match_offsets(&bytes, needle) {
+                if let Some(count) = category_matches.get_mut(category) {
+                    *count = count.saturating_add(1);
+                }
+                matches.push(json!({
+                    "category": category,
+                    "path": path.strip_prefix(profile_root).unwrap_or(&path),
+                    "offset": offset,
+                    "encoding": encoding,
+                }));
+            }
+        }
+    }
+    matches.sort_by(|left, right| {
+        (
+            left.get("category").and_then(Value::as_str),
+            left.get("path").and_then(Value::as_str),
+            left.get("offset").and_then(Value::as_u64),
+            left.get("encoding").and_then(Value::as_str),
+        )
+            .cmp(&(
+                right.get("category").and_then(Value::as_str),
+                right.get("path").and_then(Value::as_str),
+                right.get("offset").and_then(Value::as_u64),
+                right.get("encoding").and_then(Value::as_str),
+            ))
+    });
+    let stdout_matches = category_matches["stdout"];
+    let stderr_matches = category_matches["stderr"];
+    let journal_matches = category_matches["journal"];
+    let session_matches = category_matches["session"];
+    let log_matches = category_matches["log"];
+    let passed = files_scanned > 0
+        && bytes_scanned > 0
+        && declared_carrier_files > 0
+        && !credential_in_argv
+        && stdout_matches == 0
+        && stderr_matches == 0
+        && journal_matches == 0
+        && session_matches == 0
+        && log_matches == 0;
+    SecretsHygieneEvaluation {
+        metrics: BTreeMap::from([
+            (
+                "secrets_hygiene_on_disk.files_scanned".to_owned(),
+                files_scanned as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.bytes_scanned".to_owned(),
+                bytes_scanned as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.stdout_matches".to_owned(),
+                stdout_matches as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.stderr_matches".to_owned(),
+                stderr_matches as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.journal_matches".to_owned(),
+                journal_matches as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.session_matches".to_owned(),
+                session_matches as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.log_matches".to_owned(),
+                log_matches as f64,
+            ),
+            (
+                "secrets_hygiene_on_disk.declared_carrier_files".to_owned(),
+                declared_carrier_files as f64,
+            ),
+        ]),
+        details: json!({
+            "matches": matches,
+            "success_terminals": success_count,
+            "failure_terminals": failure_count,
+            "encodings_scanned": encodings.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "credential_in_argv": credential_in_argv,
+        }),
+        measurement_complete: true,
+        measurement_error: None,
+        passed,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ToolResultRoleObservation {
+    semantic_role: &'static str,
+    raw_pointer: String,
+    typed_matches: u64,
+    plain_user_matches: u64,
+}
+
+fn value_contains_text(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(needle),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_text(value, needle)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_text(value, needle)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn inspect_tool_result_role(
+    canonical: &Value,
+    dialect: &str,
+    call_id: &str,
+) -> ToolResultRoleObservation {
+    if dialect.contains("anthropic") {
+        let mut typed_matches = 0_u64;
+        let mut plain_user_matches = 0_u64;
+        if let Some(messages) = canonical.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                if message.get("role").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                match message.get("content") {
+                    Some(Value::Array(blocks)) => {
+                        for block in blocks {
+                            let typed = block.get("type").and_then(Value::as_str)
+                                == Some("tool_result")
+                                && block.get("tool_use_id").and_then(Value::as_str)
+                                    == Some(call_id);
+                            if typed {
+                                typed_matches = typed_matches.saturating_add(1);
+                            } else if value_contains_text(block, call_id) {
+                                plain_user_matches = plain_user_matches.saturating_add(1);
+                            }
+                        }
+                    }
+                    Some(content) if value_contains_text(content, call_id) => {
+                        plain_user_matches = plain_user_matches.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return ToolResultRoleObservation {
+            semantic_role: "tool_result",
+            raw_pointer: "/messages/*/content/*".to_owned(),
+            typed_matches,
+            plain_user_matches,
+        };
+    }
+    if dialect.contains("responses") {
+        let mut typed_matches = 0_u64;
+        let mut plain_user_matches = 0_u64;
+        if let Some(items) = canonical.get("input").and_then(Value::as_array) {
+            for item in items {
+                let typed = item.get("type").and_then(Value::as_str)
+                    == Some("function_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some(call_id);
+                if typed {
+                    typed_matches = typed_matches.saturating_add(1);
+                } else if item.get("role").and_then(Value::as_str) == Some("user")
+                    && value_contains_text(item, call_id)
+                {
+                    plain_user_matches = plain_user_matches.saturating_add(1);
+                }
+            }
+        }
+        return ToolResultRoleObservation {
+            semantic_role: "function_call_output",
+            raw_pointer: "/input/*".to_owned(),
+            typed_matches,
+            plain_user_matches,
+        };
+    }
+    let mut typed_matches = 0_u64;
+    let mut plain_user_matches = 0_u64;
+    if let Some(messages) = canonical.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let typed = message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some(call_id);
+            if typed {
+                typed_matches = typed_matches.saturating_add(1);
+            } else if message.get("role").and_then(Value::as_str) == Some("user")
+                && value_contains_text(message.get("content").unwrap_or(&Value::Null), call_id)
+            {
+                plain_user_matches = plain_user_matches.saturating_add(1);
+            }
+        }
+    }
+    ToolResultRoleObservation {
+        semantic_role: "tool",
+        raw_pointer: "/messages/*".to_owned(),
+        typed_matches,
+        plain_user_matches,
+    }
+}
+
+fn evaluate_tool_result_role_fidelity(
+    records: &[crate::fake_model::ModelRequestRecord],
+    expected_repetitions: u32,
+) -> ToolResultRoleFidelityEvaluation {
+    let mut observations = Vec::new();
+    let mut infrastructure_errors = Vec::new();
+    let mut checks = 0_u64;
+    let mut violations = 0_u64;
+    let mut plain_user_text_violations = 0_u64;
+    let mut missing_results = 0_u64;
+    let mut duplicate_results = 0_u64;
+    for repetition in 1..=expected_repetitions {
+        let actor = if expected_repetitions == 1 {
+            "r72".to_owned()
+        } else {
+            format!("r72a{repetition}")
+        };
+        for (checkpoint, outcome, call_id) in [
+            ("after-success", "success", format!("row72-success-{actor}")),
+            ("terminal", "failure", format!("row72-failure-{actor}")),
+        ] {
+            let matching = records
+                .iter()
+                .filter(|record| {
+                    record.accepted
+                        && record.role == "primary"
+                        && record.request.actor == actor
+                        && record.request.checkpoint == checkpoint
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                infrastructure_errors.push(format!(
+                    "repetition {repetition} {outcome} result has {} next accepted primary requests; expected one",
+                    matching.len()
+                ));
+                continue;
+            }
+            let record = matching[0];
+            let observation = inspect_tool_result_role(
+                &record.request.canonical,
+                &record.request.dialect,
+                &call_id,
+            );
+            checks = checks.saturating_add(1);
+            if observation.typed_matches == 0 {
+                missing_results = missing_results.saturating_add(1);
+            }
+            if observation.typed_matches > 1 {
+                duplicate_results =
+                    duplicate_results.saturating_add(observation.typed_matches.saturating_sub(1));
+            }
+            plain_user_text_violations =
+                plain_user_text_violations.saturating_add(observation.plain_user_matches);
+            let observation_violations = u64::from(observation.typed_matches != 1)
+                .saturating_add(observation.plain_user_matches);
+            violations = violations.saturating_add(observation_violations);
+            observations.push(json!({
+                "repetition": repetition,
+                "outcome": outcome,
+                "dialect": record.request.dialect,
+                "call_id": call_id,
+                "semantic_role": observation.semantic_role,
+                "raw_pointer": observation.raw_pointer,
+                "typed_matches": observation.typed_matches,
+                "plain_user_matches": observation.plain_user_matches,
+            }));
+        }
+    }
+    let expected_checks = u64::from(expected_repetitions).saturating_mul(2);
+    let measurement_complete = infrastructure_errors.is_empty() && checks == expected_checks;
+    let passed = measurement_complete
+        && violations == 0
+        && plain_user_text_violations == 0
+        && missing_results == 0
+        && duplicate_results == 0;
+    ToolResultRoleFidelityEvaluation {
+        metrics: BTreeMap::from([
+            ("tool_result_role_fidelity.checks".to_owned(), checks as f64),
+            (
+                "tool_result_role_fidelity.violations".to_owned(),
+                violations as f64,
+            ),
+            (
+                "tool_result_role_fidelity.plain_user_text_violations".to_owned(),
+                plain_user_text_violations as f64,
+            ),
+            (
+                "tool_result_role_fidelity.missing_results".to_owned(),
+                missing_results as f64,
+            ),
+            (
+                "tool_result_role_fidelity.duplicate_results".to_owned(),
+                duplicate_results as f64,
+            ),
+        ]),
+        details: json!({
+            "expected_repetitions": expected_repetitions,
+            "expected_checks": expected_checks,
+            "observations": observations,
+        }),
+        measurement_complete,
+        measurement_error: (!infrastructure_errors.is_empty())
+            .then(|| infrastructure_errors.join("; ")),
+        passed,
+    }
 }
 
 fn apply_memory_time_integral_summary(
@@ -1304,6 +2924,7 @@ async fn run_inner(
     )
     .await
     .map_err(|error| AhrbError::Protocol(format!("start fake model: {error}")))?;
+    let server = Some(server);
     let credential = format!("ahrb-{}-{}", &manifest_hash[..16], std::process::id());
     let mut environment = isolated_environment(&manifest, &variables)?;
     environment.extend(model_environment.clone());
@@ -1323,6 +2944,7 @@ async fn run_inner(
         "AHRB_MOCK_TURN_TIMEOUT_MS".to_owned(),
         manifest.resources.turn_timeout_ms.to_string(),
     );
+    inject_tariff_environment(&manifest, &mut environment);
     variables.insert(
         "base_url".to_owned(),
         environment
@@ -1513,7 +3135,7 @@ async fn run_inner(
     let mut cancel_cleanup_detail = None;
 
     for (row, actor_names) in &actors_by_row {
-        if (20..=29).contains(row) || matches!(*row, 42..=55 | 56..=58 | 60 | 63 | 64) {
+        if (20..=29).contains(row) || matches!(*row, 42..=55 | 56..=58 | 60 | 63..=65) {
             continue;
         }
         if !matches!(
@@ -2770,6 +4392,104 @@ async fn run_inner(
     } else {
         None
     };
+    let row65_trials = if selected_rows.contains(&65)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 65),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_injection_surface_trials(&manifest, &profile_root, &manifest_hash).await {
+            Ok(trials) => Some(trials),
+            Err(error) => {
+                let detail = format!("injection-surface evidence collection: {error}");
+                row_errors.insert(65, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(65, detail);
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let row66_evaluation = if selected_rows.contains(&66)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 66),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_budget_enforcement(
+            &manifest,
+            &variables,
+            &environment,
+            engine.as_ref(),
+            options.profile,
+        )
+        .await
+        {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let detail = format!("budget-enforcement evidence collection: {error}");
+                row_errors.insert(66, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(66, detail);
+                })?;
+                crate::wave4::Wave4Evaluation::default()
+            }
+        }
+    } else {
+        crate::wave4::Wave4Evaluation::default()
+    };
+    let row70_evaluation = if selected_rows.contains(&70)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 70),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_headless_permissions(
+            &manifest,
+            &variables,
+            &environment,
+            &profile_root,
+            options.profile,
+        )
+        .await
+        {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let detail = format!("headless-permission evidence collection: {error}");
+                row_errors.insert(70, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(70, detail);
+                })?;
+                crate::wave4::Wave4Evaluation::default()
+            }
+        }
+    } else {
+        crate::wave4::Wave4Evaluation::default()
+    };
+    let row68_evaluation = if selected_rows.contains(&68)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 68),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match collect_session_cli(&manifest, &variables, &environment, options.profile).await {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let detail = format!("session-ops-cli evidence collection: {error}");
+                row_errors.insert(68, detail.clone());
+                progress.update(|state| {
+                    state.row_errors.insert(68, detail);
+                })?;
+                crate::wave4::Wave4Evaluation {
+                    details: json!({"lifecycles": []}),
+                    ..crate::wave4::Wave4Evaluation::default()
+                }
+            }
+        }
+    } else {
+        crate::wave4::Wave4Evaluation {
+            details: json!({"lifecycles": []}),
+            ..crate::wave4::Wave4Evaluation::default()
+        }
+    };
     let determinism_trials = if selected_rows.contains(&63) || selected_rows.contains(&64) {
         match collect_determinism_trials(&manifest, options.profile, &profile_root, &manifest_hash)
             .await
@@ -2890,6 +4610,9 @@ async fn run_inner(
     if let Some(trials) = &row62_trials {
         request_records.extend(trials.requests.clone());
     }
+    if let Some(trials) = &row65_trials {
+        request_records.extend(trials.requests.clone());
+    }
     if let Some(trials) = &determinism_trials {
         request_records.extend(trials.requests.clone());
     }
@@ -2908,6 +4631,7 @@ async fn run_inner(
         || row60_trials.is_some()
         || row61_trials.is_some()
         || row62_trials.is_some()
+        || row65_trials.is_some()
         || determinism_trials.is_some()
     {
         request_records.sort_by(|left, right| {
@@ -2927,7 +4651,9 @@ async fn run_inner(
                 ))
         });
     }
-    server.shutdown().await?;
+    if let Some(active_server) = server {
+        active_server.shutdown().await?;
+    }
     // Final cleanup is part of the run outcome, not a post-report afterthought:
     // a protocol-level residue failure must be persisted as an aborted run.
     ensure_owned_cleanup()?;
@@ -3356,6 +5082,121 @@ async fn run_inner(
         evaluate_nondeterministic_fields(determinism_runs, determinism_expected_runs);
     let row64_evaluation =
         evaluate_cross_run_reproducibility(determinism_runs, determinism_expected_runs);
+    let row65_evaluation = row65_trials
+        .as_ref()
+        .map(|trials| trials.evaluation.clone())
+        .unwrap_or_default();
+    let row67_evaluation = crate::wave4::evaluate_usage_reporting(
+        state.events.get(&67).map_or(&[][..], Vec::as_slice),
+        manifest.events.metadata.as_ref(),
+        match options.profile {
+            Profile::Quick => 3,
+            Profile::Cert => 7,
+        },
+        match options.profile {
+            Profile::Quick => 3,
+            Profile::Cert => 20,
+        },
+    );
+    let row69_evaluation = crate::wave4::evaluate_event_stream_completeness(
+        state.events.get(&69).map_or(&[][..], Vec::as_slice),
+        manifest.events.metadata.as_ref(),
+        match options.profile {
+            Profile::Quick => 3,
+            Profile::Cert => 7,
+        },
+    );
+    let row71_evaluation = if selected_rows.contains(&71)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 71),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        let render_paths = |templates: &[String], extra: Option<(&str, &str)>| {
+            let mut rendered_variables = variables.clone();
+            if let Some((name, value)) = extra {
+                rendered_variables.insert(name.to_owned(), value.to_owned());
+            }
+            templates
+                .iter()
+                .map(|template| {
+                    crate::manifest::render_template(template, &rendered_variables)
+                        .map(PathBuf::from)
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let mut carrier_paths = render_paths(
+            manifest
+                .capture
+                .credential_carrier_paths
+                .as_deref()
+                .unwrap_or(&[]),
+            None,
+        )?;
+        if resource_selected {
+            let timing = ResourceTimingPlan::for_profile(ResourceProfile::from(options.profile));
+            let prefix = if per_invocation_topology(&manifest) {
+                "pr"
+            } else {
+                "rr"
+            };
+            for repetition in 0..timing.repetitions {
+                let resource_profile = profile_root.join(format!("{prefix}{repetition}"));
+                let rendered_profile = resource_profile.to_string_lossy();
+                carrier_paths.extend(
+                    render_paths(
+                        manifest
+                            .capture
+                            .credential_carrier_paths
+                            .as_deref()
+                            .unwrap_or(&[]),
+                        Some(("profile", rendered_profile.as_ref())),
+                    )?
+                    .into_iter()
+                    .filter(|path| path.is_file()),
+                );
+            }
+        }
+        carrier_paths.sort();
+        carrier_paths.dedup();
+        let session_roots = render_paths(&manifest.sessions.store_paths, None)?;
+        let mut journal_roots = render_paths(
+            manifest.resources.journal_paths.as_deref().unwrap_or(&[]),
+            None,
+        )?;
+        if !manifest.events.path.trim().is_empty() {
+            for session in state.sessions.get(&71).into_iter().flatten() {
+                let rendered = render_paths(
+                    std::slice::from_ref(&manifest.events.path),
+                    Some(("session_id", &session.0)),
+                )?;
+                journal_roots.extend(rendered);
+            }
+        }
+        let (expected_successes, expected_failures) = match options.profile {
+            Profile::Quick => (1, 1),
+            Profile::Cert => (3, 3),
+        };
+        evaluate_secrets_hygiene(SecretsHygieneInputs {
+            profile_root: &profile_root,
+            credential: &credential,
+            carrier_paths: &carrier_paths,
+            session_roots: &session_roots,
+            journal_roots: &journal_roots,
+            expected_successes,
+            expected_failures,
+            events: state.events.get(&71).map_or(&[][..], Vec::as_slice),
+            credential_in_argv: manifest.capture.allow_credential_argv,
+        })
+    } else {
+        SecretsHygieneEvaluation::default()
+    };
+    let row72_evaluation = evaluate_tool_result_role_fidelity(
+        &request_records,
+        match options.profile {
+            Profile::Quick => 1,
+            Profile::Cert => 5,
+        },
+    );
     let row44_evidence = row42_trials
         .as_ref()
         .and_then(|trials| trials.process_hygiene.as_ref())
@@ -3379,6 +5220,13 @@ async fn run_inner(
         &resource_certification,
         &profile_root,
         &DerivedRowEvaluations {
+            injection_surface: &row65_evaluation,
+            budget_enforcement: &row66_evaluation,
+            usage_reporting: &row67_evaluation,
+            session_ops_cli: &row68_evaluation,
+            event_stream_completeness: &row69_evaluation,
+            headless_permissions: &row70_evaluation,
+            secrets_hygiene: &row71_evaluation,
             model_request_efficiency: &row42_evaluation,
             turn_latency: &row43_evaluation,
             latency_vs_turn_index: &row49_evaluation,
@@ -3626,6 +5474,30 @@ async fn run_inner(
             ),
         ]));
     }
+    if selected_rows.contains(&65) && row65_evaluation.measurement_complete {
+        metrics.extend(row65_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&66) && row66_evaluation.measurement_complete {
+        metrics.extend(row66_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&67) && row67_evaluation.measurement_complete {
+        metrics.extend(row67_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&68) && row68_evaluation.measurement_complete {
+        metrics.extend(row68_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&69) && row69_evaluation.measurement_complete {
+        metrics.extend(row69_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&70) && row70_evaluation.measurement_complete {
+        metrics.extend(row70_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&71) && row71_evaluation.measurement_complete {
+        metrics.extend(row71_evaluation.metrics.clone());
+    }
+    if selected_rows.contains(&72) && row72_evaluation.measurement_complete {
+        metrics.extend(row72_evaluation.metrics.clone());
+    }
     let mut details = ReportDetails::default();
     if selected_rows.contains(&47) {
         let mut disk_details = row47_evaluation.details.clone();
@@ -3767,6 +5639,54 @@ async fn run_inner(
             row64_evaluation.details.clone(),
         );
     }
+    if selected_rows.contains(&65) {
+        details.insert(
+            "injection-surface".to_owned(),
+            row65_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&66) {
+        details.insert(
+            "budget-enforcement".to_owned(),
+            row66_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&67) {
+        details.insert(
+            "usage-reporting".to_owned(),
+            row67_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&68) {
+        details.insert(
+            "session-ops-cli".to_owned(),
+            row68_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&69) {
+        details.insert(
+            "event-stream-completeness".to_owned(),
+            row69_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&70) {
+        details.insert(
+            "headless-permission-model".to_owned(),
+            row70_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&71) {
+        details.insert(
+            "secrets-hygiene-on-disk".to_owned(),
+            row71_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&72) {
+        details.insert(
+            "tool-result-role-fidelity".to_owned(),
+            row72_evaluation.details.clone(),
+        );
+    }
     let automation = automation_score(&results);
     let automation_components_missing = automation.provisional;
     details.insert(
@@ -3807,12 +5727,16 @@ async fn run_inner(
             if value { 1.0 } else { 0.0 },
         );
     }
+    let certified_parallel_width = row54_evaluation
+        .fanout_max_measured_n
+        .and_then(|width| usize::try_from(width).ok())
+        .unwrap_or(state.parallel_agents);
     let badge = certify(
         &results,
         &manifest,
         std::env::consts::OS,
         &format!("{:?}", options.profile).to_lowercase(),
-        state.parallel_agents,
+        certified_parallel_width,
         marginal_bytes,
         resource_summary
             .latency_class
@@ -4131,21 +6055,16 @@ async fn start_model(
             let environment = BTreeMap::from([(base_url_env.to_owned(), server.base_url())]);
             Ok((ModelServer::Tcp(server), environment))
         }
-        Err(AhrbError::Io(error))
-            if error.kind() == std::io::ErrorKind::PermissionDenied
-                || is_transient_bind_error(&error) =>
-        {
+        Err(error) => {
             let tcp_error = error.to_string();
-            match start_unix_model(Arc::clone(&engine)).await {
-                Ok(started) => Ok(started),
-                Err(unix_error) => start_mailbox_model(engine).await.map_err(|mailbox_error| {
-                    AhrbError::Protocol(format!(
-                        "TCP fake-model bind failed after bounded retries ({tcp_error}); Unix-socket fallback failed ({unix_error}); provider mailbox fallback failed: {mailbox_error}"
-                    ))
-                }),
-            }
+            start_mailbox_model(engine, base_url_env)
+                .await
+                .map_err(|mailbox_error| {
+                AhrbError::Protocol(format!(
+                    "TCP fake-model bind failed after bounded retries ({tcp_error}); provider mailbox fallback failed: {mailbox_error}"
+                ))
+            })
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -4194,6 +6113,7 @@ async fn start_streaming_model(
 
 async fn start_mailbox_model(
     engine: Arc<FakeModelEngine>,
+    base_url_env: &str,
 ) -> Result<(ModelServer, BTreeMap<String, String>)> {
     #[cfg(target_os = "macos")]
     let root = PathBuf::from("/private/tmp");
@@ -4202,10 +6122,16 @@ async fn start_mailbox_model(
     let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let directory = root.join(format!("ahrb-fmb-{}-{sequence}", std::process::id()));
     let server = FakeModelMailboxServer::bind(directory.clone(), engine).await?;
-    let environment = BTreeMap::from([(
-        "AHRB_MOCK_PROVIDER_MAILBOX".to_owned(),
-        directory.to_string_lossy().into_owned(),
-    )]);
+    let environment = BTreeMap::from([
+        (
+            "AHRB_MOCK_PROVIDER_MAILBOX".to_owned(),
+            directory.to_string_lossy().into_owned(),
+        ),
+        (
+            base_url_env.to_owned(),
+            format!("ahrb+mailbox://{}", directory.display()),
+        ),
+    ]);
     Ok((ModelServer::Mailbox(server), environment))
 }
 
@@ -4479,15 +6405,38 @@ fn build_workflow(
     for row in rows {
         let count = match *row {
             26 => 8,
-            60 | 61 => match profile {
+            67 => match profile {
+                Profile::Quick => 3 * 3,
+                Profile::Cert => 7 * 20,
+            },
+            69 => match profile {
+                Profile::Quick => 3 * 2,
+                Profile::Cert => 7 * 2,
+            },
+            60 | 61 | 71 | 72 => match profile {
+                Profile::Quick if *row == 71 => 2,
                 Profile::Quick => 1,
+                Profile::Cert if *row == 71 => 6,
+                Profile::Cert if *row == 72 => 5,
                 Profile::Cert => 3,
             },
             _ => 1,
         };
         let mut row_actors = Vec::new();
         for index in 0..count {
-            let actor = if count == 1 {
+            let actor = if *row == 67 {
+                let turns = match profile {
+                    Profile::Quick => 3,
+                    Profile::Cert => 20,
+                };
+                format!("r67p{}t{}", index / turns + 1, index % turns + 1)
+            } else if *row == 69 {
+                format!(
+                    "r69p{}{}",
+                    index / 2 + 1,
+                    if index % 2 == 0 { "s" } else { "f" }
+                )
+            } else if count == 1 {
                 format!("r{row:02}")
             } else {
                 format!("r{row:02}a{}", index + 1)
@@ -4626,6 +6575,168 @@ fn build_workflow(
             &mut responses,
         )?;
     }
+    if rows.contains(&66) {
+        let (repetitions, token_limit, cost_limit, time_limit_ms) = match profile {
+            Profile::Quick => (3_u32, 128_u64, 1_000_u64, 2_000_u64),
+            Profile::Cert => (7_u32, 1_024_u64, 10_000_u64, 5_000_u64),
+        };
+        let cost_fixture = cost_limit.saturating_sub(25);
+        let cost_fixture_input = cost_fixture.saturating_sub(3) / 2;
+        for repetition in 1..=repetitions {
+            for case in ["tokens", "cost", "time"] {
+                let actor = format!("{case}-r{repetition}");
+                actors.insert(
+                    actor.clone(),
+                    Actor {
+                        id: actor.clone(),
+                        parent: None,
+                        prompt: format!("AHRB Wave-4 budget provider actor {actor}"),
+                        workspace: profile_root
+                            .join("workspaces")
+                            .join(format!("budget-{actor}"))
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
+                );
+                let usage_value = |input_tokens: u64, output_tokens: u64| {
+                    json!({
+                        "text": "SUCCESS",
+                        "_ahrb_usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens
+                        }
+                    })
+                };
+                match case {
+                    "tokens" => {
+                        responses.push(ScriptedResponse {
+                            scenario: "ahrb-matrix-v1".to_owned(),
+                            actor: actor.clone(),
+                            checkpoint: "fixture".to_owned(),
+                            request_hash: String::new(),
+                            response: usage_value(token_limit.saturating_sub(32), 16),
+                            fault: None,
+                            barrier: None,
+                        });
+                        responses.push(ScriptedResponse {
+                            scenario: "ahrb-matrix-v1".to_owned(),
+                            actor,
+                            checkpoint: "crossing".to_owned(),
+                            request_hash: String::new(),
+                            response: usage_value(8, 16),
+                            fault: None,
+                            barrier: None,
+                        });
+                    }
+                    "cost" => {
+                        responses.push(ScriptedResponse {
+                            scenario: "ahrb-matrix-v1".to_owned(),
+                            actor: actor.clone(),
+                            checkpoint: "fixture".to_owned(),
+                            request_hash: String::new(),
+                            response: usage_value(cost_fixture_input, 1),
+                            fault: None,
+                            barrier: None,
+                        });
+                        responses.push(ScriptedResponse {
+                            scenario: "ahrb-matrix-v1".to_owned(),
+                            actor,
+                            checkpoint: "crossing".to_owned(),
+                            request_hash: String::new(),
+                            response: usage_value(10, 10),
+                            fault: None,
+                            barrier: None,
+                        });
+                    }
+                    "time" => responses.push(ScriptedResponse {
+                        scenario: "ahrb-matrix-v1".to_owned(),
+                        actor,
+                        checkpoint: "crossing".to_owned(),
+                        request_hash: String::new(),
+                        response: usage_value(1, 1),
+                        fault: Some(Fault::Delay {
+                            delay_ms: time_limit_ms,
+                        }),
+                        barrier: None,
+                    }),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if rows.contains(&68) {
+        let repetitions = match profile {
+            Profile::Quick => 1_u32,
+            Profile::Cert => 5_u32,
+        };
+        for repetition in 1..=repetitions {
+            for phase in ["seed", "original", "fork"] {
+                let actor = format!("r68cli{repetition}-{phase}");
+                actors.insert(
+                    actor.clone(),
+                    Actor {
+                        id: actor.clone(),
+                        parent: None,
+                        prompt: format!("AHRB Wave-4 session CLI {phase}"),
+                        workspace: profile_root
+                            .join("workspaces")
+                            .join(&actor)
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
+                );
+                if phase == "seed" {
+                    let terminal = route_marker("ahrb-matrix-v1", &actor, "terminal");
+                    let call = mapped_tool_call(
+                        manifest,
+                        "write",
+                        format!("row68-seed-{repetition}"),
+                        json!({
+                            "path": format!("row68-seed-{repetition}.txt"),
+                            "content": format!("committed-seed{terminal}")
+                        }),
+                    )?;
+                    responses.push(ScriptedResponse {
+                        scenario: "ahrb-matrix-v1".to_owned(),
+                        actor: actor.clone(),
+                        checkpoint: "start".to_owned(),
+                        request_hash: String::new(),
+                        response: json!({
+                            "tool_calls": [call],
+                            "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
+                        }),
+                        fault: None,
+                        barrier: None,
+                    });
+                    responses.push(ScriptedResponse {
+                        scenario: "ahrb-matrix-v1".to_owned(),
+                        actor,
+                        checkpoint: "terminal".to_owned(),
+                        request_hash: String::new(),
+                        response: json!({
+                            "text": "SUCCESS",
+                            "_ahrb_usage": {"input_tokens": 140, "output_tokens": 30}
+                        }),
+                        fault: None,
+                        barrier: None,
+                    });
+                } else {
+                    responses.push(ScriptedResponse {
+                        scenario: "ahrb-matrix-v1".to_owned(),
+                        actor,
+                        checkpoint: "start".to_owned(),
+                        request_hash: String::new(),
+                        response: json!({
+                            "text": format!("SUCCESS-{phase}-{repetition}"),
+                            "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
+                        }),
+                        fault: None,
+                        barrier: None,
+                    });
+                }
+            }
+        }
+    }
     Ok((
         Workflow {
             version: WORKFLOW_SCHEMA_VERSION,
@@ -4636,6 +6747,734 @@ fn build_workflow(
         },
         actors_by_row,
     ))
+}
+
+fn injection_surface_workflow(profile_root: &Path, label: &str) -> Workflow {
+    let scenario = format!("ahrb-row65-injection-{label}");
+    let actor = format!("r65-{label}");
+    Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor.clone(),
+            Actor {
+                id: actor.clone(),
+                parent: None,
+                prompt: format!(
+                    "AHRB injection-surface {label} {}",
+                    route_marker(&scenario, &actor, "start")
+                ),
+                workspace: profile_root
+                    .join("workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![ScriptedResponse {
+            scenario,
+            actor,
+            checkpoint: "start".to_owned(),
+            request_hash: String::new(),
+            response: success_value(),
+            fault: None,
+            barrier: None,
+        }],
+    }
+}
+
+fn injection_carrier_label(component: &InjectionComponent) -> String {
+    match component.method {
+        InjectionMethod::Environment => format!("env:{}", component.environment),
+        InjectionMethod::Cli => format!(
+            "cli:{}:{}",
+            match component.argv_position {
+                ArgvPosition::Prefix => "prefix",
+                ArgvPosition::Suffix => "suffix",
+            },
+            match serde_json::to_string(&component.argv) {
+                Ok(value) => value,
+                Err(_) => "[]".to_owned(),
+            }
+        ),
+        InjectionMethod::GeneratedConfig => format!(
+            "generated-config:{}#{}",
+            component.generated_path, component.json_pointer
+        ),
+        InjectionMethod::Impossible => "impossible".to_owned(),
+    }
+}
+
+fn insert_cli_injection(
+    command: &mut Vec<String>,
+    argv: Vec<String>,
+    position: ArgvPosition,
+) -> Result<()> {
+    if command.is_empty() {
+        return Err(AhrbError::Validation(
+            "row-65 CLI injection has no public command".to_owned(),
+        ));
+    }
+    match position {
+        ArgvPosition::Prefix => {
+            command.splice(1..1, argv);
+        }
+        ArgvPosition::Suffix => command.extend(argv),
+    }
+    Ok(())
+}
+
+fn set_generated_injection_value(
+    component: &InjectionComponent,
+    value: &str,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<()> {
+    let path = PathBuf::from(crate::manifest::render_template(
+        &component.generated_path,
+        variables,
+    )?);
+    if !path.starts_with(profile_root) {
+        return Err(AhrbError::Validation(format!(
+            "row-65 generated carrier {} escapes {}",
+            path.display(),
+            profile_root.display()
+        )));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "read row-65 generated carrier {}: {error}",
+            path.display()
+        ))
+    })?;
+    let (mut document, json_encoding) = match serde_json::from_str::<Value>(&text) {
+        Ok(document) => (document, true),
+        Err(json_error) => {
+            let document = toml::from_str::<toml::Value>(&text).map_err(|toml_error| {
+                AhrbError::Validation(format!(
+                    "row-65 generated carrier {} is neither JSON ({json_error}) nor TOML ({toml_error})",
+                    path.display()
+                ))
+            })?;
+            (serde_json::to_value(document)?, false)
+        }
+    };
+    let destination = document
+        .pointer_mut(&component.json_pointer)
+        .ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "row-65 generated carrier {} lacks pointer {}",
+                path.display(),
+                component.json_pointer
+            ))
+        })?;
+    *destination = Value::String(value.to_owned());
+    let encoded = if json_encoding {
+        serde_json::to_vec_pretty(&document)?
+    } else {
+        toml::to_string_pretty(&document)
+            .map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "serialize row-65 TOML carrier {}: {error}",
+                    path.display()
+                ))
+            })?
+            .into_bytes()
+    };
+    std::fs::write(&path, encoded).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "write row-65 generated carrier {}: {error}",
+            path.display()
+        ))
+    })?;
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn apply_injection_component(
+    manifest: &mut Manifest,
+    component: &InjectionComponent,
+    value: &str,
+    variables: &BTreeMap<String, String>,
+    environment: &mut BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<()> {
+    match component.method {
+        InjectionMethod::Environment => {
+            environment.insert(component.environment.clone(), value.to_owned());
+        }
+        InjectionMethod::Cli => {
+            let rendered = render_argv(&component.argv, variables)?;
+            let command = if matches!(
+                manifest.transport.kind,
+                TransportKind::SocketJsonrpc | TransportKind::Http
+            ) && manifest.daemon.persistent
+            {
+                &mut manifest.daemon.start
+            } else {
+                &mut manifest.transport.command
+            };
+            insert_cli_injection(command, rendered, component.argv_position)?;
+        }
+        InjectionMethod::GeneratedConfig => {
+            set_generated_injection_value(component, value, variables, profile_root)?;
+        }
+        InjectionMethod::Impossible => {}
+    }
+    Ok(())
+}
+
+fn command_contains_credential(manifest: &Manifest, credential: &str) -> bool {
+    manifest
+        .transport
+        .command
+        .iter()
+        .chain(manifest.daemon.start.iter())
+        .chain(manifest.sessions.create.iter())
+        .chain(manifest.sessions.submit.iter())
+        .chain(manifest.sessions.resume.iter())
+        .any(|argument| argument.contains("{{credential}}") || argument.contains(credential))
+}
+
+fn injection_credential_fingerprints(credential: &str) -> BTreeSet<String> {
+    [
+        credential.to_owned(),
+        format!("Bearer {credential}"),
+        format!("bearer {credential}"),
+        format!("Basic {credential}"),
+    ]
+    .into_iter()
+    .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+    .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct InjectionRunObservation {
+    expected_records: Vec<crate::fake_model::ModelRequestRecord>,
+    unexpected_records: Vec<crate::fake_model::ModelRequestRecord>,
+    expected_physical_requests: u64,
+    unexpected_physical_requests: u64,
+    credential_rejections: u64,
+    active_baseline_credential_rejected: bool,
+    terminal_success: bool,
+    secret_in_argv: bool,
+}
+
+#[derive(Debug)]
+enum InjectionTrapServer {
+    Tcp(FakeModelServer),
+    Mailbox(FakeModelMailboxServer),
+}
+
+#[derive(Debug)]
+struct BoundInjectionTrap {
+    server: InjectionTrapServer,
+    base_url: String,
+}
+
+impl BoundInjectionTrap {
+    async fn bind(
+        engine: Arc<FakeModelEngine>,
+        credential: Option<&str>,
+        label: &str,
+    ) -> Result<Self> {
+        let address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let tcp = if let Some(credential) = credential {
+            FakeModelServer::bind_requiring_credential(
+                address,
+                Arc::clone(&engine),
+                credential.to_owned(),
+            )
+            .await
+        } else {
+            FakeModelServer::bind(address, Arc::clone(&engine)).await
+        };
+        match tcp {
+            Ok(server) => {
+                let base_url = server.base_url();
+                Ok(Self {
+                    server: InjectionTrapServer::Tcp(server),
+                    base_url,
+                })
+            }
+            Err(_tcp_error) => {
+                #[cfg(target_os = "macos")]
+                let root = PathBuf::from("/private/tmp");
+                #[cfg(not(target_os = "macos"))]
+                let root = PathBuf::from("/tmp");
+                let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let directory = root.join(format!(
+                    "ahrb-r65-{}-{sequence}-{label}",
+                    std::process::id()
+                ));
+                let server = if let Some(credential) = credential {
+                    FakeModelMailboxServer::bind_requiring_credential(
+                        directory.clone(),
+                        engine,
+                        credential.to_owned(),
+                    )
+                    .await?
+                } else {
+                    FakeModelMailboxServer::bind(directory.clone(), engine).await?
+                };
+                Ok(Self {
+                    server: InjectionTrapServer::Mailbox(server),
+                    base_url: format!("ahrb+mailbox://{}", directory.display()),
+                })
+            }
+        }
+    }
+
+    fn physical_request_count(&self) -> u64 {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => server.physical_request_count(),
+            InjectionTrapServer::Mailbox(server) => server.physical_request_count(),
+        }
+    }
+
+    fn credential_rejection_count(&self) -> u64 {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => server.credential_rejection_count(),
+            InjectionTrapServer::Mailbox(server) => server.credential_rejection_count(),
+        }
+    }
+
+    async fn probe_rejected_credential(&self, credential: &str) -> Result<bool> {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => {
+                probe_rejected_credential(server.local_addr(), credential).await
+            }
+            InjectionTrapServer::Mailbox(server) => {
+                probe_rejected_mailbox_credential(server.directory(), credential).await
+            }
+        }
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        match self.server {
+            InjectionTrapServer::Tcp(server) => server.shutdown().await,
+            InjectionTrapServer::Mailbox(server) => server.shutdown().await,
+        }
+    }
+}
+
+async fn probe_rejected_credential(address: SocketAddr, credential: &str) -> Result<bool> {
+    let mut stream = tokio::net::TcpStream::connect(address).await?;
+    let body = b"{}";
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {credential}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(body).await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .map_err(|_| AhrbError::Timeout("row-65 credential rejection control".to_owned()))??;
+    let Some(first_line) = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+    else {
+        return Ok(false);
+    };
+    Ok(first_line
+        .split_ascii_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        == Some(401))
+}
+
+async fn probe_rejected_mailbox_credential(directory: &Path, credential: &str) -> Result<bool> {
+    let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let id = format!("row65-probe-{}-{sequence}", std::process::id());
+    let envelope = ProviderMailboxRequest {
+        id: id.clone(),
+        method: "POST".to_owned(),
+        path: "/v1/chat/completions".to_owned(),
+        headers: BTreeMap::from([("Authorization".to_owned(), format!("Bearer {credential}"))]),
+        body: b"{}".to_vec(),
+    };
+    let temporary = directory.join(format!("{id}.request.tmp"));
+    let request = directory.join(format!("{id}.request.json"));
+    tokio::fs::write(&temporary, serde_json::to_vec(&envelope)?).await?;
+    tokio::fs::rename(temporary, request).await?;
+    let response_path = directory.join(format!("{id}.response.json"));
+    let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match tokio::fs::read(&response_path).await {
+                Ok(bytes) => break Ok::<Vec<u8>, AhrbError>(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Err(error) => break Err(error.into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| AhrbError::Timeout("row-65 mailbox credential rejection control".to_owned()))??;
+    tokio::fs::remove_file(response_path).await?;
+    let response: ProviderMailboxResponse = serde_json::from_slice(&bytes)?;
+    Ok(response.id == id && response.status == 401 && response.error.is_none())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_injection_run(
+    manifest: &Manifest,
+    run_profile_root: &Path,
+    label: &str,
+    provider: &str,
+    credential: &str,
+    baseline_credential: &str,
+    separate_baseline_listener: bool,
+) -> Result<InjectionRunObservation> {
+    let profile_root = run_profile_root.join(format!("derived-row65-{label}"));
+    prepare_profile(manifest, &profile_root)?;
+    let workflow = injection_surface_workflow(&profile_root, label);
+    workflow.validate()?;
+    let expected_engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let expected_server = BoundInjectionTrap::bind(
+        Arc::clone(&expected_engine),
+        (label == "credential").then_some(credential),
+        &format!("{label}-expected"),
+    )
+    .await
+    .map_err(|error| AhrbError::Protocol(format!("row-65 {label} expected trap: {error}")))?;
+    let expected_base_url = expected_server.base_url.clone();
+    let unexpected = if separate_baseline_listener {
+        let engine = Arc::new(FakeModelEngine::with_request_roles(
+            &workflow,
+            &manifest.model_roles,
+            &manifest.request_role_rules,
+        )?);
+        let server =
+            BoundInjectionTrap::bind(Arc::clone(&engine), None, &format!("{label}-baseline"))
+                .await
+                .map_err(|error| {
+                    AhrbError::Protocol(format!("row-65 {label} baseline trap: {error}"))
+                })?;
+        Some((engine, server))
+    } else {
+        None
+    };
+    let baseline_base_url = unexpected
+        .as_ref()
+        .map_or(expected_base_url.as_str(), |(_, server)| {
+            server.base_url.as_str()
+        });
+    let variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+        ("base_url".to_owned(), baseline_base_url.to_owned()),
+        ("credential".to_owned(), baseline_credential.to_owned()),
+        ("model".to_owned(), manifest.fake_model.model.clone()),
+        ("provider".to_owned(), manifest.fake_model.model.clone()),
+    ]);
+    let mut trial_manifest = manifest.clone();
+    let mut environment = isolated_environment(&trial_manifest, &variables)?;
+    environment.insert(
+        manifest.fake_model.base_url_env.clone(),
+        baseline_base_url.to_owned(),
+    );
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        baseline_credential.to_owned(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    write_generated_files(&trial_manifest, &variables, &profile_root)?;
+    let surface = trial_manifest
+        .capabilities
+        .injection_surface
+        .clone()
+        .ok_or_else(|| AhrbError::Validation("row-65 injection surface disappeared".to_owned()))?;
+    let mut provider_variables = variables.clone();
+    provider_variables.insert("provider".to_owned(), provider.to_owned());
+    provider_variables.insert("model".to_owned(), provider.to_owned());
+    apply_injection_component(
+        &mut trial_manifest,
+        &surface.provider,
+        provider,
+        &provider_variables,
+        &mut environment,
+        &profile_root,
+    )?;
+    let mut base_url_variables = variables.clone();
+    base_url_variables.insert("base_url".to_owned(), expected_base_url);
+    let base_url_value = base_url_variables
+        .get("base_url")
+        .cloned()
+        .unwrap_or_default();
+    apply_injection_component(
+        &mut trial_manifest,
+        &surface.base_url,
+        &base_url_value,
+        &base_url_variables,
+        &mut environment,
+        &profile_root,
+    )?;
+    let mut credential_variables = variables.clone();
+    credential_variables.insert("credential".to_owned(), credential.to_owned());
+    apply_injection_component(
+        &mut trial_manifest,
+        &surface.credential,
+        credential,
+        &credential_variables,
+        &mut environment,
+        &profile_root,
+    )?;
+    let secret_in_argv = command_contains_credential(&trial_manifest, credential)
+        || command_contains_credential(&trial_manifest, baseline_credential);
+    let active_baseline_credential_rejected = if label == "credential" {
+        expected_server
+            .probe_rejected_credential(baseline_credential)
+            .await?
+    } else {
+        false
+    };
+    let command = if trial_manifest.transport.kind == TransportKind::Exec {
+        trial_manifest.transport.command.clone()
+    } else {
+        render_argv(&trial_manifest.transport.command, &variables)?
+    };
+    let mut driver = make_driver_with_timeout(
+        &trial_manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+        outer_turn_timeout(&trial_manifest),
+    )?;
+    let actor_name = format!("r65-{label}");
+    let actor = workflow
+        .actors
+        .get(&actor_name)
+        .ok_or_else(|| AhrbError::Protocol(format!("row-65 actor {actor_name:?} disappeared")))?;
+    let mut terminal_success = false;
+    let behavioral_run: Result<()> = async {
+        driver.start().await?;
+        driver.await_readiness().await?;
+        let session = driver
+            .create_session(&format!("{}:{actor_name}", workflow.scenario))
+            .await?;
+        driver
+            .submit(&session, &actor.prompt, &format!("row-65-{label}"))
+            .await?;
+        let events = collect_session_terminal(
+            &mut driver,
+            &session,
+            None,
+            outer_turn_timeout(&trial_manifest),
+        )
+        .await?;
+        terminal_success = events
+            .iter()
+            .filter(|event| event.event == EventVocab::TerminalSuccess)
+            .count()
+            == 1;
+        if trial_manifest.transport.kind == TransportKind::Exec
+            || !trial_manifest.sessions.close_delete.is_empty()
+        {
+            driver.close(&session).await?;
+        }
+        Ok(())
+    }
+    .await;
+    let shutdown = driver.shutdown().await;
+    if behavioral_run.is_ok() {
+        shutdown?;
+    }
+    let expected_records = expected_engine.request_records().await;
+    let expected_physical_requests = expected_server.physical_request_count();
+    let credential_rejections = expected_server.credential_rejection_count();
+    let unexpected_records = if let Some((engine, server)) = unexpected {
+        let records = engine.request_records().await;
+        let physical_requests = server.physical_request_count();
+        server.shutdown().await?;
+        (records, physical_requests)
+    } else {
+        (Vec::new(), 0)
+    };
+    expected_server.shutdown().await?;
+    Ok(InjectionRunObservation {
+        expected_records,
+        unexpected_records: unexpected_records.0,
+        expected_physical_requests,
+        unexpected_physical_requests: unexpected_records.1,
+        credential_rejections,
+        active_baseline_credential_rejected,
+        terminal_success,
+        secret_in_argv,
+    })
+}
+
+async fn collect_injection_surface_trials(
+    manifest: &Manifest,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+) -> Result<InjectionSurfaceTrials> {
+    let surface = manifest
+        .capabilities
+        .injection_surface
+        .as_ref()
+        .ok_or_else(|| AhrbError::Validation("row-65 requires injection_surface".to_owned()))?;
+    let baseline_credential = format!("ahrb-row65-a-{}", &manifest_hash[..16]);
+    let trap_credential = format!("ahrb-row65-b-{}", &manifest_hash[..16]);
+    let baseline = collect_injection_run(
+        manifest,
+        run_profile_root,
+        "baseline",
+        &manifest.fake_model.model,
+        &baseline_credential,
+        &baseline_credential,
+        false,
+    )
+    .await?;
+    let baseline_records = baseline
+        .expected_records
+        .iter()
+        .filter(|record| record.accepted && record.request.actor == "r65-baseline")
+        .collect::<Vec<_>>();
+    let baseline_fingerprints = injection_credential_fingerprints(&baseline_credential);
+    let baseline_runnable = baseline.terminal_success
+        && baseline.expected_physical_requests == 1
+        && baseline_records.len() == 1
+        && baseline_records
+            .iter()
+            .all(|record| record.request.model == manifest.fake_model.model)
+        && baseline_records
+            .iter()
+            .all(|record| baseline_fingerprints.contains(&record.request.credential_fingerprint))
+        && !baseline.secret_in_argv;
+    let baseline_provider_requests = baseline.expected_physical_requests;
+    let mut requests = baseline.expected_records;
+    let mut evidence = Vec::new();
+    for (component_name, component) in [
+        ("provider", &surface.provider),
+        ("base_url", &surface.base_url),
+        ("credential", &surface.credential),
+    ] {
+        if component.method == InjectionMethod::Impossible {
+            evidence.push(InjectionTrialEvidence {
+                component: component_name,
+                method: component.method,
+                carrier: injection_carrier_label(component),
+                baseline_provider_requests,
+                perturbed_provider_requests: 0,
+                expected_endpoint_reached: false,
+                unexpected_endpoint_requests: 0,
+                credential_accepted: false,
+                baseline_credential_rejected: false,
+                secret_in_argv: false,
+                component_verified: false,
+            });
+            continue;
+        }
+        let provider = if component_name == "provider" {
+            "ahrb-trap-model"
+        } else {
+            manifest.fake_model.model.as_str()
+        };
+        let credential = if component_name == "credential" {
+            trap_credential.as_str()
+        } else {
+            baseline_credential.as_str()
+        };
+        let observation = collect_injection_run(
+            manifest,
+            run_profile_root,
+            component_name,
+            provider,
+            credential,
+            &baseline_credential,
+            component_name == "base_url",
+        )
+        .await?;
+        let actor = format!("r65-{component_name}");
+        let expected_records = observation
+            .expected_records
+            .iter()
+            .filter(|record| record.accepted && record.request.actor == actor)
+            .collect::<Vec<_>>();
+        let expected_physical_requests = if component_name == "credential" { 2 } else { 1 };
+        let expected_endpoint_reached = expected_records.len() == 1
+            && observation.expected_physical_requests == expected_physical_requests;
+        let credential_fingerprints = injection_credential_fingerprints(credential);
+        let credential_accepted = !expected_records.is_empty()
+            && expected_records.iter().all(|record| {
+                credential_fingerprints.contains(&record.request.credential_fingerprint)
+            });
+        let baseline_credential_rejected = component_name == "credential"
+            && observation.active_baseline_credential_rejected
+            && observation.credential_rejections == 1;
+        let component_verified = baseline_runnable
+            && observation.terminal_success
+            && expected_endpoint_reached
+            && observation.unexpected_physical_requests == 0
+            && credential_accepted
+            && !observation.secret_in_argv
+            && match component_name {
+                "provider" => expected_records.iter().all(|record| {
+                    record.request.model == "ahrb-trap-model"
+                        && record.request.model != manifest.fake_model.model
+                }),
+                "base_url" => true,
+                "credential" => baseline_credential_rejected,
+                _ => false,
+            };
+        evidence.push(InjectionTrialEvidence {
+            component: component_name,
+            method: component.method,
+            carrier: injection_carrier_label(component),
+            baseline_provider_requests,
+            perturbed_provider_requests: observation.expected_physical_requests,
+            expected_endpoint_reached,
+            unexpected_endpoint_requests: observation.unexpected_physical_requests,
+            credential_accepted,
+            baseline_credential_rejected,
+            secret_in_argv: observation.secret_in_argv,
+            component_verified,
+        });
+        requests.extend(observation.expected_records);
+        requests.extend(observation.unexpected_records);
+    }
+    requests.sort_by(|left, right| {
+        (
+            &left.request.scenario,
+            &left.request.actor,
+            left.semantic_ordinal,
+            &left.request.checkpoint,
+            left.attempt,
+        )
+            .cmp(&(
+                &right.request.scenario,
+                &right.request.actor,
+                right.semantic_ordinal,
+                &right.request.checkpoint,
+                right.attempt,
+            ))
+    });
+    Ok(InjectionSurfaceTrials {
+        evaluation: evaluate_injection_surface(
+            surface.provider.method,
+            surface.base_url.method,
+            surface.credential.method,
+            baseline_runnable,
+            evidence,
+        ),
+        requests,
+    })
 }
 
 fn retry_budget_workflow(profile_root: &Path, profile: Profile) -> Workflow {
@@ -7877,6 +10716,14 @@ async fn collect_journal_torn_tail_trials(
 fn stable_json_stream_hash(events: &[NormalizedEvent]) -> Result<String> {
     let mut digest = Sha256::new();
     for event in events {
+        let mut payload = event.payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            // These are AHRB observer envelopes added while normalizing a
+            // carrier. They are neither durable journal content nor part of
+            // the semantic stream whose prefix row 53 compares.
+            object.remove("_ahrb_receipt");
+            object.remove("_ahrb_source_raw");
+        }
         // Driver-local replay IDs/cursors are transport bookkeeping. Hash the
         // exact ordered normalized semantic stream so daemon and official
         // per-invocation replay can prove the same committed prefix without a
@@ -7885,7 +10732,7 @@ fn stable_json_stream_hash(events: &[NormalizedEvent]) -> Result<String> {
             "session_id": event.session_id,
             "actor": event.actor,
             "event": event.event,
-            "payload": event.payload,
+            "payload": payload,
         }))?;
         digest.update((bytes.len() as u64).to_be_bytes());
         digest.update(bytes);
@@ -15693,6 +18540,84 @@ fn scripted_row(
     };
     let terminal = route_marker(scenario, actor, "terminal");
     let scripts = match row {
+        67 => {
+            let tool_turn = actor.ends_with("t3") || actor.ends_with("t20");
+            if tool_turn {
+                let call = mapped_tool_call(
+                    manifest,
+                    "write",
+                    format!("row67-{actor}"),
+                    json!({
+                        "path": format!("{actor}.txt"),
+                        "content": format!("usage-tool-turn{terminal}")
+                    }),
+                )?;
+                vec![
+                    response(
+                        "start",
+                        json!({
+                            "tool_calls": [call],
+                            "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
+                        }),
+                        None,
+                    ),
+                    response(
+                        "terminal",
+                        json!({
+                            "text": "SUCCESS",
+                            "_ahrb_usage": {"input_tokens": 140, "output_tokens": 30}
+                        }),
+                        None,
+                    ),
+                ]
+            } else {
+                vec![response(
+                    "start",
+                    json!({
+                        "text": "SUCCESS",
+                        "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
+                    }),
+                    None,
+                )]
+            }
+        }
+        69 if actor.ends_with('s') => {
+            let call = mapped_tool_call(
+                manifest,
+                "write",
+                format!("row69-{actor}"),
+                json!({
+                    "path": format!("{actor}.txt"),
+                    "content": format!("event-stream{terminal}")
+                }),
+            )?;
+            vec![
+                response(
+                    "start",
+                    json!({
+                        "tool_calls": [call],
+                        "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
+                    }),
+                    None,
+                ),
+                response(
+                    "terminal",
+                    json!({
+                        "text": "SUCCESS",
+                        "_ahrb_usage": {"input_tokens": 140, "output_tokens": 30}
+                    }),
+                    None,
+                ),
+            ]
+        }
+        69 => vec![response(
+            "start",
+            json!({
+                "text": "{\"status\":\"FAILURE\",\"category\":\"scripted\"}",
+                "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
+            }),
+            None,
+        )],
         4 => {
             let first = mapped_tool_call(
                 manifest,
@@ -15845,6 +18770,36 @@ fn scripted_row(
                     json!({"text":"{\"status\":\"FAILURE\",\"category\":\"workspace\"}"}),
                     None,
                 ),
+            ]
+        }
+        71 if actor.ends_with('2') || actor.ends_with('4') || actor.ends_with('6') => {
+            vec![response(
+                "start",
+                json!({"text":"{\"status\":\"FAILURE\",\"category\":\"provider\"}"}),
+                None,
+            )]
+        }
+        72 => {
+            let after_success = route_marker(scenario, actor, "after-success");
+            let success_call = mapped_tool_call(
+                manifest,
+                "write",
+                format!("row72-success-{actor}"),
+                json!({
+                    "path": "row-72-success.txt",
+                    "content": format!("structured success {after_success}"),
+                }),
+            )?;
+            let failed_call = mapped_tool_call(
+                manifest,
+                "fail",
+                format!("row72-failure-{actor}"),
+                json!({"message": format!("expected structured failure {terminal}")}),
+            )?;
+            vec![
+                response("start", json!({"tool_calls":[success_call]}), None),
+                response("after-success", json!({"tool_calls":[failed_call]}), None),
+                response("terminal", success_value(), None),
             ]
         }
         _ => vec![response("start", success_value(), None)],
@@ -16195,6 +19150,9 @@ fn capability_result(
         &[],
         None,
     );
+    if matches!(definition.row, 65 | 66 | 67 | 68 | 70) {
+        result.metadata.score = Some(0.0);
+    }
     result.evidence.push(format!("capability: {reason}"));
     Some(result)
 }
@@ -16210,6 +19168,13 @@ fn evaluate_rows(
     derived: &DerivedRowEvaluations<'_>,
     profile: Profile,
 ) -> Vec<TestResult> {
+    let row65 = derived.injection_surface;
+    let row66 = derived.budget_enforcement;
+    let row67 = derived.usage_reporting;
+    let row68 = derived.session_ops_cli;
+    let row69 = derived.event_stream_completeness;
+    let row70 = derived.headless_permissions;
+    let row71 = derived.secrets_hygiene;
     let row42 = derived.model_request_efficiency;
     let row43 = derived.turn_latency;
     let row49 = derived.latency_vs_turn_index;
@@ -16233,6 +19198,13 @@ fn evaluate_rows(
     let row58 = derived.retry_budget;
     let row63 = derived.nondeterministic_fields;
     let row64 = derived.cross_run_reproducibility;
+    let row72 = evaluate_tool_result_role_fidelity(
+        requests,
+        match profile {
+            Profile::Quick => 1,
+            Profile::Cert => 5,
+        },
+    );
     selected
         .iter()
         .map(|definition| {
@@ -17077,6 +20049,316 @@ fn evaluate_rows(
                             row64.identical,
                             row64.request_stream_count,
                             row64.attempt_count,
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 65 {
+                if !row65.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row65.measurement_error.clone().unwrap_or_else(|| {
+                            "injection-surface evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                if !row65.baseline_runnable {
+                    let mut result = classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(false),
+                        &[],
+                        None,
+                    );
+                    result.metadata.score = Some(0.0);
+                    result.evidence.push(
+                        "fresh baseline could not prove both fake-provider routing and credential injection"
+                            .to_owned(),
+                    );
+                    return result;
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row65.passed,
+                        detail: format!(
+                            "provider={:.2}, base-url={:.2}, credential={:.2}, verified={:.0}/3, aggregate={:.6}",
+                            row65.metrics["injection_surface.provider_score"],
+                            row65.metrics["injection_surface.base_url_score"],
+                            row65.metrics["injection_surface.credential_score"],
+                            row65.metrics["injection_surface.verified_components"],
+                            row65.score,
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = Some(row65.score);
+                return result;
+            }
+            if definition.row == 66 {
+                if !row66.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row66.measurement_error.clone().unwrap_or_else(|| {
+                            "budget-enforcement evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row66.passed,
+                        detail: format!(
+                            "tokens={:.0}/{:.0}, cost={:.0}/{:.0}, time={:.3}/{:.0}ms, overruns={:.0}, terminals={:.0}, score={:.6}",
+                            row66.metrics["budget_enforcement.token_observed"],
+                            row66.metrics["budget_enforcement.token_limit"],
+                            row66.metrics["budget_enforcement.cost_observed_microusd"],
+                            row66.metrics["budget_enforcement.cost_limit_microusd"],
+                            row66.metrics["budget_enforcement.time_observed_ms"],
+                            row66.metrics["budget_enforcement.time_limit_ms"],
+                            row66.metrics["budget_enforcement.overrun_count"],
+                            row66.metrics["budget_enforcement.structured_failures"],
+                            row66.metrics["budget_enforcement.score"],
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = row66.metrics.get("budget_enforcement.score").copied();
+                return result;
+            }
+            if definition.row == 67 {
+                if !row67.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row67.measurement_error.clone().unwrap_or_else(|| {
+                            "usage-reporting evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row67.passed,
+                        detail: format!(
+                            "input={:.0}, output={:.0}, total={:.0}, cost={:.0}, turns={:.0}, crosschecks={:.0}",
+                            row67.metrics["usage_reporting.input_tokens"],
+                            row67.metrics["usage_reporting.output_tokens"],
+                            row67.metrics["usage_reporting.total_tokens"],
+                            row67.metrics["usage_reporting.cost_microusd"],
+                            row67.metrics["usage_reporting.turns"],
+                            row67.metrics["usage_reporting.crosscheck_errors"],
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = row67.metrics.get("usage_reporting.score").copied();
+                return result;
+            }
+            if definition.row == 68 {
+                if !row68.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row68.measurement_error.clone().unwrap_or_else(|| {
+                            "session-ops-cli evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row68.passed,
+                        detail: format!(
+                            "create={:.0}, list={:.0}, resume={:.0}, fork={:.0}, delete={:.0}, score={:.6}",
+                            row68.metrics["session_ops_cli.create_ok"],
+                            row68.metrics["session_ops_cli.list_ok"],
+                            row68.metrics["session_ops_cli.resume_ok"],
+                            row68.metrics["session_ops_cli.fork_ok"],
+                            row68.metrics["session_ops_cli.delete_ok"],
+                            row68.metrics["session_ops_cli.score"],
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = row68.metrics.get("session_ops_cli.score").copied();
+                return result;
+            }
+            if definition.row == 69 {
+                if !row69.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row69.measurement_error.clone().unwrap_or_else(|| {
+                            "event-stream-completeness evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row69.passed,
+                        detail: format!(
+                            "tool-id={:.0}, correlation={:.0}, timestamps={:.0}, usage={:.0}, terminal={:.0}, schema={:.0}, score={:.6}",
+                            row69.metrics["event_stream_completeness.tool_call_id"],
+                            row69.metrics["event_stream_completeness.correlated_result"],
+                            row69.metrics["event_stream_completeness.timestamps"],
+                            row69.metrics["event_stream_completeness.usage"],
+                            row69.metrics["event_stream_completeness.terminal_typing"],
+                            row69.metrics["event_stream_completeness.schema_version"],
+                            row69.metrics["event_stream_completeness.score"],
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = row69
+                    .metrics
+                    .get("event_stream_completeness.score")
+                    .copied();
+                return result;
+            }
+            if definition.row == 70 {
+                if !row70.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row70.measurement_error.clone().unwrap_or_else(|| {
+                            "headless-permission evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row70.passed,
+                        detail: format!(
+                            "score={:.2}, prompts={:.0}, allowed={:.0}, fs-denied={:.0}, network-denied={:.0}, scope={:.0}",
+                            row70.metrics["headless_permission_model.score"],
+                            row70.metrics["headless_permission_model.tty_prompts"],
+                            row70.metrics["headless_permission_model.allowed_effects"],
+                            row70.metrics["headless_permission_model.denied_filesystem_effects"],
+                            row70.metrics["headless_permission_model.denied_network_effects"],
+                            row70.metrics["headless_permission_model.scope_violations"],
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = row70
+                    .metrics
+                    .get("headless_permission_model.score")
+                    .copied();
+                return result;
+            }
+            if definition.row == 71 {
+                if !row71.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row71.measurement_error.clone().unwrap_or_else(|| {
+                            "secrets-hygiene-on-disk evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row71.passed,
+                        detail: format!(
+                            "files={:.0}, bytes={:.0}, stdout={:.0}, stderr={:.0}, journal={:.0}, session={:.0}, log={:.0}, carriers={:.0}",
+                            row71.metrics["secrets_hygiene_on_disk.files_scanned"],
+                            row71.metrics["secrets_hygiene_on_disk.bytes_scanned"],
+                            row71.metrics["secrets_hygiene_on_disk.stdout_matches"],
+                            row71.metrics["secrets_hygiene_on_disk.stderr_matches"],
+                            row71.metrics["secrets_hygiene_on_disk.journal_matches"],
+                            row71.metrics["secrets_hygiene_on_disk.session_matches"],
+                            row71.metrics["secrets_hygiene_on_disk.log_matches"],
+                            row71.metrics["secrets_hygiene_on_disk.declared_carrier_files"],
+                        ),
+                    }],
+                    None,
+                );
+            }
+            if definition.row == 72 {
+                if !row72.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row72.measurement_error.clone().unwrap_or_else(|| {
+                            "tool-result-role-fidelity evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                return classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row72.passed,
+                        detail: format!(
+                            "checks={:.0}, violations={:.0}, plain-user={:.0}, missing={:.0}, duplicate={:.0}",
+                            row72.metrics["tool_result_role_fidelity.checks"],
+                            row72.metrics["tool_result_role_fidelity.violations"],
+                            row72.metrics["tool_result_role_fidelity.plain_user_text_violations"],
+                            row72.metrics["tool_result_role_fidelity.missing_results"],
+                            row72.metrics["tool_result_role_fidelity.duplicate_results"],
                         ),
                     }],
                     None,
@@ -19636,6 +22918,13 @@ fn validate_recovered_suffix(
         let mut actual_durable = actual.clone();
         let mut expected_durable = expected_event.clone();
         for event in [&mut actual_durable, &mut expected_durable] {
+            if let Some(payload) = event.payload.as_object_mut() {
+                // Row 69 attaches collector receipt bounds while normalizing
+                // each carrier observation. They are deliberately external to
+                // the harness journal and therefore cannot participate in a
+                // durable replay equality check.
+                payload.remove("_ahrb_receipt");
+            }
             if matches!(
                 event.event,
                 EventVocab::TerminalSuccess

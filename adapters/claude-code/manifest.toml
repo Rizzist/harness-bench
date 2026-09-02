@@ -176,9 +176,33 @@ paths = ["{{profile}}"]
 redact_env = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
 max_bytes = 1048576
 
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "environment"
+environment = "ANTHROPIC_BASE_URL"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "ANTHROPIC_API_KEY"
+
 [capabilities.required]
 headless = "claude -p emits a terminal stream-json result"
 sessions = "Claude Code persists a caller-supplied isolated session ID"
 resume = "claude --resume reopens the prior session in a fresh process"
+tool_result_role_fidelity = "Anthropic tool_result blocks preserve the native result role"
 
 [capabilities.optional]
+
+# TODO(orchestrator): pin the exact generated `--settings` path/schema for model,
+# base URL, and credential if it is to replace env-only injection and satisfy
+# the row-71 credential-carrier validation.
+# TODO(orchestrator): pin create/list/fork/delete CLI operations and lifecycle
+# pointers before declaring session_ops_cli; `--resume`/`--continue` are not a
+# complete row-68 lifecycle.
+# TODO(orchestrator): pin all three budget controls, the harness-side tariff,
+# usage event/scope/five pointers, and closed-stdin filesystem/network denial
+# commands before declaring rows 66, 67, or 70.

@@ -159,8 +159,36 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
+credential_carrier_paths = ["{{profile}}/home/.config/rick/rick.json"]
+
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "ahrb/{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "generated-config"
+generated_path = "{{profile}}/home/.config/rick/rick.json"
+json_pointer = "/provider/ahrb/baseUrl"
+
+[capabilities.injection_surface.credential]
+method = "generated-config"
+generated_path = "{{profile}}/home/.config/rick/rick.json"
+json_pointer = "/provider/ahrb/apiKey"
 
 [capabilities.required]
 headless = "rick exec --output-format stream-json is noninteractive"
+secrets_hygiene_on_disk = "the only permitted credential carrier is the generated private provider config"
+tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native tool-result role"
 
 [capabilities.optional]
+
+# TODO(orchestrator): pin create/fork/delete commands, repeated-delete semantics,
+# and lifecycle pointers before declaring session_ops_cli; `rick sessions` and
+# `rick resume` are insufficient.
+# TODO(orchestrator): pin budget controls, tariff, usage event/scope/five
+# pointers, timestamps, and schema version before declaring rows 66, 67, or the
+# optional row-69 metadata components.
+# TODO(orchestrator): verify workspace-scoped filesystem and network denial
+# commands before declaring headless_permission_model; unscoped `--yolo` cannot
+# satisfy SPEC-v2 row 70.

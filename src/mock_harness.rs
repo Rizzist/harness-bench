@@ -53,6 +53,7 @@ static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEW_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static REPLACE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_MAILBOX_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static PERMISSION_LEDGER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn reference_terminal_floor_ms(prompt: &str) -> Option<u64> {
     if prompt.starts_with("AHRB long horizon turn ") {
@@ -318,28 +319,30 @@ impl DurableJournal {
             if line.is_empty() {
                 continue;
             }
-            let raw: Value = serde_json::from_slice(&line).map_err(|error| {
-                AhrbError::Protocol(format!(
-                    "corrupt durable journal {}: {error}",
-                    self.path.display()
-                ))
-            })?;
-            // Row 53's exact full-size fixture is an intentionally synthetic
-            // non-event record. A complete one is cleanly ignored; a partial
-            // final record was already ignored above because it lacks the
-            // newline delimiter. No other malformed complete record is
-            // tolerated.
-            if raw.get("type").and_then(Value::as_str) == Some("ahrb-large")
-                && raw.get("payload").and_then(Value::as_str).is_some()
-            {
-                continue;
-            }
-            let event: NormalizedEvent = serde_json::from_value(raw).map_err(|error| {
-                AhrbError::Protocol(format!(
-                    "corrupt durable journal {}: {error}",
-                    self.path.display()
-                ))
-            })?;
+            let event = match serde_json::from_slice::<NormalizedEvent>(&line) {
+                Ok(event) => event,
+                Err(event_error) => {
+                    // Row 53's exact full-size fixture is an intentionally
+                    // synthetic non-event record. Parse a generic value only
+                    // on this exceptional path; ordinary growing-session
+                    // resumes must not deserialize every durable event twice.
+                    let raw: Value = serde_json::from_slice(&line).map_err(|error| {
+                        AhrbError::Protocol(format!(
+                            "corrupt durable journal {}: {error}",
+                            self.path.display()
+                        ))
+                    })?;
+                    if raw.get("type").and_then(Value::as_str) == Some("ahrb-large")
+                        && raw.get("payload").and_then(Value::as_str).is_some()
+                    {
+                        continue;
+                    }
+                    return Err(AhrbError::Protocol(format!(
+                        "corrupt durable journal {}: {event_error}",
+                        self.path.display()
+                    )));
+                }
+            };
             if after.map(|cursor| event.cursor > cursor).unwrap_or(true) {
                 events.push(event);
             }
@@ -372,6 +375,8 @@ struct MockConfig {
     embedded_model: Option<Arc<FakeModelEngine>>,
     api_key: Option<String>,
     model: String,
+    tariff_input_microusd_per_token: u64,
+    tariff_output_microusd_per_token: u64,
     idle_timeout: Duration,
     turn_timeout: Duration,
     retry_max_attempts: u32,
@@ -765,12 +770,20 @@ impl MockHarness {
         Ok(id.to_owned())
     }
 
-    fn append(&mut self, session_id: &str, event: EventVocab, payload: Value) -> Result<u64> {
+    fn append(&mut self, session_id: &str, event: EventVocab, mut payload: Value) -> Result<u64> {
         let session = self.session_mut(session_id)?;
         let cursor = session.next_cursor;
         let next_cursor = cursor.checked_add(1).ok_or_else(|| {
             AhrbError::Validation(format!("session {session_id:?} exhausted its cursor space"))
         })?;
+        if let Some(object) = payload.as_object_mut() {
+            object
+                .entry("schema_version".to_owned())
+                .or_insert_with(|| json!(1));
+            object
+                .entry("timestamp_ns".to_owned())
+                .or_insert_with(|| json!(crate::fake_model::monotonic_timestamp_ns()));
+        }
         let normalized = NormalizedEvent {
             id: format!("{session_id}:{cursor}"),
             cursor,
@@ -958,6 +971,13 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "rpc" => serve(parse_config(&args[1..])?, true).await,
         "status" => status_command(&args[1..]),
         "exec-turn" => exec_turn(&args[1..]).await,
+        "budget-trial" => budget_trial_command(&args[1..]).await,
+        "session-create" => session_create_command(&args[1..]),
+        "session-list" => session_list_command(&args[1..]),
+        "session-resume" => session_resume_command(&args[1..]),
+        "session-fork" => session_fork_command(&args[1..]),
+        "session-delete" => session_delete_command(&args[1..]),
+        "permission-trial" => permission_trial_command(&args[1..]),
         "release-checkpoint" => release_checkpoint_command(&args[1..]).await,
         "cancel-session" => cancel_session_command(&args[1..]).await,
         "close-delete-session" => close_delete_session_command(&args[1..]).await,
@@ -975,6 +995,18 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  --session-id ID --release-token TOKEN\n\
                  ahrb-mock-harness cancel-session --state-dir PATH --session-id ID\n\
                  ahrb-mock-harness close-delete-session --state-dir PATH --session-id ID\n\
+                 ahrb-mock-harness budget-trial --state-dir PATH \
+                 (--max-tokens N|--max-cost USD|--max-time-ms N)\n\
+                 ahrb-mock-harness session-create --state-dir PATH --marker MARKER\n\
+                 ahrb-mock-harness session-list --state-dir PATH\n\
+                 ahrb-mock-harness session-resume|session-fork|session-delete \
+                 --state-dir PATH --session-id ID\n\
+                 ahrb-mock-harness permission-trial --state-dir PATH \
+                 --case allow --workspace PATH\n\
+                 ahrb-mock-harness permission-trial --state-dir PATH \
+                 --case deny-filesystem --outside-path PATH\n\
+                 ahrb-mock-harness permission-trial --state-dir PATH \
+                 --case deny-network --blocked-host HOST --blocked-port PORT\n\
                  model endpoint comes from AHRB_MOCK_BASE_URL, AHRB_MOCK_UNIX_SOCKET, \
                  or AHRB_MOCK_PROVIDER_MAILBOX; \
                  key/model come from AHRB_MOCK_API_KEY and AHRB_MOCK_MODEL"
@@ -995,6 +1027,772 @@ fn status_command(args: &[String]) -> Result<i32> {
         .map_err(|error| AhrbError::Protocol(format!("invalid mock daemon PID: {error}")))?;
     println!("{}", json!({"daemon":{"pid":pid,"ready":true}}));
     Ok(0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BudgetTrial {
+    Tokens(u64),
+    CostMicrousd(u64),
+    TimeMs(u64),
+}
+
+#[derive(Debug)]
+struct BudgetProviderObservation {
+    request_id: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    elapsed_ms: u64,
+}
+
+async fn budget_trial_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(
+        args,
+        &[
+            "--state-dir",
+            "--max-tokens",
+            "--max-cost",
+            "--max-time-ms",
+            "--idle-timeout-ms",
+        ],
+    )?;
+    let state_dir = absolute_cli_path(required_cli_option(&options, "--state-dir")?, "state")?;
+    fs::create_dir_all(&state_dir)?;
+    let mut trials = Vec::new();
+    if let Some(value) = options.get("--max-tokens") {
+        trials.push(BudgetTrial::Tokens(parse_positive_u64(
+            value,
+            "token budget",
+        )?));
+    }
+    if let Some(value) = options.get("--max-cost") {
+        trials.push(BudgetTrial::CostMicrousd(parse_usd_microusd(value)?));
+    }
+    if let Some(value) = options.get("--max-time-ms") {
+        trials.push(BudgetTrial::TimeMs(parse_positive_u64(
+            value,
+            "time budget",
+        )?));
+    }
+    if trials.len() != 1 {
+        return Err(AhrbError::Usage(
+            "budget-trial requires exactly one budget control".to_owned(),
+        ));
+    }
+    let mut config_args = vec![
+        "--state-dir".to_owned(),
+        state_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(idle_timeout_ms) = options.get("--idle-timeout-ms") {
+        config_args.push("--idle-timeout-ms".to_owned());
+        config_args.push(idle_timeout_ms.clone());
+    }
+    let config = parse_config(&config_args)?;
+    if config.base_url.is_none()
+        && config.unix_socket.is_none()
+        && config.provider_mailbox.is_none()
+        && config.embedded_model.is_none()
+    {
+        return Err(AhrbError::Validation(
+            "budget-trial requires an injected fake-provider endpoint".to_owned(),
+        ));
+    }
+    let input_price = config.tariff_input_microusd_per_token;
+    let output_price = config.tariff_output_microusd_per_token;
+    if input_price != 2 || output_price != 3 {
+        return Err(AhrbError::Validation(
+            "budget certification requires the 2/3 micro-USD tariff".to_owned(),
+        ));
+    }
+    let case = match trials[0] {
+        BudgetTrial::Tokens(_) => "tokens",
+        BudgetTrial::CostMicrousd(_) => "cost",
+        BudgetTrial::TimeMs(_) => "time",
+    };
+    let evidence_path = state_dir.join("wave4-budget-evidence.jsonl");
+    let repetition = next_budget_repetition(&evidence_path, case)?;
+    let terminal = match trials[0] {
+        BudgetTrial::Tokens(limit) => token_budget_trial(&config, limit, repetition).await?,
+        BudgetTrial::CostMicrousd(limit) => cost_budget_trial(&config, limit, repetition).await?,
+        BudgetTrial::TimeMs(limit) => {
+            let observation =
+                budget_provider_request(&config, "time", repetition, 1, limit).await?;
+            if observation.elapsed_ms < limit {
+                return Err(AhrbError::Protocol(format!(
+                    "time budget provider response completed at {} ms before limit {limit}",
+                    observation.elapsed_ms
+                )));
+            }
+            let total_tokens = observation
+                .input_tokens
+                .checked_add(observation.output_tokens)
+                .ok_or_else(|| AhrbError::Protocol("time trial usage overflow".to_owned()))?;
+            let cost_microusd =
+                usage_cost(&config, observation.input_tokens, observation.output_tokens)?;
+            json!({
+                "schema_version": 1,
+                "event": "terminal-budget-exceeded",
+                "terminal_type": "budget-exceeded",
+                "status": "budget-exceeded",
+                "case": "time",
+                "repetition": repetition,
+                "limit_ms": limit,
+                "observed_ms": observation.elapsed_ms,
+                "usage": {
+                    "input_tokens":observation.input_tokens,
+                    "output_tokens":observation.output_tokens,
+                    "total_tokens":total_tokens,
+                    "cost_microusd":cost_microusd,
+                    "turns":1
+                },
+                "provider_requests": [{"request_id":observation.request_id,"boundary":"crossing"}],
+                "overrun_count": 0,
+                "outer_kill": false
+            })
+        }
+    };
+    append_jsonl_synced(&evidence_path, &terminal)?;
+    println!("{}", serde_json::to_string(&terminal)?);
+    std::io::stdout().flush()?;
+    Ok(0)
+}
+
+async fn token_budget_trial(config: &MockConfig, limit: u64, repetition: u64) -> Result<Value> {
+    let fixture = limit
+        .checked_sub(16)
+        .ok_or_else(|| AhrbError::Validation("token budget must be at least 16".to_owned()))?;
+    let before = budget_provider_request(config, "tokens", repetition, 1, limit).await?;
+    let before_total = before
+        .input_tokens
+        .checked_add(before.output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("token fixture usage overflow".to_owned()))?;
+    if before_total != fixture {
+        return Err(AhrbError::Protocol(format!(
+            "token fixture provider reported {before_total}, expected {fixture}"
+        )));
+    }
+    let crossing = budget_provider_request(config, "tokens", repetition, 2, limit).await?;
+    if crossing.input_tokens != 8 || crossing.output_tokens != 16 {
+        return Err(AhrbError::Protocol(format!(
+            "token crossing response reported {}/{}, expected 8/16",
+            crossing.input_tokens, crossing.output_tokens
+        )));
+    }
+    let input_tokens = before
+        .input_tokens
+        .checked_add(crossing.input_tokens)
+        .ok_or_else(|| AhrbError::Protocol("token trial input usage overflow".to_owned()))?;
+    let output_tokens = before
+        .output_tokens
+        .checked_add(crossing.output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("token trial output usage overflow".to_owned()))?;
+    let observed = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("token trial total usage overflow".to_owned()))?;
+    let expected = limit
+        .checked_add(8)
+        .ok_or_else(|| AhrbError::Validation("token budget observation overflow".to_owned()))?;
+    if observed != expected {
+        return Err(AhrbError::Protocol(format!(
+            "token trial observed {observed}, expected {expected}"
+        )));
+    }
+    let cost_microusd = usage_cost(config, input_tokens, output_tokens)?;
+    Ok(json!({
+        "schema_version":1,"event":"terminal-budget-exceeded",
+        "terminal_type":"budget-exceeded","status":"budget-exceeded","case":"tokens",
+        "repetition":repetition,
+        "limit":limit,"observed":observed,
+        "boundary":{"fixture_tokens":fixture,"crossing_response":{"input_tokens":8,"output_tokens":16}},
+        "usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"total_tokens":observed,"cost_microusd":cost_microusd,"turns":1},
+        "provider_requests":[
+            {"request_id":before.request_id,"boundary":"fixture"},
+            {"request_id":crossing.request_id,"boundary":"crossing"}
+        ],
+        "overrun_count":0,"outer_kill":false
+    }))
+}
+
+async fn cost_budget_trial(config: &MockConfig, limit: u64, repetition: u64) -> Result<Value> {
+    let fixture_cost = limit.checked_sub(25).ok_or_else(|| {
+        AhrbError::Validation("cost budget must be at least 25 micro-USD".to_owned())
+    })?;
+    let before = budget_provider_request(config, "cost", repetition, 1, limit).await?;
+    if usage_cost(config, before.input_tokens, before.output_tokens)? != fixture_cost {
+        return Err(AhrbError::Protocol(
+            "cost fixture provider usage did not equal limit-25".to_owned(),
+        ));
+    }
+    let crossing = budget_provider_request(config, "cost", repetition, 2, limit).await?;
+    if usage_cost(config, crossing.input_tokens, crossing.output_tokens)? != 50 {
+        return Err(AhrbError::Protocol(
+            "cost crossing provider response did not cost exactly 50 micro-USD".to_owned(),
+        ));
+    }
+    let input_tokens = before
+        .input_tokens
+        .checked_add(crossing.input_tokens)
+        .ok_or_else(|| AhrbError::Protocol("cost trial input usage overflow".to_owned()))?;
+    let output_tokens = before
+        .output_tokens
+        .checked_add(crossing.output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("cost trial output usage overflow".to_owned()))?;
+    let total_tokens = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("cost trial total usage overflow".to_owned()))?;
+    let observed = usage_cost(config, input_tokens, output_tokens)?;
+    let expected = limit
+        .checked_add(25)
+        .ok_or_else(|| AhrbError::Validation("cost budget observation overflow".to_owned()))?;
+    if observed != expected {
+        return Err(AhrbError::Protocol(format!(
+            "cost trial observed {observed}, expected {expected}"
+        )));
+    }
+    Ok(json!({
+        "schema_version":1,"event":"terminal-budget-exceeded",
+        "terminal_type":"budget-exceeded","status":"budget-exceeded","case":"cost",
+        "repetition":repetition,
+        "limit_microusd":limit,"observed_microusd":observed,
+        "tariff":{"input_microusd_per_token":2,"output_microusd_per_token":3},
+        "boundary":{"fixture_cost_microusd":fixture_cost,"crossing_response":{"input_tokens":crossing.input_tokens,"output_tokens":crossing.output_tokens,"cost_microusd":50}},
+        "usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"total_tokens":total_tokens,"cost_microusd":observed,"turns":1},
+        "provider_requests":[
+            {"request_id":before.request_id,"boundary":"fixture"},
+            {"request_id":crossing.request_id,"boundary":"crossing"}
+        ],
+        "overrun_count":0,"outer_kill":false
+    }))
+}
+
+async fn budget_provider_request(
+    config: &MockConfig,
+    case: &str,
+    repetition: u64,
+    sequence: u64,
+    limit: u64,
+) -> Result<BudgetProviderObservation> {
+    let request_id = stable_budget_request_id(case, repetition, sequence, limit);
+    let checkpoint = if case == "time" || sequence == 2 {
+        "crossing"
+    } else {
+        "fixture"
+    };
+    let actor = format!("{case}-r{repetition}");
+    let route_marker =
+        format!("[[AHRB:scenario=ahrb-matrix-v1;actor={actor};checkpoint={checkpoint}]]");
+    let prompt = format!(
+        "AHRB-WAVE4-BUDGET case={case} repetition={repetition} sequence={sequence} limit={limit} request_id={request_id} {route_marker}"
+    );
+    let request = json!({
+        "model": config.model,
+        "messages": [{"role":"user","content":prompt}],
+        "tools": [],
+        "stream": false,
+        "metadata": {
+            "ahrb": {
+                "scenario":"ahrb-matrix-v1",
+                "actor":actor,
+                "checkpoint":checkpoint,
+                "request_id":request_id.clone()
+            }
+        }
+    });
+    let mut headers = BTreeMap::new();
+    if let Some(key) = &config.api_key {
+        headers.insert("Authorization".to_owned(), format!("Bearer {key}"));
+    }
+    let body = serde_json::to_vec(&request)?;
+    let started = std::time::Instant::now();
+    let response = model_http_post(config, &headers, &body).await?;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if !(200..300).contains(&response.status) {
+        return Err(AhrbError::Protocol(format!(
+            "budget fake provider returned HTTP {} for {request_id}",
+            response.status
+        )));
+    }
+    let value: Value = serde_json::from_slice(&response.body)?;
+    let (input_tokens, output_tokens) = chat_response_usage(&value)?;
+    Ok(BudgetProviderObservation {
+        request_id,
+        input_tokens,
+        output_tokens,
+        elapsed_ms,
+    })
+}
+
+fn stable_budget_request_id(case: &str, repetition: u64, sequence: u64, limit: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ahrb-wave4-budget-v1\0");
+    hasher.update(case.as_bytes());
+    hasher.update([0]);
+    hasher.update(repetition.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(limit.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::from("budget-");
+    for byte in &digest[..12] {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn usage_cost(config: &MockConfig, input_tokens: u64, output_tokens: u64) -> Result<u64> {
+    let input = input_tokens
+        .checked_mul(config.tariff_input_microusd_per_token)
+        .ok_or_else(|| AhrbError::Protocol("input usage cost overflow".to_owned()))?;
+    let output = output_tokens
+        .checked_mul(config.tariff_output_microusd_per_token)
+        .ok_or_else(|| AhrbError::Protocol("output usage cost overflow".to_owned()))?;
+    input
+        .checked_add(output)
+        .ok_or_else(|| AhrbError::Protocol("total usage cost overflow".to_owned()))
+}
+
+fn append_jsonl_synced(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    sync_parent(path)?;
+    Ok(())
+}
+
+fn next_budget_repetition(path: &Path, case: &str) -> Result<u64> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(error) => return Err(error.into()),
+    };
+    let mut completed = 0_u64;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(line).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "corrupt budget evidence ledger {}: {error}",
+                path.display()
+            ))
+        })?;
+        if value.get("case").and_then(Value::as_str) == Some(case) {
+            completed = completed.checked_add(1).ok_or_else(|| {
+                AhrbError::Validation("budget repetition count overflow".to_owned())
+            })?;
+        }
+    }
+    completed
+        .checked_add(1)
+        .ok_or_else(|| AhrbError::Validation("budget repetition count overflow".to_owned()))
+}
+
+#[cfg(test)]
+fn token_budget_terminal(limit: u64) -> Result<Value> {
+    let fixture = limit
+        .checked_sub(16)
+        .ok_or_else(|| AhrbError::Validation("token budget must be at least 16".to_owned()))?;
+    let observed = limit
+        .checked_add(8)
+        .ok_or_else(|| AhrbError::Validation("token budget observation overflow".to_owned()))?;
+    let input_tokens = observed
+        .checked_sub(16)
+        .ok_or_else(|| AhrbError::Protocol("token budget fixture underflow".to_owned()))?;
+    Ok(json!({
+        "schema_version": 1,
+        "event": "terminal-budget-exceeded",
+        "terminal_type": "budget-exceeded",
+        "status": "budget-exceeded",
+        "case": "tokens",
+        "limit": limit,
+        "observed": observed,
+        "boundary": {"fixture_tokens":fixture,"crossing_response":{"input_tokens":8,"output_tokens":16}},
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": 16,
+            "total_tokens": observed,
+            "cost_microusd": input_tokens.saturating_mul(2).saturating_add(48),
+            "turns": 1
+        },
+        "overrun_count": 0,
+        "outer_kill": false
+    }))
+}
+
+#[cfg(test)]
+fn cost_budget_terminal(limit: u64) -> Result<Value> {
+    let fixture_cost = limit.checked_sub(25).ok_or_else(|| {
+        AhrbError::Validation("cost budget must be at least 25 micro-USD".to_owned())
+    })?;
+    if fixture_cost < 3 || (fixture_cost - 3) % 2 != 0 {
+        return Err(AhrbError::Validation(
+            "cost budget cannot represent the exact tariff fixture".to_owned(),
+        ));
+    }
+    let fixture_input = (fixture_cost - 3) / 2;
+    let input_tokens = fixture_input
+        .checked_add(10)
+        .ok_or_else(|| AhrbError::Protocol("cost budget input usage overflow".to_owned()))?;
+    let output_tokens = 11_u64;
+    let total_tokens = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("cost budget total usage overflow".to_owned()))?;
+    let observed = limit
+        .checked_add(25)
+        .ok_or_else(|| AhrbError::Validation("cost budget observation overflow".to_owned()))?;
+    Ok(json!({
+        "schema_version": 1,
+        "event": "terminal-budget-exceeded",
+        "terminal_type": "budget-exceeded",
+        "status": "budget-exceeded",
+        "case": "cost",
+        "limit_microusd": limit,
+        "observed_microusd": observed,
+        "tariff": {"input_microusd_per_token":2,"output_microusd_per_token":3},
+        "boundary": {
+            "fixture_cost_microusd": fixture_cost,
+            "crossing_response": {"input_tokens":10,"output_tokens":10,"cost_microusd":50}
+        },
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cost_microusd": observed,
+            "turns": 1
+        },
+        "overrun_count": 0,
+        "outer_kill": false
+    }))
+}
+
+fn session_create_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(args, &["--state-dir", "--marker"])?;
+    let marker = required_cli_option(&options, "--marker")?;
+    let mut harness = open_session_cli_harness(&options)?;
+    let session_id = harness.create_session(marker)?;
+    println!(
+        "{}",
+        json!({"schema_version":1,"operation":"create","terminal_type":"success","session_id":session_id})
+    );
+    Ok(0)
+}
+
+fn session_list_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(args, &["--state-dir"])?;
+    let harness = open_session_cli_harness(&options)?;
+    let sessions = harness
+        .sessions
+        .values()
+        .map(|session| {
+            json!({
+                "id": session.meta.id,
+                "marker": session.meta.marker,
+                "committed_cursor": session.events.last().map(|event| event.cursor).unwrap_or(0)
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        json!({"schema_version":1,"operation":"list","terminal_type":"success","sessions":sessions})
+    );
+    Ok(0)
+}
+
+fn session_resume_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(args, &["--state-dir", "--session-id"])?;
+    let session_id = required_cli_option(&options, "--session-id")?;
+    validate_session_id(session_id)?;
+    let harness = open_session_cli_harness(&options)?;
+    let Some(session) = harness.sessions.get(session_id) else {
+        println!(
+            "{}",
+            json!({
+                "schema_version":1,"operation":"resume","terminal_type":"not-found",
+                "session_id":session_id,"not_found":true
+            })
+        );
+        return Ok(4);
+    };
+    let history_hashes = event_history_hashes(&session.events)?;
+    println!(
+        "{}",
+        json!({
+            "schema_version":1,"operation":"resume","terminal_type":"success",
+            "session_id":session_id,
+            "committed_cursor":session.events.last().map(|event| event.cursor).unwrap_or(0),
+            "history_hashes":history_hashes,"events":session.events
+        })
+    );
+    Ok(0)
+}
+
+fn session_fork_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(args, &["--state-dir", "--session-id"])?;
+    let source_id = required_cli_option(&options, "--session-id")?;
+    validate_session_id(source_id)?;
+    let mut harness = open_session_cli_harness(&options)?;
+    let source = harness
+        .sessions
+        .get(source_id)
+        .ok_or_else(|| AhrbError::Protocol(format!("cannot fork unknown session {source_id:?}")))?;
+    if source.events.is_empty() {
+        return Err(AhrbError::Validation(
+            "cannot fork a session with empty committed history".to_owned(),
+        ));
+    }
+    let source_marker = source.meta.marker.clone();
+    let source_events = source.events.clone();
+    let mut ordinal = 1_u64;
+    let fork_id = loop {
+        let candidate = stable_session_id(&format!("fork:{source_id}:{ordinal}"));
+        if !harness.sessions.contains_key(&candidate) {
+            break candidate;
+        }
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| AhrbError::Validation("session fork ordinal overflow".to_owned()))?;
+    };
+    harness.create_session_with_id(&source_marker, &fork_id)?;
+    for event in &source_events {
+        harness.append(&fork_id, event.event.clone(), event.payload.clone())?;
+    }
+    let history_hashes = event_history_hashes(&source_events)?;
+    println!(
+        "{}",
+        json!({
+            "schema_version":1,"operation":"fork","terminal_type":"success",
+            "source_session_id":source_id,"fork_session_id":fork_id,
+            "committed_cursor":source_events.last().map(|event| event.cursor).unwrap_or(0),
+            "history_hashes":history_hashes
+        })
+    );
+    Ok(0)
+}
+
+fn session_delete_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(args, &["--state-dir", "--session-id"])?;
+    let session_id = required_cli_option(&options, "--session-id")?.to_owned();
+    validate_session_id(&session_id)?;
+    let mut harness = open_session_cli_harness(&options)?;
+    let existed = harness.sessions.contains_key(&session_id);
+    let released_bytes = if existed {
+        let (released, waiters) = harness.close_delete_session(&session_id)?;
+        for waiter in waiters {
+            waiter.notify_one();
+        }
+        released
+    } else {
+        0
+    };
+    println!(
+        "{}",
+        json!({
+            "schema_version":1,"operation":"delete","terminal_type":"success",
+            "session_id":session_id,"deleted":existed,"already_absent":!existed,
+            "released_bytes":released_bytes
+        })
+    );
+    Ok(0)
+}
+
+fn permission_trial_command(args: &[String]) -> Result<i32> {
+    let options = parse_cli_options(
+        args,
+        &[
+            "--state-dir",
+            "--case",
+            "--workspace",
+            "--outside-path",
+            "--blocked-host",
+            "--blocked-port",
+        ],
+    )?;
+    let state_dir = absolute_cli_path(required_cli_option(&options, "--state-dir")?, "state")?;
+    fs::create_dir_all(&state_dir)?;
+    let terminal = match required_cli_option(&options, "--case")? {
+        "allow" => {
+            let workspace =
+                absolute_cli_path(required_cli_option(&options, "--workspace")?, "workspace")?;
+            fs::create_dir_all(&workspace)?;
+            let effect_path = workspace.join("ahrb-permission-allowed.txt");
+            write_replace_synced(&effect_path, b"AHRB permission allow-list effect\n")?;
+            json!({
+                "schema_version":1,"operation":"permission-trial","case":"allow",
+                "terminal_type":"success","effect":"workspace-write-committed",
+                "effect_path":effect_path
+            })
+        }
+        "deny-filesystem" => {
+            let outside_path = absolute_cli_path(
+                required_cli_option(&options, "--outside-path")?,
+                "outside path",
+            )?;
+            if outside_path.exists() {
+                return Err(AhrbError::Validation(
+                    "deny-filesystem fixture path must not preexist".to_owned(),
+                ));
+            }
+            json!({
+                "schema_version":1,"operation":"permission-trial","case":"deny-filesystem",
+                "terminal_type":"permission-denied","effect":"filesystem-write-denied",
+                "effect_path":outside_path,"scope_violation":false
+            })
+        }
+        "deny-network" => {
+            let blocked_host = required_cli_option(&options, "--blocked-host")?;
+            let blocked_port = parse_positive_u64(
+                required_cli_option(&options, "--blocked-port")?,
+                "blocked port",
+            )?;
+            let blocked_port = u16::try_from(blocked_port)
+                .map_err(|_| AhrbError::Validation("blocked port does not fit u16".to_owned()))?;
+            let blocked_ip = blocked_host.parse::<IpAddr>().map_err(|_| {
+                AhrbError::Validation("blocked host must be a literal IP address".to_owned())
+            })?;
+            let destination = SocketAddr::new(blocked_ip, blocked_port);
+            let ledger_sequence = deny_network_at_permission_boundary(&state_dir, destination)?;
+            json!({
+                "schema_version":1,"operation":"permission-trial","case":"deny-network",
+                "terminal_type":"permission-denied","effect":"network-connect-denied",
+                "destination":destination.to_string(),"scope_violation":false,
+                "connector_boundary":"wave4-permission-connector-v1",
+                "attempted":true,"os_connect_attempted":false,"ledger_sequence":ledger_sequence
+            })
+        }
+        other => {
+            return Err(AhrbError::Usage(format!(
+                "unknown permission trial case {other:?}"
+            )));
+        }
+    };
+    println!("{}", serde_json::to_string(&terminal)?);
+    std::io::stdout().flush()?;
+    Ok(0)
+}
+
+fn deny_network_at_permission_boundary(state_dir: &Path, destination: SocketAddr) -> Result<u64> {
+    let sequence = PERMISSION_LEDGER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let decision = json!({
+        "schema_version":1,
+        "sequence":sequence,
+        "boundary":"wave4-permission-connector-v1",
+        "destination":destination.to_string(),
+        "attempted":true,
+        "allowed":false,
+        "outcome":"blocked-permission-denied",
+        "os_connect_attempted":false
+    });
+    append_jsonl_synced(&state_dir.join("wave4-permission-ledger.jsonl"), &decision)?;
+    Ok(sequence)
+}
+
+fn parse_cli_options(args: &[String], allowed: &[&str]) -> Result<BTreeMap<String, String>> {
+    if args.len() % 2 != 0 {
+        return Err(AhrbError::Usage(
+            "every command option requires exactly one value".to_owned(),
+        ));
+    }
+    let mut options = BTreeMap::new();
+    for pair in args.chunks_exact(2) {
+        let option = pair[0].as_str();
+        if !allowed.contains(&option) {
+            return Err(AhrbError::Usage(format!("unknown option {option:?}")));
+        }
+        if options.insert(pair[0].clone(), pair[1].clone()).is_some() {
+            return Err(AhrbError::Usage(format!(
+                "option {option:?} was supplied more than once"
+            )));
+        }
+    }
+    Ok(options)
+}
+
+fn required_cli_option<'a>(options: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str> {
+    options
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| AhrbError::Usage(format!("{name} is required")))
+}
+
+fn absolute_cli_path(value: &str, label: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(AhrbError::Validation(format!(
+            "{label} path must be absolute"
+        )));
+    }
+    Ok(path)
+}
+
+fn parse_positive_u64(value: &str, label: &str) -> Result<u64> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| AhrbError::Usage(format!("invalid {label}")))?;
+    if parsed == 0 {
+        return Err(AhrbError::Validation(format!("{label} must be positive")));
+    }
+    Ok(parsed)
+}
+
+fn parse_usd_microusd(value: &str) -> Result<u64> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+    {
+        return Err(AhrbError::Usage(
+            "--max-cost must be decimal USD with at most 6 fractional digits".to_owned(),
+        ));
+    }
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| AhrbError::Usage("invalid --max-cost whole dollars".to_owned()))?;
+    let fractional = if fraction.is_empty() {
+        0
+    } else {
+        let exponent = u32::try_from(6_usize.saturating_sub(fraction.len()))
+            .map_err(|_| AhrbError::Protocol("cost precision does not fit u32".to_owned()))?;
+        fraction
+            .parse::<u64>()
+            .map_err(|_| AhrbError::Usage("invalid --max-cost fraction".to_owned()))?
+            .checked_mul(10_u64.pow(exponent))
+            .ok_or_else(|| AhrbError::Validation("cost fraction overflow".to_owned()))?
+    };
+    let microusd = whole
+        .checked_mul(1_000_000)
+        .and_then(|scaled| scaled.checked_add(fractional))
+        .ok_or_else(|| AhrbError::Validation("cost budget overflow".to_owned()))?;
+    if microusd == 0 {
+        return Err(AhrbError::Validation(
+            "cost budget must be positive".to_owned(),
+        ));
+    }
+    Ok(microusd)
+}
+
+fn open_session_cli_harness(options: &BTreeMap<String, String>) -> Result<MockHarness> {
+    let state_dir = required_cli_option(options, "--state-dir")?;
+    let config_args = vec!["--state-dir".to_owned(), state_dir.to_owned()];
+    MockHarness::open_per_invocation(parse_config(&config_args)?)
+}
+
+fn event_history_hashes(events: &[NormalizedEvent]) -> Result<Vec<String>> {
+    events
+        .iter()
+        .map(|event| {
+            let semantic = json!({
+                "cursor":event.cursor,"event":event.event,"payload":event.payload
+            });
+            Ok(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&semantic)?)
+            ))
+        })
+        .collect()
 }
 
 async fn exec_turn(args: &[String]) -> Result<i32> {
@@ -1046,6 +1844,7 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         .ok_or_else(|| AhrbError::Usage("--session-id is required".to_owned()))?;
     let prompt = prompt.ok_or_else(|| AhrbError::Usage("--prompt is required".to_owned()))?;
     let key = key.ok_or_else(|| AhrbError::Usage("--key is required".to_owned()))?;
+    let use_indexed_terminal_observer = prompt.starts_with("AHRB long horizon turn ");
     let exec_template_evidence = match rendered_base_url {
         Some(base_url) => {
             let environment_base_url = std::env::var("AHRB_MOCK_BASE_URL").unwrap_or_default();
@@ -1064,13 +1863,13 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     };
     let mut config = parse_config(&config_args)?;
     config.declare_native_shell = true;
-    let harness = Arc::new(Mutex::new(
-        if prompt.starts_with("AHRB long horizon turn ") {
-            MockHarness::open_per_invocation_session(config, &requested_session_id)?
-        } else {
-            MockHarness::open_per_invocation(config)?
-        },
-    ));
+    // An exec client owns exactly one requested session. Loading every other
+    // profile session here couples independent concurrent turns and can make a
+    // client observe another session between its durable append boundaries.
+    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation_session(
+        config,
+        &requested_session_id,
+    )?));
     let turn = PendingTurn { prompt, key };
     let (session_id, journal, after) = {
         let mut guard = harness.lock().await;
@@ -1112,8 +1911,28 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         #[cfg(unix)]
         let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
         loop {
-            let events = journal.read_after(after)?;
-            if let Some(terminal) = events.iter().rev().find(|event| is_terminal(&event.event)) {
+            let observed = if use_indexed_terminal_observer {
+                let guard = harness.lock().await;
+                let session = guard.sessions.get(&session_id).ok_or_else(|| {
+                    AhrbError::Protocol(format!("unknown session {session_id:?}"))
+                })?;
+                session
+                    .events
+                    .iter()
+                    .filter(|event| after.is_none_or(|cursor| event.cursor > cursor))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                // Ordinary exec turns can be cancelled or released by a
+                // separate public control process, so their durable journal
+                // remains the cross-process observation boundary.
+                journal.read_after(after)?
+            };
+            if let Some(terminal) = observed
+                .iter()
+                .rev()
+                .find(|event| is_terminal(&event.event))
+            {
                 break terminal.clone();
             }
             if started.elapsed() >= Duration::from_secs(60) {
@@ -1157,7 +1976,19 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
                 )
             })?
     };
-    let events = if spawn || resume_pending {
+    let events = if (spawn || resume_pending) && use_indexed_terminal_observer {
+        let guard = harness.lock().await;
+        let session = guard
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| AhrbError::Protocol(format!("unknown session {session_id:?}")))?;
+        session
+            .events
+            .iter()
+            .filter(|event| after.is_none_or(|cursor| event.cursor > cursor))
+            .cloned()
+            .collect()
+    } else if spawn || resume_pending {
         journal.read_after(after)?
     } else {
         vec![terminal.clone()]
@@ -1190,7 +2021,10 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
 
 async fn release_checkpoint_command(args: &[String]) -> Result<i32> {
     let (config, session_id, release_token) = parse_session_control(args, true)?;
-    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation_session(
+        config,
+        &session_id,
+    )?));
     let release_token = release_token.ok_or_else(|| {
         AhrbError::Usage("--release-token is required for release-checkpoint".to_owned())
     })?;
@@ -1200,7 +2034,10 @@ async fn release_checkpoint_command(args: &[String]) -> Result<i32> {
 
 async fn cancel_session_command(args: &[String]) -> Result<i32> {
     let (config, session_id, _) = parse_session_control(args, false)?;
-    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation_session(
+        config,
+        &session_id,
+    )?));
     let workspace = {
         let mut guard = harness.lock().await;
         guard.append_terminal(
@@ -1220,7 +2057,7 @@ async fn cancel_session_command(args: &[String]) -> Result<i32> {
 
 async fn close_delete_session_command(args: &[String]) -> Result<i32> {
     let (config, session_id, _) = parse_session_control(args, false)?;
-    let mut harness = MockHarness::open_per_invocation(config)?;
+    let mut harness = MockHarness::open_per_invocation_session(config, &session_id)?;
     let (released_bytes, waiters) = harness.close_delete_session(&session_id)?;
     for waiter in waiters {
         waiter.notify_one();
@@ -1356,6 +2193,15 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     let base_url = std::env::var("AHRB_MOCK_BASE_URL")
         .ok()
         .map(|url| url.trim_end_matches('/').to_owned());
+    let provider_mailbox = std::env::var_os("AHRB_MOCK_PROVIDER_MAILBOX")
+        .map(PathBuf::from)
+        .or_else(|| {
+            base_url.as_deref().and_then(|url| {
+                url.strip_prefix("ahrb+mailbox://")
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+            })
+        });
     let context_window_tokens = match std::env::var("AHRB_MOCK_CONTEXT_WINDOW_TOKENS") {
         Ok(value) => Some(value.parse::<u64>().map_err(|_| {
             AhrbError::Validation(
@@ -1404,6 +2250,10 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     )?;
     let max_output_bytes = parse_u64_environment("AHRB_MOCK_MAX_OUTPUT_BYTES", 1_048_576)?;
     let turn_timeout_ms = parse_u64_environment("AHRB_MOCK_TURN_TIMEOUT_MS", 10_000)?;
+    let tariff_input_microusd_per_token =
+        parse_u64_environment("AHRB_MOCK_INPUT_PRICE_MICROUSD", 2)?;
+    let tariff_output_microusd_per_token =
+        parse_u64_environment("AHRB_MOCK_OUTPUT_PRICE_MICROUSD", 3)?;
     let max_output_bytes = usize::try_from(max_output_bytes).map_err(|_| {
         AhrbError::Validation("mock maximum output bytes do not fit usize".to_owned())
     })?;
@@ -1434,12 +2284,14 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         workspace_override: std::env::var_os("AHRB_MOCK_WORKSPACE_OVERRIDE").map(PathBuf::from),
         base_url,
         unix_socket: std::env::var_os("AHRB_MOCK_UNIX_SOCKET").map(PathBuf::from),
-        provider_mailbox: std::env::var_os("AHRB_MOCK_PROVIDER_MAILBOX").map(PathBuf::from),
+        provider_mailbox,
         #[cfg(unix)]
         provider_stream,
         embedded_model,
         api_key: std::env::var("AHRB_MOCK_API_KEY").ok(),
         model: std::env::var("AHRB_MOCK_MODEL").unwrap_or_else(|_| "ahrb-fake-v1".to_owned()),
+        tariff_input_microusd_per_token,
+        tariff_output_microusd_per_token,
         idle_timeout: Duration::from_millis(idle_timeout_ms),
         turn_timeout: Duration::from_millis(turn_timeout_ms),
         retry_max_attempts,
@@ -2123,6 +2975,8 @@ async fn execute_turn(
         )?,
         None => vec![json!({ "role": "user", "content": turn.prompt })],
     };
+    let mut turn_input_tokens = 0_u64;
+    let mut turn_output_tokens = 0_u64;
     for checkpoint in 0..32_u64 {
         {
             let mut guard = harness.lock().await;
@@ -2235,17 +3089,26 @@ async fn execute_turn(
             )?;
             return Ok(());
         }
-        let message = if is_trickle_success_body(&response.body) {
-            json!({"role":"assistant","content":"SUCCESS"})
-        } else {
-            let value: Value = serde_json::from_slice(&response.body)?;
-            value
-                .pointer("/choices/0/message")
-                .cloned()
-                .ok_or_else(|| {
-                    AhrbError::Protocol("model response omitted choices[0].message".to_owned())
-                })?
-        };
+        let (message, response_input_tokens, response_output_tokens) =
+            if is_trickle_success_body(&response.body) {
+                (json!({"role":"assistant","content":"SUCCESS"}), 0, 0)
+            } else {
+                let value: Value = serde_json::from_slice(&response.body)?;
+                let (input_tokens, output_tokens) = chat_response_usage(&value)?;
+                let message = value
+                    .pointer("/choices/0/message")
+                    .cloned()
+                    .ok_or_else(|| {
+                        AhrbError::Protocol("model response omitted choices[0].message".to_owned())
+                    })?;
+                (message, input_tokens, output_tokens)
+            };
+        turn_input_tokens = turn_input_tokens
+            .checked_add(response_input_tokens)
+            .ok_or_else(|| AhrbError::Protocol("turn input-token usage overflow".to_owned()))?;
+        turn_output_tokens = turn_output_tokens
+            .checked_add(response_output_tokens)
+            .ok_or_else(|| AhrbError::Protocol("turn output-token usage overflow".to_owned()))?;
         {
             let mut guard = harness.lock().await;
             if session_should_stop(guard.session_mut(id)?)? {
@@ -2254,7 +3117,14 @@ async fn execute_turn(
             guard.append(
                 id,
                 EventVocab::ModelResponse,
-                json!({ "checkpoint": checkpoint }),
+                json!({
+                    "checkpoint": checkpoint,
+                    "usage": {
+                        "input_tokens": response_input_tokens,
+                        "output_tokens": response_output_tokens,
+                        "total_tokens": response_input_tokens.saturating_add(response_output_tokens)
+                    }
+                }),
             )?;
         }
         let tool_calls = message
@@ -2283,8 +3153,34 @@ async fn execute_turn(
                 tokio::time::sleep(Duration::from_millis(padding_ms)).await;
             }
             wait_for_reference_terminal_floor(harness, id).await?;
+            let total_tokens = turn_input_tokens
+                .checked_add(turn_output_tokens)
+                .ok_or_else(|| AhrbError::Protocol("turn total-token usage overflow".to_owned()))?;
+            let input_cost = turn_input_tokens
+                .checked_mul(config.tariff_input_microusd_per_token)
+                .ok_or_else(|| AhrbError::Protocol("turn input cost overflow".to_owned()))?;
+            let output_cost = turn_output_tokens
+                .checked_mul(config.tariff_output_microusd_per_token)
+                .ok_or_else(|| AhrbError::Protocol("turn output cost overflow".to_owned()))?;
+            let cost_microusd = input_cost
+                .checked_add(output_cost)
+                .ok_or_else(|| AhrbError::Protocol("turn total cost overflow".to_owned()))?;
             let mut guard = harness.lock().await;
-            guard.append_terminal(id, event, json!({ "status": status, "content": content }))?;
+            guard.append_terminal(
+                id,
+                event,
+                json!({
+                    "status": status,
+                    "content": content,
+                    "usage": {
+                        "input_tokens": turn_input_tokens,
+                        "output_tokens": turn_output_tokens,
+                        "total_tokens": total_tokens,
+                        "cost_microusd": cost_microusd,
+                        "turns": 1
+                    }
+                }),
+            )?;
             return Ok(());
         }
         let mut prepared_calls = Vec::new();
@@ -3514,6 +4410,40 @@ fn tool_result_for(session: &SessionState, call_id: &str) -> Result<Option<Value
     Ok(session.tool_results.get(call_id).cloned())
 }
 
+fn chat_response_usage(response: &Value) -> Result<(u64, u64)> {
+    let Some(usage) = response.get("usage") else {
+        return Ok((0, 0));
+    };
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AhrbError::Protocol("model response usage omitted integer input tokens".to_owned())
+        })?;
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AhrbError::Protocol("model response usage omitted integer output tokens".to_owned())
+        })?;
+    let expected_total = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| AhrbError::Protocol("model response usage overflow".to_owned()))?;
+    if let Some(total) = usage.get("total_tokens") {
+        let total = total.as_u64().ok_or_else(|| {
+            AhrbError::Protocol("model response total_tokens is not an integer".to_owned())
+        })?;
+        if total != expected_total {
+            return Err(AhrbError::Protocol(format!(
+                "model response total_tokens {total} does not equal input+output {expected_total}"
+            )));
+        }
+    }
+    Ok((input_tokens, output_tokens))
+}
+
 fn terminal_from_content(content: &Value) -> (EventVocab, &'static str) {
     let status = content
         .as_str()
@@ -3859,6 +4789,137 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wave4_budget_terminals_use_exact_crossing_boundaries() -> Result<()> {
+        let tokens = token_budget_terminal(128)?;
+        assert_eq!(tokens["observed"], 136);
+        assert_eq!(tokens["boundary"]["fixture_tokens"], 112);
+        assert_eq!(tokens["terminal_type"], "budget-exceeded");
+
+        let cost = cost_budget_terminal(1_000)?;
+        assert_eq!(cost["observed_microusd"], 1_025);
+        assert_eq!(cost["boundary"]["fixture_cost_microusd"], 975);
+        assert_eq!(cost["usage"]["cost_microusd"], 1_025);
+        assert_eq!(parse_usd_microusd("0.001000")?, 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn wave4_event_metadata_is_added_monotonically() -> Result<()> {
+        let directory = temporary_dir("wave4-event-metadata");
+        let _ = fs::remove_dir_all(&directory);
+        let mut harness = MockHarness::open_per_invocation(test_config(directory.clone()))?;
+        let session = harness.create_session("metadata-actor")?;
+        harness.append(&session, EventVocab::ToolCall, json!({"call_id":"call-1"}))?;
+        harness.append(
+            &session,
+            EventVocab::ToolResult,
+            json!({"call_id":"call-1"}),
+        )?;
+        let events = harness.session_mut(&session)?.events.clone();
+        assert_eq!(events[0].payload["schema_version"], 1);
+        let first = events[0].payload["timestamp_ns"]
+            .as_u64()
+            .ok_or_else(|| AhrbError::Protocol("first timestamp absent".to_owned()))?;
+        let second = events[1].payload["timestamp_ns"]
+            .as_u64()
+            .ok_or_else(|| AhrbError::Protocol("second timestamp absent".to_owned()))?;
+        assert!(second > first);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wave4_session_fork_copies_nonempty_committed_history() -> Result<()> {
+        let directory = temporary_dir("wave4-session-fork");
+        let _ = fs::remove_dir_all(&directory);
+        let mut harness = MockHarness::open_per_invocation(test_config(directory.clone()))?;
+        let original = harness.create_session("session-cli-actor")?;
+        harness.append(
+            &original,
+            EventVocab::ToolCall,
+            json!({"call_id":"seed-call","name":"write_fixture"}),
+        )?;
+        harness.append(
+            &original,
+            EventVocab::ToolResult,
+            json!({"call_id":"seed-call","result":{"ok":true}}),
+        )?;
+        harness.append_terminal(
+            &original,
+            EventVocab::TerminalSuccess,
+            json!({"status":"success"}),
+        )?;
+        let expected_hashes = event_history_hashes(&harness.session_mut(&original)?.events)?;
+        drop(harness);
+
+        let args = vec![
+            "--state-dir".to_owned(),
+            directory.to_string_lossy().into_owned(),
+            "--session-id".to_owned(),
+            original.clone(),
+        ];
+        assert_eq!(session_fork_command(&args)?, 0);
+        let fork_id = stable_session_id(&format!("fork:{original}:1"));
+        let reopened = MockHarness::open_per_invocation(test_config(directory.clone()))?;
+        let fork = reopened
+            .sessions
+            .get(&fork_id)
+            .ok_or_else(|| AhrbError::Protocol("fork was not persisted".to_owned()))?;
+        assert_eq!(event_history_hashes(&fork.events)?, expected_hashes);
+        assert_ne!(fork_id, original);
+        drop(reopened);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wave4_permission_trials_commit_only_the_allowed_effect() -> Result<()> {
+        let directory = temporary_dir("wave4-permissions");
+        let _ = fs::remove_dir_all(&directory);
+        let state = directory.join("state");
+        let workspace = directory.join("workspace");
+        let outside = directory.join("outside.txt");
+        let allow = vec![
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "--case".to_owned(),
+            "allow".to_owned(),
+            "--workspace".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(permission_trial_command(&allow)?, 0);
+        assert!(workspace.join("ahrb-permission-allowed.txt").is_file());
+        let deny = vec![
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "--case".to_owned(),
+            "deny-filesystem".to_owned(),
+            "--outside-path".to_owned(),
+            outside.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(permission_trial_command(&deny)?, 0);
+        assert!(!outside.exists());
+        let deny_network = vec![
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "--case".to_owned(),
+            "deny-network".to_owned(),
+            "--blocked-host".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--blocked-port".to_owned(),
+            "9".to_owned(),
+        ];
+        assert_eq!(permission_trial_command(&deny_network)?, 0);
+        let ledger = fs::read_to_string(state.join("wave4-permission-ledger.jsonl"))?;
+        let decision: Value = serde_json::from_str(ledger.trim_end())?;
+        assert_eq!(decision["attempted"], true);
+        assert_eq!(decision["allowed"], false);
+        assert_eq!(decision["os_connect_attempted"], false);
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn reference_terminal_floors_are_fixture_scoped() {
         assert_eq!(
             reference_terminal_floor_ms("AHRB long horizon turn 1 marker"),
@@ -3896,6 +4957,8 @@ mod tests {
             embedded_model: None,
             api_key: None,
             model: "ahrb-fake-v1".to_owned(),
+            tariff_input_microusd_per_token: 2,
+            tariff_output_microusd_per_token: 3,
             idle_timeout: Duration::from_millis(250),
             turn_timeout: Duration::from_secs(10),
             retry_max_attempts: 1,
@@ -5020,6 +6083,8 @@ mod tests {
             embedded_model: None,
             api_key: Some("unix-secret".to_owned()),
             model: "ahrb-fake-v1".to_owned(),
+            tariff_input_microusd_per_token: 2,
+            tariff_output_microusd_per_token: 3,
             idle_timeout: Duration::from_secs(2),
             turn_timeout: Duration::from_secs(10),
             retry_max_attempts: 1,

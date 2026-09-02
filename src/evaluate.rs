@@ -257,6 +257,47 @@ pub fn event_stream_reference_envelope(components: [bool; 6]) -> bool {
     passed >= 4 && components[0] && components[1] && components[4]
 }
 
+/// Row 70's exact count-sensitive PASS boundary.
+///
+/// The three effect counts are sums over independent trials, so each must
+/// equal the repetition count rather than merely being nonzero.
+#[allow(clippy::too_many_arguments)]
+pub fn headless_permission_model_passes(
+    score: f64,
+    repetitions: u64,
+    tty_prompts: u64,
+    allowed_effects: u64,
+    denied_filesystem_effects: u64,
+    denied_network_effects: u64,
+    scope_violations: u64,
+) -> bool {
+    score.is_finite()
+        && (0.50..=1.0).contains(&score)
+        && repetitions > 0
+        && allowed_effects == repetitions
+        && denied_filesystem_effects == repetitions
+        && denied_network_effects == repetitions
+        && tty_prompts == 0
+        && scope_violations == 0
+}
+
+/// Row 72's exact non-vacuous, repetition-sensitive PASS boundary.
+pub fn tool_result_role_fidelity_passes(
+    repetitions: u64,
+    checks: u64,
+    violations: u64,
+    plain_user_text_violations: u64,
+    missing_results: u64,
+    duplicate_results: u64,
+) -> bool {
+    repetitions > 0
+        && checks == repetitions.saturating_mul(2)
+        && violations == 0
+        && plain_user_text_violations == 0
+        && missing_results == 0
+        && duplicate_results == 0
+}
+
 fn default_badge_spec_version() -> u32 {
     1
 }
@@ -615,6 +656,22 @@ mod automation_tests {
         assert!(!event_stream_reference_envelope([
             true, false, true, true, true, true
         ]));
+    }
+
+    #[test]
+    fn permission_boundary_requires_exact_trial_counts() {
+        assert!(headless_permission_model_passes(0.50, 5, 0, 5, 5, 5, 0));
+        assert!(!headless_permission_model_passes(0.50, 5, 0, 4, 5, 5, 0));
+        assert!(!headless_permission_model_passes(0.50, 5, 1, 5, 5, 5, 0));
+        assert!(!headless_permission_model_passes(0.25, 5, 0, 5, 5, 5, 0));
+    }
+
+    #[test]
+    fn tool_role_boundary_requires_two_checks_per_repetition() {
+        assert!(tool_result_role_fidelity_passes(5, 10, 0, 0, 0, 0));
+        assert!(!tool_result_role_fidelity_passes(5, 9, 0, 0, 0, 0));
+        assert!(!tool_result_role_fidelity_passes(0, 0, 0, 0, 0, 0));
+        assert!(!tool_result_role_fidelity_passes(5, 10, 1, 0, 0, 0));
     }
 
     #[test]

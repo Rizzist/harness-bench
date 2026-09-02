@@ -222,9 +222,37 @@ paths = ["{{profile}}"]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
 
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "cli"
+argv = ["-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"']
+argv_position = "suffix"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "OPENAI_API_KEY"
+
 [capabilities.required]
 headless = "codex exec --json terminates without an interactive UI"
 sessions = "Codex persists a thread under isolated CODEX_HOME"
 resume = "codex exec resume reopens the prior thread in a fresh process"
+tool_result_role_fidelity = "Responses function_call_output items preserve the native tool-result role"
 
 [capabilities.optional]
+
+# TODO(orchestrator): verify whether `codex exec` accepts the row-65 `--model`
+# and `-c model_providers.ahrb.base_url=...` suffix perturbations after the
+# prompt; otherwise the prefix/suffix carrier schema cannot express their
+# verified pre-prompt positions.
+# TODO(orchestrator): pin complete public create/list/fork/delete argv and the
+# lifecycle JSON pointers before declaring session_ops_cli; `exec resume` alone
+# is insufficient.
+# TODO(orchestrator): pin a mode-0600 Codex-generated auth file containing
+# `{{credential}}`, or revise SPEC-v2 rule 6 for env-only credentials, before
+# declaring secrets_hygiene_on_disk.
+# TODO(orchestrator): pin exact budget, tariff, usage carrier/scope/pointers, and
+# network-denial behavior before declaring rows 66, 67, or the complete row 70.

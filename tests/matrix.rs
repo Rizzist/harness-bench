@@ -4,14 +4,14 @@ use ahrb::scenarios::{PRIORITIZED_ROWS, RequirementKind, all};
 #[test]
 fn matrix_has_implemented_rows_in_exact_order_with_unique_ids() {
     let tests = all();
-    assert_eq!(tests.len(), 64);
+    assert_eq!(tests.len(), 72);
     let rows: Vec<u8> = tests.iter().map(|test| test.row).collect();
-    let expected = (1_u8..=64).collect::<Vec<_>>();
+    let expected = (1_u8..=72).collect::<Vec<_>>();
     assert_eq!(rows, expected);
     let mut ids: Vec<&str> = tests.iter().map(|test| test.id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 64);
+    assert_eq!(ids.len(), 72);
 }
 
 #[test]

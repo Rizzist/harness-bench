@@ -41,14 +41,21 @@ command = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{prof
 timeout_ms = 30000
 
 [sessions]
-create = []
+create = ["target/debug/ahrb-mock-harness", "session-create", "--state-dir", "{{profile}}/state", "--marker", "{{marker}}"]
 submit = []
 attach = []
-resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
+resume = ["target/debug/ahrb-mock-harness", "session-resume", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
+continue_turn = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
 close_delete = ["target/debug/ahrb-mock-harness", "close-delete-session", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
 store_paths = ["{{profile}}/state/sessions"]
-list = []
+list = ["target/debug/ahrb-mock-harness", "session-list", "--state-dir", "{{profile}}/state"]
+fork = ["target/debug/ahrb-mock-harness", "session-fork", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
+delete = ["target/debug/ahrb-mock-harness", "session-delete", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
 id_pointer = "/session_id"
+fork_id_pointer = "/fork_session_id"
+list_array_pointer = "/sessions"
+list_item_id_pointer = "/id"
+delete_missing_semantics = "idempotent-success"
 
 [next_input]
 [agents]
@@ -73,6 +80,19 @@ path = "{{profile}}/state/sessions/{{session_id}}/journal.jsonl"
 id_pointer = "/id"
 cursor_pointer = "/cursor"
 replay_command = ["target/debug/ahrb-mock-harness", "inspect-journal", "--state-dir", "{{profile}}/state", "--session", "{{session_id}}", "--after", "{{cursor}}"]
+
+[events.metadata]
+timestamp_pointer = "/payload/timestamp_ns"
+timestamp_format = "monotonic-ns"
+schema_version_pointer = "/payload/schema_version"
+schema_version_value = "1"
+usage_event = "terminal-success"
+usage_scope = "turn"
+input_tokens_pointer = "/payload/usage/input_tokens"
+output_tokens_pointer = "/payload/usage/output_tokens"
+total_tokens_pointer = "/payload/usage/total_tokens"
+cost_microusd_pointer = "/payload/usage/cost_microusd"
+turns_pointer = "/payload/usage/turns"
 
 [[events.rules]]
 matches = "turn-accepted"
@@ -146,6 +166,18 @@ argv = []
 generated_path = ""
 json_pointer = ""
 
+[resources.budget_controls]
+max_tokens = ["target/debug/ahrb-mock-harness", "budget-trial", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "7000", "--max-tokens", "{{budget_tokens}}"]
+max_cost = ["target/debug/ahrb-mock-harness", "budget-trial", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "7000", "--max-cost", "{{budget_cost_usd}}"]
+max_time = ["target/debug/ahrb-mock-harness", "budget-trial", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "7000", "--max-time-ms", "{{budget_time_ms}}"]
+
+[resources.budget_controls.tariff]
+surface = "environment"
+input_microusd_per_token = 2
+output_microusd_per_token = 3
+input_environment = "AHRB_MOCK_INPUT_PRICE_MICROUSD"
+output_environment = "AHRB_MOCK_OUTPUT_PRICE_MICROUSD"
+
 [input]
 prompt_uses_stdin = false
 
@@ -156,9 +188,28 @@ paths = ["{{profile}}"]
 [capture]
 redact_env = ["AHRB_MOCK_API_KEY"]
 max_bytes = 1048576
+credential_carrier_paths = ["{{profile}}/config/provider.toml"]
 
 [capture.truncation_marker]
 regex = 'TRUNCATED truncated=(?P<truncated>true) original=(?P<original_bytes>[0-9]+) payload=(?P<payload_bytes>[0-9]+) sha256=(?P<sha256>[0-9a-f]{64})'
+
+[permissions]
+mode = "allow-list-and-sandbox"
+allow = ["target/debug/ahrb-mock-harness", "permission-trial", "--state-dir", "{{profile}}/state", "--case", "allow", "--workspace", "{{workspace}}"]
+deny_filesystem = ["target/debug/ahrb-mock-harness", "permission-trial", "--state-dir", "{{profile}}/state", "--case", "deny-filesystem", "--outside-path", "{{outside_path}}"]
+deny_network = ["target/debug/ahrb-mock-harness", "permission-trial", "--state-dir", "{{profile}}/state", "--case", "deny-network", "--blocked-host", "{{blocked_host}}", "--blocked-port", "{{blocked_port}}"]
+
+[capabilities.injection_surface.provider]
+method = "environment"
+environment = "AHRB_MOCK_MODEL"
+
+[capabilities.injection_surface.base_url]
+method = "environment"
+environment = "AHRB_MOCK_BASE_URL"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "AHRB_MOCK_API_KEY"
 
 [capabilities.required]
 headless = "fresh process with closed stdin"
@@ -167,5 +218,11 @@ resume = "exec-turn reopens the fsync-backed session journal"
 durable_journal = "append-only per-session JSONL journal is fsync-backed and replayed after restart"
 cancel_cleanup = "the active one-shot process is terminated and its isolated workspace is removed"
 context_limit_recovery = "fresh resume deterministically compacts while preserving session and tool correlations"
+secrets_hygiene_on_disk = "one exact generated private credential carrier is excluded; all artifacts are scanned"
+tool_result_role_fidelity = "Chat tool results use role=tool with exact call IDs"
 
 [capabilities.optional]
+budget_enforcement = "public headless token/cost/time controls terminate with typed budget-exceeded JSON"
+usage_reporting = "terminal-success events carry exact per-turn token/cost/turn usage"
+session_ops_cli = "public direct argv create/list/resume/fork/delete lifecycle with idempotent delete"
+headless_permission_model = "public allow-list and sandbox trials deny filesystem/network scope without prompting"
