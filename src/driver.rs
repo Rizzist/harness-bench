@@ -2959,6 +2959,11 @@ impl Driver for PerInvocationDriver {
         let prompt = prompt.to_owned();
         let key = key.to_owned();
         Box::pin(async move {
+            // `start` publishes the launcher PID before a resident daemon has
+            // necessarily completed readiness and profile-local initialization,
+            // so resource samplers can include cold startup. Never let the first
+            // thin-client invocation race that initialization boundary.
+            self.await_readiness().await?;
             let persisted = self
                 .sessions
                 .get(&id)
@@ -5838,6 +5843,79 @@ mod tests {
         driver.shutdown().await.expect("stop thin-client driver");
         assert!(driver.owned_pids().is_empty());
         std::fs::remove_dir_all(profile).expect("remove thin-client profile");
+    }
+
+    #[tokio::test]
+    async fn per_invocation_submit_waits_for_daemon_initialization() {
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-thin-client-init-fence-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if profile.exists() {
+            std::fs::remove_dir_all(&profile).expect("remove stale init-fence profile");
+        }
+        let manifest = crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+            .expect("load exec reference manifest");
+        let initialized = profile.join("initialized");
+        let daemon = ManagedDaemonConfig {
+            command: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+            launcher_exits: false,
+            initialize_command: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 0.1".to_owned(),
+            ],
+            initialize_marker: initialized.clone(),
+            environment: BTreeMap::new(),
+            readiness: Probe {
+                kind: "process".to_owned(),
+                target: String::new(),
+                command: Vec::new(),
+                json_pointer_roots: BTreeMap::new(),
+                timeout_ms: 1_000,
+                ..Probe::default()
+            },
+            shutdown_command: Vec::new(),
+            shutdown_result: ShutdownResult::default(),
+            grace: Duration::from_millis(100),
+            log_directory: profile.join("daemon-logs"),
+        };
+        let mut driver = PerInvocationDriver::new(PerInvocationConfig {
+            daemon: Some(daemon),
+            command: vec!["/usr/bin/true".to_owned()],
+            resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
+            close_delete_command: Vec::new(),
+            release_command: Vec::new(),
+            cancel_command: Vec::new(),
+            replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
+            environment: BTreeMap::new(),
+            base_variables: BTreeMap::new(),
+            profile_root: profile.clone(),
+            events: manifest.events,
+            exit: manifest.exit,
+            session_id_pointer: String::new(),
+            run_id_pointer: String::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4_096,
+            gate_launch: false,
+        });
+        driver.start().await.expect("start thin-client driver");
+        assert!(driver.daemon_start.is_some());
+        let session = driver
+            .create_session("init-fence")
+            .await
+            .expect("create init-fence session");
+        driver
+            .submit(&session, "ignored", "turn-1")
+            .await
+            .expect("launch child after daemon initialization");
+        assert!(initialized.is_file());
+        driver.shutdown().await.expect("stop thin-client driver");
+        std::fs::remove_dir_all(profile).expect("remove init-fence profile");
     }
 
     #[tokio::test]

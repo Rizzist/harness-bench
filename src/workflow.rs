@@ -878,6 +878,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_first_checkpoint_keeps_later_checkpoint_non_primary() -> Result<()> {
+        let mut scripted = workflow();
+        scripted.responses.push(ScriptedResponse {
+            scenario: "scenario".to_owned(),
+            actor: "a".to_owned(),
+            checkpoint: "two".to_owned(),
+            request_hash: String::new(),
+            response: Value::String("done again".to_owned()),
+            fault: None,
+            barrier: None,
+        });
+        let machine = WorkflowMachine::new(&scripted)?;
+        let first = RouteMarker::new("scenario", "a", "one")?;
+        let second = RouteMarker::new("scenario", "a", "two")?;
+
+        assert_eq!(
+            machine.recognize(&second).await,
+            TransitionRecognition::NonPrimary
+        );
+        assert!(!machine.accept(&first, "first-hash").await?.retry);
+        assert_eq!(
+            machine.recognize(&second).await,
+            TransitionRecognition::Current
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn barrier_requires_all_declared_actor_states() -> Result<()> {
         let mut workflow = workflow();
         workflow.actors.insert(

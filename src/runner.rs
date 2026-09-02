@@ -9260,6 +9260,7 @@ async fn collect_model_request_efficiency_trials(
             outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
+        driver.await_readiness().await?;
         let mut hygiene_sampler = collect_process_hygiene.then(platform_sampler);
         let daemon_roots = if collect_process_hygiene && !per_invocation {
             let roots = driver.owned_pids();
@@ -9998,6 +9999,7 @@ async fn collect_one_fanout_trial(
         trial_deadline,
     )?;
     driver.start().await?;
+    driver.await_readiness().await?;
     let timing = ResourceTimingPlan::for_profile(ResourceProfile::from(profile));
     #[cfg(target_os = "macos")]
     let sampler_cadence = Duration::from_millis(timing.macos_rusage_cadence_ms);
@@ -10463,6 +10465,7 @@ async fn collect_journal_torn_tail_trials(
             )?;
             stage.set("start source driver");
             source_driver.start().await?;
+            source_driver.await_readiness().await?;
             let actor_name = format!("r53-g{group}");
             let actor = workflow
                 .actors
@@ -10628,6 +10631,7 @@ async fn collect_journal_torn_tail_trials(
                 Duration::from_secs(10),
             )?;
             recovered_driver.start().await?;
+            recovered_driver.await_readiness().await?;
             stage.set("replay recovered committed prefix");
             let recovered = if manifest.transport.kind == TransportKind::Exec {
                 // Per-invocation drivers keep client-side reconstruction
@@ -11872,6 +11876,7 @@ async fn collect_turn_latency_repetition(
         outer_turn_timeout(manifest),
     )?;
     driver.start().await?;
+    driver.await_readiness().await?;
     let session = driver
         .create_session(&format!("{}:row43", workflow.scenario))
         .await?;
@@ -13820,6 +13825,7 @@ async fn collect_time_to_first_model_request_trials(
         )?;
         let daemon_launch_ns = (!per_invocation).then(monotonic_timestamp_ns);
         driver.start().await?;
+        driver.await_readiness().await?;
         let session = driver
             .create_session(&format!("{}:row45", workflow.scenario))
             .await?;
@@ -14385,6 +14391,7 @@ async fn collect_determinism_trials(
             outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
+        driver.await_readiness().await?;
         let mut execution_events = Vec::new();
         for actor_name in ["d63-direct", "d63-tool"] {
             let actor = workflow.actors.get(actor_name).ok_or_else(|| {
@@ -15293,6 +15300,7 @@ async fn collect_memory_time_integral_trials(
             outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
+        driver.await_readiness().await?;
         let daemon_roots = if per_invocation {
             Vec::new()
         } else {
