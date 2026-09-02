@@ -22924,6 +22924,17 @@ fn validate_recovered_suffix(
                 // the harness journal and therefore cannot participate in a
                 // durable replay equality check.
                 payload.remove("_ahrb_receipt");
+                // `_ahrb_source_raw` retains the verbatim harness event for
+                // evidence only; the durable-replay equality must compare the
+                // NORMALIZED durable content (event kind/id/cursor + the
+                // normalized payload), not raw bytes. Harnesses legitimately add
+                // carrier-derived fields to the live raw event that the replay
+                // path reconstructs without (verified haider 0.0.968/0.0.969:
+                // the live durable terminal's raw payload carries
+                // `terminal_kind`/`error_code` while the replay does not) — an
+                // additive change that must NOT abort the run, per the
+                // no-silent-degradation / unmapped-is-additive contract.
+                payload.remove("_ahrb_source_raw");
             }
             if matches!(
                 event.event,
@@ -22953,7 +22964,11 @@ fn validate_recovered_suffix(
         }
         if actual_durable != expected_durable {
             return Err(format!(
-                "journal replay event at suffix index {index} disagrees with the pre-crash durable journal"
+                "journal replay event at suffix index {index} disagrees with the pre-crash durable journal (kind actual={:?} expected={:?}; actual_payload={}; expected_payload={})",
+                actual_durable.event,
+                expected_durable.event,
+                serde_json::to_string(&actual_durable.payload).unwrap_or_default(),
+                serde_json::to_string(&expected_durable.payload).unwrap_or_default(),
             ));
         }
         expected_cursor = expected_cursor.saturating_add(1);
