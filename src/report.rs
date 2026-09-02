@@ -1,5 +1,6 @@
 //! Human-readable, machine-readable, and raw-evidence reports.
 
+use crate::economy::EconomySummary;
 use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
 use crate::manifest::Manifest;
 use crate::process::{ProcIdentity, ProcOwnership, ProcessSample, Sample};
@@ -1193,6 +1194,9 @@ pub struct Report {
     /// Cross-topology headline summary derived from external observations.
     #[serde(default)]
     pub resource_summary: ResourceSummary,
+    /// Third-pillar harness-economy summary. Absent from ordinary v1/v2 runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub economy_summary: Option<EconomySummary>,
     /// Raw resource samples.
     pub samples: Vec<Sample>,
     /// Raw row-46 continuous whole-tree counter samples.
@@ -1332,62 +1336,101 @@ pub fn render_markdown(report: &Report) -> String {
     } else {
         let _ = writeln!(output, "**No badge certified.**\n");
     }
-    let _ = writeln!(output, "| Row | Pillar | Test | Outcome |");
-    let _ = writeln!(output, "|---:|---|---|---|");
-    let mut results: Vec<&TestResult> = report.results.iter().collect();
-    results.sort_by_key(|result| result.row);
-    for result in results {
+    if let Some(summary) = &report.economy_summary {
+        let _ = writeln!(output, "## Harness economy\n");
         let _ = writeln!(
             output,
-            "| {} | {:?} | `{}` | {} |",
-            result.row,
-            result.pillar,
-            result.id,
-            outcome_label(&result.outcome)
+            "Reference tokenizer: `{}` (`{}`, vocabulary SHA-256 `{}`).\n",
+            summary.reference_tokenizer.encoding,
+            summary.reference_tokenizer.version,
+            summary.reference_tokenizer.vocabulary_sha256,
+        );
+        let _ = writeln!(
+            output,
+            "Reference tariff: `${:.2}` per 1M reference request tokens. Completion means **{}**; it is not real-task success.\n",
+            summary.reference_tariff_usd_per_million_tokens, summary.completion_label,
+        );
+        let _ = writeln!(
+            output,
+            "| Harness | Model turns | Total {} | Tool calls / batching factor | Last context {} | Completion | Reference cost | Tokens / completed task |",
+            summary.reference_token_label, summary.reference_token_label,
+        );
+        let _ = writeln!(output, "|---|---:|---:|---:|---:|---|---:|---:|");
+        let tokens_per_task = summary
+            .tokens_per_completed_task
+            .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
+        let _ = writeln!(
+            output,
+            "| `{}` | {} | {} | {} / {:.6} | {} | {} | ${:.8} | {} |\n",
+            report.fingerprint.harness,
+            summary.model_turns,
+            summary.total_reference_tokens,
+            summary.tool_calls,
+            summary.tool_batching_factor,
+            summary.last_context_size_tokens,
+            crate::economy::completion_name(&summary.completion),
+            summary.reference_cost_usd,
+            tokens_per_task,
         );
     }
-    let _ = writeln!(output, "\n## Resource summary\n");
-    let _ = writeln!(
-        output,
-        "`{}`",
-        render_resource_summary(&report.resource_summary)
-    );
-    if !report.resource_metrics.is_empty() {
-        let topology = report
-            .resource_metrics
-            .values()
-            .next()
-            .map(|metric| metric.topology.as_str())
-            .unwrap_or("unknown");
-        let _ = writeln!(output, "\n## Resource metrics — `{topology}`\n");
-        let _ = writeln!(
-            output,
-            "> R-class and marginal β are comparable only within the same topology.\n"
-        );
-        for (name, metric) in &report.resource_metrics {
+    if report.economy_summary.is_none() {
+        let _ = writeln!(output, "| Row | Pillar | Test | Outcome |");
+        let _ = writeln!(output, "|---:|---|---|---|");
+        let mut results: Vec<&TestResult> = report.results.iter().collect();
+        results.sort_by_key(|result| result.row);
+        for result in results {
             let _ = writeln!(
                 output,
-                "- `{name}`: {:.3} (topology: `{}`; profile: `{}`; scope: `{}`)",
-                metric.value, metric.topology, metric.profile, metric.comparison_scope
+                "| {} | {:?} | `{}` | {} |",
+                result.row,
+                result.pillar,
+                result.id,
+                outcome_label(&result.outcome)
             );
         }
-    }
-    let diagnostic_metrics: BTreeMap<_, _> = report
-        .metrics
-        .iter()
-        .filter(|(name, _)| !report.resource_metrics.contains_key(*name))
-        .collect();
-    if !diagnostic_metrics.is_empty() {
-        let _ = writeln!(output, "\n## Automation diagnostics\n");
-        for (name, value) in diagnostic_metrics {
-            let _ = writeln!(output, "- `{name}`: {value:.3}");
+        let _ = writeln!(output, "\n## Resource summary\n");
+        let _ = writeln!(
+            output,
+            "`{}`",
+            render_resource_summary(&report.resource_summary)
+        );
+        if !report.resource_metrics.is_empty() {
+            let topology = report
+                .resource_metrics
+                .values()
+                .next()
+                .map(|metric| metric.topology.as_str())
+                .unwrap_or("unknown");
+            let _ = writeln!(output, "\n## Resource metrics — `{topology}`\n");
+            let _ = writeln!(
+                output,
+                "> R-class and marginal β are comparable only within the same topology.\n"
+            );
+            for (name, metric) in &report.resource_metrics {
+                let _ = writeln!(
+                    output,
+                    "- `{name}`: {:.3} (topology: `{}`; profile: `{}`; scope: `{}`)",
+                    metric.value, metric.topology, metric.profile, metric.comparison_scope
+                );
+            }
         }
-    }
-    if !report.details.is_empty() {
-        let _ = writeln!(output, "\n## Details\n");
-        for (name, value) in &report.details {
-            let rendered = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-            let _ = writeln!(output, "- `{name}`: `{rendered}`");
+        let diagnostic_metrics: BTreeMap<_, _> = report
+            .metrics
+            .iter()
+            .filter(|(name, _)| !report.resource_metrics.contains_key(*name))
+            .collect();
+        if !diagnostic_metrics.is_empty() {
+            let _ = writeln!(output, "\n## Automation diagnostics\n");
+            for (name, value) in diagnostic_metrics {
+                let _ = writeln!(output, "- `{name}`: {value:.3}");
+            }
+        }
+        if !report.details.is_empty() {
+            let _ = writeln!(output, "\n## Details\n");
+            for (name, value) in &report.details {
+                let rendered = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+                let _ = writeln!(output, "- `{name}`: `{rendered}`");
+            }
         }
     }
     let _ = writeln!(output, "\n## Fingerprint\n");

@@ -102,8 +102,28 @@ pub fn parse(args: &[String]) -> Result<Options> {
     })
 }
 
+/// Parse `hbench economy <name>` using the same adapter and output flags.
+pub fn parse_economy(args: &[String]) -> Result<Options> {
+    let options = parse(args)?;
+    if !options.tests.is_empty() {
+        return Err(AhrbError::Usage(
+            "--tests cannot be combined with hbench economy".to_owned(),
+        ));
+    }
+    Ok(options)
+}
+
 /// Resolve, availability-check, and execute the complete matrix.
 pub async fn execute(options: Options) -> Result<i32> {
+    execute_pillar(options, false).await
+}
+
+/// Resolve, availability-check, and execute the isolated economy pillar.
+pub async fn execute_economy(options: Options) -> Result<i32> {
+    execute_pillar(options, true).await
+}
+
+async fn execute_pillar(options: Options, economy: bool) -> Result<i32> {
     let manifest = resolve_bundled_manifest(&options.name).map_err(|error| {
         unavailable_error(
             &options.name,
@@ -124,7 +144,7 @@ pub async fn execute(options: Options) -> Result<i32> {
         };
         return Err(unavailable_error(&options.name, &detail));
     }
-    crate::runner::run(RunOptions {
+    let run_options = RunOptions {
         manifest,
         output: options.output,
         profile: options.profile,
@@ -133,13 +153,17 @@ pub async fn execute(options: Options) -> Result<i32> {
         deadline_secs: options.deadline_secs,
         no_save: options.no_save,
         harness_version: doctor.version,
-    })
-    .await
+    };
+    if economy {
+        crate::runner::run_economy(run_options).await
+    } else {
+        crate::runner::run(run_options).await
+    }
 }
 
 /// One-line command synopsis.
 pub fn usage() -> &'static str {
-    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
+    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy <codex|claude-code|opencode|pi|rick|haider|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
 }
 
 fn unavailable_error(name: &str, detail: &str) -> AhrbError {
@@ -223,6 +247,18 @@ mod tests {
         assert!(!parsed.junit);
         assert_eq!(parsed.deadline_secs, None);
         assert!(!parsed.no_save);
+        Ok(())
+    }
+
+    #[test]
+    fn economy_shorthand_accepts_mock_and_rejects_rows() -> Result<()> {
+        let parsed =
+            parse_economy(&["mock".to_owned(), "--profile".to_owned(), "cert".to_owned()])?;
+        assert_eq!(parsed.name, "mock");
+        assert_eq!(parsed.profile, Profile::Cert);
+        assert!(
+            parse_economy(&["mock".to_owned(), "--tests".to_owned(), "1".to_owned(),]).is_err()
+        );
         Ok(())
     }
 

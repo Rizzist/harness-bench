@@ -3,6 +3,8 @@
 AHRB is a standalone Rust benchmark for coding-agent harnesses. It replaces real model
 inference with deterministic local responses, then checks tool-call correctness,
 functionality, whole-process-tree resources, and unattended automation readiness.
+The separate harness-economy pillar measures how economically a harness drives one
+standardized fake-model task to its scripted terminal.
 
 The benchmark never needs a model credential, database, container, Python runtime, or
 external service. A built-in reference harness exercises the complete pipeline.
@@ -16,6 +18,8 @@ cargo build --locked
 cargo run --locked --bin ahrb -- doctor --manifest adapters/mock/manifest.toml
 cargo run --locked --bin ahrb -- list-tests
 cargo run --locked --bin ahrb -- run --manifest adapters/mock/manifest.toml --profile quick
+cargo run --locked --bin ahrb -- run --pillar economy \
+  --manifest adapters/mock/manifest.toml --profile quick
 ```
 
 The run produces `report.md`, `report.json`, `samples.jsonl`, `processes.jsonl`,
@@ -35,6 +39,19 @@ The `hbench` shorthand accepts the same row selection, for example
 `hbench codex --tests 1-19,30-41`. Run the resource pillar (rows 20-29) on a
 quiet host: its wall-clock and process measurements are intentionally sensitive
 to machine contention.
+
+Run the economy pillar independently with either command form:
+
+```console
+hbench economy mock --profile quick
+ahrb run --pillar economy --manifest adapters/mock/manifest.toml --profile quick
+```
+
+Economy runs use no real inference. They emit a typed `economy_summary` containing
+model turns, total reference request tokens, tool calls and batching factor, peak
+carried context, scripted-terminal completion, and reference cost. Reference-token
+and cost values are deterministic comparison proxies, not provider usage or a bill.
+The complete contract is in [`docs/SPEC-v3-economy.md`](docs/SPEC-v3-economy.md).
 
 ## Deadlines and saved results
 

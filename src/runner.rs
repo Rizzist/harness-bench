@@ -2641,6 +2641,390 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
     }
 }
 
+/// Execute the isolated third-pillar harness-economy task and persist its report.
+pub async fn run_economy(mut options: RunOptions) -> Result<i32> {
+    let manifest = crate::manifest::load(&options.manifest)?;
+    let persistence = crate::results::prepare(&options, &manifest)?;
+    options.output = persistence.output.clone();
+    let deadline_secs = crate::cli::deadline_secs(&options)?;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(deadline_secs),
+        run_economy_inner(options.clone(), manifest, persistence),
+    )
+    .await;
+    let outcome = match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            let detail = format!("economy deadline after {deadline_secs}s");
+            let error = AhrbError::Timeout(detail);
+            crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
+            Err(error)
+        }
+    };
+    let cleanup = ensure_owned_cleanup();
+    match (outcome, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(code), Ok(())) => Ok(code),
+    }
+}
+
+async fn run_economy_inner(
+    options: RunOptions,
+    manifest: Manifest,
+    persistence: crate::results::RunPersistence,
+) -> Result<i32> {
+    let manifest_hash = crate::manifest::hash(&manifest)?;
+    let profile_root = persistence.profile_path.clone();
+    prepare_profile(&manifest, &profile_root)
+        .map_err(|error| AhrbError::Protocol(format!("prepare economy profile: {error}")))?;
+    let workflow = economy_workflow(&manifest)?;
+    workflow.validate()?;
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let (server, model_environment) = start_model(
+        Arc::clone(&engine),
+        &workflow,
+        &profile_root,
+        false,
+        &manifest.fake_model.base_url_env,
+    )
+    .await
+    .map_err(|error| AhrbError::Protocol(format!("start economy fake model: {error}")))?;
+    let mut variables = BTreeMap::from([
+        (
+            "profile".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        ),
+        ("endpoint".to_owned(), String::new()),
+    ]);
+    let hash_prefix = manifest_hash.get(..16).unwrap_or(manifest_hash.as_str());
+    let credential = format!("ahrb-{hash_prefix}-economy-{}", std::process::id());
+    let mut environment = isolated_environment(&manifest, &variables)?;
+    environment.extend(model_environment);
+    environment.insert(
+        manifest.fake_model.credential_env.clone(),
+        credential.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MODEL".to_owned(),
+        manifest.fake_model.model.clone(),
+    );
+    environment.insert(
+        "AHRB_MOCK_MAX_OUTPUT_BYTES".to_owned(),
+        manifest.resources.max_output_bytes.to_string(),
+    );
+    environment.insert(
+        "AHRB_MOCK_TURN_TIMEOUT_MS".to_owned(),
+        manifest.resources.turn_timeout_ms.to_string(),
+    );
+    inject_tariff_environment(&manifest, &mut environment);
+    variables.insert(
+        "base_url".to_owned(),
+        environment
+            .get(&manifest.fake_model.base_url_env)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    variables.insert("credential".to_owned(), credential);
+    variables.insert("model".to_owned(), manifest.fake_model.model.clone());
+    write_generated_files(&manifest, &variables, &profile_root)?;
+    if !manifest.hooks.acceptance.is_empty() {
+        let hook = render_argv(&manifest.hooks.acceptance, &variables)?;
+        environment.insert(
+            "AHRB_MOCK_ACCEPTANCE_HOOK".to_owned(),
+            serde_json::to_string(&hook)?,
+        );
+    }
+    if !manifest.hooks.completion.is_empty() {
+        let hook = render_argv(&manifest.hooks.completion, &variables)?;
+        environment.insert(
+            "AHRB_MOCK_COMPLETION_HOOK".to_owned(),
+            serde_json::to_string(&hook)?,
+        );
+    }
+    let command = if manifest.transport.kind == TransportKind::Exec {
+        manifest.transport.command.clone()
+    } else {
+        render_argv(&manifest.transport.command, &variables)?
+    };
+    let mut driver = make_driver_with_timeout(
+        &manifest,
+        &command,
+        &environment,
+        &variables,
+        &profile_root,
+        false,
+        outer_turn_timeout(&manifest),
+    )?;
+    driver
+        .start()
+        .await
+        .map_err(|error| AhrbError::Protocol(format!("start economy harness driver: {error}")))?;
+    driver.await_readiness().await.map_err(|error| {
+        AhrbError::Protocol(format!("await economy harness readiness: {error}"))
+    })?;
+    let actor = workflow
+        .actors
+        .get("economy")
+        .ok_or_else(|| AhrbError::Protocol("economy workflow actor disappeared".to_owned()))?;
+    let session = driver
+        .create_session(&format!("{}:economy", workflow.scenario))
+        .await?;
+    driver
+        .submit(&session, &actor.prompt, "economy-task")
+        .await?;
+    let (events, collector_timed_out) =
+        match collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(&manifest))
+            .await
+        {
+            Ok(events) => (events, false),
+            Err(AhrbError::Timeout(_)) => {
+                let _ = driver.cancel(&session).await;
+                let events = match tokio::time::timeout(
+                    Duration::from_secs(1),
+                    driver.attach(&session, None),
+                )
+                .await
+                {
+                    Ok(Ok(events)) => events,
+                    Ok(Err(_)) | Err(_) => Vec::new(),
+                };
+                (events, true)
+            }
+            Err(error) => return Err(error),
+        };
+    if manifest.transport.kind == TransportKind::Exec || !manifest.sessions.close_delete.is_empty()
+    {
+        let close_result = driver.close(&session).await;
+        if !collector_timed_out {
+            close_result?;
+        }
+    }
+    driver.shutdown().await?;
+    let lifecycle_notes = driver.lifecycle_notes();
+    server.shutdown().await?;
+    let records = engine.request_records().await;
+    let profile = format!("{:?}", options.profile).to_lowercase();
+    let turn_budget = match options.profile {
+        Profile::Quick => 8,
+        Profile::Cert => 20,
+    };
+    let economy_summary = crate::economy::analyze(
+        &workflow,
+        &records,
+        &events,
+        &profile,
+        turn_budget,
+        collector_timed_out,
+    )?;
+    let workflow_bytes = serde_json::to_vec(&workflow)?;
+    let workflow_sha256 = format!("{:x}", Sha256::digest(workflow_bytes));
+    let mut run_digest = Sha256::new();
+    run_digest.update(manifest_hash.as_bytes());
+    run_digest.update(crate::economy::ECONOMY_TASK_ID.as_bytes());
+    let run_hash = format!("{:x}", run_digest.finalize());
+    let run_prefix = run_hash.get(..16).unwrap_or(run_hash.as_str());
+    let model_requests = records
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let raw_events = events
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let report = Report {
+        schema: 3,
+        spec_version: 3,
+        run_id: format!("ahrb-economy-{run_prefix}"),
+        profile_path: profile_root.to_string_lossy().into_owned(),
+        fingerprint: Fingerprint {
+            harness: manifest.identity.id.clone(),
+            harness_version: persistence.harness_version.clone(),
+            manifest: manifest_hash,
+            workflows: workflow_sha256,
+            fake_model: env!("CARGO_PKG_VERSION").to_owned(),
+            normalizer: env!("CARGO_PKG_VERSION").to_owned(),
+            ahrb_revision: crate::results::ahrb_revision(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            host_memory_bytes: host_memory_bytes(),
+            profile: profile.clone(),
+        },
+        metrics: BTreeMap::from([
+            (
+                "economy.model_turns".to_owned(),
+                economy_summary.model_turns as f64,
+            ),
+            (
+                "economy.total_reference_tokens".to_owned(),
+                economy_summary.total_reference_tokens as f64,
+            ),
+            (
+                "economy.tool_calls".to_owned(),
+                economy_summary.tool_calls as f64,
+            ),
+            (
+                "economy.tool_batching_factor".to_owned(),
+                economy_summary.tool_batching_factor,
+            ),
+            (
+                "economy.last_context_size_tokens".to_owned(),
+                economy_summary.last_context_size_tokens as f64,
+            ),
+            (
+                "economy.reference_cost_usd".to_owned(),
+                economy_summary.reference_cost_usd,
+            ),
+        ]),
+        lifecycle_notes,
+        resource_summary: ResourceSummary {
+            topology: manifest.concurrency.topology,
+            profile,
+            comparison_scope: "cross-topology-economy-only".to_owned(),
+            ..ResourceSummary::default()
+        },
+        economy_summary: Some(economy_summary),
+        events: raw_events,
+        model_requests,
+        ..Report::default()
+    };
+    crate::results::persist_report(&persistence, &report, options.junit, false)?;
+    if let Some(summary) = &report.economy_summary {
+        println!("{}", crate::economy::render_summary(summary));
+    }
+    Ok(0)
+}
+
+fn economy_workflow(manifest: &Manifest) -> Result<Workflow> {
+    let scenario = crate::economy::ECONOMY_TASK_ID.to_owned();
+    let actor = "economy".to_owned();
+    let marker = |checkpoint: &str| route_marker(&scenario, &actor, checkpoint);
+    let read_call = |id: &str, path: &str, checkpoint: &str| {
+        mapped_tool_call(
+            manifest,
+            "read",
+            id.to_owned(),
+            json!({"path":path,"route":marker(checkpoint)}),
+        )
+    };
+    let fixture_contents = [
+        (
+            "a",
+            "alpha architecture notes and stable constraints\n".repeat(16),
+        ),
+        (
+            "b",
+            "bravo interface notes and deterministic inputs\n".repeat(16),
+        ),
+        (
+            "c",
+            "charlie verification notes and expected outputs\n".repeat(16),
+        ),
+        (
+            "d",
+            "delta edge cases and bounded failure behavior\n".repeat(16),
+        ),
+        (
+            "e",
+            "echo integration notes and terminal conditions\n".repeat(16),
+        ),
+    ];
+    let bootstrap_calls = fixture_contents
+        .iter()
+        .map(|(suffix, content)| {
+            mapped_tool_call(
+                manifest,
+                "write",
+                format!("economy-bootstrap-{suffix}"),
+                json!({
+                    "path":format!("context-{suffix}.txt"),
+                    "content":content,
+                    "route":marker("context-build")
+                }),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let context_calls = [
+        ("economy-context-a", "context-a.txt"),
+        ("economy-context-b", "context-b.txt"),
+        ("economy-context-c", "context-c.txt"),
+        ("economy-context-d", "context-d.txt"),
+        ("economy-context-e", "context-e.txt"),
+    ]
+    .into_iter()
+    .map(|(id, path)| read_call(id, path, "batch-probe"))
+    .collect::<Result<Vec<_>>>()?;
+    let batch_calls = [
+        ("economy-probe-a", "context-a.txt"),
+        ("economy-probe-c", "context-c.txt"),
+        ("economy-probe-e", "context-e.txt"),
+    ]
+    .into_iter()
+    .map(|(id, path)| read_call(id, path, "edit"))
+    .collect::<Result<Vec<_>>>()?;
+    let edit_call = mapped_tool_call(
+        manifest,
+        "write",
+        "economy-edit".to_owned(),
+        json!({
+            "path":"economy-output.txt",
+            "content":"AHRB economy fixture edit v1\n",
+            "route":marker("verify")
+        }),
+    )?;
+    let verify_call = mapped_tool_call(
+        manifest,
+        "read",
+        "economy-verify".to_owned(),
+        json!({
+            "path":"economy-output.txt",
+            "expected_from_a":"AHRB economy fixture edit v1\n",
+            "route":marker("iterate-one")
+        }),
+    )?;
+    let iterate_one = read_call("economy-iterate-one", "context-b.txt", "iterate-two")?;
+    let iterate_two = read_call("economy-iterate-two", "context-d.txt", "terminal")?;
+    let response = |checkpoint: &str, value: Value| ScriptedResponse {
+        scenario: scenario.clone(),
+        actor: actor.clone(),
+        checkpoint: checkpoint.to_owned(),
+        request_hash: String::new(),
+        response: value,
+        fault: None,
+        barrier: None,
+    };
+    Ok(Workflow {
+        version: WORKFLOW_SCHEMA_VERSION,
+        scenario: scenario.clone(),
+        actors: BTreeMap::from([(
+            actor.clone(),
+            Actor {
+                id: actor.clone(),
+                parent: None,
+                prompt: format!(
+                    "Complete the standardized AHRB harness-economy task exactly as scripted. {}",
+                    marker("bootstrap")
+                ),
+                workspace: "economy".to_owned(),
+            },
+        )]),
+        barriers: BTreeMap::new(),
+        responses: vec![
+            response("bootstrap", json!({"tool_calls":bootstrap_calls})),
+            response("context-build", json!({"tool_calls":context_calls})),
+            response("batch-probe", json!({"tool_calls":batch_calls})),
+            response("edit", json!({"tool_calls":[edit_call]})),
+            response("verify", json!({"tool_calls":[verify_call]})),
+            response("iterate-one", json!({"tool_calls":[iterate_one]})),
+            response("iterate-two", json!({"tool_calls":[iterate_two]})),
+            response("terminal", success_value()),
+        ],
+    })
+}
+
 fn ensure_owned_cleanup() -> Result<()> {
     let survivors = crate::process::cleanup_owned_processes(Duration::from_millis(500))?;
     if survivors.is_empty() {
@@ -5783,6 +6167,7 @@ async fn run_inner(
         control_evidence: state.control_evidence,
         resource_metrics,
         resource_summary,
+        economy_summary: None,
         samples: state.samples,
         memory_time_samples: row46_trials
             .as_ref()

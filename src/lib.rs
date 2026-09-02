@@ -5,6 +5,7 @@ pub mod cli;
 pub mod determinism;
 pub mod diff;
 pub mod driver;
+pub mod economy;
 pub mod error;
 pub mod evaluate;
 pub mod events;

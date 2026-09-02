@@ -13,6 +13,8 @@ pub enum Command {
     },
     /// Execute benchmark scenarios.
     Run(RunOptions),
+    /// Execute the isolated harness-economy task.
+    Economy(RunOptions),
     /// Re-render an existing JSON report.
     Report {
         /// Existing `report.json` path.
@@ -72,7 +74,9 @@ pub fn parse(args: &[String]) -> Result<Command> {
         Some("run") => {
             let values = parse_flags(
                 &args[1..],
-                &["manifest", "output", "profile", "tests", "deadline"],
+                &[
+                    "manifest", "output", "profile", "tests", "deadline", "pillar",
+                ],
                 &["junit", "no-save"],
             )?;
             let profile = match values.get("profile").map(String::as_str).unwrap_or("quick") {
@@ -89,7 +93,18 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 .map(|text| parse_test_rows(text))
                 .transpose()?
                 .unwrap_or_default();
-            Ok(Command::Run(RunOptions {
+            let pillar = values.get("pillar").map(String::as_str).unwrap_or("matrix");
+            if !matches!(pillar, "matrix" | "economy") {
+                return Err(AhrbError::Usage(format!(
+                    "--pillar must be matrix or economy, not {pillar:?}"
+                )));
+            }
+            if pillar == "economy" && !tests.is_empty() {
+                return Err(AhrbError::Usage(
+                    "--tests cannot be combined with --pillar economy".to_owned(),
+                ));
+            }
+            let options = RunOptions {
                 manifest: PathBuf::from(required(&values, "manifest")?),
                 output: values.get("output").map(PathBuf::from).unwrap_or_default(),
                 profile,
@@ -101,7 +116,12 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     .transpose()?,
                 no_save: values.contains_key("no-save"),
                 harness_version: None,
-            }))
+            };
+            if pillar == "economy" {
+                Ok(Command::Economy(options))
+            } else {
+                Ok(Command::Run(options))
+            }
         }
         Some("report") => {
             let values = parse_flags(&args[1..], &["input"], &[])?;
@@ -162,6 +182,7 @@ pub async fn execute(command: Command) -> Result<i32> {
             Ok(if result.ready { 0 } else { 1 })
         }
         Command::Run(options) => crate::runner::run(options).await,
+        Command::Economy(options) => crate::runner::run_economy(options).await,
         Command::Report { input } => {
             let bytes = std::fs::read(input)?;
             let report: crate::report::Report = serde_json::from_slice(&bytes)?;
@@ -353,6 +374,43 @@ mod tests {
         };
         assert_eq!(options.deadline_secs, Some(45));
         Ok(())
+    }
+
+    #[test]
+    fn parses_isolated_economy_pillar() -> Result<()> {
+        let args = [
+            "run",
+            "--pillar",
+            "economy",
+            "--manifest",
+            "mock.toml",
+            "--profile",
+            "cert",
+        ]
+        .map(str::to_owned);
+        let Command::Economy(options) = parse(&args)? else {
+            return Err(AhrbError::Protocol(
+                "economy command was not parsed".to_owned(),
+            ));
+        };
+        assert_eq!(options.profile, Profile::Cert);
+        assert!(options.tests.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn economy_rejects_matrix_row_filters() {
+        let args = [
+            "run",
+            "--pillar",
+            "economy",
+            "--manifest",
+            "mock.toml",
+            "--tests",
+            "1",
+        ]
+        .map(str::to_owned);
+        assert!(parse(&args).is_err());
     }
 
     #[test]

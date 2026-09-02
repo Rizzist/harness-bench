@@ -183,6 +183,18 @@ struct DiffDocument {
     comparison_scope: String,
     rows: Vec<RowDiff>,
     resource_summary_deltas: BTreeMap<String, ResourceDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    economy_summary_deltas: Option<EconomySummaryDiff>,
+}
+
+#[derive(Debug, Serialize)]
+struct EconomySummaryDiff {
+    comparison_scope: String,
+    tokenizer_match: bool,
+    completion_before: Option<String>,
+    completion_after: Option<String>,
+    completion_change: String,
+    values: BTreeMap<String, ResourceDelta>,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +230,10 @@ fn build_document(
     let comparable = comparable_scope(&left, &right);
     let resource_summary_deltas =
         compare_resources(&left_report.raw, &right_report.raw, comparable);
+    let economy_summary_deltas = compare_economy(
+        left_report.parsed.economy_summary.as_ref(),
+        right_report.parsed.economy_summary.as_ref(),
+    );
     Ok((
         DiffDocument {
             schema: 1,
@@ -226,9 +242,110 @@ fn build_document(
             comparison_scope: "within-topology-only".to_owned(),
             rows,
             resource_summary_deltas,
+            economy_summary_deltas,
         },
         gating_regression,
     ))
+}
+
+fn compare_economy(
+    left: Option<&crate::economy::EconomySummary>,
+    right: Option<&crate::economy::EconomySummary>,
+) -> Option<EconomySummaryDiff> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+    let tokenizer_match = left.zip(right).is_some_and(|(left, right)| {
+        left.reference_tokenizer == right.reference_tokenizer
+            && left.reference_tariff_usd_per_million_tokens
+                == right.reference_tariff_usd_per_million_tokens
+    });
+    let fields = [
+        "model_turns",
+        "total_reference_tokens",
+        "tool_calls",
+        "tool_batching_factor",
+        "last_context_size_tokens",
+        "reference_cost_usd",
+        "tokens_per_completed_task",
+    ];
+    let values = fields
+        .into_iter()
+        .map(|field| {
+            let before = left.and_then(|summary| economy_numeric(summary, field));
+            let after = right.and_then(|summary| economy_numeric(summary, field));
+            let delta = if tokenizer_match {
+                numeric_delta(before, after)
+            } else {
+                ResourceDelta {
+                    before,
+                    after,
+                    delta: None,
+                    delta_pct: None,
+                    change: Some("not-comparable-tokenizer-or-tariff".to_owned()),
+                }
+            };
+            (field.to_owned(), delta)
+        })
+        .collect();
+    let completion_before =
+        left.map(|summary| crate::economy::completion_name(&summary.completion).to_owned());
+    let completion_after =
+        right.map(|summary| crate::economy::completion_name(&summary.completion).to_owned());
+    let completion_change = if completion_before == completion_after {
+        "unchanged"
+    } else if completion_before.is_none() {
+        "added"
+    } else if completion_after.is_none() {
+        "removed"
+    } else {
+        "changed"
+    };
+    Some(EconomySummaryDiff {
+        comparison_scope: "cross-topology".to_owned(),
+        tokenizer_match,
+        completion_before,
+        completion_after,
+        completion_change: completion_change.to_owned(),
+        values,
+    })
+}
+
+fn economy_numeric(summary: &crate::economy::EconomySummary, field: &str) -> Option<f64> {
+    match field {
+        "model_turns" => Some(summary.model_turns as f64),
+        "total_reference_tokens" => Some(summary.total_reference_tokens as f64),
+        "tool_calls" => Some(summary.tool_calls as f64),
+        "tool_batching_factor" => Some(summary.tool_batching_factor),
+        "last_context_size_tokens" => Some(summary.last_context_size_tokens as f64),
+        "reference_cost_usd" => Some(summary.reference_cost_usd),
+        "tokens_per_completed_task" => summary.tokens_per_completed_task.map(|value| value as f64),
+        _ => None,
+    }
+}
+
+fn numeric_delta(before: Option<f64>, after: Option<f64>) -> ResourceDelta {
+    if let (Some(before_value), Some(after_value)) = (before, after) {
+        ResourceDelta {
+            before,
+            after,
+            delta: Some(after_value - before_value),
+            delta_pct: Some(if before_value == 0.0 {
+                None
+            } else {
+                Some(100.0 * (after_value - before_value) / before_value)
+            }),
+            change: None,
+        }
+    } else {
+        ResourceDelta {
+            before,
+            after,
+            delta: None,
+            delta_pct: None,
+            change: Some("unavailable".to_owned()),
+        }
+    }
 }
 
 fn compare_rows(left: &[TestResult], right: &[TestResult]) -> Result<(Vec<RowDiff>, bool)> {
@@ -603,6 +720,7 @@ fn row_measurement_complete(value: &serde_json::Value, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::economy::{EconomyCompletion, EconomySummary, ReferenceTokenizerPin};
     use crate::evaluate::{Pillar, TestResultMetadata};
 
     fn result(row: u8, id: &str, outcome: TestOutcome) -> TestResult {
@@ -640,6 +758,54 @@ mod tests {
             workflow_sha256: "workflow".to_owned(),
             ahrb_revision: "revision".to_owned(),
         }
+    }
+
+    fn economy(tokens: u64) -> EconomySummary {
+        EconomySummary {
+            schema: 1,
+            task: "economy-test".to_owned(),
+            profile: "quick".to_owned(),
+            turn_budget: 8,
+            reference_tokenizer: ReferenceTokenizerPin {
+                encoding: "reference".to_owned(),
+                version: "v1".to_owned(),
+                vocabulary_sha256: "0".repeat(64),
+                vocabulary_entries: 256,
+            },
+            reference_token_label: "reference tokens".to_owned(),
+            model_turns: 8,
+            total_reference_tokens: tokens,
+            tool_calls: 17,
+            tool_results: 17,
+            tool_result_requests: 7,
+            tool_batching_factor: 17.0 / 7.0,
+            last_context_size_tokens: tokens / 2,
+            completion: EconomyCompletion::Completed,
+            completion_label: "followed scripted terminal".to_owned(),
+            reference_tariff_usd_per_million_tokens: 10.0,
+            reference_cost_usd: tokens as f64 * 10.0 / 1_000_000.0,
+            tokens_per_completed_task: Some(tokens),
+        }
+    }
+
+    #[test]
+    fn economy_diff_is_cross_topology_and_pin_guarded() {
+        let before = economy(100);
+        let after = economy(125);
+        let compared = compare_economy(Some(&before), Some(&after)).expect("economy diff");
+        assert_eq!(compared.comparison_scope, "cross-topology");
+        assert!(compared.tokenizer_match);
+        assert_eq!(compared.values["total_reference_tokens"].delta, Some(25.0));
+
+        let mut mismatched = after;
+        mismatched.reference_tokenizer.version = "v2".to_owned();
+        let guarded =
+            compare_economy(Some(&before), Some(&mismatched)).expect("guarded economy diff");
+        assert!(!guarded.tokenizer_match);
+        assert_eq!(
+            guarded.values["total_reference_tokens"].change.as_deref(),
+            Some("not-comparable-tokenizer-or-tariff")
+        );
     }
 
     #[test]
