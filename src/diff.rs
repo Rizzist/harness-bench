@@ -195,6 +195,17 @@ struct EconomySummaryDiff {
     completion_after: Option<String>,
     completion_change: String,
     values: BTreeMap<String, ResourceDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_token_curve: Option<ContextTokenCurveDiff>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextTokenCurveDiff {
+    before: Option<Vec<u64>>,
+    after: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<Vec<f64>>,
+    change: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -268,6 +279,14 @@ fn compare_economy(
         "last_context_size_tokens",
         "reference_cost_usd",
         "tokens_per_completed_task",
+        "cache_eligible_fraction",
+        "redundant_tokens",
+        "context_token_curve_slope",
+        "per_turn_fixed_overhead_tokens",
+        "wasted_tool_call_count",
+        "cache_control_breakpoints",
+        "retry_attempts",
+        "retry_reference_tokens",
     ];
     let values = fields
         .into_iter()
@@ -301,6 +320,7 @@ fn compare_economy(
     } else {
         "changed"
     };
+    let context_token_curve = compare_context_token_curve(left, right, tokenizer_match);
     Some(EconomySummaryDiff {
         comparison_scope: "cross-topology".to_owned(),
         tokenizer_match,
@@ -308,10 +328,69 @@ fn compare_economy(
         completion_after,
         completion_change: completion_change.to_owned(),
         values,
+        context_token_curve,
+    })
+}
+
+fn compare_context_token_curve(
+    left: Option<&crate::economy::EconomySummary>,
+    right: Option<&crate::economy::EconomySummary>,
+    tokenizer_match: bool,
+) -> Option<ContextTokenCurveDiff> {
+    let before = left
+        .filter(|summary| summary.schema >= 2)
+        .map(|summary| summary.context_token_curve.clone());
+    let after = right
+        .filter(|summary| summary.schema >= 2)
+        .map(|summary| summary.context_token_curve.clone());
+    if before.is_none() && after.is_none() {
+        return None;
+    }
+    let (delta, change) = if !tokenizer_match {
+        (None, "not-comparable-tokenizer-or-tariff")
+    } else if let (Some(before), Some(after)) = (&before, &after) {
+        if before.len() == after.len() {
+            (
+                Some(
+                    before
+                        .iter()
+                        .zip(after)
+                        .map(|(before, after)| *after as f64 - *before as f64)
+                        .collect(),
+                ),
+                "comparable",
+            )
+        } else {
+            (None, "different-length")
+        }
+    } else if before.is_none() {
+        (None, "added")
+    } else {
+        (None, "removed")
+    };
+    Some(ContextTokenCurveDiff {
+        before,
+        after,
+        delta,
+        change: change.to_owned(),
     })
 }
 
 fn economy_numeric(summary: &crate::economy::EconomySummary, field: &str) -> Option<f64> {
+    let advanced = matches!(
+        field,
+        "cache_eligible_fraction"
+            | "redundant_tokens"
+            | "context_token_curve_slope"
+            | "per_turn_fixed_overhead_tokens"
+            | "wasted_tool_call_count"
+            | "cache_control_breakpoints"
+            | "retry_attempts"
+            | "retry_reference_tokens"
+    );
+    if advanced && summary.schema < 2 {
+        return None;
+    }
     match field {
         "model_turns" => Some(summary.model_turns as f64),
         "total_reference_tokens" => Some(summary.total_reference_tokens as f64),
@@ -320,6 +399,14 @@ fn economy_numeric(summary: &crate::economy::EconomySummary, field: &str) -> Opt
         "last_context_size_tokens" => Some(summary.last_context_size_tokens as f64),
         "reference_cost_usd" => Some(summary.reference_cost_usd),
         "tokens_per_completed_task" => summary.tokens_per_completed_task.map(|value| value as f64),
+        "cache_eligible_fraction" => Some(summary.cache_eligible_fraction),
+        "redundant_tokens" => Some(summary.redundant_tokens as f64),
+        "context_token_curve_slope" => Some(summary.context_token_curve_slope),
+        "per_turn_fixed_overhead_tokens" => Some(summary.per_turn_fixed_overhead_tokens as f64),
+        "wasted_tool_call_count" => Some(summary.wasted_tool_call_count as f64),
+        "cache_control_breakpoints" => Some(summary.cache_control_breakpoints as f64),
+        "retry_attempts" => Some(summary.retry_attempts as f64),
+        "retry_reference_tokens" => Some(summary.retry_reference_tokens as f64),
         _ => None,
     }
 }
@@ -762,7 +849,7 @@ mod tests {
 
     fn economy(tokens: u64) -> EconomySummary {
         EconomySummary {
-            schema: 1,
+            schema: 2,
             task: "economy-test".to_owned(),
             profile: "quick".to_owned(),
             turn_budget: 8,
@@ -785,6 +872,25 @@ mod tests {
             reference_tariff_usd_per_million_tokens: 10.0,
             reference_cost_usd: tokens as f64 * 10.0 / 1_000_000.0,
             tokens_per_completed_task: Some(tokens),
+            cache_eligible_fraction: 0.5,
+            cache_eligible_fraction_label: "cache upper bound".to_owned(),
+            cache_control_breakpoints: 0,
+            cache_control_breakpoints_per_request: vec![0; 8],
+            cache_control_breakpoints_label: "separate declarations".to_owned(),
+            cache_eligibility_note: "upper bound".to_owned(),
+            redundant_tokens: tokens / 3,
+            redundant_tokens_label: "reference tokens".to_owned(),
+            context_token_curve: vec![tokens / 2, tokens],
+            context_token_curve_slope: tokens as f64 / 2.0,
+            context_token_curve_label: "reference tokens/request".to_owned(),
+            context_token_curve_last_matches_last_context_size: false,
+            per_turn_fixed_overhead_tokens: 10,
+            per_turn_fixed_overhead_tokens_label: "reference tokens".to_owned(),
+            wasted_tool_call_count: 0,
+            wasted_tool_call_count_label: "proven only".to_owned(),
+            retry_attempts: 0,
+            retry_reference_tokens: 0,
+            retry_label: "separate".to_owned(),
         }
     }
 
@@ -796,6 +902,13 @@ mod tests {
         assert_eq!(compared.comparison_scope, "cross-topology");
         assert!(compared.tokenizer_match);
         assert_eq!(compared.values["total_reference_tokens"].delta, Some(25.0));
+        assert_eq!(
+            compared
+                .context_token_curve
+                .as_ref()
+                .and_then(|curve| curve.delta.as_ref()),
+            Some(&vec![12.0, 25.0])
+        );
 
         let mut mismatched = after;
         mismatched.reference_tokenizer.version = "v2".to_owned();

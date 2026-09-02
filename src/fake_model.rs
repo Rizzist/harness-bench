@@ -253,6 +253,27 @@ pub struct ModelRequestEfficiencyEvaluation {
     pub reference_envelope_pass: bool,
 }
 
+/// Count physical retry attempts by semantic request using row 42's attempt-total evidence.
+pub fn retry_attempt_count(records: &[ModelRequestRecord]) -> u64 {
+    let mut semantic_attempts = BTreeMap::new();
+    for record in records {
+        semantic_attempts
+            .entry((
+                record.request.scenario.as_str(),
+                record.request.actor.as_str(),
+                record.request.checkpoint.as_str(),
+                record.semantic_ordinal,
+            ))
+            .and_modify(|total: &mut u64| {
+                *total = (*total).max(record.semantic_attempts_total);
+            })
+            .or_insert(record.semantic_attempts_total);
+    }
+    semantic_attempts.values().fold(0_u64, |total, attempts| {
+        total.saturating_add(attempts.saturating_sub(1))
+    })
+}
+
 /// Aggregate physical request attempts for row 42 without instrumenting the harness path.
 pub fn evaluate_model_request_efficiency(
     records: &[ModelRequestRecord],
@@ -306,23 +327,7 @@ pub fn evaluate_model_request_efficiency_repetitions(
                 )
             ))
     });
-    let mut semantic_attempts = BTreeMap::new();
-    for record in records {
-        semantic_attempts
-            .entry((
-                record.request.scenario.as_str(),
-                record.request.actor.as_str(),
-                record.request.checkpoint.as_str(),
-                record.semantic_ordinal,
-            ))
-            .and_modify(|total: &mut u64| {
-                *total = (*total).max(record.semantic_attempts_total);
-            })
-            .or_insert(record.semantic_attempts_total);
-    }
-    let retry_attempts = semantic_attempts.values().fold(0_u64, |total, attempts| {
-        total.saturating_add(attempts.saturating_sub(1))
-    });
+    let retry_attempts = retry_attempt_count(records);
     let body_sizes = records
         .iter()
         .map(|record| record.body_bytes)

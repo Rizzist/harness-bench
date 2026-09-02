@@ -2820,6 +2820,7 @@ async fn run_economy_inner(
         &profile,
         turn_budget,
         collector_timed_out,
+        &manifest.concurrency.topology,
     )?;
     let workflow_bytes = serde_json::to_vec(&workflow)?;
     let workflow_sha256 = format!("{:x}", Sha256::digest(workflow_bytes));
@@ -2877,6 +2878,34 @@ async fn run_economy_inner(
             (
                 "economy.reference_cost_usd".to_owned(),
                 economy_summary.reference_cost_usd,
+            ),
+            (
+                "economy.cache_eligible_fraction".to_owned(),
+                economy_summary.cache_eligible_fraction,
+            ),
+            (
+                "economy.redundant_tokens".to_owned(),
+                economy_summary.redundant_tokens as f64,
+            ),
+            (
+                "economy.context_token_curve_slope".to_owned(),
+                economy_summary.context_token_curve_slope,
+            ),
+            (
+                "economy.per_turn_fixed_overhead_tokens".to_owned(),
+                economy_summary.per_turn_fixed_overhead_tokens as f64,
+            ),
+            (
+                "economy.wasted_tool_call_count".to_owned(),
+                economy_summary.wasted_tool_call_count as f64,
+            ),
+            (
+                "economy.retry_attempts".to_owned(),
+                economy_summary.retry_attempts as f64,
+            ),
+            (
+                "economy.retry_reference_tokens".to_owned(),
+                economy_summary.retry_reference_tokens as f64,
             ),
         ]),
         lifecycle_notes,

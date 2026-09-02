@@ -1372,6 +1372,57 @@ pub fn render_markdown(report: &Report) -> String {
             summary.reference_cost_usd,
             tokens_per_task,
         );
+        if summary.schema >= 2 {
+            let curve = summary
+                .context_token_curve
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cache_controls = summary
+                .cache_control_breakpoints_per_request
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(output, "### Advanced economy columns\n");
+            let _ = writeln!(
+                output,
+                "| {} | {} | {} + slope | {} | {} |",
+                summary.cache_eligible_fraction_label,
+                summary.redundant_tokens_label,
+                summary.context_token_curve_label,
+                summary.per_turn_fixed_overhead_tokens_label,
+                summary.wasted_tool_call_count_label,
+            );
+            let _ = writeln!(output, "|---:|---:|---|---:|---:|");
+            let _ = writeln!(
+                output,
+                "| {:.6} | {} | [{}] / {:.6} reference tokens/request | {} | {} |\n",
+                summary.cache_eligible_fraction,
+                summary.redundant_tokens,
+                curve,
+                summary.context_token_curve_slope,
+                summary.per_turn_fixed_overhead_tokens,
+                summary.wasted_tool_call_count,
+            );
+            let _ = writeln!(
+                output,
+                "Cache note: {}. {}: {} total; per primary request `[{}]`.\n",
+                summary.cache_eligibility_note,
+                summary.cache_control_breakpoints_label,
+                summary.cache_control_breakpoints,
+                cache_controls,
+            );
+            let _ = writeln!(
+                output,
+                "Curve cross-check (final point equals `last_context_size_tokens`): `{}`. Retries: {} attempts / {} reference tokens. {}.\n",
+                summary.context_token_curve_last_matches_last_context_size,
+                summary.retry_attempts,
+                summary.retry_reference_tokens,
+                summary.retry_label,
+            );
+        }
     }
     if report.economy_summary.is_none() {
         let _ = writeln!(output, "| Row | Pillar | Test | Outcome |");
