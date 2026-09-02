@@ -552,6 +552,9 @@ pub struct LongHorizonObservation {
     pub points: Vec<LongHorizonPoint>,
     /// Number of turns that reached a durable terminal event.
     pub completed_turns: u32,
+    /// Exact external interval for every growing-session turn (row 49).
+    #[serde(default)]
+    pub turns: Vec<crate::report::TurnObservation>,
     /// Every turn mapped to its distinct durable tool-result events.
     pub tool_results_by_turn: BTreeMap<u32, Vec<LongHorizonToolResult>>,
     /// Session created for the long-horizon workload.
@@ -3693,6 +3696,7 @@ mod tests {
                     })
                     .collect(),
                 completed_turns: timing.long_horizon_turns,
+                turns: Vec::new(),
                 tool_results_by_turn,
                 expected_session_id: format!("long-session-{repetition}"),
                 closed_session_id: Some(format!("long-session-{repetition}")),

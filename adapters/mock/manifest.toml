@@ -14,7 +14,7 @@ dialect = "open-ai-chat-completions"
 base_url_env = "AHRB_MOCK_BASE_URL"
 credential_env = "AHRB_MOCK_API_KEY"
 model = "ahrb-fake-v1"
-allowed_paths = ["/v1/chat/completions"]
+allowed_paths = ["/v1/chat/completions", "/v1/models"]
 
 [model_roles.primary]
 model = "ahrb-fake-v1"
@@ -82,7 +82,8 @@ create = ["session.create"]
 submit = ["session.submit"]
 attach = ["session.attach"]
 resume = ["session.resume"]
-close_delete = ["session.close"]
+close_delete = ["session.close-delete"]
+store_paths = ["{{profile}}/state/sessions"]
 list = []
 wait_ready = ["sessions.wait-ready"]
 id_pointer = "/session_id"
@@ -184,6 +185,14 @@ retry_max_delay_ms = 200
 log_paths = []
 journal_paths = []
 
+[resources.context_window]
+surface = "environment"
+tokens = 4096
+environment = "AHRB_MOCK_CONTEXT_WINDOW_TOKENS"
+argv = []
+generated_path = ""
+json_pointer = ""
+
 [input]
 prompt_uses_stdin = true
 
@@ -209,6 +218,7 @@ resume = "accepted turns are reconstructed from the journal"
 steer = "safe-boundary injected input"
 queue = "distinct queued turns"
 durable_journal = "append-only fsync-backed JSONL source of truth"
+context_limit_recovery = "deterministic compaction preserves instructions, goals, and exact tool correlations"
 
 [capabilities.optional]
 parallel_tool_execution = "concurrent fixture calls expose durable reverse-release checkpoints"

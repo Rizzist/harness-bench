@@ -169,6 +169,45 @@ fn capability_resolution_treats_missing_operations_as_unsupported() {
 }
 
 #[test]
+fn context_recovery_core_declaration_must_be_required_not_optional() {
+    let mut optional_only = manifest();
+    let declaration = optional_only
+        .capabilities
+        .required
+        .remove("context_limit_recovery")
+        .expect("mock declares required context recovery");
+    optional_only
+        .capabilities
+        .optional
+        .insert("context_limit_recovery".to_owned(), declaration);
+    assert!(matches!(
+        capability_for_row(&optional_only, 51),
+        CapabilityStatus::Absent(_)
+    ));
+}
+
+#[test]
+fn fanout_width_distinguishes_absent_from_explicitly_insufficient() {
+    let mut missing = manifest();
+    missing.concurrency.max_agents = None;
+    for row in [54, 55] {
+        assert!(matches!(
+            capability_for_row(&missing, row),
+            CapabilityStatus::Absent(_)
+        ));
+    }
+
+    let mut insufficient = manifest();
+    insufficient.concurrency.max_agents = Some(4);
+    for row in [54, 55] {
+        assert!(matches!(
+            capability_for_row(&insufficient, row),
+            CapabilityStatus::Unsupported(_)
+        ));
+    }
+}
+
+#[test]
 fn unsupported_operation_is_nonfatal_but_missing_g2_rows_suppress_v2_badge() {
     let mut reduced_manifest = manifest();
     reduced_manifest

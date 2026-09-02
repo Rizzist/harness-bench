@@ -276,6 +276,7 @@ fn direct_driver(profile: &Path, journal_file: bool, delay_ms: u64) -> PerInvoca
         resume_command: command,
         resume_control_command: Vec::new(),
         recover_probe_command: Vec::new(),
+        close_delete_command: Vec::new(),
         release_command: Vec::new(),
         cancel_command: Vec::new(),
         replay_command: Vec::new(),

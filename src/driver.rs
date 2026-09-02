@@ -8,7 +8,7 @@ use crate::events::{
     EventNormalizer, EventVocab, NATIVE_FIXTURE_METADATA_PREFIX, NormalizedEvent, rule_matches,
 };
 use crate::manifest::{EventMapping, ExitContract, Probe, ShutdownResult};
-use crate::process::ProcIdentity;
+use crate::process::{ProcIdentity, Sample, Sampler};
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,7 +23,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -463,6 +464,46 @@ async fn run_owned_output(
     let mut child = command.spawn()?;
     crate::process::register_child(&child)?;
     wait_owned_output(&mut child, timeout, label).await
+}
+
+fn driver_platform_sampler() -> Box<dyn Sampler> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::process::macos::MacOsSampler::default())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::process::linux::LinuxSampler::default())
+    }
+}
+
+async fn observe_registered_command_tree(
+    pid: u32,
+    finished: Arc<AtomicBool>,
+    command_timeout: Duration,
+    phase: String,
+) -> Result<(Vec<Sample>, Option<Sample>)> {
+    let mut sampler = driver_platform_sampler();
+    let started = std::time::Instant::now();
+    let audit_timeout = command_timeout.saturating_add(Duration::from_secs(2));
+    let mut samples = Vec::new();
+    loop {
+        let tree = sampler.discover(&[pid])?;
+        crate::process::track_process_tree(&tree)?;
+        let current_sample = if tree.members.is_empty() {
+            None
+        } else {
+            Some(sampler.sample(&tree, &phase)?)
+        };
+        samples.extend(current_sample.iter().cloned());
+        if finished.load(Ordering::Acquire) && tree.members.is_empty() {
+            return Ok((samples, None));
+        }
+        if started.elapsed() >= audit_timeout {
+            return Ok((samples, current_sample));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 #[derive(Debug)]
@@ -1134,6 +1175,12 @@ pub trait Driver: Send {
     fn create_session(&mut self, marker: &str) -> DriverFuture<'_, SessionId>;
     /// Submit a prompt with an idempotency key.
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()>;
+    /// Path receiving the active invocation's live structured event stream,
+    /// when the transport exposes events through captured stdout rather than
+    /// a manifest-declared per-session journal.
+    fn live_event_path(&self, _session: &SessionId) -> Option<PathBuf> {
+        None
+    }
     /// Attach strictly after a durable cursor.
     fn attach(
         &mut self,
@@ -1189,8 +1236,13 @@ pub trait Driver: Send {
     }
     /// Cancel active work.
     fn cancel(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
-    /// Close and delete a session.
+    /// Close a session through the topology's ordinary lifecycle surface.
     fn close(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
+    /// Invoke the manifest-declared real close-delete operation. Topologies
+    /// whose ordinary close already performs deletion may use the default.
+    fn close_delete(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
+        self.close(session)
+    }
     /// Shut down and clean up the harness.
     fn shutdown(&mut self) -> DriverFuture<'_, ()>;
     /// Successfully close the harness stdin input/control surface.
@@ -1253,6 +1305,13 @@ pub trait Driver: Send {
     fn control_evidence(&self, _session: &SessionId) -> Vec<Value> {
         Vec::new()
     }
+    /// External owned-tree evidence for the public per-invocation close-delete command.
+    fn close_delete_process_observation(
+        &self,
+        _session: &SessionId,
+    ) -> Option<CloseDeleteProcessObservation> {
+        None
+    }
     /// Notes from typed shutdown and owned-tree escalation.
     fn lifecycle_notes(&self) -> Vec<String> {
         Vec::new()
@@ -1271,6 +1330,18 @@ pub struct CompletedTurnBoundary {
     pub launch_ns: u64,
     /// Boundary immediately after observing child exit.
     pub exit_ns: u64,
+}
+
+/// Out-of-band process evidence collected while a public close-delete command ran.
+#[derive(Clone, Debug)]
+pub struct CloseDeleteProcessObservation {
+    /// Samples captured from the command's registered owned process tree.
+    pub samples: Vec<Sample>,
+    /// Final nonempty sample when the bounded post-exit reclaim wait expired;
+    /// absence means the externally rediscovered tree was empty.
+    pub residue_sample: Option<Sample>,
+    /// The public command returned a successful exit status.
+    pub result_validated: bool,
 }
 
 /// Explicit process-exit evidence used by daemon-topology resource fencing.
@@ -1742,6 +1813,8 @@ pub struct PerInvocationConfig {
     pub resume_control_command: Vec<String>,
     /// Headless post-restart recovery probe argv.
     pub recover_probe_command: Vec<String>,
+    /// Harness-owned public close-and-delete argv.
+    pub close_delete_command: Vec<String>,
     /// Out-of-process command used to release a durable checkpoint token.
     pub release_command: Vec<String>,
     /// Out-of-process command used after terminating an active invocation.
@@ -1806,6 +1879,7 @@ struct ExecSession {
     active: Option<ActiveInvocation>,
     client_exit: ClientExit,
     control_evidence: Vec<Value>,
+    close_delete_process_observation: Option<CloseDeleteProcessObservation>,
 }
 
 #[derive(Clone, Debug)]
@@ -2084,6 +2158,7 @@ impl PerInvocationDriver {
                     active: None,
                     client_exit: ClientExit::Exited(Some(0)),
                     control_evidence: Vec::new(),
+                    close_delete_process_observation: None,
                 },
             );
         }
@@ -2710,6 +2785,72 @@ impl PerInvocationDriver {
         Ok(Some(value))
     }
 
+    async fn run_close_delete_command(
+        &self,
+        session: &PersistedExecSession,
+    ) -> Result<CloseDeleteProcessObservation> {
+        let variables = self.invocation_variables(session, "", "");
+        let argv = self
+            .config
+            .close_delete_command
+            .iter()
+            .map(|argument| crate::manifest::render_template(argument, &variables))
+            .collect::<Result<Vec<_>>>()?;
+        let (program, arguments) = argv.split_first().ok_or_else(|| {
+            AhrbError::Validation("per-invocation close-delete command is empty".to_owned())
+        })?;
+        let mut command = Command::new(program);
+        #[cfg(unix)]
+        command.process_group(0);
+        command
+            .args(arguments)
+            .envs(&self.config.environment)
+            .current_dir(self.session_directory(&session.local_id).join("workspace"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        crate::process::register_child(&child)?;
+        let pid = child.id().ok_or_else(|| {
+            AhrbError::Protocol("close-delete child has no process ID".to_owned())
+        })?;
+        let finished = Arc::new(AtomicBool::new(false));
+        let observer_finished = Arc::clone(&finished);
+        let observer = tokio::spawn(observe_registered_command_tree(
+            pid,
+            observer_finished,
+            self.config.timeout,
+            format!("close-delete-{}", session.local_id),
+        ));
+        // Give the external sampler its first scheduling opportunity before a
+        // very short control command can complete.
+        tokio::task::yield_now().await;
+        let output_result = wait_owned_output(
+            &mut child,
+            self.config.timeout,
+            "per-invocation close-delete command",
+        )
+        .await;
+        finished.store(true, Ordering::Release);
+        let (samples, residue_sample) = observer.await.map_err(|error| {
+            AhrbError::Protocol(format!("close-delete process observer failed: {error}"))
+        })??;
+        let output = output_result?;
+        if !output.status.success() {
+            return Err(AhrbError::Protocol(format!(
+                "per-invocation close-delete command exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(CloseDeleteProcessObservation {
+            samples,
+            residue_sample,
+            result_validated: true,
+        })
+    }
+
     fn cached_after(&self, id: &str, after: Option<Cursor>) -> Result<Vec<NormalizedEvent>> {
         let mut events = Self::read_cached_events(&self.events_path(id))?;
         events.retain(|event| after.is_none_or(|cursor| event.cursor > cursor.0));
@@ -2806,6 +2947,7 @@ impl Driver for PerInvocationDriver {
                     active: None,
                     client_exit: ClientExit::Exited(Some(0)),
                     control_evidence: Vec::new(),
+                    close_delete_process_observation: None,
                 },
             );
             Ok(SessionId(id))
@@ -2922,6 +3064,13 @@ impl Driver for PerInvocationDriver {
             item.client_exit = ClientExit::Running;
             Ok(())
         })
+    }
+
+    fn live_event_path(&self, session: &SessionId) -> Option<PathBuf> {
+        self.sessions
+            .get(&session.0)
+            .and_then(|item| item.active.as_ref())
+            .map(|active| active.stdout_path.clone())
     }
 
     fn attach(
@@ -3263,6 +3412,7 @@ impl Driver for PerInvocationDriver {
                         active: None,
                         client_exit: ClientExit::Exited(Some(0)),
                         control_evidence: evidence_log,
+                        close_delete_process_observation: None,
                     },
                 );
                 return Ok(());
@@ -3283,6 +3433,7 @@ impl Driver for PerInvocationDriver {
                     active: None,
                     client_exit: ClientExit::Exited(Some(0)),
                     control_evidence: Vec::new(),
+                    close_delete_process_observation: None,
                 },
             );
             Ok(())
@@ -3464,11 +3615,83 @@ impl Driver for PerInvocationDriver {
             {
                 self.cancel(&SessionId(id.clone())).await?;
             }
+            let persisted = self
+                .sessions
+                .get(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?
+                .persisted
+                .clone();
+            if persisted.closed {
+                return Ok(());
+            }
+            if persisted.invocations == 0 {
+                // `create_session` is an AHRB-local handle for exec adapters; the
+                // harness does not receive it until the first invocation is spawned.
+                // Closing an unmaterialized handle therefore has no public harness
+                // lifecycle to invoke and cannot leave harness-owned residue.
+                let item = self
+                    .sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?;
+                item.persisted.closed = true;
+                let persisted = item.persisted.clone();
+                return Self::persist_session_at(&self.metadata_path(&id), &persisted);
+            }
             let item = self
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?;
             item.persisted.closed = true;
+            let persisted = item.persisted.clone();
+            Self::persist_session_at(&self.metadata_path(&id), &persisted)
+        })
+    }
+
+    fn close_delete(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
+        let id = session.0.clone();
+        Box::pin(async move {
+            if self
+                .sessions
+                .get(&id)
+                .is_some_and(|item| item.active.is_some())
+            {
+                self.cancel(&SessionId(id.clone())).await?;
+            }
+            let persisted = self
+                .sessions
+                .get(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?
+                .persisted
+                .clone();
+            if persisted.closed
+                && self
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|item| item.close_delete_process_observation.is_some())
+            {
+                return Ok(());
+            }
+            if persisted.invocations == 0 {
+                let item = self
+                    .sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?;
+                item.persisted.closed = true;
+                let persisted = item.persisted.clone();
+                return Self::persist_session_at(&self.metadata_path(&id), &persisted);
+            }
+            if self.config.close_delete_command.is_empty() {
+                return Err(AhrbError::Unsupported(
+                    "per-invocation close-delete command is not declared".to_owned(),
+                ));
+            }
+            let observation = self.run_close_delete_command(&persisted).await?;
+            let item = self
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?;
+            item.persisted.closed = true;
+            item.close_delete_process_observation = Some(observation);
             let persisted = item.persisted.clone();
             Self::persist_session_at(&self.metadata_path(&id), &persisted)
         })
@@ -3596,6 +3819,15 @@ impl Driver for PerInvocationDriver {
             .get(&session.0)
             .map(|item| item.control_evidence.clone())
             .unwrap_or_default()
+    }
+
+    fn close_delete_process_observation(
+        &self,
+        session: &SessionId,
+    ) -> Option<CloseDeleteProcessObservation> {
+        self.sessions
+            .get(&session.0)
+            .and_then(|item| item.close_delete_process_observation.clone())
     }
 
     fn lifecycle_notes(&self) -> Vec<String> {
@@ -5584,6 +5816,7 @@ mod tests {
             resume_command: Vec::new(),
             resume_control_command: Vec::new(),
             recover_probe_command: Vec::new(),
+            close_delete_command: Vec::new(),
             release_command: Vec::new(),
             cancel_command: Vec::new(),
             replay_command: Vec::new(),
@@ -5604,6 +5837,92 @@ mod tests {
         driver.shutdown().await.expect("stop thin-client driver");
         assert!(driver.owned_pids().is_empty());
         std::fs::remove_dir_all(profile).expect("remove thin-client profile");
+    }
+
+    #[tokio::test]
+    async fn per_invocation_close_validates_public_delete_before_metadata_closure() {
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-exec-close-delete-order-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if profile.exists() {
+            std::fs::remove_dir_all(&profile).expect("remove stale close-delete profile");
+        }
+        let manifest = crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+            .expect("load exec reference manifest");
+        let mut driver = PerInvocationDriver::new(PerInvocationConfig {
+            daemon: None,
+            command: vec!["/usr/bin/true".to_owned()],
+            resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
+            close_delete_command: vec!["/usr/bin/false".to_owned(), "{{session_id}}".to_owned()],
+            release_command: Vec::new(),
+            cancel_command: Vec::new(),
+            replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
+            environment: BTreeMap::new(),
+            base_variables: BTreeMap::new(),
+            profile_root: profile.clone(),
+            events: manifest.events,
+            exit: manifest.exit,
+            session_id_pointer: String::new(),
+            run_id_pointer: String::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4_096,
+            gate_launch: false,
+        });
+        driver.start().await.expect("start close-delete driver");
+        let session = driver
+            .create_session("close-delete-order")
+            .await
+            .expect("create close-delete session");
+        let materialized = {
+            let item = driver
+                .sessions
+                .get_mut(&session.0)
+                .expect("session metadata is present");
+            item.persisted.invocations = 1;
+            item.persisted.clone()
+        };
+        PerInvocationDriver::persist_session_at(&driver.metadata_path(&session.0), &materialized)
+            .expect("persist materialized session state");
+
+        let error = driver
+            .close_delete(&session)
+            .await
+            .expect_err("failed public delete must reject close");
+        assert!(error.to_string().contains("close-delete command exited"));
+        let persisted = driver
+            .sessions
+            .get(&session.0)
+            .expect("session metadata remains present");
+        assert!(!persisted.persisted.closed);
+        let disk: PersistedExecSession = serde_json::from_slice(
+            &std::fs::read(driver.metadata_path(&session.0)).expect("read session metadata"),
+        )
+        .expect("decode session metadata");
+        assert!(!disk.closed);
+
+        driver.config.close_delete_command =
+            vec!["/usr/bin/true".to_owned(), "{{session_id}}".to_owned()];
+        driver
+            .close_delete(&session)
+            .await
+            .expect("successful public delete closes metadata");
+        let disk: PersistedExecSession = serde_json::from_slice(
+            &std::fs::read(driver.metadata_path(&session.0)).expect("read closed metadata"),
+        )
+        .expect("decode closed metadata");
+        assert!(disk.closed);
+        driver.config.close_delete_command =
+            vec!["/usr/bin/false".to_owned(), "{{session_id}}".to_owned()];
+        driver
+            .close_delete(&session)
+            .await
+            .expect("already validated close is idempotent");
+        std::fs::remove_dir_all(profile).expect("remove close-delete profile");
     }
 
     #[tokio::test]
@@ -5652,6 +5971,7 @@ mod tests {
             resume_command: Vec::new(),
             resume_control_command: Vec::new(),
             recover_probe_command: Vec::new(),
+            close_delete_command: Vec::new(),
             release_command: Vec::new(),
             cancel_command: Vec::new(),
             replay_command: Vec::new(),
@@ -5812,7 +6132,11 @@ mod tests {
                 readiness: Probe {
                     kind: "file".to_owned(),
                     target: logs.join("never-ready").to_string_lossy().into_owned(),
-                    timeout_ms: 25,
+                    // This timeout also bounds waiting for the detached
+                    // `/usr/bin/true` launcher. Keep the negative readiness
+                    // fixture deterministic on a loaded host instead of
+                    // accidentally exercising the launcher-timeout branch.
+                    timeout_ms: 2_000,
                     ..Probe::default()
                 },
                 shutdown_command: vec![
@@ -5828,7 +6152,7 @@ mod tests {
                     clean_outcomes: vec!["not_running".to_owned()],
                     escalate_outcomes: vec!["did_not_stop".to_owned()],
                 },
-                grace: Duration::from_millis(250),
+                grace: Duration::from_millis(2_000),
                 log_directory: logs.clone(),
             },
         );
@@ -5836,7 +6160,10 @@ mod tests {
             .start()
             .await
             .expect_err("readiness timeout must fail detached startup");
-        assert!(error.to_string().contains("daemon readiness"));
+        assert!(
+            error.to_string().contains("daemon readiness"),
+            "unexpected detached-start error: {error}"
+        );
         assert_eq!(
             std::fs::read_to_string(&shutdown_marker).expect("typed shutdown marker"),
             "shutdown"

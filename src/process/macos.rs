@@ -1,8 +1,8 @@
 //! macOS libproc whole-tree sampler.
 
 use crate::process::{
-    ProcIdentity, ProcOwnership, ProcessDiskObservation, ProcessInfo, ProcessSample, ProcessTree,
-    Sample, Sampler, TreeCpuTracker,
+    CpuAccountingWarning, ProcIdentity, ProcOwnership, ProcessDiskObservation, ProcessInfo,
+    ProcessSample, ProcessTree, Sample, Sampler, TreeCpuTracker,
 };
 use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +19,40 @@ const RUSAGE_INFO_V4: c_int = 4;
 const TASK_VM_INFO: c_int = 22;
 const KERN_SUCCESS: c_int = 0;
 const MAXCOMLEN: usize = 16;
+// Darwin's two cumulative libproc CPU fields can be observed a few
+// microseconds lower on an adjacent read under scheduler migration. Keep the
+// generic tracker strict, but clamp this documented platform-local sampling
+// jitter while retaining a raw warning. Larger regressions remain fatal.
+const CPU_COUNTER_JITTER_NS: u64 = 1_000_000;
+
+fn normalize_cpu_counter(
+    identity: ProcIdentity,
+    observed_ns: u64,
+    previous_ns: Option<u64>,
+    kind: &str,
+    warnings: &mut Vec<CpuAccountingWarning>,
+) -> Result<u64> {
+    let Some(previous_ns) = previous_ns else {
+        return Ok(observed_ns);
+    };
+    if observed_ns >= previous_ns {
+        return Ok(observed_ns);
+    }
+    if previous_ns.saturating_sub(observed_ns) > CPU_COUNTER_JITTER_NS {
+        return Err(AhrbError::Protocol(format!(
+            "process ({},{}) cumulative CPU regressed from {previous_ns} to {observed_ns}",
+            identity.pid, identity.start_time
+        )));
+    }
+    warnings.push(CpuAccountingWarning {
+        kind: kind.to_owned(),
+        identity,
+        consecutive_misses: 0,
+        previous_cpu_ns: previous_ns,
+        observed_cpu_ns: observed_ns,
+    });
+    Ok(previous_ns)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -434,6 +468,7 @@ impl Sampler for MacOsSampler {
         let mut counters = Vec::new();
         let mut live_cpu = BTreeMap::new();
         let mut child_rollup_cpu = BTreeMap::new();
+        let mut platform_cpu_warnings = Vec::new();
         let identities_by_pid: BTreeMap<u32, ProcIdentity> = tree
             .members
             .keys()
@@ -462,14 +497,24 @@ impl Sampler for MacOsSampler {
             };
             rss_bytes = rss_bytes.saturating_add(usage.ri_resident_size);
             footprint_bytes = footprint_bytes.saturating_add(usage.ri_phys_footprint);
-            let process_cpu_ns = usage.ri_user_time.saturating_add(usage.ri_system_time);
+            let process_cpu_ns = normalize_cpu_counter(
+                *identity,
+                usage.ri_user_time.saturating_add(usage.ri_system_time),
+                self.last_self_cpu.get(identity).copied(),
+                "macos-self-cpu-jitter-clamped",
+                &mut platform_cpu_warnings,
+            )?;
             live_cpu.insert(*identity, process_cpu_ns);
-            child_rollup_cpu.insert(
+            let child_cpu_ns = normalize_cpu_counter(
                 *identity,
                 usage
                     .ri_child_user_time
                     .saturating_add(usage.ri_child_system_time),
-            );
+                self.child_rollup_cpu.get(identity).copied(),
+                "macos-child-cpu-jitter-clamped",
+                &mut platform_cpu_warnings,
+            )?;
+            child_rollup_cpu.insert(*identity, child_cpu_ns);
             let process_open_fds = u64::from(current.pbi_nfiles);
             open_fds = open_fds.saturating_add(process_open_fds);
             let (process_threads, proc_crosscheck) = match task_details(identity.pid)? {
@@ -506,7 +551,8 @@ impl Sampler for MacOsSampler {
             });
         }
 
-        let cpu_update = self.cpu.update(&live_cpu)?;
+        let mut cpu_update = self.cpu.update(&live_cpu)?;
+        cpu_update.warnings.extend(platform_cpu_warnings);
         let unsampled_child_cpu_ns = self.reconcile_child_cpu(
             &live_cpu,
             &current_parents,
@@ -1039,6 +1085,38 @@ mod tests {
                 .any(|identity| identity.pid == std::process::id())
         );
         assert_eq!(sample.phase, "self");
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_libproc_cpu_jitter_is_clamped_but_larger_regressions_fail() -> Result<()> {
+        let identity = ProcIdentity {
+            pid: 123,
+            start_time: 456,
+        };
+        let mut warnings = Vec::new();
+        assert_eq!(
+            normalize_cpu_counter(
+                identity,
+                995_000,
+                Some(1_000_000),
+                "macos-self-cpu-jitter-clamped",
+                &mut warnings,
+            )?,
+            1_000_000
+        );
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].observed_cpu_ns, 995_000);
+        assert!(
+            normalize_cpu_counter(
+                identity,
+                0,
+                Some(CPU_COUNTER_JITTER_NS + 1),
+                "macos-self-cpu-jitter-clamped",
+                &mut warnings,
+            )
+            .is_err()
+        );
         Ok(())
     }
 

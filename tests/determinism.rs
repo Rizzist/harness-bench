@@ -31,6 +31,7 @@ fn record(
         attempt,
         received_ns: 1,
         body_bytes: 1,
+        input_tokens: None,
         role: "primary".to_owned(),
         side_channel_kind: None,
         response_status: Some(200),

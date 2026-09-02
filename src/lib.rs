@@ -23,6 +23,8 @@ pub mod sampler;
 pub mod scenarios;
 pub mod wave2;
 pub mod wave2_automation;
+pub mod wave3_concurrency;
+pub mod wave3_long_horizon;
 pub mod workflow;
 
 pub use error::{AhrbError, Result};

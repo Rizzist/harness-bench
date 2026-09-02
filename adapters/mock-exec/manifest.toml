@@ -14,7 +14,7 @@ dialect = "open-ai-chat-completions"
 base_url_env = "AHRB_MOCK_BASE_URL"
 credential_env = "AHRB_MOCK_API_KEY"
 model = "ahrb-fake-v1"
-allowed_paths = ["/v1/chat/completions"]
+allowed_paths = ["/v1/chat/completions", "/v1/models"]
 
 [isolation.roots]
 HOME = "{{profile}}/home"
@@ -45,7 +45,8 @@ create = []
 submit = []
 attach = []
 resume = ["target/debug/ahrb-mock-harness", "exec-turn", "--state-dir", "{{profile}}/state", "--idle-timeout-ms", "2500", "--session-memory-mib", "4", "--retry-max-attempts", "3", "--retry-base-delay-ms", "100", "--retry-max-delay-ms", "200", "--post-output-delay-ms", "350", "--base-url", "{{base_url}}", "--marker", "{{marker}}", "--session-id", "{{session_id}}", "--prompt", "{{prompt}}", "--key", "{{turn_key}}"]
-close_delete = []
+close_delete = ["target/debug/ahrb-mock-harness", "close-delete-session", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
+store_paths = ["{{profile}}/state/sessions"]
 list = []
 id_pointer = "/session_id"
 
@@ -55,7 +56,7 @@ cancel = ["target/debug/ahrb-mock-harness", "cancel-session", "--state-dir", "{{
 
 [concurrency]
 topology = "client-process-fanout"
-max_agents = 8
+max_agents = 32
 fanout_mode = "client"
 release = ["target/debug/ahrb-mock-harness", "release-checkpoint", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}", "--release-token", "{{release_token}}"]
 
@@ -137,6 +138,14 @@ retry_max_delay_ms = 200
 log_paths = []
 journal_paths = []
 
+[resources.context_window]
+surface = "environment"
+tokens = 4096
+environment = "AHRB_MOCK_CONTEXT_WINDOW_TOKENS"
+argv = []
+generated_path = ""
+json_pointer = ""
+
 [input]
 prompt_uses_stdin = false
 
@@ -157,5 +166,6 @@ sessions = "mock session journal is reopened by the next process"
 resume = "exec-turn reopens the fsync-backed session journal"
 durable_journal = "append-only per-session JSONL journal is fsync-backed and replayed after restart"
 cancel_cleanup = "the active one-shot process is terminated and its isolated workspace is removed"
+context_limit_recovery = "fresh resume deterministically compacts while preserving session and tool correlations"
 
 [capabilities.optional]

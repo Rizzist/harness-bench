@@ -316,18 +316,29 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
         _ => match row {
             15 | 34 => Some("headless"),
             30 => Some("sessions"),
-            35 | 37 => Some("resume"),
-            40 => Some("durable_journal"),
+            35 | 37 | 52 => Some("resume"),
+            40 | 53 => Some("durable_journal"),
+            51 => Some("context_limit_recovery"),
             _ => None,
         },
     };
     if let Some(key) = capability_key {
-        let declared = manifest.capabilities.required.contains_key(key)
-            || manifest.capabilities.optional.contains_key(key);
+        let declared = if row == 51 {
+            manifest.capabilities.required.contains_key(key)
+        } else {
+            manifest.capabilities.required.contains_key(key)
+                || manifest.capabilities.optional.contains_key(key)
+        };
         if !declared {
-            return CapabilityStatus::Unsupported(format!(
-                "capability {key} is not declared by this architecture"
-            ));
+            return if matches!(row, 51..=53) {
+                CapabilityStatus::Absent(format!(
+                    "required capability {key} is not declared by this architecture"
+                ))
+            } else {
+                CapabilityStatus::Unsupported(format!(
+                    "capability {key} is not declared by this architecture"
+                ))
+            };
         }
         if !operation_surface_present(manifest, row) {
             return CapabilityStatus::Unsupported(format!(
@@ -335,11 +346,30 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
             ));
         }
     }
-    if row == 17 && manifest.concurrency.max_agents < 2 {
+    if row == 17 && manifest.concurrency.max_agents.unwrap_or(0) < 2 {
         return CapabilityStatus::Unsupported("actor concurrency is below N=2".to_owned());
     }
-    if row == 26 && manifest.concurrency.max_agents < 8 {
+    if row == 26 && manifest.concurrency.max_agents.unwrap_or(0) < 8 {
         return CapabilityStatus::Unsupported("parallel resource surface is below N=8".to_owned());
+    }
+    if row == 50
+        && (manifest.sessions.close_delete.is_empty() || manifest.sessions.store_paths.is_empty())
+    {
+        return CapabilityStatus::Absent(
+            "sessions.close_delete or profile-contained sessions.store_paths is absent".to_owned(),
+        );
+    }
+    if matches!(row, 54 | 55) {
+        let Some(max_agents) = manifest.concurrency.max_agents else {
+            return CapabilityStatus::Absent(
+                "concurrency.max_agents width declaration is absent".to_owned(),
+            );
+        };
+        if max_agents < 8 {
+            return CapabilityStatus::Unsupported(
+                "fanout architecture explicitly declares concurrency below quick N=8".to_owned(),
+            );
+        }
     }
     if row == 36 && manifest.agents.cancel.is_empty() {
         return CapabilityStatus::Unsupported("agent cancellation operation is absent".to_owned());
@@ -363,7 +393,10 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
 
 fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
     match row {
-        4 => manifest.concurrency.max_agents >= 2,
+        4 => manifest
+            .concurrency
+            .max_agents
+            .is_some_and(|value| value >= 2),
         15 | 34 => {
             !manifest.transport.command.is_empty() || !manifest.transport.endpoint.is_empty()
         }
@@ -409,13 +442,13 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
                     && !manifest.sessions.attach.is_empty()
             }
         }
-        37 => {
+        37 | 52 => {
             (!manifest.sessions.resume.is_empty() || !manifest.sessions.resume_control.is_empty())
                 && (manifest.transport.kind == TransportKind::Exec
                     || !manifest.sessions.attach.is_empty())
         }
         39 => !manifest.hooks.acceptance.is_empty() && !manifest.hooks.completion.is_empty(),
-        40 => {
+        40 | 53 => {
             manifest.events.framing == "jsonl"
                 && !manifest.events.cursor_pointer.is_empty()
                 && if manifest.transport.kind == TransportKind::Exec {
@@ -424,6 +457,7 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
                     manifest.events.source == "journal" && !manifest.events.path.is_empty()
                 }
         }
+        51 => manifest.resources.context_window.is_some(),
         _ => true,
     }
 }

@@ -192,6 +192,7 @@ async fn launch_gate_and_process_group_retain_an_orphan_after_launcher_exit() {
         resume_command: Vec::new(),
         resume_control_command: Vec::new(),
         recover_probe_command: Vec::new(),
+        close_delete_command: Vec::new(),
         release_command: Vec::new(),
         cancel_command: Vec::new(),
         replay_command: Vec::new(),

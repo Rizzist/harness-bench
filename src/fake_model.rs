@@ -14,7 +14,7 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -194,6 +194,9 @@ pub struct ModelRequestRecord {
     pub received_ns: u64,
     /// Exact raw HTTP request body length before JSON parsing.
     pub body_bytes: u64,
+    /// Revision-2.3 fake-provider token count when a context window is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
     /// `primary`, `side-channel`, or `unclassified`.
     pub role: String,
     /// Classified auxiliary kind; null for a primary request.
@@ -640,6 +643,8 @@ pub struct FakeModelEngine {
     attempt_sequences: Mutex<BTreeMap<SemanticRequestKey, u64>>,
     request_role_rules: Vec<RequestRoleRule>,
     semantic_ordinals: BTreeMap<(String, String, String), u64>,
+    context_window_tokens: Option<u64>,
+    context_faulted_routes: Mutex<BTreeSet<(String, String, String)>>,
 }
 
 impl FakeModelEngine {
@@ -659,9 +664,24 @@ impl FakeModelEngine {
     /// Build an engine with model IDs and ordered non-primary request classifiers.
     pub fn with_request_roles(
         workflow: &Workflow,
-        _model_roles: &BTreeMap<String, ModelRole>,
+        model_roles: &BTreeMap<String, ModelRole>,
         request_role_rules: &[RequestRoleRule],
     ) -> Result<Self> {
+        Self::with_request_roles_and_context_window(workflow, model_roles, request_role_rules, None)
+    }
+
+    /// Build an engine with one advertised and enforced fake context window.
+    pub fn with_request_roles_and_context_window(
+        workflow: &Workflow,
+        _model_roles: &BTreeMap<String, ModelRole>,
+        request_role_rules: &[RequestRoleRule],
+        context_window_tokens: Option<u64>,
+    ) -> Result<Self> {
+        if context_window_tokens == Some(0) {
+            return Err(AhrbError::Validation(
+                "fake context window must be positive".to_owned(),
+            ));
+        }
         let mut request_role_rules = request_role_rules.to_vec();
         request_role_rules.sort_by_key(|rule| rule.priority);
         let mut next_by_actor = BTreeMap::<String, u64>::new();
@@ -687,7 +707,14 @@ impl FakeModelEngine {
             attempt_sequences: Mutex::new(BTreeMap::new()),
             request_role_rules,
             semantic_ordinals,
+            context_window_tokens,
+            context_faulted_routes: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    /// Advertised row-51 provider context window, when configured.
+    pub fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
     }
 
     /// Validate, route, and await any named barrier for a canonical request.
@@ -735,6 +762,12 @@ impl FakeModelEngine {
             })?;
             *attempt
         };
+        let input_tokens = self.context_window_tokens.map(|_| {
+            crate::wave3_long_horizon::fake_context_input_tokens(
+                &request.dialect,
+                &request.canonical,
+            )
+        });
         {
             let mut records = self.requests.lock().await;
             let attempts = records.entry(record_key.clone()).or_default();
@@ -747,6 +780,7 @@ impl FakeModelEngine {
                 attempt,
                 received_ns,
                 body_bytes,
+                input_tokens,
                 role: "unclassified".to_owned(),
                 side_channel_kind: Some("unknown-side-channel".to_owned()),
                 response_status: None,
@@ -757,8 +791,58 @@ impl FakeModelEngine {
             });
         }
 
+        let recognition = self.machine.recognize(&marker).await;
+        let route = (
+            marker.scenario.clone(),
+            marker.actor.clone(),
+            marker.checkpoint.clone(),
+        );
+        let context_faulted = self.context_faulted_routes.lock().await.contains(&route);
+        if recognition == TransitionRecognition::Retry && context_faulted {
+            let response = self
+                .machine
+                .response_for_checkpoint(&marker)
+                .ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "context recovery retry lacks its scripted checkpoint".to_owned(),
+                    )
+                })?;
+            let window_tokens = match response.fault {
+                Some(Fault::ContextLength { window_tokens }) => window_tokens,
+                _ => {
+                    return Err(AhrbError::Protocol(
+                        "context recovery route no longer carries a context-length fixture"
+                            .to_owned(),
+                    ));
+                }
+            };
+            let observed_tokens = input_tokens.ok_or_else(|| {
+                AhrbError::Protocol(
+                    "context recovery retry lacks provider token evidence".to_owned(),
+                )
+            })?;
+            let accepted =
+                observed_tokens <= window_tokens && body_bytes <= window_tokens.saturating_mul(8);
+            self.mark_request_accepted(&record_key, "primary", None)
+                .await?;
+            let value = adapt_scripted_tool_calls(&response.response, &request.canonical)?;
+            return Ok(ModelResponse {
+                dialect: request.dialect,
+                model: request.model,
+                scenario: marker.scenario,
+                actor: marker.actor,
+                checkpoint: marker.checkpoint,
+                request_hash,
+                attempt,
+                value,
+                fault: (!accepted).then_some(Fault::ContextLength { window_tokens }),
+                retry: true,
+                stream: request.stream,
+            });
+        }
+
         if matches!(
-            self.machine.recognize(&marker).await,
+            recognition,
             TransitionRecognition::Current | TransitionRecognition::Retry
         ) {
             let accepted = self.machine.accept(&marker, &request_hash).await?;
@@ -769,6 +853,49 @@ impl FakeModelEngine {
                 self.barriers.wait_for_release(barrier).await?;
             }
             let value = adapt_scripted_tool_calls(&accepted.response.response, &request.canonical)?;
+            if let Some(Fault::ContextLength { window_tokens }) = accepted.response.fault.as_ref() {
+                if self.context_window_tokens != Some(*window_tokens) {
+                    return Err(AhrbError::Protocol(format!(
+                        "context-length fixture declares W={window_tokens}, provider advertises {:?}",
+                        self.context_window_tokens
+                    )));
+                }
+                let observed_tokens = input_tokens.ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "context-length fixture lacks provider token evidence".to_owned(),
+                    )
+                })?;
+                let expected_tokens = window_tokens.saturating_add(256);
+                let expected_body = window_tokens
+                    .checked_mul(8)
+                    .and_then(|value| value.checked_add(1_024))
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "context-length fixture byte target overflow".to_owned(),
+                        )
+                    })?;
+                if observed_tokens != expected_tokens || body_bytes != expected_body {
+                    return Err(AhrbError::Protocol(format!(
+                        "context-length pre-error request measured {observed_tokens} tokens/{body_bytes} bytes; expected {expected_tokens}/{expected_body}"
+                    )));
+                }
+                self.context_faulted_routes.lock().await.insert(route);
+                return Ok(ModelResponse {
+                    dialect: request.dialect,
+                    model: request.model,
+                    scenario: marker.scenario,
+                    actor: marker.actor,
+                    checkpoint: marker.checkpoint,
+                    request_hash,
+                    attempt,
+                    value,
+                    fault: Some(Fault::ContextLength {
+                        window_tokens: *window_tokens,
+                    }),
+                    retry: accepted.retry,
+                    stream: request.stream,
+                });
+            }
 
             return Ok(ModelResponse {
                 dialect: request.dialect,
@@ -1784,6 +1911,12 @@ async fn handle_provider_mailbox_request(
         Some(Fault::HttpStatus { status, body } | Fault::SustainedHttpStatus { status, body }) => {
             (*status, body.as_bytes().to_vec())
         }
+        Some(Fault::ContextLength { window_tokens }) => (
+            400,
+            serde_json::to_vec(
+                &json!({"error":{"type":"context_length_exceeded","code":"context_length_exceeded","context_window":window_tokens}}),
+            )?,
+        ),
         Some(Fault::Stall) => std::future::pending::<(u16, Vec<u8>)>().await,
         Some(Fault::MidStreamDisconnect { .. }) => {
             return Err(AhrbError::Protocol(
@@ -1794,6 +1927,11 @@ async fn handle_provider_mailbox_request(
             return Err(AhrbError::Protocol(
                 "provider mailbox cannot represent timed trickle frames".to_owned(),
             ));
+        }
+        Some(Fault::Delay { delay_ms }) => {
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            let rendered = frontend.render(&selected)?;
+            (rendered.status, rendered.body)
         }
         None | Some(Fault::Fragment { .. }) | Some(Fault::RepeatFrame { .. }) => {
             let rendered = frontend.render(&selected)?;
@@ -1969,12 +2107,25 @@ async fn handle_http(
         );
     }
     if request.method() == Method::GET && path == "/v1/models" {
+        let model = match engine.context_window_tokens() {
+            Some(tokens) => json!({
+                "object":"list",
+                "data":[{
+                    "id":"ahrb-fake-v1",
+                    "object":"model",
+                    "context_window":tokens,
+                    "context_length":tokens,
+                }]
+            }),
+            None => json!({
+                "object":"list",
+                "data":[{"id":"ahrb-fake-v1","object":"model"}]
+            }),
+        };
         return response_from_parts(
             200,
             &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
-            DeterministicBody::full(Bytes::from_static(
-                b"{\"object\":\"list\",\"data\":[{\"id\":\"ahrb-fake-v1\",\"object\":\"model\"}]}",
-            )),
+            DeterministicBody::full(Bytes::from(serde_json::to_vec(&model)?)),
         );
     }
     if request.method() != Method::POST {
@@ -2013,7 +2164,33 @@ async fn handle_http(
             DeterministicBody::full(Bytes::copy_from_slice(body.as_bytes())),
         );
     }
+    if let Some(Fault::ContextLength { window_tokens }) = &selected.fault {
+        let headers_ns = engine.mark_response_status(&selected, 400).await?;
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "type": "context_length_exceeded",
+                "code": "context_length_exceeded",
+                "message": format!("maximum context length is {window_tokens} tokens"),
+                "context_window": window_tokens,
+            }
+        }))?;
+        let observation_sink = engine.frame_observation_sink(&selected);
+        let response_body = DeterministicBody::from_fault(
+            body,
+            selected.fault.as_ref(),
+            Some(observation_sink),
+            Some(headers_ns),
+        )?;
+        return response_from_parts(
+            400,
+            &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+            response_body,
+        );
+    }
 
+    if let Some(Fault::Delay { delay_ms }) = selected.fault.as_ref() {
+        tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+    }
     let mut rendered = frontend.render(&selected)?;
     if let Some(Fault::Trickle { count, .. }) = selected.fault.as_ref() {
         rendered.body = trickle_success_body(*count)?;
@@ -3053,6 +3230,12 @@ fn diagnostic_response(error: &AhrbError) -> Response<DeterministicBody> {
 #[derive(Debug)]
 enum BodyState {
     Frames(VecDeque<Bytes>),
+    ObservedFrames {
+        frames: VecDeque<Bytes>,
+        next_ordinal: u32,
+        scheduled_ns: u64,
+        observation_sink: FrameObservationSink,
+    },
     Disconnect {
         prefix: Option<Bytes>,
         emitted_error: bool,
@@ -3081,9 +3264,22 @@ impl DeterministicBody {
         response_headers_ns: Option<u64>,
     ) -> Result<Self> {
         match fault {
-            None | Some(Fault::HttpStatus { .. }) | Some(Fault::SustainedHttpStatus { .. }) => {
-                Ok(Self::full(Bytes::from(bytes)))
-            }
+            Some(Fault::ContextLength { .. }) => Ok(Self {
+                state: BodyState::ObservedFrames {
+                    frames: VecDeque::from([Bytes::from(bytes)]),
+                    next_ordinal: 1,
+                    scheduled_ns: response_headers_ns.unwrap_or_else(monotonic_timestamp_ns),
+                    observation_sink: observation_sink.ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "context-length body lacks frame observation sink".to_owned(),
+                        )
+                    })?,
+                },
+            }),
+            None
+            | Some(Fault::HttpStatus { .. })
+            | Some(Fault::SustainedHttpStatus { .. })
+            | Some(Fault::Delay { .. }) => Ok(Self::full(Bytes::from(bytes))),
             Some(Fault::Stall) => Ok(Self {
                 state: BodyState::Stall,
             }),
@@ -3186,6 +3382,27 @@ impl Body for DeterministicBody {
             BodyState::Frames(frames) => {
                 Poll::Ready(frames.pop_front().map(|bytes| Ok(Frame::data(bytes))))
             }
+            BodyState::ObservedFrames {
+                frames,
+                next_ordinal,
+                scheduled_ns,
+                observation_sink,
+            } => {
+                let Some(bytes) = frames.pop_front() else {
+                    return Poll::Ready(None);
+                };
+                let yielded_ns = monotonic_timestamp_ns();
+                if let Err(error) = observation_sink.record(
+                    *next_ordinal,
+                    *scheduled_ns,
+                    yielded_ns,
+                    bytes.len() as u64,
+                ) {
+                    return Poll::Ready(Some(Err(error)));
+                }
+                *next_ordinal = next_ordinal.saturating_add(1);
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
             BodyState::Disconnect {
                 prefix,
                 emitted_error,
@@ -3209,6 +3426,7 @@ impl Body for DeterministicBody {
 
     fn is_end_stream(&self) -> bool {
         matches!(&self.state, BodyState::Frames(frames) if frames.is_empty())
+            || matches!(&self.state, BodyState::ObservedFrames { frames, .. } if frames.is_empty())
             || matches!(
                 &self.state,
                 BodyState::Disconnect {
@@ -3221,7 +3439,7 @@ impl Body for DeterministicBody {
 
     fn size_hint(&self) -> SizeHint {
         let mut hint = SizeHint::new();
-        if let BodyState::Frames(frames) = &self.state {
+        if let BodyState::Frames(frames) | BodyState::ObservedFrames { frames, .. } = &self.state {
             let total = frames
                 .iter()
                 .fold(0_u64, |sum, frame| sum.saturating_add(frame.len() as u64));
@@ -4499,6 +4717,7 @@ mod tests {
             attempt: 1,
             received_ns: turn as u64,
             body_bytes: 256,
+            input_tokens: None,
             role: role.to_owned(),
             side_channel_kind: side_kind.map(str::to_owned),
             response_status: Some(200),

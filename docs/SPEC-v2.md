@@ -1,6 +1,6 @@
 # AHRB v2 — Agent Harness Readiness Benchmark specification
 
-Status: implementation specification, **revision 2.2 (2026-09-01)**.
+Status: implementation specification, **revision 2.3 (2026-09-02)**.
 `docs/SPEC.md` remains the authoritative v1 specification; this document defines the
 additive v2 contract. Revision 2.1 is a normative amendment: it does not renumber a row
 or change `spec_version = 2`, but implementations claiming v2 MUST implement this
@@ -8,6 +8,14 @@ revision.
 
 Revision 2.2 incorporates the Wave-2 independent re-verification corrections for rows
 47, 48, and 56–62 without changing row IDs or `spec_version`.
+
+Revision 2.3 incorporates the Wave-3 independent re-verification corrections for rows
+49–55 without changing row IDs or `spec_version`: a topology-neutral long-session
+latency-slope allowance, typed profile-contained session-store roots and identity-safe
+traversal, exact fake-provider context counting and recovery boundaries, null resume-
+ratio handling, exact torn-tail truncation targets, aggregate-then-cliff fanout
+evaluation, censored fairness latency, and a positive monotonic-clock resolution
+requirement.
 
 ### Revision 2.1 changelog
 
@@ -211,11 +219,65 @@ fixture starts is `ERROR` under the precedence table.
 
 | Row / stable ID | Type, pillar, badge impact | Topology handling | Fixture and profile | Exact evidence | Oracle | Manifest and feasibility |
 |---|---|---|---|---|---|---|
-| **49 `latency-vs-turn-index`** | CHEAP; Resource; **CORE** | Measured for both using one growing session. Per-invocation invokes official resume/continue for each turn; daemon keeps the same session. No N/A. | Extend v1 row 29 exactly: 100 turns quick, 1,000 cert, fixture tool every tenth turn, in 3/7 repetitions. Use each external turn wall interval, not batch wall time. | `resource_summary.latency_slope_ms_per_100_turns`, `.latency_last_first_decile_ratio`; `metrics.latency_vs_turn_index.first_decile_p50_ms`, `.last_decile_p50_ms`, `.theil_sen_ms_per_turn`; raw `turns.jsonl.turn_index`. Compute each repetition first and publish the median of repetition fields. `latency_last_first_decile_ratio` is exactly `last_decile_p50_ms / first_decile_p50_ms`; if the first median is zero the ratio is JSON null in `resource_summary`/typed details, is absent from numeric `resource_metrics`, and cannot pass. | PASS iff all turns terminalize in every repetition, `latency_slope_ms_per_100_turns <= max(0.01*first_decile_p50_ms,1.0 ms)` (equivalently the per-turn Theil–Sen slope is at most that bound divided by 100), `latency_last_first_decile_ratio<=1.25`, and last-decile median `<=1.25*first-decile median + 50 ms`. | No new key. `runner::run_long_horizon` already timestamps turns and row 29 already has the correct session; v1 reports only aggregate wall mean, so v2 preserves per-turn values. |
+| **49 `latency-vs-turn-index`** | CHEAP; Resource; **CORE** | Measured for both using one growing session. Per-invocation invokes official resume/continue for each turn; daemon keeps the same session. No N/A. | Extend v1 row 29 exactly: 100 turns quick, 1,000 cert, fixture tool every tenth turn, in 3/7 repetitions. Use each external turn wall interval, not batch wall time. | `resource_summary.latency_slope_ms_per_100_turns`, `.latency_last_first_decile_ratio`; `metrics.latency_vs_turn_index.first_decile_p50_ms`, `.last_decile_p50_ms`, `.theil_sen_ms_per_turn`; raw `turns.jsonl.turn_index`. Compute each repetition first and publish the median of repetition fields. `latency_last_first_decile_ratio` is exactly `last_decile_p50_ms / first_decile_p50_ms`; if the first median is zero the ratio is JSON null in `resource_summary`/typed details, is absent from numeric `resource_metrics`, and cannot pass. | PASS iff all turns terminalize in every repetition, `latency_slope_ms_per_100_turns <= max(0.05*first_decile_p50_ms,25.0 ms)` (equivalently the per-turn Theil–Sen slope is at most that bound divided by 100), `latency_last_first_decile_ratio<=1.25`, and last-decile median `<=1.25*first-decile median + 50 ms`. The 5% term admits proportional fresh-process startup and persisted-resume drift at a high wall baseline; the 25 ms floor admits bounded host scheduling/startup variance at a low baseline. This slope conjunct remains a monotonic-runaway guard, while the unchanged ratio and last-decile conjuncts independently cap absolute end-to-end growth. The formula is identical for both topologies and MUST NOT branch on topology name. | No new key. `runner::run_long_horizon` already timestamps turns and row 29 already has the correct session; v1 reports only aggregate wall mean, so v2 preserves per-turn values. |
 | **50 `session-residue-sweep`** | NEW; Resource; **CORE** | Measured for both. Per-invocation creates each persisted session and invokes a real harness-owned close-and-delete surface, then audits profile-owned processes and the declared session store; changing only AHRB metadata is not a close. Daemon repeatedly creates/closes/deletes sessions without restarting the daemon, then compares to warm baseline B. No N/A. | Create/use/close-delete N sessions sequentially in 3/7 independent sweeps: N=20 quick, N=200 cert. Measure process and recursive session-store checkpoints at 0, every 10, and N; run a final 10 s reclaim window. Each file snapshot records device/inode, size, and digest so replacement cannot masquerade as truncation. | `resource_summary.session_residue_slope_mib_per_session`, `.session_residue_final_mib`, `.session_store_byte_slope_per_session`, `.session_store_file_count_slope_per_session`, `.session_store_final_residue_bytes`, `.session_store_final_residue_files`; `metrics.session_residue_sweep.fd_slope_per_session`, `.thread_slope_per_session`, `.process_slope_per_session`, `.unretired_sessions`, `.closed_sessions`, `.created_sessions`. Slopes are Theil–Sen per sweep; published slopes are their medians and final residues are maxima after reclaim. `details.session-residue-sweep.store_checkpoints[]` contains repetition, session count, bytes and files relative to baseline. | PASS iff all N public close-delete commands succeed in every sweep; memory slope `<=0.03125 MiB/session` (32 KiB); final memory residual `<=max(64 MiB,20% of maximum active delta)`; FD/thread/process slopes are each `<=0`; `unretired_sessions=0`; store byte and file-count slopes are each `<=0`; and final store residue is exactly 0 bytes and 0 files relative to baseline. These total slope rules replace any separate informal monotonic-growth test. | Require an official `sessions.close_delete` command/operation. `PerInvocationDriver::close` MUST invoke that harness surface and verify its result before marking AHRB metadata closed; daemon drivers invoke the declared transport equivalent. Existing row-23/28 baselines and identities plus row-29 checkpoint structs are reusable, but the create/close-delete and recursive storage sweep are new. |
 | **51 `context-limit-recovery`** | NEW; AutomationReadiness; **CORE** | Measured for both. Recovery may be in-process, a daemon session operation, or a fresh per-invocation resume, but the same session identity and tool correlations must survive. Missing the required declaration is badge-blocking `ABSENT`, never `FAIL` or auto-PASS. | Fake `/v1/models` advertises deterministic context limit W; the named pre-error request is dialect-padded and externally asserted to have exactly `W+256` fake-provider input tokens and exactly `8*W+1,024` raw body bytes, then receives one dialect-native context-length error. Quick: W=4,096, 16 turns, 4 tool pairs. Cert: W=16,384, 128 turns, 32 tool pairs. Every ordinary-history fixture message contains a deterministic ordinal+SHA-256 history marker. The fake provider continues enforcing W after the one-shot error, so the first post-error primary request it accepts is the compaction candidate. Failure to construct/observe either exact pre-error total is `ERROR`. | `metrics.context_limit_recovery.context_errors`, `.extra_requests`, `.recovery_ms`, `.terminal_success`, `.tool_pairs_before`, `.tool_pairs_after`, `.orphan_tool_calls`, `.orphan_tool_results`, `.duplicate_effects`; `details.context-limit-recovery` adds `.pre_error_input_tokens`, `.pre_error_body_bytes`, `.compaction_request_hashes`, `.accepted_input_tokens`, `.accepted_body_bytes`, `.retained_markers`, `.omitted_markers`, `.summary_markers`, and `.normalized_compacted_stream_sha256_by_repetition`. | “Compacted” means all of the following: (1) the accepted candidate has fake-provider input tokens `<=W` and raw body bytes `<=8*W`; (2) dialect system/developer instructions and tool definitions are unchanged after only the row-63 normalization; (3) the initial user-goal marker, the latest four non-tool history markers, **every** 4/32 tool-call+result pair with exact correlation/content/order, and every committed-effect marker remain; (4) at least one older ordinary message from the exact over-limit request is omitted, and **all and only** omitted ordinary-history markers are represented by exactly one textual summary item in a dialect-native system/developer context item, each exactly once in increasing ordinal order; no summary may replace or synthesize a tool call/result; and (5) the normalized length-prefixed canonical candidate stream is byte-identical across all 3/7 repetitions. PASS further requires exactly one context error, success within the turn deadline, no more than two extra requests, no orphan/duplicate pair/effect, and unchanged session identity. An unchanged/no-op or history-discarding retry FAILs. | Add `capabilities.required.context_limit_recovery` and `[resources.context_window]`; the row itself is CORE. Requires a context-window field in `/v1/models`, a one-shot `ContextLength` fault, continued W enforcement, and a workflow transition accepting only candidates satisfying this oracle. Current fake `/v1/models` returns only an ID and current faults cannot change after one attempt. |
 | **52 `resume-latency-vs-length`** | NEW; AutomationReadiness; **CORE** | Measured for both through the official persisted resume surface. Per-invocation starts a fresh client; daemon detaches the client while the controller stays ready, excluding daemon cold start. A missing required resume declaration is `ABSENT`; an explicitly unavailable architectural resume is badge-blocking `UNSUPPORTED`, never `FAIL`. | Build lengths `{1,10,50}` quick and `{1,50,100,250,500}` cert. Close/detach, then invoke one deterministic continuation through the manifest's resume path. Time from resume-command spawn/daemon reattach-submit to completion of the first resumed request body at the fake provider; the provider returns an immediate terminal. Three/seven fresh sessions per length. | `resource_summary.resume_latency_p50_ms`, `.resume_latency_p95_ms`, `.resume_latency_slope_ms_per_turn`; `metrics.resume_latency_vs_length.short_p50_ms`, `.mid_p50_ms`, `.long_p50_ms`, `.long_short_ratio`. `short/mid/long` mean L=1/10/50 in quick and L=1/100/500 in cert. Aggregate repetitions at each length first; headline resource p50/p95 are the p50/p95 distribution at the **longest** length, and slope is Theil–Sen over per-length median latencies. All raw lengths remain in `details.resume-latency-vs-length.points[]` as `{length,repetition,resume_start_ns,first_request_ns,latency_ms,session_id_hash,cursor}`. | PASS iff every first request resumes the same session at the exact cursor, longest-length p95 `<=5,000 ms`, Theil–Sen slope `<=5 ms/turn`, and `T(long)/T(short) <=2.5`. The fixed continuation cost is deliberately present at every L and cancels in the slope/ratio. | Existing `sessions.resume` supplies adapter data, but `PerInvocationDriver::resume` currently reloads only AHRB metadata and the real resume argv is launched by the next `submit`. Therefore this row requires a new external timer spanning that submit to `fake_model::handle_http`; timing `Driver::resume` alone is invalid. |
 | **53 `journal-torn-tail-sweep`** | NEW; AutomationReadiness; **CORE** | Measured for both. Kill the active one-shot worker for per-invocation or the persistent daemon for daemon topology. The recoverable source remains the manifest-declared journal/session store. A missing required journal declaration is `ABSENT`; explicit architectural unavailability is badge-blocking `UNSUPPORTED`. | Run exactly N=5 quick / 25 cert trials, overriding 3/7. The fixture's final record is exactly 1,048,576 ASCII bytes including its final newline: prefix `{"type":"ahrb-large","payload":"`, then enough `A` bytes to make the total exact, then suffix `"}\n`. A 1 ms watcher records the first growth and waits until size is at least `pre_size+1,048,576`, then SIGSTOPs/SIGKILLs; evidence claims **kill after complete growth was observed**, never inside a syscall. On five killed-profile copies apply cyclic record-relative cut offsets exactly `{0,262144,524288,786432,1048575}` bytes (0%,25%,50%,75%, immediately before the newline delimiter), restart, and attach after the last committed cursor. Failure to observe the exact full growth before terminal/timeout is `ERROR`. | `metrics.journal_torn_tail_sweep.trials`, `.kill_after_growth_observed_trials`, `.clean_recoveries`, `.corrupt_recoveries`, `.lost_committed_events`, `.duplicate_events`, `.duplicate_effects`, `.recovery_p95_ms`; `details.journal-torn-tail-sweep.cut_positions[]` has `{trial,pre_size,observed_size,cut_offset,growth_observed_ns,kill_ns}` plus recovered hashes. | PASS iff `kill_after_growth_observed_trials=trials`; the record digest and observed length match the exact fixture before copying; every trial recovers within 10 s; committed prefix/suffix agreement is exact; the cut final record is fully present or cleanly absent; and no parse corruption, gap, fabrication, duplicate event, or duplicate effect occurs. Any one bad trial fails. | No new manifest key; reuse `events.path`, `events.cursor_pointer`, replay command, and row-40 validation concepts. The existing helper appends one synced synthetic malformed tail; it does **not** implement profile copies, five cut positions, the 1 ms live watcher, or repeated kills. Those are all required NEW work. Polling proves only kill after observed growth and never a syscall/fsync boundary. |
+
+#### Revision-2.3 Wave-3 clarifications (normative)
+
+These rules amend the row table above and take precedence where older wording is less
+specific.
+
+- **Row 50 storage locator and traversal.** A selected row 50 requires nonempty
+  `sessions.store_paths`, with every rendered root lexically and physically contained in
+  `{{profile}}`. Traverse recursively without following symlinks. Record every directory
+  entry by relative path, file type, device, and inode; count only regular files and
+  their logical bytes. A symlink, hard-linked identity reachable through multiple
+  declared roots, mount/device escape, traversal cycle, or any resolved identity outside
+  the isolated profile is `ERROR`, not a favorable deduplication. Every public
+  `sessions.close_delete` result MUST be received and validated before its residue
+  checkpoint; AHRB metadata-only close is never evidence of deletion.
+- **Row 51 fake token counting.** Parse the request JSON and walk string values, never
+  keys, in the dialect context projection: Chat `messages` then `tools`; Responses
+  `instructions`, `input`, then `tools`; Anthropic `system`, `messages`, then `tools`.
+  Arrays retain order and object values use UTF-8 lexical key order. Within each decoded
+  string, every maximal ASCII `[A-Za-z0-9_]+` run is one token, ASCII whitespace is a
+  zero-token separator, and every other Unicode scalar is one token. Missing or null
+  projection members contribute zero. The dedicated ordinary-history padding string
+  uses `z ` runs plus one lengthened final `z...z` run: the run count supplies exactly
+  `W+256` tokens and the final-run length supplies exactly `8*W+1,024` received body
+  bytes. The provider recomputes both totals from the received bytes before faulting;
+  inability to hit either exact value is `ERROR`.
+- **Row 51 recovery window.** `recovery_ms` starts when the fake provider yields the
+  final byte of the one context-length error response and ends when it completes reading
+  the first post-error primary request body satisfying both accepted limits.
+  `extra_requests` counts every physical model POST body completed strictly after the
+  error-byte boundary and no later than AHRB receipt of the successful structural
+  terminal. It includes the accepted candidate, side-channel requests, and retries, but
+  excludes the faulting request. PASS requires
+  `recovery_ms<=resources.turn_timeout_ms` and `extra_requests<=2` in addition to the
+  row-table conjuncts.
+- **Row 52 zero denominator.** If the aggregated short-length p50 is zero,
+  `long_short_ratio` is JSON null in typed details and omitted from numeric metric maps;
+  zero is never substituted. The measurement is complete, but the required ratio
+  conjunct cannot pass, so the row is `FAIL` rather than `ERROR`, `PASS`, or
+  `UNSUPPORTED`. Haider's list/resume surfaces are declared feasibility inputs but their
+  behavior is unverified and cannot be treated as evidence or an automatic PASS.
+- **Row 53 exact cuts.** Each copied journal is truncated to exactly
+  `pre_size+cut_offset` bytes, with cyclic offsets
+  `{0,262144,524288,786432,1048575}`. The offset is never subtracted from observed size
+  or applied relative to a previous cut. Record `truncated_size`; failure to obtain the
+  exact target size is `ERROR`.
+- **Row 54 aggregate then detect.** First aggregate all required repetitions at each N
+  by median into one RSS and one wall point. Only those per-N aggregate points feed local
+  elasticity, prior-increment, global-alpha, and cliff tests; trial-level values never
+  feed a cliff test directly.
+- **Row 55 censorship and clock.** A scheduled actor without a terminal is assigned
+  latency exactly equal to the declared turn deadline for CV, spread, and ratio and is
+  also starved. `clock_getres(CLOCK_MONOTONIC)` must succeed and return a strictly
+  positive resolution; failure or a nonpositive result is infrastructure `ERROR`.
 
 ### C. Concurrency
 
@@ -1006,6 +1068,7 @@ yolo = []                       # complete argv; if nonempty contains {{workspac
 [sessions]
 # Existing fields remain.
 close_delete = ["harness", "session", "delete", "{{session_id}}"]
+store_paths = ["{{profile}}/state/sessions"]
 fork = ["harness", "session", "fork", "{{session_id}}"]
 delete = ["harness", "session", "delete", "{{session_id}}"]
 fork_id_pointer = "/session_id"
@@ -1079,7 +1142,9 @@ Validation rules:
 5. Declaring `headless_permission_model` requires a non-`none` permissions mode and
    complete replacement argv for allow, deny-filesystem, and deny-network. A yolo argv
    must be workspace/profile scoped.
-6. Every log/journal/carrier/generated path must be lexically under `{{profile}}`.
+6. Every session-store/log/journal/carrier/generated path must be lexically under
+   `{{profile}}`. `sessions.store_paths` contains no duplicate rendered root and is
+   traversed with the row-50 no-follow/device/identity rules.
 7. Retry maximum is 2..=6; base delay is at least 50 ms, max delay is positive, and base<=max. The row-58
    declared worst case formula must be <= both 10,000 ms and `turn_timeout_ms`.
 8. `events.path` is automatically scanned and measured; manifests cannot exclude it.
@@ -1099,10 +1164,12 @@ Validation rules:
     profile-contained `GeneratedFile`, and its template contains
     `{{context_window_tokens}}` exactly once at that pointer. AHRB substitutes the quick
     or cert row-51 token count before launch.
-12. Row 50 requires nonempty `sessions.close_delete` with `{{session_id}}` exactly once;
-    it is a public harness command/transport operation and may not alias AHRB's metadata
-    close. Row 68's `delete` may use the same argv only when both typed fields are
-    explicitly populated and independently validated.
+12. Row 50 requires nonempty `sessions.close_delete` with `{{session_id}}` exactly once
+    and nonempty profile-contained `sessions.store_paths`; close-delete is a public
+    harness command/transport operation and may not alias AHRB's metadata close. Its
+    successful result is validated before every residue measurement. Row 68's `delete`
+    may use the same argv only when both typed fields are explicitly populated and
+    independently validated.
 13. `[input].prompt_uses_stdin` is required when row 57 is selected. If true, launch must
     retain an AHRB-owned stdin writer; if false, stdin EOF is N/A only when transport
     also proves stdin is not a control channel.
@@ -1127,8 +1194,8 @@ typed blocks. The implementing lane MUST verify actual command/config behavior a
 support from product name or an environment variable that is merely an AHRB rendering
 input. Current code establishes that Claude, Codex, OpenCode are per-invocation with
 resume surfaces; Pi and Rick currently lack generic session operations; Haider is the
-shared-daemon adapter with max 32 and list but no proven headless resume command. Those
-are feasibility inputs, not permission to auto-PASS any v2 row.
+shared-daemon adapter with max 32 and declared list/resume surfaces whose behavior has
+not been verified. Those are feasibility inputs, not permission to auto-PASS any v2 row.
 
 ## 8. Four implementation waves
 

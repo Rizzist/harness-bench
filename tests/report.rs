@@ -3,12 +3,12 @@ use ahrb::evaluate::{
 };
 use ahrb::process::{ProcIdentity, ProcOwnership, Sample};
 use ahrb::report::{
-    MembershipSample, MemoryTimeIntegralEvidence, MemoryTimeIntegralSample, ProcessHygieneAudit,
-    ProcessHygieneCadenceSample, ProcessHygieneCheckpoint, ProcessHygieneEvidence,
-    ProcessHygieneProcess, Report, ResourceSummary, TurnObservation, evaluate_memory_time_integral,
-    evaluate_process_hygiene, evaluate_time_to_first_model_request, evaluate_turn_latency,
-    evaluate_turn_latency_repetitions, record_capability_declarations, render_markdown,
-    render_resource_summary, summarize_resources,
+    MembershipSample, MemoryTimeIntegralEvidence, MemoryTimeIntegralSample, NullableSummaryValue,
+    ProcessHygieneAudit, ProcessHygieneCadenceSample, ProcessHygieneCheckpoint,
+    ProcessHygieneEvidence, ProcessHygieneProcess, Report, ResourceSummary, TurnObservation,
+    evaluate_latency_vs_turn_index, evaluate_memory_time_integral, evaluate_process_hygiene,
+    evaluate_time_to_first_model_request, evaluate_turn_latency, evaluate_turn_latency_repetitions,
+    record_capability_declarations, render_markdown, render_resource_summary, summarize_resources,
 };
 use std::path::Path;
 use std::time::SystemTime;
@@ -105,6 +105,36 @@ fn incomplete_resource_summary_omits_non_nullable_wave_one_derivatives() {
     }
 }
 
+#[test]
+fn wave3_nullable_summary_distinguishes_omitted_from_measured_null() {
+    let omitted =
+        serde_json::to_value(ResourceSummary::default()).expect("serialize omitted summary");
+    for field in [
+        "latency_last_first_decile_ratio",
+        "fanout_cliff_n_rss",
+        "fanout_cliff_n_wall",
+        "fairness_latency_max_min_ratio",
+    ] {
+        assert!(omitted.get(field).is_none(), "{field} must be omitted");
+    }
+
+    let measured = ResourceSummary {
+        latency_last_first_decile_ratio: NullableSummaryValue::Null,
+        fanout_cliff_n_rss: NullableSummaryValue::Null,
+        fanout_cliff_n_wall: NullableSummaryValue::Value(8),
+        fairness_latency_max_min_ratio: NullableSummaryValue::Null,
+        ..ResourceSummary::default()
+    };
+    let value = serde_json::to_value(&measured).expect("serialize measured nullable summary");
+    assert!(value["latency_last_first_decile_ratio"].is_null());
+    assert!(value["fanout_cliff_n_rss"].is_null());
+    assert_eq!(value["fanout_cliff_n_wall"], 8);
+    assert!(value["fairness_latency_max_min_ratio"].is_null());
+    let round_trip: ResourceSummary =
+        serde_json::from_value(value).expect("deserialize measured nullable summary");
+    assert_eq!(round_trip, measured);
+}
+
 fn latency_turn(index: u32, start_ns: u64, wall_ns: u64) -> TurnObservation {
     TurnObservation {
         repetition: 1,
@@ -117,6 +147,28 @@ fn latency_turn(index: u32, start_ns: u64, wall_ns: u64) -> TurnObservation {
         first_model_request_ns: None,
         terminal_ns: Some(start_ns + wall_ns),
         exit_ns: None,
+        turn_wall_ns: Some(wall_ns),
+    }
+}
+
+fn long_latency_turn(
+    repetition: u32,
+    index: u32,
+    wall_ns: u64,
+    per_invocation: bool,
+) -> TurnObservation {
+    let start_ns = 1_000_000_000_u64.saturating_add(u64::from(index) * 10_000_000);
+    TurnObservation {
+        repetition,
+        turn_index: index,
+        actor: format!("long-{repetition}"),
+        session_id_hash: format!("session-{repetition}"),
+        phase: "latency-vs-turn-index".to_owned(),
+        launch_ns: per_invocation.then_some(start_ns),
+        submit_ns: Some(start_ns),
+        first_model_request_ns: None,
+        terminal_ns: Some(start_ns.saturating_add(wall_ns)),
+        exit_ns: per_invocation.then_some(start_ns.saturating_add(wall_ns)),
         turn_wall_ns: Some(wall_ns),
     }
 }
@@ -646,6 +698,149 @@ fn per_invocation_turn_latency_requires_launch_and_exit_boundaries() {
     let mut missing_exit = complete;
     missing_exit.exit_ns = None;
     assert!(!evaluate_turn_latency(&[missing_exit], 1, true, 1_000).measurement_complete);
+}
+
+#[test]
+fn latency_vs_turn_index_flat_growing_sessions_pass_and_publish_exact_metrics() {
+    let turns = (1..=3)
+        .flat_map(|repetition| {
+            (1..=10).map(move |turn| long_latency_turn(repetition, turn, 5_000_000, false))
+        })
+        .collect::<Vec<_>>();
+    let evaluation = evaluate_latency_vs_turn_index(&turns, 3, 10, false);
+    assert!(evaluation.measurement_complete);
+    assert!(evaluation.passed);
+    assert_eq!(evaluation.first_decile_p50_ms, 5.0);
+    assert_eq!(evaluation.last_decile_p50_ms, 5.0);
+    assert_eq!(evaluation.theil_sen_ms_per_turn, 0.0);
+    assert_eq!(evaluation.latency_slope_ms_per_100_turns, 0.0);
+    assert_eq!(evaluation.latency_last_first_decile_ratio, Some(1.0));
+    assert_eq!(
+        evaluation.metrics["latency_vs_turn_index.first_decile_p50_ms"],
+        5.0
+    );
+    assert_eq!(
+        evaluation.metrics["latency_vs_turn_index.last_decile_p50_ms"],
+        5.0
+    );
+    assert_eq!(
+        evaluation.metrics["latency_vs_turn_index.theil_sen_ms_per_turn"],
+        0.0
+    );
+}
+
+#[test]
+fn latency_vs_turn_index_applies_growth_oracle_to_published_medians() {
+    let mut turns = Vec::new();
+    for repetition in 1..=3 {
+        for turn in 1..=10 {
+            let wall_ns = if repetition == 3 {
+                u64::from(turn).saturating_mul(10_000_000)
+            } else {
+                5_000_000
+            };
+            turns.push(long_latency_turn(repetition, turn, wall_ns, false));
+        }
+    }
+    let evaluation = evaluate_latency_vs_turn_index(&turns, 3, 10, false);
+    assert!(evaluation.measurement_complete);
+    assert_eq!(evaluation.theil_sen_ms_per_turn, 0.0);
+    assert!(evaluation.passed);
+    assert!(evaluation.failure_detail.is_none());
+    assert_eq!(evaluation.details["repetitions"][2]["passed"], false);
+}
+
+#[test]
+fn latency_vs_turn_index_allows_bounded_resume_drift_with_one_topology_neutral_formula() {
+    let turns = (1..=100)
+        .map(|turn| {
+            let wall_ns = 730_000_000_u64.saturating_add(u64::from(turn) * 240_000);
+            long_latency_turn(1, turn, wall_ns, true)
+        })
+        .collect::<Vec<_>>();
+
+    let per_invocation = evaluate_latency_vs_turn_index(&turns, 1, 100, true);
+    let daemon = evaluate_latency_vs_turn_index(&turns, 1, 100, false);
+    for evaluation in [&per_invocation, &daemon] {
+        assert!(evaluation.measurement_complete);
+        assert!(evaluation.passed);
+        assert!((evaluation.first_decile_p50_ms - 731.2).abs() < f64::EPSILON);
+        assert!((evaluation.last_decile_p50_ms - 752.8).abs() < f64::EPSILON);
+        assert!((evaluation.latency_slope_ms_per_100_turns - 24.0).abs() < 1e-9);
+        let bound = evaluation.details["repetitions"][0]["slope_bound_ms_per_100_turns"]
+            .as_f64()
+            .expect("numeric slope bound");
+        assert!((bound - 36.56).abs() < 1e-9);
+        assert!(
+            evaluation
+                .latency_last_first_decile_ratio
+                .is_some_and(|ratio| ratio < 1.25)
+        );
+        assert!(evaluation.last_decile_p50_ms <= 1.25 * evaluation.first_decile_p50_ms + 50.0);
+    }
+    assert_eq!(
+        per_invocation.latency_slope_ms_per_100_turns,
+        daemon.latency_slope_ms_per_100_turns
+    );
+}
+
+#[test]
+fn latency_vs_turn_index_rejects_synthetic_runaway_growth() {
+    let turns = (1..=100)
+        .map(|turn| {
+            let wall_ns = 100_000_000_u64.saturating_add(u64::from(turn) * 1_000_000);
+            long_latency_turn(1, turn, wall_ns, true)
+        })
+        .collect::<Vec<_>>();
+    let evaluation = evaluate_latency_vs_turn_index(&turns, 1, 100, true);
+
+    assert!(evaluation.measurement_complete);
+    assert!(!evaluation.passed);
+    assert!((evaluation.latency_slope_ms_per_100_turns - 100.0).abs() < 1e-9);
+    assert!(
+        evaluation
+            .latency_last_first_decile_ratio
+            .is_some_and(|ratio| ratio > 1.25)
+    );
+    assert!(evaluation.last_decile_p50_ms > 1.25 * evaluation.first_decile_p50_ms + 50.0);
+    assert_eq!(
+        evaluation.details["repetitions"][0]["slope_bound_ms_per_100_turns"],
+        25.0
+    );
+    assert_eq!(evaluation.details["repetitions"][0]["passed"], false);
+}
+
+#[test]
+fn latency_vs_turn_index_zero_first_decile_is_null_and_cannot_pass() {
+    let turns = (1..=10)
+        .map(|turn| long_latency_turn(1, turn, 0, false))
+        .collect::<Vec<_>>();
+    let evaluation = evaluate_latency_vs_turn_index(&turns, 1, 10, false);
+    assert!(evaluation.measurement_complete);
+    assert!(!evaluation.passed);
+    assert_eq!(evaluation.latency_last_first_decile_ratio, None);
+    assert!(
+        evaluation.details["latency_last_first_decile_ratio"].is_null(),
+        "typed details must preserve JSON null"
+    );
+}
+
+#[test]
+fn latency_vs_turn_index_requires_topology_specific_external_boundaries() {
+    let mut turns = (1..=10)
+        .map(|turn| long_latency_turn(1, turn, 5_000_000, true))
+        .collect::<Vec<_>>();
+    assert!(evaluate_latency_vs_turn_index(&turns, 1, 10, true).measurement_complete);
+
+    turns[4].exit_ns = None;
+    let missing = evaluate_latency_vs_turn_index(&turns, 1, 10, true);
+    assert!(!missing.measurement_complete);
+    assert!(
+        missing
+            .measurement_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("launch/exit"))
+    );
 }
 
 #[test]

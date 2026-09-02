@@ -174,7 +174,7 @@ const AR: Pillar = Pillar::AutomationReadiness;
 /// Matrix rows that must pass early in the implementation and verification loop.
 pub const PRIORITIZED_ROWS: &[u8] = &[1, 2, 3, 9, 10, 12, 20, 26, 30, 35, 40];
 
-const TESTS: [TestDefinition; 57] = [
+const TESTS: [TestDefinition; 64] = [
     test(
         1,
         "routing",
@@ -558,6 +558,62 @@ const TESTS: [TestDefinition; 57] = [
         RS,
         "owned-tree CPU while a paced provider response is pending",
         "all paced frames arrive once; exactly one success; owned-tree CPU <=5% of one core",
+    ),
+    test(
+        49,
+        "latency-vs-turn-index",
+        "Latency versus turn index",
+        RS,
+        "Theil-Sen wall-latency slope and first/last-decile medians",
+        "every growing-session turn terminalizes; slope, decile ratio, and last-decile latency remain bounded",
+    ),
+    test(
+        50,
+        "session-residue-sweep",
+        "Session residue sweep",
+        RS,
+        "process and identity-safe declared-store residue after repeated public close-delete",
+        "all sessions are really deleted and process, memory, FD, thread, and store slopes remain bounded",
+    ),
+    test(
+        51,
+        "context-limit-recovery",
+        "Context limit recovery",
+        AR,
+        "fake-provider request stream across an exact context-length fault and compacted retry",
+        "one bounded deterministic recovery preserves session identity, instructions, markers, effects, and every tool pair",
+    ),
+    test(
+        52,
+        "resume-latency-vs-length",
+        "Resume latency versus session length",
+        AR,
+        "external resume-to-first-request latency over persisted session lengths",
+        "session identity and cursor are exact while p95, Theil-Sen slope, and long/short ratio remain bounded",
+    ),
+    test(
+        53,
+        "journal-torn-tail-sweep",
+        "Journal torn-tail sweep",
+        AR,
+        "repeated kill-after-growth journal copies truncated at exact record-relative cuts",
+        "every committed prefix recovers cleanly without corruption, loss, fabrication, or duplicate effects",
+    ),
+    test(
+        54,
+        "fanout-cliff",
+        "Fanout cliff",
+        RS,
+        "median-aggregated RSS and wall scaling across the required fanout widths",
+        "all widths terminalize without an RSS/wall cliff, super-linear global RSS, or excessive N8 peak",
+    ),
+    test(
+        55,
+        "fairness-under-fanout",
+        "Fairness under fanout",
+        RS,
+        "barrier-release-to-terminal latency distribution for every scheduled actor",
+        "no starvation and bounded population CV, spread, and non-null max/min ratio",
     ),
     test(
         56,

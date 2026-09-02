@@ -123,6 +123,22 @@ impl<'de> Deserialize<'de> for ReportDetails {
                     serde_json::from_value::<TimeToFirstModelRequestDetails>(value.clone())
                         .map(|_| ())
                 }
+                "latency-vs-turn-index" => {
+                    serde_json::from_value::<LatencyVsTurnIndexDetails>(value.clone()).map(|_| ())
+                }
+                "session-residue-sweep" => {
+                    serde_json::from_value::<SessionResidueSweepDetails>(value.clone()).map(|_| ())
+                }
+                "context-limit-recovery" => {
+                    serde_json::from_value::<ContextLimitRecoveryDetails>(value.clone()).map(|_| ())
+                }
+                "resume-latency-vs-length" => {
+                    serde_json::from_value::<ResumeLatencyVsLengthDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "journal-torn-tail-sweep" => {
+                    serde_json::from_value::<JournalTornTailSweepDetails>(value.clone()).map(|_| ())
+                }
                 "memory-time-integral" => {
                     serde_json::from_value::<MemoryTimeIntegralDetails>(value.clone()).map(|_| ())
                 }
@@ -137,6 +153,14 @@ impl<'de> Deserialize<'de> for ReportDetails {
                     serde_json::from_value::<CrossRunReproducibilityDetails>(value.clone())
                         .map(|_| ())
                 }
+                "fanout-cliff" => serde_json::from_value::<
+                    crate::wave3_concurrency::FanoutCliffDetails,
+                >(value.clone())
+                .map(|_| ()),
+                "fairness-under-fanout" => serde_json::from_value::<
+                    crate::wave3_concurrency::FairnessDetails,
+                >(value.clone())
+                .map(|_| ()),
                 "resource-summary" => {
                     serde_json::from_value::<ResourceSummaryDetails>(value.clone()).map(|_| ())
                 }
@@ -263,6 +287,76 @@ struct GrowthDiagnosticDetail {
 #[derive(Deserialize)]
 struct TimeToFirstModelRequestDetails {
     first_request_role: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct LatencyVsTurnIndexDetails {
+    measurement_complete: bool,
+    #[serde(default)]
+    measurement_error: Option<String>,
+    #[serde(default)]
+    first_decile_p50_ms: Option<f64>,
+    #[serde(default)]
+    last_decile_p50_ms: Option<f64>,
+    #[serde(default)]
+    theil_sen_ms_per_turn: Option<f64>,
+    #[serde(default)]
+    latency_slope_ms_per_100_turns: Option<f64>,
+    #[serde(default)]
+    latency_last_first_decile_ratio: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct SessionResidueSweepDetails {
+    measurement_complete: bool,
+    #[serde(default)]
+    measurement_error: Option<String>,
+    #[serde(default)]
+    store_checkpoints: Vec<crate::wave3_long_horizon::SessionResidueCheckpoint>,
+    #[serde(default)]
+    repetitions: Vec<crate::wave3_long_horizon::SessionResidueSweep>,
+    #[serde(default)]
+    final_memory_bound_mib: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ContextLimitRecoveryDetails {
+    measurement_complete: bool,
+    #[serde(default)]
+    measurement_error: Option<String>,
+    #[serde(default)]
+    trials: Vec<crate::wave3_long_horizon::ContextRecoveryTrial>,
+    #[serde(default)]
+    normalized_compacted_stream_sha256_by_repetition: Vec<(u32, String)>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct ResumeLatencyVsLengthDetails {
+    measurement_complete: bool,
+    #[serde(default)]
+    measurement_error: Option<String>,
+    #[serde(default)]
+    points: Vec<crate::wave3_long_horizon::ResumeLatencyPoint>,
+    #[serde(default)]
+    length_medians_ms: Vec<(u32, f64)>,
+    #[serde(default)]
+    long_short_ratio: Option<f64>,
+    #[serde(default)]
+    identity_cursor_preserved: Option<bool>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct JournalTornTailSweepDetails {
+    measurement_complete: bool,
+    #[serde(default)]
+    measurement_error: Option<String>,
+    #[serde(default)]
+    cut_positions: Vec<crate::wave3_long_horizon::JournalTornTailTrial>,
 }
 
 #[allow(dead_code)]
@@ -540,6 +634,66 @@ pub struct ProcessHygieneEvidence {
 /// whole-tree samples, membership-discovery accounting, and the external turn
 /// wall clocks that already enforce turn deadlines. Summary construction never
 /// executes synchronously in the harness turn path.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum NullableSummaryValue<T> {
+    /// The source row was not selected or did not complete, so omit the field.
+    #[default]
+    Omitted,
+    /// The source row completed and the meaningful result is JSON null.
+    Null,
+    /// The source row completed and produced a numeric value.
+    Value(T),
+}
+
+impl<T> NullableSummaryValue<T> {
+    fn is_omitted(&self) -> bool {
+        matches!(self, Self::Omitted)
+    }
+
+    fn as_option(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Omitted | Self::Null => None,
+        }
+    }
+}
+
+impl<T> From<Option<T>> for NullableSummaryValue<T> {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Null, Self::Value)
+    }
+}
+
+impl<T: PartialEq> PartialEq<Option<T>> for NullableSummaryValue<T> {
+    fn eq(&self, other: &Option<T>) -> bool {
+        match self {
+            Self::Value(value) => other.as_ref() == Some(value),
+            Self::Omitted | Self::Null => other.is_none(),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for NullableSummaryValue<T> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Value(value) => serializer.serialize_some(value),
+            Self::Omitted | Self::Null => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for NullableSummaryValue<T> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Option::<T>::deserialize(deserializer)?.into())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ResourceSummary {
     /// Architecture topology under which resource values were measured.
@@ -638,8 +792,8 @@ pub struct ResourceSummary {
     /// Long-session latency fields (row 49).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_slope_ms_per_100_turns: Option<f64>,
-    #[serde(default)]
-    pub latency_last_first_decile_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "NullableSummaryValue::is_omitted")]
+    pub latency_last_first_decile_ratio: NullableSummaryValue<f64>,
     /// Session residue/store fields (row 50).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_residue_slope_mib_per_session: Option<f64>,
@@ -661,10 +815,10 @@ pub struct ResourceSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_latency_slope_ms_per_turn: Option<f64>,
     /// Fanout cliff/scaling fields (row 54).
-    #[serde(default)]
-    pub fanout_cliff_n_rss: Option<u32>,
-    #[serde(default)]
-    pub fanout_cliff_n_wall: Option<u32>,
+    #[serde(default, skip_serializing_if = "NullableSummaryValue::is_omitted")]
+    pub fanout_cliff_n_rss: NullableSummaryValue<u32>,
+    #[serde(default, skip_serializing_if = "NullableSummaryValue::is_omitted")]
+    pub fanout_cliff_n_wall: NullableSummaryValue<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout_max_local_rss_alpha: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -676,8 +830,8 @@ pub struct ResourceSummary {
     /// Fairness fields (row 55).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fairness_latency_cv: Option<f64>,
-    #[serde(default)]
-    pub fairness_latency_max_min_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "NullableSummaryValue::is_omitted")]
+    pub fairness_latency_max_min_ratio: NullableSummaryValue<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fairness_latency_spread_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -995,6 +1149,12 @@ pub fn render_resource_summary(summary: &ResourceSummary) -> String {
     );
     let _ = write!(
         output,
+        " latency_slope_ms_per_100_turns={} latency_last_first_decile_ratio={}",
+        optional_milliseconds(summary.latency_slope_ms_per_100_turns),
+        optional_decimal(summary.latency_last_first_decile_ratio.as_option().copied(),),
+    );
+    let _ = write!(
+        output,
         " sampler_overhead_pct={:.3}",
         summary.sampler_overhead_pct
     );
@@ -1138,6 +1298,33 @@ pub struct TurnLatencyEvaluation {
     pub reference_envelope_pass: bool,
     /// Deterministic measurement diagnostic when incomplete.
     pub measurement_error: Option<String>,
+}
+
+/// Deterministic row-49 long-session latency-growth decision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LatencyVsTurnIndexEvaluation {
+    /// Exact top-level `metrics.latency_vs_turn_index.*` values.
+    pub metrics: BTreeMap<String, f64>,
+    /// Median of the per-repetition first-decile p50 values.
+    pub first_decile_p50_ms: f64,
+    /// Median of the per-repetition last-decile p50 values.
+    pub last_decile_p50_ms: f64,
+    /// Median per-repetition Theil-Sen slope.
+    pub theil_sen_ms_per_turn: f64,
+    /// Median per-repetition slope scaled to 100 turns.
+    pub latency_slope_ms_per_100_turns: f64,
+    /// Exact headline last/first decile ratio, absent when the first median is zero.
+    pub latency_last_first_decile_ratio: Option<f64>,
+    /// Exact structured `details.latency-vs-turn-index` value.
+    pub details: Value,
+    /// Whether every required external boundary and turn interval was present.
+    pub measurement_complete: bool,
+    /// CORE oracle decision over the published median-of-repetitions fields.
+    pub passed: bool,
+    /// Deterministic measurement diagnostic when incomplete.
+    pub measurement_error: Option<String>,
+    /// Deterministic behavioral diagnostic when complete but outside the oracle.
+    pub failure_detail: Option<String>,
 }
 
 /// Deterministic row-45 cold-launch distribution and evidence decision.
@@ -1845,6 +2032,248 @@ pub fn evaluate_turn_latency_repetitions(
         reference_envelope_pass: all_repetitions_pass,
         measurement_error: None,
     }
+}
+
+const LATENCY_SLOPE_BASELINE_FRACTION: f64 = 0.05;
+const LATENCY_SLOPE_ABSOLUTE_FLOOR_MS_PER_100_TURNS: f64 = 25.0;
+
+fn latency_slope_bound_ms_per_100_turns(first_decile_p50_ms: f64) -> f64 {
+    (LATENCY_SLOPE_BASELINE_FRACTION * first_decile_p50_ms)
+        .max(LATENCY_SLOPE_ABSOLUTE_FLOOR_MS_PER_100_TURNS)
+}
+
+/// Evaluate row 49 from the row-29 growing-session turn clocks.
+pub fn evaluate_latency_vs_turn_index(
+    observations: &[TurnObservation],
+    expected_repetitions: u32,
+    turns_per_repetition: u32,
+    per_invocation: bool,
+) -> LatencyVsTurnIndexEvaluation {
+    let incomplete = |detail: String| LatencyVsTurnIndexEvaluation {
+        metrics: BTreeMap::new(),
+        first_decile_p50_ms: 0.0,
+        last_decile_p50_ms: 0.0,
+        theil_sen_ms_per_turn: 0.0,
+        latency_slope_ms_per_100_turns: 0.0,
+        latency_last_first_decile_ratio: None,
+        details: serde_json::json!({
+            "measurement_complete": false,
+            "measurement_error": detail,
+        }),
+        measurement_complete: false,
+        passed: false,
+        measurement_error: Some(detail),
+        failure_detail: None,
+    };
+    if expected_repetitions == 0 || turns_per_repetition < 10 || turns_per_repetition % 10 != 0 {
+        return incomplete(format!(
+            "row-49 plan requires repetitions and a positive whole-decile turn count; repetitions={expected_repetitions}, turns={turns_per_repetition}"
+        ));
+    }
+    let expected_turns = expected_repetitions.saturating_mul(turns_per_repetition);
+    if observations.len() != expected_turns as usize {
+        return incomplete(format!(
+            "expected {expected_turns} long-session turn intervals, observed {}",
+            observations.len()
+        ));
+    }
+
+    let decile_len = usize::try_from(turns_per_repetition / 10).unwrap_or(usize::MAX);
+    let mut first_deciles = Vec::with_capacity(expected_repetitions as usize);
+    let mut last_deciles = Vec::with_capacity(expected_repetitions as usize);
+    let mut slopes = Vec::with_capacity(expected_repetitions as usize);
+    let mut repetition_details = Vec::with_capacity(expected_repetitions as usize);
+
+    for repetition in 1..=expected_repetitions {
+        let mut turns = observations
+            .iter()
+            .filter(|observation| observation.repetition == repetition)
+            .collect::<Vec<_>>();
+        turns.sort_by_key(|observation| observation.turn_index);
+        if turns.len() != turns_per_repetition as usize {
+            return incomplete(format!(
+                "repetition {repetition} expected {turns_per_repetition} long-session intervals, observed {}",
+                turns.len()
+            ));
+        }
+        let Some(first_turn) = turns.first() else {
+            return incomplete(format!("repetition {repetition} has no long-session turns"));
+        };
+        if first_turn.actor.is_empty() || first_turn.session_id_hash.is_empty() {
+            return incomplete(format!(
+                "repetition {repetition} lacks the growing-session actor or session identity"
+            ));
+        }
+        let expected_actor = first_turn.actor.as_str();
+        let expected_session = first_turn.session_id_hash.as_str();
+        let mut wall_ms = Vec::with_capacity(turns.len());
+        for (index, observation) in turns.iter().enumerate() {
+            let expected_index = index as u32 + 1;
+            if observation.turn_index != expected_index {
+                return incomplete(format!(
+                    "repetition {repetition} turn index expected {expected_index}, observed {}",
+                    observation.turn_index
+                ));
+            }
+            if observation.phase != "latency-vs-turn-index"
+                || observation.actor != expected_actor
+                || observation.session_id_hash != expected_session
+            {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} is not attributable to one growing row-49 session",
+                    observation.turn_index
+                ));
+            }
+            if observation.terminal_ns.is_none() {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks a structured-terminal boundary",
+                    observation.turn_index
+                ));
+            }
+            let boundaries = if per_invocation {
+                observation.launch_ns.zip(observation.exit_ns)
+            } else {
+                observation.submit_ns.zip(observation.terminal_ns)
+            };
+            let Some((start_ns, end_ns)) = boundaries else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks required {} boundaries",
+                    observation.turn_index,
+                    if per_invocation {
+                        "launch/exit"
+                    } else {
+                        "submit/terminal"
+                    }
+                ));
+            };
+            let Some(expected_wall_ns) = end_ns.checked_sub(start_ns) else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} external boundaries are reversed",
+                    observation.turn_index
+                ));
+            };
+            let Some(turn_wall_ns) = observation.turn_wall_ns else {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} lacks turn_wall_ns",
+                    observation.turn_index
+                ));
+            };
+            if turn_wall_ns != expected_wall_ns {
+                return incomplete(format!(
+                    "repetition {repetition} turn {} wall interval disagrees with its external boundaries",
+                    observation.turn_index
+                ));
+            }
+            wall_ms.push(turn_wall_ns as f64 / 1_000_000.0);
+        }
+
+        let first_decile_p50_ms = nearest_rank_f64(&wall_ms[..decile_len], 50);
+        let last_decile_p50_ms =
+            nearest_rank_f64(&wall_ms[wall_ms.len().saturating_sub(decile_len)..], 50);
+        let theil_sen_ms_per_turn = theil_sen_indexed_f64(&wall_ms);
+        let slope_ms_per_100_turns = theil_sen_ms_per_turn * 100.0;
+        let ratio =
+            (first_decile_p50_ms != 0.0).then_some(last_decile_p50_ms / first_decile_p50_ms);
+        let slope_bound_ms_per_100_turns =
+            latency_slope_bound_ms_per_100_turns(first_decile_p50_ms);
+        let repetition_passed = slope_ms_per_100_turns <= slope_bound_ms_per_100_turns
+            && ratio.is_some_and(|value| value <= 1.25)
+            && last_decile_p50_ms <= 1.25 * first_decile_p50_ms + 50.0;
+        first_deciles.push(first_decile_p50_ms);
+        last_deciles.push(last_decile_p50_ms);
+        slopes.push(theil_sen_ms_per_turn);
+        repetition_details.push(serde_json::json!({
+            "repetition": repetition,
+            "turns": turns_per_repetition,
+            "first_decile_p50_ms": first_decile_p50_ms,
+            "last_decile_p50_ms": last_decile_p50_ms,
+            "theil_sen_ms_per_turn": theil_sen_ms_per_turn,
+            "latency_slope_ms_per_100_turns": slope_ms_per_100_turns,
+            "latency_last_first_decile_ratio": ratio,
+            "slope_bound_ms_per_100_turns": slope_bound_ms_per_100_turns,
+            "passed": repetition_passed,
+        }));
+    }
+
+    first_deciles.sort_by(f64::total_cmp);
+    last_deciles.sort_by(f64::total_cmp);
+    slopes.sort_by(f64::total_cmp);
+    let first_decile_p50_ms = median_sorted_f64(&first_deciles);
+    let last_decile_p50_ms = median_sorted_f64(&last_deciles);
+    let theil_sen_ms_per_turn = median_sorted_f64(&slopes);
+    let latency_slope_ms_per_100_turns = theil_sen_ms_per_turn * 100.0;
+    // The schema explicitly defines the headline ratio from the two published
+    // headline decile medians, rather than as a separately rounded aggregate.
+    let latency_last_first_decile_ratio =
+        (first_decile_p50_ms != 0.0).then_some(last_decile_p50_ms / first_decile_p50_ms);
+    let headline_bound = latency_slope_bound_ms_per_100_turns(first_decile_p50_ms);
+    let headline_passed = latency_slope_ms_per_100_turns <= headline_bound
+        && latency_last_first_decile_ratio.is_some_and(|value| value <= 1.25)
+        && last_decile_p50_ms <= 1.25 * first_decile_p50_ms + 50.0;
+    let failure_detail = (!headline_passed).then(|| {
+        format!(
+            "headline: slope100={latency_slope_ms_per_100_turns:.6}/{headline_bound:.6}ms ratio={} last={last_decile_p50_ms:.6}/{:.6}ms",
+            latency_last_first_decile_ratio
+                .map_or_else(|| "null".to_owned(), |value| format!("{value:.6}")),
+            1.25 * first_decile_p50_ms + 50.0,
+        )
+    });
+    // SPEC-v2 publishes the median of independently computed repetition
+    // fields and applies the growth oracle to those headline fields. Every
+    // repetition must still be structurally complete; that is enforced by
+    // the fail-closed validation above. Retain each repetition's diagnostic
+    // `passed` flag in details without introducing an additional veto.
+    let passed = headline_passed;
+    let metrics = BTreeMap::from([
+        (
+            "latency_vs_turn_index.first_decile_p50_ms".to_owned(),
+            first_decile_p50_ms,
+        ),
+        (
+            "latency_vs_turn_index.last_decile_p50_ms".to_owned(),
+            last_decile_p50_ms,
+        ),
+        (
+            "latency_vs_turn_index.theil_sen_ms_per_turn".to_owned(),
+            theil_sen_ms_per_turn,
+        ),
+    ]);
+    LatencyVsTurnIndexEvaluation {
+        metrics,
+        first_decile_p50_ms,
+        last_decile_p50_ms,
+        theil_sen_ms_per_turn,
+        latency_slope_ms_per_100_turns,
+        latency_last_first_decile_ratio,
+        details: serde_json::json!({
+            "measurement_complete": true,
+            "measurement_error": null,
+            "first_decile_p50_ms": first_decile_p50_ms,
+            "last_decile_p50_ms": last_decile_p50_ms,
+            "theil_sen_ms_per_turn": theil_sen_ms_per_turn,
+            "latency_slope_ms_per_100_turns": latency_slope_ms_per_100_turns,
+            "latency_last_first_decile_ratio": latency_last_first_decile_ratio,
+            "repetitions": repetition_details,
+            "passed": passed,
+            "failure_detail": failure_detail,
+        }),
+        measurement_complete: true,
+        passed,
+        measurement_error: None,
+        failure_detail,
+    }
+}
+
+fn theil_sen_indexed_f64(values: &[f64]) -> f64 {
+    let pair_count = values.len().saturating_mul(values.len().saturating_sub(1)) / 2;
+    let mut slopes = Vec::with_capacity(pair_count);
+    for left in 0..values.len() {
+        for right in (left + 1)..values.len() {
+            slopes.push((values[right] - values[left]) / (right - left) as f64);
+        }
+    }
+    slopes.sort_by(f64::total_cmp);
+    median_sorted_f64(&slopes)
 }
 
 /// Complete row-44 aggregation and CORE oracle decision.

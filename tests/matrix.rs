@@ -4,15 +4,14 @@ use ahrb::scenarios::{PRIORITIZED_ROWS, RequirementKind, all};
 #[test]
 fn matrix_has_implemented_rows_in_exact_order_with_unique_ids() {
     let tests = all();
-    assert_eq!(tests.len(), 57);
+    assert_eq!(tests.len(), 64);
     let rows: Vec<u8> = tests.iter().map(|test| test.row).collect();
-    let mut expected = (1_u8..=48).collect::<Vec<_>>();
-    expected.extend(56_u8..=64);
+    let expected = (1_u8..=64).collect::<Vec<_>>();
     assert_eq!(rows, expected);
     let mut ids: Vec<&str> = tests.iter().map(|test| test.id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 57);
+    assert_eq!(ids.len(), 64);
 }
 
 #[test]
@@ -48,6 +47,13 @@ fn row_46_is_informational_resource_evidence() {
     let definition = all().iter().find(|test| test.row == 46).expect("row 46");
     assert_eq!(definition.id, "memory-time-integral");
     assert_eq!(definition.requirement(), RequirementKind::Informational);
+}
+
+#[test]
+fn row_49_is_core_resource_evidence() {
+    let definition = all().iter().find(|test| test.row == 49).expect("row 49");
+    assert_eq!(definition.id, "latency-vs-turn-index");
+    assert_eq!(definition.requirement(), RequirementKind::Core);
 }
 
 #[test]

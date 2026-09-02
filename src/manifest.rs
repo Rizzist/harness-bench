@@ -367,6 +367,9 @@ pub struct SessionOps {
     /// Close/delete operation name or argv template.
     #[serde(default)]
     pub close_delete: Vec<String>,
+    /// Profile-contained harness-owned session-store roots audited after close/delete.
+    #[serde(default)]
+    pub store_paths: Vec<String>,
     /// List operation name or argv template.
     #[serde(default)]
     pub list: Vec<String>,
@@ -445,7 +448,8 @@ pub struct Concurrency {
     /// Reported topology label.
     pub topology: String,
     /// Maximum simultaneous agents.
-    pub max_agents: usize,
+    #[serde(default)]
+    pub max_agents: Option<usize>,
     /// Fan-out mode.
     pub fanout_mode: String,
     /// Event evidence used to establish barrier presence.
@@ -664,6 +668,32 @@ pub struct ResourceControls {
     /// Additional journal paths; `events.path` is always implicit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_paths: Option<Vec<String>>,
+    /// Harness context-window injection surface used by row 51.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<ContextWindowConfig>,
+}
+
+/// Typed context-window carrier declared by an adapter.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ContextWindowConfig {
+    /// `provider-metadata`, `environment`, `cli`, or `generated-config`.
+    #[serde(default)]
+    pub surface: String,
+    /// Manifest example value; the runner substitutes the active profile value.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Environment variable used by the `environment` surface.
+    #[serde(default)]
+    pub environment: String,
+    /// Direct argv used by the `cli` surface.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Generated-file path used by the `generated-config` surface.
+    #[serde(default)]
+    pub generated_path: String,
+    /// Non-root JSON pointer inside the generated configuration.
+    #[serde(default)]
+    pub json_pointer: String,
 }
 
 /// Acceptance and completion hook argv templates.
@@ -911,7 +941,8 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         ));
     }
     validate_wave_2_resources(manifest)?;
-    if manifest.concurrency.max_agents == 0 {
+    validate_wave_3_resources(manifest)?;
+    if manifest.concurrency.max_agents == Some(0) {
         return Err(AhrbError::Validation(
             "concurrency.max_agents must be positive".to_owned(),
         ));
@@ -1086,6 +1117,7 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         ));
     }
     for (label, paths) in [
+        ("sessions.store_paths", Some(&manifest.sessions.store_paths)),
         ("resources.log_paths", manifest.resources.log_paths.as_ref()),
         (
             "resources.journal_paths",
@@ -1093,13 +1125,36 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         ),
     ] {
         if let Some(paths) = paths {
+            let mut normalized = std::collections::BTreeSet::new();
             for path in paths {
                 if !profile_scoped_template(path) {
                     return Err(AhrbError::Validation(format!(
                         "{label} entry {path:?} must be lexically contained under {{{{profile}}}}"
                     )));
                 }
+                if label == "sessions.store_paths"
+                    && !normalized.insert(normalized_profile_template(path))
+                {
+                    return Err(AhrbError::Validation(format!(
+                        "{label} contains duplicate rendered root {path:?}"
+                    )));
+                }
             }
+        }
+    }
+    if manifest.transport.kind == TransportKind::Exec && !manifest.sessions.close_delete.is_empty()
+    {
+        let session_id_placeholders = manifest
+            .sessions
+            .close_delete
+            .iter()
+            .map(|argument| argument.match_indices("{{session_id}}").count())
+            .sum::<usize>();
+        if session_id_placeholders != 1 {
+            return Err(AhrbError::Validation(
+                "sessions.close_delete for exec transport must contain {{session_id}} exactly once"
+                    .to_owned(),
+            ));
         }
     }
     if !manifest.events.replay_envelope_pointer.is_empty()
@@ -1335,6 +1390,83 @@ fn validate_wave_2_resources(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn validate_wave_3_resources(manifest: &Manifest) -> Result<()> {
+    let Some(context) = manifest.resources.context_window.as_ref() else {
+        return Ok(());
+    };
+    if context.tokens == 0 {
+        return Err(AhrbError::Validation(
+            "resources.context_window.tokens must be positive".to_owned(),
+        ));
+    }
+    let placeholder_count = context
+        .argv
+        .iter()
+        .map(|argument| argument.match_indices("{{context_window_tokens}}").count())
+        .sum::<usize>();
+    let no_generated = context.generated_path.is_empty() && context.json_pointer.is_empty();
+    match context.surface.as_str() {
+        "provider-metadata" => {
+            if !context.environment.is_empty() || !context.argv.is_empty() || !no_generated {
+                return Err(AhrbError::Validation(
+                    "provider-metadata context window cannot declare a carrier".to_owned(),
+                ));
+            }
+        }
+        "environment" => {
+            if context.environment.trim().is_empty() || !context.argv.is_empty() || !no_generated {
+                return Err(AhrbError::Validation(
+                    "environment context window requires only a nonempty environment name"
+                        .to_owned(),
+                ));
+            }
+        }
+        "cli" => {
+            if !context.environment.is_empty()
+                || context.argv.is_empty()
+                || placeholder_count != 1
+                || !no_generated
+            {
+                return Err(AhrbError::Validation(
+                    "cli context window requires only argv with {{context_window_tokens}} exactly once"
+                        .to_owned(),
+                ));
+            }
+        }
+        "generated-config" => {
+            let pointer_valid =
+                context.json_pointer.starts_with('/') && context.json_pointer != "/";
+            let generated = manifest
+                .isolation
+                .generated_files
+                .iter()
+                .find(|file| file.path == context.generated_path);
+            if !context.environment.is_empty()
+                || !context.argv.is_empty()
+                || !profile_scoped_template(&context.generated_path)
+                || !pointer_valid
+                || generated.is_none_or(|file| {
+                    file.content
+                        .match_indices("{{context_window_tokens}}")
+                        .count()
+                        != 1
+                })
+            {
+                return Err(AhrbError::Validation(
+                    "generated-config context window requires one profile-contained generated file and one placeholder"
+                        .to_owned(),
+                ));
+            }
+        }
+        other => {
+            return Err(AhrbError::Validation(format!(
+                "unsupported resources.context_window.surface {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_wave_2_capture_limits(manifest: &Manifest) -> Result<()> {
     const MAX_CAPTURE_BYTES: usize = 1_048_576;
     if !(1..=MAX_CAPTURE_BYTES).contains(&manifest.resources.max_output_bytes) {
@@ -1364,6 +1496,69 @@ fn profile_scoped_template(template: &str) -> bool {
             std::path::Component::ParentDir | std::path::Component::Prefix(_)
         )
     })
+}
+
+fn normalized_profile_template(template: &str) -> PathBuf {
+    let suffix = template.strip_prefix("{{profile}}").unwrap_or(template);
+    Path::new(suffix).components().collect()
+}
+
+/// Render the declared session-store roots and re-check lexical profile containment.
+///
+/// Physical containment and identity-safe recursive traversal are deliberately checked
+/// by the row-50 collector once the harness has created the roots. This helper ensures
+/// that template substitution cannot introduce `..`, an absolute replacement, or a
+/// duplicate lexical root before that filesystem audit starts.
+pub fn render_session_store_paths(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    let normalized_profile = normalize_rendered_path(profile_root).ok_or_else(|| {
+        AhrbError::Validation(format!(
+            "session-store profile root {} is not an absolute traversal-free path",
+            profile_root.display()
+        ))
+    })?;
+    let mut rendered = std::collections::BTreeSet::new();
+    for template in &manifest.sessions.store_paths {
+        let path = PathBuf::from(render_template(template, variables)?);
+        let normalized = normalize_rendered_path(&path).ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "rendered sessions.store_paths entry {} is not an absolute traversal-free path",
+                path.display()
+            ))
+        })?;
+        if !normalized.starts_with(&normalized_profile) {
+            return Err(AhrbError::Validation(format!(
+                "rendered sessions.store_paths entry {} escapes profile {}",
+                normalized.display(),
+                normalized_profile.display()
+            )));
+        }
+        if !rendered.insert(normalized.clone()) {
+            return Err(AhrbError::Validation(format!(
+                "sessions.store_paths renders duplicate root {}",
+                normalized.display()
+            )));
+        }
+    }
+    Ok(rendered.into_iter().collect())
+}
+
+fn normalize_rendered_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => return None,
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized)
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
@@ -1549,8 +1744,10 @@ fn resolve_executable(candidate: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod version_tests {
     use super::{
-        Manifest, RequestRoleRule, SideChannelKind, TruncationMarker, concise_version, validate,
+        Manifest, RequestRoleRule, SideChannelKind, TruncationMarker, concise_version,
+        render_session_store_paths, validate,
     };
+    use std::collections::BTreeMap;
 
     fn wave_2_manifest() -> Manifest {
         let mut manifest = super::load(std::path::Path::new("adapters/aider/manifest.toml"))
@@ -1644,6 +1841,71 @@ mod version_tests {
         manifest.resources.journal_paths = Some(vec!["{{profile}}/../journal".to_owned()]);
         let error = validate(&manifest).expect_err("traversing journal path must be rejected");
         assert!(error.to_string().contains("resources.journal_paths"));
+    }
+
+    #[test]
+    fn wave_3_session_store_paths_are_typed_unique_and_profile_scoped() {
+        let daemon = super::load(std::path::Path::new("adapters/mock/manifest.toml"))
+            .expect("load daemon mock manifest");
+        assert_eq!(
+            daemon.sessions.store_paths,
+            vec!["{{profile}}/state/sessions"]
+        );
+        assert_eq!(daemon.sessions.close_delete, vec!["session.close-delete"]);
+
+        let mut exec = super::load(std::path::Path::new("adapters/mock-exec/manifest.toml"))
+            .expect("load exec mock manifest");
+        assert_eq!(exec.sessions.store_paths, daemon.sessions.store_paths);
+        assert!(
+            exec.sessions
+                .close_delete
+                .iter()
+                .any(|argument| argument == "{{session_id}}")
+        );
+
+        exec.sessions.store_paths = vec!["state/sessions".to_owned()];
+        let error = validate(&exec).expect_err("relative session store must be rejected");
+        assert!(error.to_string().contains("sessions.store_paths"));
+
+        exec.sessions.store_paths = vec![
+            "{{profile}}/state/sessions".to_owned(),
+            "{{profile}}//state/./sessions".to_owned(),
+        ];
+        let error = validate(&exec).expect_err("duplicate rendered roots must be rejected");
+        assert!(error.to_string().contains("duplicate rendered root"));
+
+        exec.sessions.store_paths = vec!["{{profile}}/state/sessions".to_owned()];
+        exec.sessions.close_delete = vec!["/usr/bin/true".to_owned()];
+        let error = validate(&exec).expect_err("exec close-delete requires the session ID");
+        assert!(error.to_string().contains("{{session_id}} exactly once"));
+    }
+
+    #[test]
+    fn rendered_session_store_paths_cannot_escape_through_substitution() {
+        let mut manifest = super::load(std::path::Path::new("adapters/mock/manifest.toml"))
+            .expect("load daemon mock manifest");
+        manifest.sessions.store_paths = vec!["{{profile}}/{{store_suffix}}".to_owned()];
+        validate(&manifest).expect("unrendered path remains lexically profile scoped");
+        let profile = std::env::temp_dir().join("ahrb-session-store-render-test");
+        let variables = BTreeMap::from([
+            ("profile".to_owned(), profile.to_string_lossy().into_owned()),
+            ("store_suffix".to_owned(), "../outside".to_owned()),
+        ]);
+        let error = render_session_store_paths(&manifest, &variables, &profile)
+            .expect_err("rendered parent traversal must be rejected");
+        assert!(error.to_string().contains("traversal-free"));
+
+        manifest.sessions.store_paths = vec![
+            "{{profile}}/state/sessions".to_owned(),
+            "{{profile}}/{{store_suffix}}".to_owned(),
+        ];
+        let variables = BTreeMap::from([
+            ("profile".to_owned(), profile.to_string_lossy().into_owned()),
+            ("store_suffix".to_owned(), "state/sessions".to_owned()),
+        ]);
+        let error = render_session_store_paths(&manifest, &variables, &profile)
+            .expect_err("rendered duplicate roots must be rejected");
+        assert!(error.to_string().contains("duplicate root"));
     }
 
     #[test]

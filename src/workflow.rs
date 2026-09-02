@@ -243,6 +243,16 @@ pub enum Fault {
         /// Exact response body.
         body: String,
     },
+    /// Return one dialect-native context-length error, then accept one compacted retry.
+    ContextLength {
+        /// Advertised fake-provider context window.
+        window_tokens: u64,
+    },
+    /// Delay an otherwise normal complete response by a fixed interval.
+    Delay {
+        /// Delay after request acceptance and any barrier release.
+        delay_ms: u64,
+    },
     /// Close after a deterministic byte prefix.
     MidStreamDisconnect {
         /// Number of body bytes emitted before close.
@@ -279,6 +289,12 @@ impl Fault {
             Self::SustainedHttpStatus { status, .. } if !matches!(status, 429 | 500) => Err(
                 validation(format!("invalid sustained HTTP fault status {status}")),
             ),
+            Self::Delay { delay_ms: 0 } => Err(validation(
+                "delay fault delay-ms must be positive".to_owned(),
+            )),
+            Self::ContextLength { window_tokens } if *window_tokens == 0 => {
+                Err(validation("context-length window-tokens must be nonzero"))
+            }
             Self::Fragment { boundaries } => {
                 let mut previous = 0;
                 for boundary in boundaries {
@@ -489,6 +505,21 @@ impl WorkflowMachine {
         } else {
             TransitionRecognition::NonPrimary
         }
+    }
+
+    /// Return the immutable scripted response for a recognized checkpoint.
+    ///
+    /// The fake provider uses this only for the one context-length retry whose
+    /// canonical request must change after deterministic compaction.
+    pub fn response_for_checkpoint(&self, marker: &RouteMarker) -> Option<ScriptedResponse> {
+        if marker.scenario != self.scenario {
+            return None;
+        }
+        self.scripts_by_actor
+            .get(&marker.actor)?
+            .iter()
+            .find(|response| response.checkpoint == marker.checkpoint)
+            .cloned()
     }
 
     /// Validate and accept one request transition.

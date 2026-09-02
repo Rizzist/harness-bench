@@ -45,6 +45,7 @@ fn model_record(actor: &str) -> ModelRequestRecord {
         attempt: 1,
         received_ns: 1,
         body_bytes: 32,
+        input_tokens: None,
         role: "primary".to_owned(),
         side_channel_kind: None,
         response_status: Some(200),

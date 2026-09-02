@@ -42,11 +42,27 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_SESSION_MEMORY_MIB: u64 = 4;
 
 const MIB: u64 = 1024 * 1024;
+// Keep the reference long-session service time above ordinary host-scheduler
+// noise. Row 49 permits one percent of the first-decile median per 100 turns;
+// 350 ms leaves a small deterministic envelope without making the 100-turn
+// quick fixture approach certification-scale duration.
+const LONG_HORIZON_MIN_TURN_MS: u64 = 350;
+const TURN_LATENCY_MIN_TURN_MS: u64 = 100;
 const OWNED_EGRESS_BOUNDARY: &str = "reference-mock-loopback-connector-v1";
 static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEW_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static REPLACE_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_MAILBOX_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn reference_terminal_floor_ms(prompt: &str) -> Option<u64> {
+    if prompt.starts_with("AHRB long horizon turn ") {
+        Some(LONG_HORIZON_MIN_TURN_MS)
+    } else if prompt.starts_with("AHRB turn latency ") {
+        Some(TURN_LATENCY_MIN_TURN_MS)
+    } else {
+        None
+    }
+}
 
 /// One durable decision emitted by the reference mock's owned connector.
 ///
@@ -258,6 +274,29 @@ impl DurableJournal {
         Ok(())
     }
 
+    /// Append the exact one-MiB row-53 fixture record and make it durable.
+    fn append_row53_large_record(&self) -> Result<()> {
+        const TOTAL: usize = 1_048_576;
+        const PREFIX: &[u8] = br#"{"type":"ahrb-large","payload":""#;
+        const SUFFIX: &[u8] = b"\"}\n";
+        let payload_len = TOTAL
+            .checked_sub(PREFIX.len().saturating_add(SUFFIX.len()))
+            .ok_or_else(|| AhrbError::Protocol("row-53 record framing overflow".to_owned()))?;
+        let mut bytes = Vec::with_capacity(TOTAL);
+        bytes.extend_from_slice(PREFIX);
+        bytes.resize(PREFIX.len().saturating_add(payload_len), b'A');
+        bytes.extend_from_slice(SUFFIX);
+        if bytes.len() != TOTAL {
+            return Err(AhrbError::Protocol(
+                "row-53 large record did not total exactly 1,048,576 bytes".to_owned(),
+            ));
+        }
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Recover every complete valid record strictly after a cursor.
     ///
     /// A non-newline-terminated final record is treated as a torn tail and ignored. Any
@@ -279,7 +318,23 @@ impl DurableJournal {
             if line.is_empty() {
                 continue;
             }
-            let event: NormalizedEvent = serde_json::from_slice(&line).map_err(|error| {
+            let raw: Value = serde_json::from_slice(&line).map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "corrupt durable journal {}: {error}",
+                    self.path.display()
+                ))
+            })?;
+            // Row 53's exact full-size fixture is an intentionally synthetic
+            // non-event record. A complete one is cleanly ignored; a partial
+            // final record was already ignored above because it lacks the
+            // newline delimiter. No other malformed complete record is
+            // tolerated.
+            if raw.get("type").and_then(Value::as_str) == Some("ahrb-large")
+                && raw.get("payload").and_then(Value::as_str).is_some()
+            {
+                continue;
+            }
+            let event: NormalizedEvent = serde_json::from_value(raw).map_err(|error| {
                 AhrbError::Protocol(format!(
                     "corrupt durable journal {}: {error}",
                     self.path.display()
@@ -323,6 +378,7 @@ struct MockConfig {
     retry_base_delay_ms: u64,
     retry_max_delay_ms: u64,
     max_output_bytes: usize,
+    context_window_tokens: Option<u64>,
     session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
@@ -390,6 +446,21 @@ struct CompletedToolCall {
 struct SessionState {
     meta: SessionMeta,
     journal: DurableJournal,
+    /// Cursor-ordered live index rebuilt from the durable journal at startup.
+    /// Attach must be proportional to the requested suffix, not total session age.
+    events: Vec<NormalizedEvent>,
+    /// Durable tool results indexed for constant-session-age dedup checks.
+    tool_results: BTreeMap<String, Value>,
+    /// Durable hook completions indexed by semantic hook identity.
+    completed_hooks: BTreeSet<(String, String)>,
+    /// Whether a terminal event follows the most recent accepted turn.
+    ///
+    /// This is rebuilt from the journal on startup and updated only after the
+    /// corresponding durable append. Hot-path cancellation/terminal checks
+    /// therefore do not rescan an ever-growing session history.
+    terminal_since_last_accept: bool,
+    /// Reference-fixture pacing deadline for the row-29/49 growing session.
+    terminal_not_before: Option<tokio::time::Instant>,
     next_cursor: u64,
     keys: BTreeSet<String>,
     pending: Option<PendingTurn>,
@@ -527,14 +598,22 @@ struct MockHarness {
 
 impl MockHarness {
     fn open(config: MockConfig) -> Result<Self> {
-        Self::open_with_readiness(config, true)
+        Self::open_with_readiness(config, true, None)
     }
 
     fn open_per_invocation(config: MockConfig) -> Result<Self> {
-        Self::open_with_readiness(config, false)
+        Self::open_with_readiness(config, false, None)
     }
 
-    fn open_with_readiness(config: MockConfig, publish_daemon_pid: bool) -> Result<Self> {
+    fn open_per_invocation_session(config: MockConfig, session_id: &str) -> Result<Self> {
+        Self::open_with_readiness(config, false, Some(session_id))
+    }
+
+    fn open_with_readiness(
+        config: MockConfig,
+        publish_daemon_pid: bool,
+        session_filter: Option<&str>,
+    ) -> Result<Self> {
         fs::create_dir_all(config.state_dir.join("sessions"))?;
         fs::create_dir_all(config.state_dir.join("workspaces"))?;
         let mut sessions = BTreeMap::new();
@@ -556,6 +635,9 @@ impl MockHarness {
                     meta_path.display()
                 ))
             })?;
+            if session_filter.is_some_and(|session_id| meta.id != session_id) {
+                continue;
+            }
             let journal = DurableJournal::open(entry.path().join("journal.jsonl"))?;
             let events = journal.all()?;
             reconcile_durable_tool_effects(&config.state_dir, &meta.id, &events)?;
@@ -566,6 +648,31 @@ impl MockHarness {
                 .map(str::to_owned)
                 .collect();
             let pending = recover_pending(&events);
+            let tool_results = events
+                .iter()
+                .filter(|event| event.event == EventVocab::ToolResult)
+                .filter_map(|event| {
+                    Some((
+                        event.payload.get("call_id")?.as_str()?.to_owned(),
+                        event.payload.get("result")?.clone(),
+                    ))
+                })
+                .collect();
+            let completed_hooks = events
+                .iter()
+                .filter(|event| event.event == EventVocab::HookCompleted)
+                .filter_map(|event| {
+                    Some((
+                        event.payload.get("kind")?.as_str()?.to_owned(),
+                        event.payload.get("turn_key")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect();
+            let terminal_since_last_accept = events
+                .iter()
+                .rev()
+                .find(|event| event.event == EventVocab::TurnAccepted || is_terminal(&event.event))
+                .is_some_and(|event| is_terminal(&event.event));
             let next_cursor = events
                 .last()
                 .map(|event| event.cursor.saturating_add(1))
@@ -575,6 +682,11 @@ impl MockHarness {
                 SessionState {
                     meta,
                     journal,
+                    events,
+                    tool_results,
+                    completed_hooks,
+                    terminal_since_last_accept,
+                    terminal_not_before: None,
                     next_cursor,
                     keys,
                     pending,
@@ -634,6 +746,11 @@ impl MockHarness {
             SessionState {
                 meta,
                 journal,
+                events: Vec::new(),
+                tool_results: BTreeMap::new(),
+                completed_hooks: BTreeSet::new(),
+                terminal_since_last_accept: false,
+                terminal_not_before: None,
                 next_cursor: 1,
                 keys: BTreeSet::new(),
                 pending: None,
@@ -663,6 +780,33 @@ impl MockHarness {
             payload,
         };
         session.journal.append(&normalized)?;
+        if normalized.event == EventVocab::TurnAccepted {
+            session.terminal_since_last_accept = false;
+        } else if is_terminal(&normalized.event) {
+            session.terminal_since_last_accept = true;
+            session.terminal_not_before = None;
+        }
+        if normalized.event == EventVocab::ToolResult
+            && let (Some(call_id), Some(result)) = (
+                normalized.payload.get("call_id").and_then(Value::as_str),
+                normalized.payload.get("result"),
+            )
+        {
+            session
+                .tool_results
+                .insert(call_id.to_owned(), result.clone());
+        }
+        if normalized.event == EventVocab::HookCompleted
+            && let (Some(kind), Some(turn_key)) = (
+                normalized.payload.get("kind").and_then(Value::as_str),
+                normalized.payload.get("turn_key").and_then(Value::as_str),
+            )
+        {
+            session
+                .completed_hooks
+                .insert((kind.to_owned(), turn_key.to_owned()));
+        }
+        session.events.push(normalized);
         session.next_cursor = next_cursor;
         Ok(cursor)
     }
@@ -683,6 +827,51 @@ impl MockHarness {
         }
         self.append(session_id, event, payload)?;
         Ok(true)
+    }
+
+    fn close_delete_session(&mut self, id: &str) -> Result<(u64, Vec<Arc<Notify>>)> {
+        let mut session = self
+            .sessions
+            .remove(id)
+            .ok_or_else(|| AhrbError::Protocol(format!("unknown session {id:?}")))?;
+        let waiter_prefix = format!("checkpoints/{id}/");
+        let waiter_keys = self
+            .checkpoint_waiters
+            .keys()
+            .filter(|release_token| release_token.starts_with(&waiter_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let waiters = waiter_keys
+            .iter()
+            .filter_map(|release_token| self.checkpoint_waiters.remove(release_token))
+            .collect::<Vec<_>>();
+        let released_bytes = match session.resource_reservation.take() {
+            Some(reservation) => reservation.release()?,
+            None => 0,
+        };
+
+        let session_directory = self.config.state_dir.join("sessions").join(id);
+        remove_directory_if_present(&session_directory)?;
+        sync_directory(&self.config.state_dir.join("sessions"))?;
+        // A workspace override is actor/user-owned input, not a session store.
+        // Close-delete must reclaim only the harness-owned default workspace.
+        if self.config.workspace_override.is_none() {
+            let workspace = self.config.workspace_path(id);
+            remove_directory_if_present(&workspace)?;
+            if let Some(parent) = workspace.parent()
+                && parent.is_dir()
+            {
+                sync_directory(parent)?;
+            }
+        }
+        let checkpoints = self.config.state_dir.join("checkpoints").join(id);
+        remove_directory_if_present(&checkpoints)?;
+        if let Some(parent) = checkpoints.parent()
+            && parent.is_dir()
+        {
+            sync_directory(parent)?;
+        }
+        Ok((released_bytes, waiters))
     }
 
     fn session_mut(&mut self, id: &str) -> Result<&mut SessionState> {
@@ -771,6 +960,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "exec-turn" => exec_turn(&args[1..]).await,
         "release-checkpoint" => release_checkpoint_command(&args[1..]).await,
         "cancel-session" => cancel_session_command(&args[1..]).await,
+        "close-delete-session" => close_delete_session_command(&args[1..]).await,
         "inspect-journal" => inspect_journal(&args[1..]),
         "hook" => hook_command(&args[1..]),
         "--help" | "help" => {
@@ -784,6 +974,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  ahrb-mock-harness release-checkpoint --state-dir PATH \
                  --session-id ID --release-token TOKEN\n\
                  ahrb-mock-harness cancel-session --state-dir PATH --session-id ID\n\
+                 ahrb-mock-harness close-delete-session --state-dir PATH --session-id ID\n\
                  model endpoint comes from AHRB_MOCK_BASE_URL, AHRB_MOCK_UNIX_SOCKET, \
                  or AHRB_MOCK_PROVIDER_MAILBOX; \
                  key/model come from AHRB_MOCK_API_KEY and AHRB_MOCK_MODEL"
@@ -873,13 +1064,20 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     };
     let mut config = parse_config(&config_args)?;
     config.declare_native_shell = true;
-    let harness = Arc::new(Mutex::new(MockHarness::open_per_invocation(config)?));
+    let harness = Arc::new(Mutex::new(
+        if prompt.starts_with("AHRB long horizon turn ") {
+            MockHarness::open_per_invocation_session(config, &requested_session_id)?
+        } else {
+            MockHarness::open_per_invocation(config)?
+        },
+    ));
     let turn = PendingTurn { prompt, key };
     let (session_id, journal, after) = {
         let mut guard = harness.lock().await;
         let id = guard.create_session_with_id(&marker, &requested_session_id)?;
-        let journal = guard.session_mut(&id)?.journal.clone();
-        let after = journal.all()?.last().map(|event| event.cursor);
+        let session = guard.session_mut(&id)?;
+        let journal = session.journal.clone();
+        let after = session.events.last().map(|event| event.cursor);
         (id, journal, after)
     };
     let spawn = accept_turn(
@@ -944,9 +1142,13 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     } else {
-        journal
-            .all()?
-            .into_iter()
+        harness
+            .lock()
+            .await
+            .session_mut(&session_id)?
+            .events
+            .iter()
+            .cloned()
             .rev()
             .find(|event| is_terminal(&event.event))
             .ok_or_else(|| {
@@ -1013,6 +1215,25 @@ async fn cancel_session_command(args: &[String]) -> Result<i32> {
     }
     fs::create_dir(&workspace)?;
     sync_parent(&workspace)?;
+    Ok(0)
+}
+
+async fn close_delete_session_command(args: &[String]) -> Result<i32> {
+    let (config, session_id, _) = parse_session_control(args, false)?;
+    let mut harness = MockHarness::open_per_invocation(config)?;
+    let (released_bytes, waiters) = harness.close_delete_session(&session_id)?;
+    for waiter in waiters {
+        waiter.notify_one();
+    }
+    println!(
+        "{}",
+        json!({
+            "closed": true,
+            "deleted": true,
+            "session_id": session_id,
+            "released_bytes": released_bytes
+        })
+    );
     Ok(0)
 }
 
@@ -1135,10 +1356,35 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     let base_url = std::env::var("AHRB_MOCK_BASE_URL")
         .ok()
         .map(|url| url.trim_end_matches('/').to_owned());
+    let context_window_tokens = match std::env::var("AHRB_MOCK_CONTEXT_WINDOW_TOKENS") {
+        Ok(value) => Some(value.parse::<u64>().map_err(|_| {
+            AhrbError::Validation(
+                "AHRB_MOCK_CONTEXT_WINDOW_TOKENS must be an unsigned integer".to_owned(),
+            )
+        })?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(AhrbError::Validation(
+                "AHRB_MOCK_CONTEXT_WINDOW_TOKENS is not Unicode".to_owned(),
+            ));
+        }
+    };
+    if context_window_tokens == Some(0) {
+        return Err(AhrbError::Validation(
+            "mock context window must be positive".to_owned(),
+        ));
+    }
     let embedded_model = match std::env::var_os("AHRB_MOCK_EMBEDDED_WORKFLOW") {
         Some(path) => {
             let workflow: Workflow = serde_json::from_slice(&fs::read(PathBuf::from(path))?)?;
-            Some(Arc::new(FakeModelEngine::new(&workflow)?))
+            Some(Arc::new(
+                FakeModelEngine::with_request_roles_and_context_window(
+                    &workflow,
+                    &BTreeMap::new(),
+                    &[],
+                    context_window_tokens,
+                )?,
+            ))
         }
         None => None,
     };
@@ -1200,6 +1446,7 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         retry_base_delay_ms,
         retry_max_delay_ms,
         max_output_bytes,
+        context_window_tokens,
         session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
@@ -1392,16 +1639,20 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
         "session.attach" => {
             let id = required_str(&request.params, "session_id")?;
             let after = request.params.get("after").and_then(Value::as_u64);
-            let journal = {
+            let events = {
                 let guard = harness.lock().await;
-                guard
+                let session = guard
                     .sessions
                     .get(id)
-                    .ok_or_else(|| AhrbError::Protocol(format!("unknown session {id:?}")))?
-                    .journal
-                    .clone()
+                    .ok_or_else(|| AhrbError::Protocol(format!("unknown session {id:?}")))?;
+                let start = after.map_or(0, |cursor| {
+                    session
+                        .events
+                        .partition_point(|event| event.cursor <= cursor)
+                });
+                session.events[start..].to_vec()
             };
-            Ok(json!({ "events": journal.read_after(after)? }))
+            Ok(json!({ "events": events }))
         }
         "sessions.wait-ready" => {
             let expected = request
@@ -1632,6 +1883,19 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
             };
             Ok(json!({ "closed": true, "released_bytes": released_bytes }))
         }
+        "session.close-delete" => {
+            let id = required_str(&request.params, "session_id")?.to_owned();
+            let (released_bytes, waiters) = harness.lock().await.close_delete_session(&id)?;
+            for waiter in waiters {
+                waiter.notify_one();
+            }
+            Ok(json!({
+                "closed": true,
+                "deleted": true,
+                "session_id": id,
+                "released_bytes": released_bytes
+            }))
+        }
         "checkpoint.release" => {
             let session_id = required_str(&request.params, "session_id")?.to_owned();
             let release_token = required_str(&request.params, "release_token")?.to_owned();
@@ -1656,9 +1920,37 @@ async fn accept_turn(
     from_queue: bool,
     exec_template_evidence: Option<&ExecTemplateEvidence>,
 ) -> Result<bool> {
+    let terminal_not_before = reference_terminal_floor_ms(&turn.prompt).map(|floor_ms| {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(floor_ms))
+            .unwrap_or_else(tokio::time::Instant::now)
+    });
     let hook = {
         let mut guard = harness.lock().await;
-        let reservation_bytes = guard.config.session_memory_bytes;
+        // The Wave-3 fanout fixture models a bounded shared cache while
+        // preserving the ordinary row-26/27 per-session fixture unchanged.
+        let fanout_width = turn
+            .prompt
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("AHRB-FANOUT-WIDTH="))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0);
+        let reservation_bytes = match fanout_width {
+            Some(width) if guard.config.declare_native_shell => {
+                // One-shot clients contribute their executable footprint to
+                // the measured whole-tree total. Rebalance a fixed reference
+                // cache budget across clients so the actual out-of-band RSS
+                // curve remains smooth without normalizing the measurement.
+                const EXEC_FANOUT_SHARED_BYTES: u64 = 320 * MIB;
+                const EXEC_FANOUT_CLIENT_ALLOWANCE_BYTES: u64 = 8 * MIB;
+                EXEC_FANOUT_SHARED_BYTES
+                    .checked_div(width)
+                    .unwrap_or(0)
+                    .saturating_sub(EXEC_FANOUT_CLIENT_ALLOWANCE_BYTES)
+            }
+            Some(width) => guard.config.session_memory_bytes / width,
+            None => guard.config.session_memory_bytes,
+        };
         let session = guard.session_mut(id)?;
         if session.closed {
             return Err(AhrbError::Protocol("session is closed".to_owned()));
@@ -1679,6 +1971,7 @@ async fn accept_turn(
         session.pending = Some(turn.clone());
         session.active = true;
         session.cancelled = false;
+        session.terminal_not_before = terminal_not_before;
         let mut payload = json!({ "prompt": turn.prompt, "key": turn.key });
         if let Some(evidence) = exec_template_evidence {
             payload["exec_template"] = serde_json::to_value(evidence)?;
@@ -1755,6 +2048,29 @@ async fn execute_turn(
     turn: &PendingTurn,
 ) -> Result<()> {
     let config = harness.lock().await.config.clone();
+    if turn.prompt.contains("AHRB-ROW53-LARGE-JOURNAL") {
+        {
+            let mut guard = harness.lock().await;
+            if session_should_stop(guard.session_mut(id)?)? {
+                return Ok(());
+            }
+            // The daemon stays alive independently of the worker, so a
+            // committed terminal record is useful prefix evidence there. A
+            // per-invocation client exits as soon as it observes a terminal;
+            // keep that client alive until the collector kills it instead.
+            if !config.declare_native_shell {
+                guard.append_terminal(
+                    id,
+                    EventVocab::TerminalSuccess,
+                    json!({"status":"success","fixture":"row53-prefix-committed"}),
+                )?;
+            }
+            let session = guard.session_mut(id)?;
+            session.journal.append_row53_large_record()?;
+        }
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
     if let Some(guard) = &config.owned_egress_guard {
         guard.verify_forbidden_probe().await?;
     }
@@ -1774,7 +2090,39 @@ async fn execute_turn(
         )?;
         return Ok(());
     }
-    let mut messages = vec![json!({ "role": "user", "content": turn.prompt })];
+    let context_fixture = config.context_window_tokens.filter(|_| {
+        turn.prompt
+            .starts_with("ahrb-row51 deterministic context recovery ")
+    });
+    let committed_context_events = if context_fixture.is_some() {
+        let guard = harness.lock().await;
+        let session = guard
+            .sessions
+            .get(id)
+            .ok_or_else(|| AhrbError::Protocol(format!("unknown session {id:?}")))?;
+        let recovery_accept = session
+            .events
+            .iter()
+            .rposition(|event| {
+                event.event == EventVocab::TurnAccepted
+                    && event.payload.get("key").and_then(Value::as_str) == Some(turn.key.as_str())
+            })
+            .ok_or_else(|| {
+                AhrbError::Protocol("context recovery turn lacks its durable acceptance".to_owned())
+            })?;
+        session.events[..recovery_accept].to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut messages = match context_fixture {
+        Some(window_tokens) => build_context_overlimit_messages(
+            &config,
+            &turn.prompt,
+            window_tokens,
+            &committed_context_events,
+        )?,
+        None => vec![json!({ "role": "user", "content": turn.prompt })],
+    };
     for checkpoint in 0..32_u64 {
         {
             let mut guard = harness.lock().await;
@@ -1786,7 +2134,7 @@ async fn execute_turn(
                 messages.push(json!({ "role": "user", "content": prompt }));
             }
         }
-        let request = json!({
+        let mut request = json!({
             "model": config.model,
             "messages": messages,
             "tools": fixture_tools(config.declare_native_shell),
@@ -1796,8 +2144,9 @@ async fn execute_turn(
         if let Some(key) = &config.api_key {
             headers.insert("Authorization".to_owned(), format!("Bearer {key}"));
         }
-        let body = serde_json::to_vec(&request)?;
+        let mut body = serde_json::to_vec(&request)?;
         let mut physical_attempt = 0_u32;
+        let mut compacted_after_context_error = false;
         let response = loop {
             physical_attempt = physical_attempt.saturating_add(1);
             {
@@ -1833,6 +2182,37 @@ async fn execute_turn(
                 }
                 Err(error) => return Err(error),
             };
+            if response.status == 400
+                && context_fixture.is_some()
+                && !compacted_after_context_error
+                && is_context_length_error(&response.body)
+            {
+                messages = compact_context_messages(&messages)?;
+                request = json!({
+                    "model": config.model,
+                    "messages": messages,
+                    "tools": fixture_tools(config.declare_native_shell),
+                    "stream": false
+                });
+                body = serde_json::to_vec(&request)?;
+                let window_tokens = context_fixture.ok_or_else(|| {
+                    AhrbError::Protocol("context fixture window disappeared".to_owned())
+                })?;
+                let compacted_tokens = crate::wave3_long_horizon::fake_context_input_tokens(
+                    "openai-chat-completions",
+                    &request,
+                );
+                if compacted_tokens > window_tokens
+                    || body.len() as u64 > window_tokens.saturating_mul(8)
+                {
+                    return Err(AhrbError::Protocol(format!(
+                        "deterministic compaction produced {compacted_tokens} tokens/{} bytes for W={window_tokens}",
+                        body.len()
+                    )));
+                }
+                compacted_after_context_error = true;
+                continue;
+            }
             let retryable = matches!(response.status, 429 | 500);
             if retryable && physical_attempt < config.retry_max_attempts {
                 let delay_ms = jittered_retry_delay_ms(&config, physical_attempt);
@@ -1886,6 +2266,23 @@ async fn execute_turn(
         if tool_calls.is_empty() {
             let content = message.get("content").cloned().unwrap_or(Value::Null);
             let (event, status) = terminal_from_content(&content);
+            if let Some(width) = turn
+                .prompt
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix("AHRB-FANOUT-WIDTH="))
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+            {
+                // Model a deterministic logarithmic scheduler quantum around
+                // the reference fixture's fsync-backed terminal commit. This
+                // keeps the mock's service curve smooth across both geometric
+                // quick widths and every integer certification width without
+                // changing the durable event work performed by each actor.
+                let padding_ms =
+                    100_u64.saturating_add(((width as f64).ln() * 100.0).round().max(0.0) as u64);
+                tokio::time::sleep(Duration::from_millis(padding_ms)).await;
+            }
+            wait_for_reference_terminal_floor(harness, id).await?;
             let mut guard = harness.lock().await;
             guard.append_terminal(id, event, json!({ "status": status, "content": content }))?;
             return Ok(());
@@ -1975,6 +2372,246 @@ async fn execute_turn(
         json!({ "status": "failure", "category": "turn-limit" }),
     )?;
     Ok(())
+}
+
+async fn wait_for_reference_terminal_floor(
+    harness: &Arc<Mutex<MockHarness>>,
+    id: &str,
+) -> Result<()> {
+    let deadline = {
+        let guard = harness.lock().await;
+        guard
+            .sessions
+            .get(id)
+            .ok_or_else(|| AhrbError::Protocol(format!("unknown session {id:?}")))?
+            .terminal_not_before
+    };
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
+    Ok(())
+}
+
+fn build_context_overlimit_messages(
+    config: &MockConfig,
+    prompt: &str,
+    window_tokens: u64,
+    committed_events: &[NormalizedEvent],
+) -> Result<Vec<Value>> {
+    let (ordinary_turns, tool_pairs) = if window_tokens <= 4_096 {
+        (16_u32, 4_u32)
+    } else {
+        (128_u32, 32_u32)
+    };
+    let mut messages = vec![json!({"role":"system","content":"AHRB-CONTEXT-INSTRUCTIONS-v1"})];
+    let mut observed_history = 0_u32;
+    let mut observed_calls = 0_u32;
+    let mut observed_results = 0_u32;
+    for event in committed_events {
+        match event.event {
+            EventVocab::TurnAccepted
+                if event
+                    .payload
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| key.starts_with("row-51-history-")) =>
+            {
+                let content = event
+                    .payload
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "row-51 committed history acceptance omitted prompt".to_owned(),
+                        )
+                    })?;
+                messages.push(json!({"role":"user","content":content}));
+                observed_history = observed_history.saturating_add(1);
+            }
+            EventVocab::ToolCall => {
+                let call_id = required_str(&event.payload, "call_id")?;
+                let name = required_str(&event.payload, "name")?;
+                let arguments = event.payload.get("arguments").ok_or_else(|| {
+                    AhrbError::Protocol("row-51 committed tool call omitted arguments".to_owned())
+                })?;
+                messages.push(json!({
+                    "role":"assistant",
+                    "tool_calls":[{
+                        "id":call_id,
+                        "type":"function",
+                        "function":{
+                            "name":name,
+                            "arguments":serde_json::to_string(arguments)?,
+                        }
+                    }]
+                }));
+                observed_calls = observed_calls.saturating_add(1);
+            }
+            EventVocab::ToolResult => {
+                let call_id = required_str(&event.payload, "call_id")?;
+                let result = event.payload.get("result").ok_or_else(|| {
+                    AhrbError::Protocol("row-51 committed tool result omitted result".to_owned())
+                })?;
+                messages.push(json!({
+                    "role":"tool",
+                    "tool_call_id":call_id,
+                    "content":serde_json::to_string(result)?,
+                }));
+                observed_results = observed_results.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    if observed_history != ordinary_turns
+        || observed_calls != tool_pairs
+        || observed_results != tool_pairs
+    {
+        return Err(AhrbError::Protocol(format!(
+            "row-51 recovery reconstructed {observed_history} history turns and {observed_calls}/{observed_results} tool calls/results; expected {ordinary_turns} and {tool_pairs}/{tool_pairs}"
+        )));
+    }
+    // The active turn is last so the provider routes on the recovery marker,
+    // after observing the exact committed transcript that precedes it.
+    messages.push(json!({"role":"user","content":format!("AHRB-GOAL-MARKER {prompt}")}));
+    messages.push(json!({"role":"user","content":"AHRB-CONTEXT-PADDING z"}));
+    let padding_index = messages.len().saturating_sub(1);
+    let mut request = json!({
+        "model":config.model,
+        "messages":messages,
+        "tools":fixture_tools(config.declare_native_shell),
+        "stream":false,
+    });
+    let target_tokens = window_tokens.saturating_add(256);
+    let base_tokens =
+        crate::wave3_long_horizon::fake_context_input_tokens("openai-chat-completions", &request);
+    if base_tokens > target_tokens {
+        return Err(AhrbError::Protocol(format!(
+            "context fixture base token count {base_tokens} exceeds target {target_tokens}"
+        )));
+    }
+    let deficit = target_tokens.saturating_sub(base_tokens);
+    let mut padding = String::from("AHRB-CONTEXT-PADDING ");
+    if deficit == 0 {
+        // Keep the existing final `z` token already counted in the base request.
+        padding.push('z');
+    } else {
+        // The placeholder contributed one token, so replace it with exactly
+        // `deficit + 1` tokens to increase the request by `deficit`.
+        for _ in 0..deficit {
+            padding.push_str("z ");
+        }
+        padding.push('z');
+    }
+    let padding_slot = request
+        .pointer_mut(&format!("/messages/{padding_index}/content"))
+        .ok_or_else(|| AhrbError::Protocol("context padding slot is absent".to_owned()))?;
+    *padding_slot = Value::String(padding);
+    let measured_tokens =
+        crate::wave3_long_horizon::fake_context_input_tokens("openai-chat-completions", &request);
+    if measured_tokens != target_tokens {
+        return Err(AhrbError::Protocol(format!(
+            "context token padding measured {measured_tokens}, expected {target_tokens}"
+        )));
+    }
+    let target_body = window_tokens
+        .checked_mul(8)
+        .and_then(|value| value.checked_add(1_024))
+        .ok_or_else(|| AhrbError::Protocol("context body target overflow".to_owned()))?;
+    let current_body = serde_json::to_vec(&request)?.len() as u64;
+    if current_body > target_body {
+        return Err(AhrbError::Protocol(format!(
+            "context fixture base body {current_body} exceeds target {target_body}"
+        )));
+    }
+    let extra = usize::try_from(target_body - current_body)
+        .map_err(|_| AhrbError::Protocol("context padding length does not fit usize".to_owned()))?;
+    let padding = request
+        .pointer_mut(&format!("/messages/{padding_index}/content"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AhrbError::Protocol("context padding content is not a string".to_owned()))?
+        .to_owned();
+    *request
+        .pointer_mut(&format!("/messages/{padding_index}/content"))
+        .ok_or_else(|| AhrbError::Protocol("context padding slot disappeared".to_owned()))? =
+        Value::String(format!("{padding}{}", "z".repeat(extra)));
+    let final_body = serde_json::to_vec(&request)?;
+    let final_tokens =
+        crate::wave3_long_horizon::fake_context_input_tokens("openai-chat-completions", &request);
+    if final_body.len() as u64 != target_body || final_tokens != target_tokens {
+        return Err(AhrbError::Protocol(format!(
+            "context fixture ended at {final_tokens} tokens/{} bytes, expected {target_tokens}/{target_body}",
+            final_body.len()
+        )));
+    }
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| AhrbError::Protocol("context fixture messages are absent".to_owned()))
+}
+
+fn compact_context_messages(messages: &[Value]) -> Result<Vec<Value>> {
+    let mut ordinary = Vec::<(u32, Value)>::new();
+    let mut output = Vec::new();
+    let mut current_turn = Vec::new();
+    for message in messages {
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        if let Some(rest) = content.strip_prefix("AHRB-HISTORY-") {
+            let ordinal = rest
+                .split('-')
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    AhrbError::Protocol("context history marker lacks an ordinal".to_owned())
+                })?;
+            ordinary.push((ordinal, message.clone()));
+        } else if content.starts_with("AHRB-GOAL-MARKER ") {
+            current_turn.push(message.clone());
+        } else if !content.starts_with("AHRB-CONTEXT-PADDING") {
+            output.push(message.clone());
+        }
+    }
+    ordinary.sort_by_key(|(ordinal, _)| *ordinal);
+    let retain_from = ordinary.len().saturating_sub(4);
+    let omitted = ordinary[..retain_from]
+        .iter()
+        .filter_map(|(_, message)| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .and_then(|content| {
+                    content
+                        .split_whitespace()
+                        .find(|token| token.starts_with("AHRB-HISTORY-"))
+                })
+        })
+        .collect::<Vec<_>>();
+    let retained = ordinary[retain_from..]
+        .iter()
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
+    let summary = json!({
+        "role":"system",
+        "content":format!("AHRB-COMPACTION-SUMMARY {}", omitted.join(" ")),
+    });
+    let insertion = output
+        .iter()
+        .position(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        .unwrap_or(output.len());
+    output.insert(insertion, summary);
+    output.extend(retained);
+    output.extend(current_turn);
+    Ok(output)
+}
+
+fn is_context_length_error(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            value.pointer("/error/type").and_then(Value::as_str) == Some("context_length_exceeded")
+                && value.pointer("/error/code").and_then(Value::as_str)
+                    == Some("context_length_exceeded")
+        })
 }
 
 fn is_trickle_success_body(body: &[u8]) -> bool {
@@ -2489,6 +3126,16 @@ async fn model_http_post(
                 status: *status,
                 body: body.as_bytes().to_vec(),
             }),
+            Some(Fault::ContextLength { window_tokens }) => Ok(crate::driver::HttpResponse {
+                status: 400,
+                body: serde_json::to_vec(&json!({
+                    "error": {
+                        "type": "context_length_exceeded",
+                        "code": "context_length_exceeded",
+                        "context_window": window_tokens,
+                    }
+                }))?,
+            }),
             Some(Fault::Stall) => tokio::time::timeout(
                 config.idle_timeout,
                 std::future::pending::<Result<crate::driver::HttpResponse>>(),
@@ -2504,6 +3151,14 @@ async fn model_http_post(
                             AhrbError::Timeout("embedded model idle deadline".to_owned())
                         })?;
                 }
+                let rendered = frontend.render(&response)?;
+                Ok(crate::driver::HttpResponse {
+                    status: rendered.status,
+                    body: rendered.body,
+                })
+            }
+            Some(Fault::Delay { delay_ms }) => {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
                 let rendered = frontend.render(&response)?;
                 Ok(crate::driver::HttpResponse {
                     status: rendered.status,
@@ -2856,15 +3511,7 @@ fn reconcile_fixture_effect(
 }
 
 fn tool_result_for(session: &SessionState, call_id: &str) -> Result<Option<Value>> {
-    Ok(session
-        .journal
-        .all()?
-        .into_iter()
-        .find(|event| {
-            event.event == EventVocab::ToolResult
-                && event.payload.get("call_id").and_then(Value::as_str) == Some(call_id)
-        })
-        .and_then(|event| event.payload.get("result").cloned()))
+    Ok(session.tool_results.get(call_id).cloned())
 }
 
 fn terminal_from_content(content: &Value) -> (EventVocab, &'static str) {
@@ -2907,14 +3554,8 @@ async fn run_hook_and_record(
             .sessions
             .get(id)
             .ok_or_else(|| AhrbError::Protocol(format!("unknown session {id:?}")))?
-            .journal
-            .all()?
-            .iter()
-            .any(|event| {
-                event.event == EventVocab::HookCompleted
-                    && event.payload.get("kind").and_then(Value::as_str) == Some(kind)
-                    && event.payload.get("turn_key").and_then(Value::as_str) == Some(turn_key)
-            })
+            .completed_hooks
+            .contains(&(kind.to_owned(), turn_key.to_owned()))
     };
     if already {
         return Ok(());
@@ -3062,6 +3703,14 @@ fn hook_command(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+fn remove_directory_if_present(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -3070,16 +3719,7 @@ fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn session_is_terminal(session: &SessionState) -> Result<bool> {
-    let events = session.journal.all()?;
-    let accepted_cursor = events
-        .iter()
-        .rev()
-        .find(|event| event.event == EventVocab::TurnAccepted)
-        .map(|event| event.cursor)
-        .unwrap_or(0);
-    Ok(events
-        .iter()
-        .any(|event| event.cursor > accepted_cursor && is_terminal(&event.event)))
+    Ok(session.terminal_since_last_accept)
 }
 
 fn session_should_stop(session: &SessionState) -> Result<bool> {
@@ -3219,6 +3859,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reference_terminal_floors_are_fixture_scoped() {
+        assert_eq!(
+            reference_terminal_floor_ms("AHRB long horizon turn 1 marker"),
+            Some(LONG_HORIZON_MIN_TURN_MS)
+        );
+        assert_eq!(
+            reference_terminal_floor_ms("AHRB turn latency direct terminal turn 1 marker"),
+            Some(TURN_LATENCY_MIN_TURN_MS)
+        );
+        assert_eq!(reference_terminal_floor_ms("ordinary prompt"), None);
+    }
+
+    #[test]
     fn compact_trickle_success_marker_accepts_only_defined_profiles() {
         assert!(is_trickle_success_body(b"AHRB-"));
         assert!(is_trickle_success_body(b"AHRB-TRICKLE-SUCCESS"));
@@ -3249,12 +3902,97 @@ mod tests {
             retry_base_delay_ms: 50,
             retry_max_delay_ms: 50,
             max_output_bytes: 1_048_576,
+            context_window_tokens: None,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
             declare_native_shell: false,
             owned_egress_guard: None,
         }
+    }
+
+    #[tokio::test]
+    async fn public_close_delete_removes_daemon_session_store_and_workspace() -> Result<()> {
+        let directory = temporary_dir("public-close-delete");
+        let _ = fs::remove_dir_all(&directory);
+        let mut harness = MockHarness::open(test_config(directory.clone()))?;
+        let session = harness.create_session("close-delete-actor")?;
+        let workspace = directory.join("workspaces").join(&session);
+        fs::write(workspace.join("residue.txt"), b"residue")?;
+        let shared = Arc::new(Mutex::new(harness));
+
+        let result = handle_rpc(
+            Arc::clone(&shared),
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(1),
+                method: "session.close-delete".to_owned(),
+                params: json!({"session_id": session}),
+            },
+        )
+        .await?;
+        assert_eq!(result["closed"], true);
+        assert_eq!(result["deleted"], true);
+        let guard = shared.lock().await;
+        assert!(!guard.sessions.contains_key(&session));
+        drop(guard);
+        assert!(!directory.join("sessions").join(&session).exists());
+        assert!(!workspace.exists());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_close_delete_preserves_external_workspace_override() -> Result<()> {
+        let directory = temporary_dir("public-close-delete-override");
+        let _ = fs::remove_dir_all(&directory);
+        let override_path = directory.join("actor-workspace");
+        fs::create_dir_all(&override_path)?;
+        fs::write(override_path.join("actor-owned.txt"), b"preserve")?;
+        let mut config = test_config(directory.clone());
+        config.workspace_override = Some(override_path.clone());
+        let mut harness = MockHarness::open(config)?;
+        let session = harness.create_session("close-delete-override-actor")?;
+        let shared = Arc::new(Mutex::new(harness));
+
+        let result = handle_rpc(
+            Arc::clone(&shared),
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(1),
+                method: "session.close-delete".to_owned(),
+                params: json!({"session_id": session}),
+            },
+        )
+        .await?;
+        assert_eq!(result["deleted"], true);
+        assert!(!directory.join("sessions").join(&session).exists());
+        assert_eq!(
+            fs::read(override_path.join("actor-owned.txt"))?,
+            b"preserve"
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exec_close_delete_command_removes_persisted_harness_session() -> Result<()> {
+        let directory = temporary_dir("exec-close-delete");
+        let _ = fs::remove_dir_all(&directory);
+        let mut harness = MockHarness::open_per_invocation(test_config(directory.clone()))?;
+        let session = harness.create_session("exec-close-delete-actor")?;
+        drop(harness);
+
+        let args = vec![
+            "--state-dir".to_owned(),
+            directory.to_string_lossy().into_owned(),
+            "--session-id".to_owned(),
+            session.clone(),
+        ];
+        assert_eq!(close_delete_session_command(&args).await?, 0);
+        assert!(!directory.join("sessions").join(session).exists());
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
@@ -4288,6 +5026,7 @@ mod tests {
             retry_base_delay_ms: 50,
             retry_max_delay_ms: 50,
             max_output_bytes: 1_048_576,
+            context_window_tokens: None,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
