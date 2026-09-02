@@ -182,11 +182,18 @@ pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersisten
     } else {
         absolute_path(&options.output)?
     };
+    // Keep the short "/tmp" spelling rather than its "/private/tmp" realpath.
+    // macOS caps a Unix-domain socket's sun_path at 104 bytes, and the extra 8
+    // bytes of "/private" pushed deep derived-profile socket paths (e.g. row 42
+    // under a socket harness like haider) over the isolation-path limit. "/tmp"
+    // binds fine; only non-unix falls back to the canonicalized temp dir.
     #[cfg(unix)]
     let temporary_root = PathBuf::from("/tmp");
     #[cfg(not(unix))]
-    let temporary_root = std::env::temp_dir();
-    let temporary_root = std::fs::canonicalize(&temporary_root).unwrap_or(temporary_root);
+    let temporary_root = {
+        let root = std::env::temp_dir();
+        std::fs::canonicalize(&root).unwrap_or(root)
+    };
     let profile_path = temporary_root.join(format!("ahrb-{short_id}-{:x}", std::process::id()));
     let harness_version = options
         .harness_version

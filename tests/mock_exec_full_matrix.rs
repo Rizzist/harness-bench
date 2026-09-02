@@ -65,7 +65,7 @@ fn derived_row43_journal(profile: &Path) -> String {
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("derived-row43-r"))
+                .is_some_and(|name| name.starts_with("dr43-r"))
         })
         .flat_map(|entry| {
             std::fs::read_dir(entry.path().join("state/sessions"))
@@ -162,11 +162,11 @@ fn assert_exec_template_propagation(report: &Report) {
     }
 
     let derived_profiles = BTreeMap::from([
-        ("ahrb-row42-r1:row42", "derived-row42-r1"),
-        ("ahrb-row42-r2:row42", "derived-row42-r2"),
-        ("ahrb-row43-r1:row43", "derived-row43-r1"),
-        ("ahrb-row43-r2:row43", "derived-row43-r2"),
-        ("ahrb-row43-r3:row43", "derived-row43-r3"),
+        ("ahrb-row42-r1:row42", "dr42-r1"),
+        ("ahrb-row42-r2:row42", "dr42-r2"),
+        ("ahrb-row43-r1:row43", "dr43-r1"),
+        ("ahrb-row43-r2:row43", "dr43-r2"),
+        ("ahrb-row43-r3:row43", "dr43-r3"),
     ]);
     let mut derived_credentials = Vec::new();
     let mut derived_accepted_turns = 0_usize;
@@ -286,7 +286,7 @@ fn assert_exec_template_propagation(report: &Report) {
         derived_credentials
             .iter()
             .all(|credential| { !serialized_report.contains(credential) }),
-        "raw derived-row credential leaked into report evidence"
+        "raw dr credential leaked into report evidence"
     );
 }
 

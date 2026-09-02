@@ -7129,7 +7129,7 @@ async fn collect_injection_run(
     baseline_credential: &str,
     separate_baseline_listener: bool,
 ) -> Result<InjectionRunObservation> {
-    let profile_root = run_profile_root.join(format!("derived-row65-{label}"));
+    let profile_root = run_profile_root.join(format!("dr65-{label}"));
     prepare_profile(manifest, &profile_root)?;
     let workflow = injection_surface_workflow(&profile_root, label);
     workflow.validate()?;
@@ -7942,7 +7942,7 @@ async fn collect_child_failure_trials(
     run_profile_root: &Path,
     manifest_hash: &str,
 ) -> Result<ChildFailureTrials> {
-    let profile_root = run_profile_root.join("derived-row56");
+    let profile_root = run_profile_root.join("dr56");
     prepare_profile(manifest, &profile_root)
         .map_err(|error| AhrbError::Protocol(format!("prepare row-56 profile: {error}")))?;
     let workflow = child_failure_workflow(&profile_root);
@@ -8342,7 +8342,7 @@ async fn collect_signal_matrix_case(
     Vec<crate::fake_model::ModelRequestRecord>,
 )> {
     let profile_root = run_profile_root
-        .join("derived-row57")
+        .join("dr57")
         .join(format!("{}-r{repetition}", case.label()));
     prepare_profile(manifest, &profile_root)
         .map_err(|error| AhrbError::Protocol(format!("prepare row-57 profile: {error}")))?;
@@ -8693,7 +8693,7 @@ async fn collect_retry_budget_trials(
     let max_delay_ms = manifest.resources.retry_max_delay_ms.ok_or_else(|| {
         AhrbError::Validation("retry-budget requires retry_max_delay_ms".to_owned())
     })?;
-    let profile_root = run_profile_root.join("derived-row58");
+    let profile_root = run_profile_root.join("dr58");
     prepare_profile(manifest, &profile_root)?;
     let workflow = retry_budget_workflow(&profile_root, profile);
     workflow.validate()?;
@@ -9167,7 +9167,7 @@ async fn collect_model_request_efficiency_trials(
     let mut process_hygiene = collect_process_hygiene.then(ProcessHygieneEvidence::default);
     for repetition in 1..=2_u32 {
         let per_invocation = per_invocation_topology(manifest);
-        let profile_root = run_profile_root.join(format!("derived-row42-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr42-r{repetition}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-42 repetition {repetition} fresh profile: {error}"
@@ -9932,7 +9932,7 @@ async fn collect_one_fanout_trial(
     repetition: u32,
     width: u32,
 ) -> Result<FanoutTrials> {
-    let profile_root = run_profile_root.join(format!("derived-row54-r{repetition}-n{width}"));
+    let profile_root = run_profile_root.join(format!("dr54-r{repetition}-n{width}"));
     prepare_profile(manifest, &profile_root)?;
     let workflow = fanout_workflow(manifest, &profile_root, repetition, width)?;
     let engine = Arc::new(FakeModelEngine::with_request_roles(
@@ -10396,7 +10396,7 @@ async fn collect_journal_torn_tail_trials(
         let group = trial_number;
         let stage = std::cell::Cell::new("prepare source profile");
         let group_result: Result<()> = async {
-            let source_root = run_profile_root.join(format!("derived-row53-source-{group}"));
+            let source_root = run_profile_root.join(format!("dr53-source-{group}"));
             prepare_profile(manifest, &source_root)?;
             stage.set("start source fake provider");
             let workflow = journal_torn_tail_workflow(&source_root, group);
@@ -10568,7 +10568,7 @@ async fn collect_journal_torn_tail_trials(
                 .unwrap_or(usize::MAX)
                 % CUTS.len()];
             stage.set("prepare recovery profile");
-            let trial_root = run_profile_root.join(format!("derived-row53-trial-{trial_number}"));
+            let trial_root = run_profile_root.join(format!("dr53-trial-{trial_number}"));
             prepare_profile(manifest, &trial_root)?;
             let target_journal = trial_root.join(journal_relative);
             let target_session_dir = target_journal.parent().ok_or_else(|| {
@@ -11418,7 +11418,7 @@ async fn collect_session_residue_trials(
     let mut all_samples = Vec::new();
     let mut sweeps = Vec::new();
     for repetition in 1..=expected_repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row50-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr50-r{repetition}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-50 repetition {repetition} fresh profile: {error}"
@@ -11808,7 +11808,7 @@ async fn collect_turn_latency_repetition(
     repetition: u32,
     turns: u32,
 ) -> Result<TurnLatencyTrials> {
-    let profile_root = run_profile_root.join(format!("derived-row43-r{repetition}"));
+    let profile_root = run_profile_root.join(format!("dr43-r{repetition}"));
     prepare_profile(manifest, &profile_root)
         .map_err(|error| AhrbError::Protocol(format!("prepare row-43 fresh profile: {error}")))?;
     let workflow = turn_latency_workflow(&profile_root, repetition, turns);
@@ -13080,7 +13080,7 @@ async fn collect_context_recovery_repetition(
     tool_pairs: u32,
     window_tokens: u64,
 ) -> Result<ContextRecoveryTrials> {
-    let profile_root = run_profile_root.join(format!("derived-row51-r{repetition}"));
+    let profile_root = run_profile_root.join(format!("dr51-r{repetition}"));
     prepare_profile(manifest, &profile_root).map_err(|error| {
         AhrbError::Protocol(format!("prepare row-51 repetition {repetition}: {error}"))
     })?;
@@ -13506,7 +13506,7 @@ async fn collect_resume_latency_point(
     length: u32,
     repetition: u32,
 ) -> Result<ResumeLatencyTrials> {
-    let profile_root = run_profile_root.join(format!("derived-row52-l{length}-r{repetition}"));
+    let profile_root = run_profile_root.join(format!("dr52-l{length}-r{repetition}"));
     prepare_profile(manifest, &profile_root).map_err(|error| {
         AhrbError::Protocol(format!("prepare row-52 L={length} r={repetition}: {error}"))
     })?;
@@ -13748,7 +13748,7 @@ async fn collect_time_to_first_model_request_trials(
     let mut turns = Vec::with_capacity(repetitions as usize);
     let mut first_request_roles = Vec::with_capacity(repetitions as usize);
     for repetition in 1..=repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row45-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr45-r{repetition}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-45 repetition {repetition} fresh profile: {error}"
@@ -14318,7 +14318,7 @@ async fn collect_determinism_trials(
     let mut all_events = Vec::new();
     let mut all_requests = Vec::new();
     for execution in 1..=expected_runs {
-        let profile_root = run_profile_root.join(format!("derived-row63-run-{execution:03}"));
+        let profile_root = run_profile_root.join(format!("dr63-run-{execution:03}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-63 execution {execution} fresh profile: {error}"
@@ -14851,7 +14851,7 @@ async fn collect_disk_io_trials(
         log_evidence,
     };
     for repetition in 1..=repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row47-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr47-r{repetition}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-47 repetition {repetition} fresh profile: {error}"
@@ -15221,7 +15221,7 @@ async fn collect_memory_time_integral_trials(
     let mut all_events = Vec::new();
     let mut all_requests = Vec::new();
     for repetition in 1..=plan.repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row46-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr46-r{repetition}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-46 repetition {repetition} fresh profile: {error}"
@@ -15941,7 +15941,7 @@ async fn collect_large_output_trials(
     };
 
     for repetition in 1..=repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row60-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr60-r{repetition}"));
         prepare_profile(manifest, &profile_root).map_err(|error| {
             AhrbError::Protocol(format!(
                 "prepare row-60 repetition {repetition} fresh profile: {error}"
@@ -17018,7 +17018,7 @@ async fn collect_workspace_fault_trials(
     let mut evidence = Vec::new();
     let mut filesystem_snapshots = Vec::new();
     for repetition in 1..=repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row61-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr61-r{repetition}"));
         prepare_profile(manifest, &profile_root)?;
         let workflow = workspace_fault_workflow(&profile_root, repetition, manifest)?;
         workflow.validate()?;
@@ -17649,7 +17649,7 @@ async fn collect_offline_mode_trials(
         egress_attempts: Vec::new(),
     };
     for repetition in 1..=repetitions {
-        let profile_root = run_profile_root.join(format!("derived-row62-r{repetition}"));
+        let profile_root = run_profile_root.join(format!("dr62-r{repetition}"));
         prepare_profile(manifest, &profile_root)?;
         let workflow = offline_mode_workflow(&profile_root, repetition, manifest)?;
         workflow.validate()?;
@@ -17845,7 +17845,7 @@ async fn collect_streaming_case(
     outer_deadline_ms: u64,
     measure_cpu: bool,
 ) -> Result<StreamingCaseResult> {
-    let profile_root = run_profile_root.join(format!("derived-row{row}-{case}-r{repetition}"));
+    let profile_root = run_profile_root.join(format!("dr{row}-{case}-r{repetition}"));
     prepare_profile(manifest, &profile_root).map_err(|error| {
         AhrbError::Protocol(format!(
             "prepare row-{row} {case} repetition {repetition} fresh profile: {error}"

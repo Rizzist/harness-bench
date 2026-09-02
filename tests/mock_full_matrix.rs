@@ -67,7 +67,7 @@ fn derived_row43_journal(report: &Report) -> String {
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("derived-row43-r"))
+                .is_some_and(|name| name.starts_with("dr43-r"))
         })
         .flat_map(|entry| {
             std::fs::read_dir(entry.path().join("state/sessions"))
