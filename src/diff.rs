@@ -191,12 +191,18 @@ struct DiffDocument {
 struct EconomySummaryDiff {
     comparison_scope: String,
     tokenizer_match: bool,
+    cache_input_discount_match: bool,
+    cache_regime_before: Option<String>,
+    cache_regime_after: Option<String>,
+    cache_regime_change: String,
     completion_before: Option<String>,
     completion_after: Option<String>,
     completion_change: String,
     values: BTreeMap<String, ResourceDelta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_token_curve: Option<ContextTokenCurveDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalidated_prefix_tokens_per_turn: Option<ContextTokenCurveDiff>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +277,11 @@ fn compare_economy(
             && left.reference_tariff_usd_per_million_tokens
                 == right.reference_tariff_usd_per_million_tokens
     });
+    let cache_input_discount_match = left.zip(right).is_some_and(|(left, right)| {
+        left.schema >= 3
+            && right.schema >= 3
+            && left.cache_input_discount == right.cache_input_discount
+    });
     let fields = [
         "model_turns",
         "total_reference_tokens",
@@ -278,8 +289,13 @@ fn compare_economy(
         "tool_batching_factor",
         "last_context_size_tokens",
         "reference_cost_usd",
+        "effective_reference_tokens",
+        "effective_cost_usd",
         "tokens_per_completed_task",
         "cache_eligible_fraction",
+        "stable_prefix_preserved_fraction",
+        "cache_bust_count",
+        "invalidated_prefix_tokens",
         "redundant_tokens",
         "context_token_curve_slope",
         "per_turn_fixed_overhead_tokens",
@@ -293,7 +309,11 @@ fn compare_economy(
         .map(|field| {
             let before = left.and_then(|summary| economy_numeric(summary, field));
             let after = right.and_then(|summary| economy_numeric(summary, field));
-            let delta = if tokenizer_match {
+            let effective_cost_field =
+                matches!(field, "effective_reference_tokens" | "effective_cost_usd");
+            let comparable =
+                tokenizer_match && (!effective_cost_field || cache_input_discount_match);
+            let delta = if comparable {
                 numeric_delta(before, after)
             } else {
                 ResourceDelta {
@@ -301,12 +321,26 @@ fn compare_economy(
                     after,
                     delta: None,
                     delta_pct: None,
-                    change: Some("not-comparable-tokenizer-or-tariff".to_owned()),
+                    change: Some(
+                        if effective_cost_field {
+                            "not-comparable-tokenizer-tariff-or-cache-input-discount"
+                        } else {
+                            "not-comparable-tokenizer-or-tariff"
+                        }
+                        .to_owned(),
+                    ),
                 }
             };
             (field.to_owned(), delta)
         })
         .collect();
+    let cache_regime_before = left
+        .filter(|summary| summary.schema >= 3)
+        .map(|summary| summary.cache_regime.clone());
+    let cache_regime_after = right
+        .filter(|summary| summary.schema >= 3)
+        .map(|summary| summary.cache_regime.clone());
+    let cache_regime_change = value_change(&cache_regime_before, &cache_regime_after);
     let completion_before =
         left.map(|summary| crate::economy::completion_name(&summary.completion).to_owned());
     let completion_after =
@@ -321,15 +355,35 @@ fn compare_economy(
         "changed"
     };
     let context_token_curve = compare_context_token_curve(left, right, tokenizer_match);
+    let invalidated_prefix_tokens_per_turn =
+        compare_invalidated_prefix_tokens(left, right, tokenizer_match);
     Some(EconomySummaryDiff {
         comparison_scope: "cross-topology".to_owned(),
         tokenizer_match,
+        cache_input_discount_match,
+        cache_regime_before,
+        cache_regime_after,
+        cache_regime_change,
         completion_before,
         completion_after,
         completion_change: completion_change.to_owned(),
         values,
         context_token_curve,
+        invalidated_prefix_tokens_per_turn,
     })
+}
+
+fn value_change<T: PartialEq>(before: &Option<T>, after: &Option<T>) -> String {
+    if before == after {
+        "unchanged"
+    } else if before.is_none() {
+        "added"
+    } else if after.is_none() {
+        "removed"
+    } else {
+        "changed"
+    }
+    .to_owned()
 }
 
 fn compare_context_token_curve(
@@ -343,6 +397,58 @@ fn compare_context_token_curve(
     let after = right
         .filter(|summary| summary.schema >= 2)
         .map(|summary| summary.context_token_curve.clone());
+    if before.is_none() && after.is_none() {
+        return None;
+    }
+    let (delta, change) = if !tokenizer_match {
+        (None, "not-comparable-tokenizer-or-tariff")
+    } else if let (Some(before), Some(after)) = (&before, &after) {
+        if before.len() == after.len() {
+            (
+                Some(
+                    before
+                        .iter()
+                        .zip(after)
+                        .map(|(before, after)| *after as f64 - *before as f64)
+                        .collect(),
+                ),
+                "comparable",
+            )
+        } else {
+            (None, "different-length")
+        }
+    } else if before.is_none() {
+        (None, "added")
+    } else {
+        (None, "removed")
+    };
+    Some(ContextTokenCurveDiff {
+        before,
+        after,
+        delta,
+        change: change.to_owned(),
+    })
+}
+
+fn compare_invalidated_prefix_tokens(
+    left: Option<&crate::economy::EconomySummary>,
+    right: Option<&crate::economy::EconomySummary>,
+    tokenizer_match: bool,
+) -> Option<ContextTokenCurveDiff> {
+    let before = left
+        .filter(|summary| summary.schema >= 3)
+        .map(|summary| summary.invalidated_prefix_tokens_per_turn.clone());
+    let after = right
+        .filter(|summary| summary.schema >= 3)
+        .map(|summary| summary.invalidated_prefix_tokens_per_turn.clone());
+    compare_u64_arrays(before, after, tokenizer_match)
+}
+
+fn compare_u64_arrays(
+    before: Option<Vec<u64>>,
+    after: Option<Vec<u64>>,
+    tokenizer_match: bool,
+) -> Option<ContextTokenCurveDiff> {
     if before.is_none() && after.is_none() {
         return None;
     }
@@ -391,6 +497,17 @@ fn economy_numeric(summary: &crate::economy::EconomySummary, field: &str) -> Opt
     if advanced && summary.schema < 2 {
         return None;
     }
+    let cache_economics = matches!(
+        field,
+        "effective_reference_tokens"
+            | "effective_cost_usd"
+            | "stable_prefix_preserved_fraction"
+            | "cache_bust_count"
+            | "invalidated_prefix_tokens"
+    );
+    if cache_economics && summary.schema < 3 {
+        return None;
+    }
     match field {
         "model_turns" => Some(summary.model_turns as f64),
         "total_reference_tokens" => Some(summary.total_reference_tokens as f64),
@@ -398,8 +515,13 @@ fn economy_numeric(summary: &crate::economy::EconomySummary, field: &str) -> Opt
         "tool_batching_factor" => Some(summary.tool_batching_factor),
         "last_context_size_tokens" => Some(summary.last_context_size_tokens as f64),
         "reference_cost_usd" => Some(summary.reference_cost_usd),
+        "effective_reference_tokens" => Some(summary.effective_reference_tokens),
+        "effective_cost_usd" => Some(summary.effective_cost_usd),
         "tokens_per_completed_task" => summary.tokens_per_completed_task.map(|value| value as f64),
         "cache_eligible_fraction" => Some(summary.cache_eligible_fraction),
+        "stable_prefix_preserved_fraction" => Some(summary.stable_prefix_preserved_fraction),
+        "cache_bust_count" => Some(summary.cache_bust_count as f64),
+        "invalidated_prefix_tokens" => Some(summary.invalidated_prefix_tokens as f64),
         "redundant_tokens" => Some(summary.redundant_tokens as f64),
         "context_token_curve_slope" => Some(summary.context_token_curve_slope),
         "per_turn_fixed_overhead_tokens" => Some(summary.per_turn_fixed_overhead_tokens as f64),
@@ -849,7 +971,7 @@ mod tests {
 
     fn economy(tokens: u64) -> EconomySummary {
         EconomySummary {
-            schema: 2,
+            schema: 3,
             task: "economy-test".to_owned(),
             profile: "quick".to_owned(),
             turn_budget: 8,
@@ -891,6 +1013,18 @@ mod tests {
             retry_attempts: 0,
             retry_reference_tokens: 0,
             retry_label: "separate".to_owned(),
+            cache_regime: "automatic-prefix".to_owned(),
+            cache_regime_label: "zero explicit breakpoints expected".to_owned(),
+            cache_input_discount: 0.90,
+            cache_input_discount_label: "stated assumption".to_owned(),
+            effective_reference_tokens: tokens as f64 * 0.55,
+            effective_cost_usd: tokens as f64 * 0.55 * 10.0 / 1_000_000.0,
+            effective_cost_label: "upper-bound proxy".to_owned(),
+            stable_prefix_preserved_fraction: 1.0,
+            cache_bust_count: 0,
+            invalidated_prefix_tokens: 0,
+            invalidated_prefix_tokens_per_turn: vec![0],
+            prefix_stability_label: "reference-token LCP".to_owned(),
         }
     }
 
@@ -902,12 +1036,24 @@ mod tests {
         assert_eq!(compared.comparison_scope, "cross-topology");
         assert!(compared.tokenizer_match);
         assert_eq!(compared.values["total_reference_tokens"].delta, Some(25.0));
+        assert!(
+            compared.values["effective_reference_tokens"]
+                .delta
+                .is_some_and(|delta| (delta - 13.75).abs() < f64::EPSILON * 64.0)
+        );
         assert_eq!(
             compared
                 .context_token_curve
                 .as_ref()
                 .and_then(|curve| curve.delta.as_ref()),
             Some(&vec![12.0, 25.0])
+        );
+        assert_eq!(
+            compared
+                .invalidated_prefix_tokens_per_turn
+                .as_ref()
+                .and_then(|curve| curve.delta.as_ref()),
+            Some(&vec![0.0])
         );
 
         let mut mismatched = after;
@@ -918,6 +1064,22 @@ mod tests {
         assert_eq!(
             guarded.values["total_reference_tokens"].change.as_deref(),
             Some("not-comparable-tokenizer-or-tariff")
+        );
+
+        let mut mismatched_discount = economy(125);
+        mismatched_discount.cache_input_discount = 0.50;
+        let discount_guarded = compare_economy(Some(&before), Some(&mismatched_discount))
+            .expect("discount-guarded economy diff");
+        assert!(!discount_guarded.cache_input_discount_match);
+        assert_eq!(
+            discount_guarded.values["effective_cost_usd"]
+                .change
+                .as_deref(),
+            Some("not-comparable-tokenizer-tariff-or-cache-input-discount")
+        );
+        assert_eq!(
+            discount_guarded.values["total_reference_tokens"].delta,
+            Some(25.0)
         );
     }
 

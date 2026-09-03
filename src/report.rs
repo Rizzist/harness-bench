@@ -1422,6 +1422,43 @@ pub fn render_markdown(report: &Report) -> String {
                 summary.retry_reference_tokens,
                 summary.retry_label,
             );
+            if summary.schema >= 3 {
+                let invalidated = summary
+                    .invalidated_prefix_tokens_per_turn
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(output, "### Cache-adjusted economy\n");
+                let _ = writeln!(
+                    output,
+                    "Cache regime: `{}`. {}.\n",
+                    summary.cache_regime, summary.cache_regime_label,
+                );
+                let _ = writeln!(
+                    output,
+                    "Cache input discount: `{:.2}` ({:.0}%). {}.\n",
+                    summary.cache_input_discount,
+                    summary.cache_input_discount * 100.0,
+                    summary.cache_input_discount_label,
+                );
+                let _ = writeln!(
+                    output,
+                    "Effective reference tokens: `{:.6}`. Effective cost: `${:.8}`. {}.\n",
+                    summary.effective_reference_tokens,
+                    summary.effective_cost_usd,
+                    summary.effective_cost_label,
+                );
+                let _ = writeln!(
+                    output,
+                    "Stable prefix preserved fraction: `{:.6}`. Cache busts: `{}`. Invalidated prefix: `{}` reference tokens; per measured turn `[{}]`. {}.\n",
+                    summary.stable_prefix_preserved_fraction,
+                    summary.cache_bust_count,
+                    summary.invalidated_prefix_tokens,
+                    invalidated,
+                    summary.prefix_stability_label,
+                );
+            }
         }
     }
     if report.economy_summary.is_none() {

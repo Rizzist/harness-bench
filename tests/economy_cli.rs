@@ -1,5 +1,7 @@
 use ahrb::economy::{
-    EconomyCompletion, REFERENCE_TARIFF_USD_PER_MILLION_TOKENS, REFERENCE_TOKENIZER_VERSION,
+    CACHE_INPUT_DISCOUNT, CACHE_INPUT_DISCOUNT_LABEL, CACHE_REGIME_LABEL, EFFECTIVE_COST_LABEL,
+    EconomyCompletion, PREFIX_STABILITY_LABEL, REFERENCE_TARIFF_USD_PER_MILLION_TOKENS,
+    REFERENCE_TOKENIZER_VERSION,
 };
 use ahrb::report::Report;
 use std::path::Path;
@@ -104,7 +106,7 @@ fn reference_mock_pins_all_five_v3_full_economy_columns() {
     .expect("parse v3-full economy report");
     let summary = report.economy_summary.expect("v3-full economy summary");
 
-    assert_eq!(summary.schema, 2);
+    assert_eq!(summary.schema, 3);
     assert_eq!(summary.cache_eligible_fraction, 0.817_066_502_631_399_1);
     assert_eq!(summary.redundant_tokens, 71_626);
     assert_eq!(
@@ -125,4 +127,61 @@ fn reference_mock_pins_all_five_v3_full_economy_columns() {
             .contains("cache-eligible fraction (prefix upper bound)")
     );
     std::fs::remove_dir_all(output).expect("remove v3-full economy output");
+}
+
+#[test]
+fn reference_mock_pins_schema_three_cache_economics() {
+    let output = std::env::temp_dir().join(format!(
+        "ahrb-economy-cache-integration-{}",
+        std::process::id()
+    ));
+    if output.exists() {
+        std::fs::remove_dir_all(&output).expect("remove stale cache-economy output");
+    }
+    let command = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args([
+            "run",
+            "--pillar",
+            "economy",
+            "--manifest",
+            "adapters/mock/manifest.toml",
+            "--profile",
+            "quick",
+            "--output",
+        ])
+        .arg(&output)
+        .arg("--no-save")
+        .output()
+        .expect("run cache-economy pillar against reference mock");
+    assert!(
+        command.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&command.stdout),
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let report: Report = serde_json::from_slice(
+        &std::fs::read(output.join("report.json")).expect("read cache-economy report"),
+    )
+    .expect("parse cache-economy report");
+    let summary = report.economy_summary.expect("cache-economy summary");
+
+    assert_eq!(summary.schema, 3);
+    assert_eq!(summary.cache_regime, "automatic-prefix");
+    assert_eq!(summary.cache_regime_label, CACHE_REGIME_LABEL);
+    assert_eq!(summary.cache_input_discount, CACHE_INPUT_DISCOUNT);
+    assert_eq!(
+        summary.cache_input_discount_label,
+        CACHE_INPUT_DISCOUNT_LABEL
+    );
+    assert_eq!(summary.effective_reference_tokens, 25_518.190_875_538_24);
+    assert_eq!(summary.effective_cost_usd, 0.255_181_908_755_382_4);
+    assert_eq!(summary.effective_cost_label, EFFECTIVE_COST_LABEL);
+    assert_eq!(summary.stable_prefix_preserved_fraction, 1.0);
+    assert_eq!(summary.cache_bust_count, 0);
+    assert_eq!(summary.invalidated_prefix_tokens, 0);
+    assert_eq!(summary.invalidated_prefix_tokens_per_turn, vec![0; 7]);
+    assert_eq!(summary.prefix_stability_label, PREFIX_STABILITY_LABEL);
+
+    std::fs::remove_dir_all(output).expect("remove cache-economy output");
 }

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Stable economy-task and analysis schema.
-pub const ECONOMY_SCHEMA_VERSION: u32 = 2;
+pub const ECONOMY_SCHEMA_VERSION: u32 = 3;
 /// Stable identifier for the single standardized MVP task.
 pub const ECONOMY_TASK_ID: &str = "ahrb-harness-economy-mvp-v1";
 /// Human-readable reference-token label. This is intentionally not a bill.
@@ -20,6 +20,8 @@ pub const REFERENCE_TOKEN_LABEL: &str = "reference tokens (o200k_base-style)";
 pub const REFERENCE_TOKENIZER_VERSION: &str = "ahrb-o200k-base-style-bpe-v1";
 /// Fixed neutral tariff applied to request/reference tokens only.
 pub const REFERENCE_TARIFF_USD_PER_MILLION_TOKENS: f64 = 10.0;
+/// Stated assumption: fraction of full input price not paid for a cache-eligible token.
+pub const CACHE_INPUT_DISCOUNT: f64 = 0.90;
 /// Honest public label for the cache-prefix proxy.
 pub const CACHE_ELIGIBLE_LABEL: &str = "cache-eligible fraction (prefix upper bound)";
 /// Honest public label for block-level repeated context.
@@ -31,6 +33,14 @@ pub const CONTEXT_TOKEN_CURVE_LABEL: &str =
 pub const FIXED_OVERHEAD_LABEL: &str = "fixed overhead / turn (reference tokens)";
 /// Honest public label for the conservative scripted-effect oracle.
 pub const WASTED_TOOL_CALL_LABEL: &str = "wasted tool calls (deterministic task-proven only)";
+/// Honest public interpretation of provider cache regimes and explicit declarations.
+pub const CACHE_REGIME_LABEL: &str = "provider cache regime; 0 cache_control breakpoints under automatic-prefix is expected, NOT no caching";
+/// Honest public interpretation of the cache discount constant.
+pub const CACHE_INPUT_DISCOUNT_LABEL: &str = "STATED assumption: fraction of full input price not paid for a cache-eligible token; NOT a measured provider rate";
+/// Honest public interpretation of effective cost.
+pub const EFFECTIVE_COST_LABEL: &str = "effective cost assuming automatic prefix caching of the eligible prefix at 90% input discount; UPPER-BOUND proxy from serialized-prefix reuse, NOT a measured server cache-hit rate";
+/// Honest public interpretation of the consecutive-request cache-bust measurements.
+pub const PREFIX_STABILITY_LABEL: &str = "consecutive primary-request serialized-message-prefix stability (reference-token LCP; ordered invalidation array covers turns N>=2)";
 /// The in-repository BPE merge vocabulary. Single-byte tokens are normative and implicit.
 const REFERENCE_VOCABULARY: &[u8] = include_bytes!("../assets/ahrb_o200k_base_style_v1.tiktoken");
 
@@ -63,7 +73,7 @@ pub struct ReferenceTokenizerPin {
     pub vocabulary_entries: u64,
 }
 
-/// The schema-2 economy result plus the metadata needed to audit each value.
+/// The schema-3 economy result plus the metadata needed to audit each value.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EconomySummary {
     /// Economy summary schema.
@@ -159,6 +169,42 @@ pub struct EconomySummary {
     /// Honest interpretation of the retry attribution.
     #[serde(default)]
     pub retry_label: String,
+    /// Provider cache behavior inferred from the primary request dialect.
+    #[serde(default)]
+    pub cache_regime: String,
+    /// Explains why zero explicit breakpoints is expected for automatic caching.
+    #[serde(default)]
+    pub cache_regime_label: String,
+    /// Stated fraction of full input price discounted for cache-eligible tokens.
+    #[serde(default)]
+    pub cache_input_discount: f64,
+    /// Identifies the discount as an assumption rather than a measured rate.
+    #[serde(default)]
+    pub cache_input_discount_label: String,
+    /// Billable-equivalent reference tokens under the stated cache assumption.
+    #[serde(default)]
+    pub effective_reference_tokens: f64,
+    /// Cache-adjusted cost proxy under the stated discount and reference tariff.
+    #[serde(default)]
+    pub effective_cost_usd: f64,
+    /// Honest upper-bound interpretation of the effective cost proxy.
+    #[serde(default)]
+    pub effective_cost_label: String,
+    /// Fraction of measured consecutive primary-request transitions with no prefix invalidation.
+    #[serde(default)]
+    pub stable_prefix_preserved_fraction: f64,
+    /// Number of measured consecutive primary-request transitions that invalidated a prefix.
+    #[serde(default)]
+    pub cache_bust_count: u64,
+    /// Sum of prior-request reference tokens invalidated by consecutive-request prefix changes.
+    #[serde(default)]
+    pub invalidated_prefix_tokens: u64,
+    /// Ordered invalidated reference tokens for primary request transitions N>=2.
+    #[serde(default)]
+    pub invalidated_prefix_tokens_per_turn: Vec<u64>,
+    /// Honest interpretation of the cache-bust measurements.
+    #[serde(default)]
+    pub prefix_stability_label: String,
 }
 
 impl EconomySummary {
@@ -273,7 +319,13 @@ pub fn analyze(
         (completion == EconomyCompletion::Completed).then_some(total_reference_tokens);
     let reference_cost_usd =
         total_reference_tokens as f64 * REFERENCE_TARIFF_USD_PER_MILLION_TOKENS / 1_000_000.0;
-    let cache_eligible_fraction = cache_eligible_fraction(&primary_records, &tokenizer)?;
+    let cache_prefix = cache_prefix_metrics(&primary_records, &tokenizer)?;
+    let cache_eligible_fraction = cache_prefix.eligible_fraction;
+    let cache_regime = cache_regime(&primary_records).to_owned();
+    let effective_reference_tokens =
+        total_reference_tokens as f64 * (1.0 - cache_eligible_fraction * CACHE_INPUT_DISCOUNT);
+    let effective_cost_usd =
+        effective_reference_tokens * REFERENCE_TARIFF_USD_PER_MILLION_TOKENS / 1_000_000.0;
     let cache_control_breakpoints_per_request = primary_records
         .iter()
         .map(|record| count_named_fields(&record.request.canonical, "cache_control"))
@@ -333,6 +385,18 @@ pub fn analyze(
         retry_label:
             "physical retries reported separately; retry request tokens remain in MVP totals"
                 .to_owned(),
+        cache_regime,
+        cache_regime_label: CACHE_REGIME_LABEL.to_owned(),
+        cache_input_discount: CACHE_INPUT_DISCOUNT,
+        cache_input_discount_label: CACHE_INPUT_DISCOUNT_LABEL.to_owned(),
+        effective_reference_tokens,
+        effective_cost_usd,
+        effective_cost_label: EFFECTIVE_COST_LABEL.to_owned(),
+        stable_prefix_preserved_fraction: cache_prefix.stable_prefix_preserved_fraction,
+        cache_bust_count: cache_prefix.cache_bust_count,
+        invalidated_prefix_tokens: cache_prefix.invalidated_prefix_tokens,
+        invalidated_prefix_tokens_per_turn: cache_prefix.invalidated_prefix_tokens_per_turn,
+        prefix_stability_label: PREFIX_STABILITY_LABEL.to_owned(),
     })
 }
 
@@ -341,8 +405,9 @@ pub fn render_summary(summary: &EconomySummary) -> String {
     let context_token_curve = render_u64_array(&summary.context_token_curve);
     let cache_control_breakpoints =
         render_u64_array(&summary.cache_control_breakpoints_per_request);
+    let invalidated_prefix_tokens = render_u64_array(&summary.invalidated_prefix_tokens_per_turn);
     format!(
-        "economy_summary schema={} task={} model_turns={} total_reference_tokens={} tool_calls={} tool_batching_factor={:.6} last_context_size_tokens={} completion={} completion_label=\"{}\" reference_cost_usd={:.8} tokens_per_completed_task={} reference_tariff_usd_per_million_tokens={:.2} reference_tokenizer={} reference_vocabulary_sha256={} cache_eligible_fraction={:.6} cache_eligible_label=\"{}\" cache_control_breakpoints={} cache_control_breakpoints_per_request={} redundant_tokens={} redundant_tokens_label=\"{}\" context_token_curve={} context_token_curve_slope={:.6} context_token_curve_label=\"{}\" per_turn_fixed_overhead_tokens={} per_turn_fixed_overhead_label=\"{}\" wasted_tool_call_count={} wasted_tool_call_label=\"{}\" retry_attempts={} retry_reference_tokens={}",
+        "economy_summary schema={} task={} model_turns={} total_reference_tokens={} tool_calls={} tool_batching_factor={:.6} last_context_size_tokens={} completion={} completion_label=\"{}\" reference_cost_usd={:.8} tokens_per_completed_task={} reference_tariff_usd_per_million_tokens={:.2} reference_tokenizer={} reference_vocabulary_sha256={} cache_eligible_fraction={:.6} cache_eligible_label=\"{}\" cache_control_breakpoints={} cache_control_breakpoints_per_request={} redundant_tokens={} redundant_tokens_label=\"{}\" context_token_curve={} context_token_curve_slope={:.6} context_token_curve_label=\"{}\" per_turn_fixed_overhead_tokens={} per_turn_fixed_overhead_label=\"{}\" wasted_tool_call_count={} wasted_tool_call_label=\"{}\" retry_attempts={} retry_reference_tokens={} cache_regime={} cache_regime_label=\"{}\" cache_input_discount={:.2} cache_input_discount_label=\"{}\" effective_reference_tokens={:.6} effective_cost_usd={:.8} effective_cost_label=\"{}\" stable_prefix_preserved_fraction={:.6} cache_bust_count={} invalidated_prefix_tokens={} invalidated_prefix_tokens_per_turn={} prefix_stability_label=\"{}\"",
         summary.schema,
         summary.task,
         summary.model_turns,
@@ -374,6 +439,18 @@ pub fn render_summary(summary: &EconomySummary) -> String {
         summary.wasted_tool_call_count_label,
         summary.retry_attempts,
         summary.retry_reference_tokens,
+        summary.cache_regime,
+        summary.cache_regime_label,
+        summary.cache_input_discount,
+        summary.cache_input_discount_label,
+        summary.effective_reference_tokens,
+        summary.effective_cost_usd,
+        summary.effective_cost_label,
+        summary.stable_prefix_preserved_fraction,
+        summary.cache_bust_count,
+        summary.invalidated_prefix_tokens,
+        invalidated_prefix_tokens,
+        summary.prefix_stability_label,
     )
 }
 
@@ -465,40 +542,125 @@ fn primary_message_array(record: &ModelRequestRecord) -> Value {
     }
 }
 
-fn cache_eligible_fraction(
+fn cache_regime(records: &[&ModelRequestRecord]) -> &'static str {
+    if records.is_empty() {
+        return "none";
+    }
+    if records.iter().all(|record| {
+        matches!(
+            record.request.dialect.as_str(),
+            "openai-chat-completions"
+                | "open-ai-chat-completions"
+                | "openai-responses"
+                | "open-ai-responses"
+                | "openai"
+        )
+    }) {
+        "automatic-prefix"
+    } else if records.iter().all(|record| {
+        matches!(
+            record.request.dialect.as_str(),
+            "anthropic-messages" | "anthropic"
+        )
+    }) {
+        "explicit-cache-control"
+    } else {
+        "none"
+    }
+}
+
+struct CachePrefixMetrics {
+    eligible_fraction: f64,
+    stable_prefix_preserved_fraction: f64,
+    cache_bust_count: u64,
+    invalidated_prefix_tokens: u64,
+    invalidated_prefix_tokens_per_turn: Vec<u64>,
+}
+
+fn cache_prefix_metrics(
     records: &[&ModelRequestRecord],
     tokenizer: &ReferenceTokenizer,
-) -> Result<f64> {
-    let mut previous = None::<Vec<Vec<u8>>>;
+) -> Result<CachePrefixMetrics> {
+    let mut previous_eligibility = None::<Vec<Vec<u8>>>;
+    let mut previous_stability = None::<(Value, Vec<Vec<u8>>)>;
     let mut eligible = 0_u64;
     let mut denominator = 0_u64;
+    let mut invalidated_prefix_tokens = 0_u64;
+    let mut invalidated_prefix_tokens_per_turn = Vec::new();
     for record in records {
-        let serialized = serde_json::to_vec(&primary_message_array(record))?;
+        let message_array = primary_message_array(record);
+        let serialized = serde_json::to_vec(&message_array)?;
         let current = tokenizer.encode(&serialized)?;
         denominator = denominator
             .checked_add(u64::try_from(current.len()).map_err(|_| {
                 AhrbError::Protocol("cache token count does not fit u64".to_owned())
             })?)
             .ok_or_else(|| AhrbError::Protocol("cache denominator overflow".to_owned()))?;
-        if let Some(prior) = previous.as_ref() {
-            let prefix = prior
-                .iter()
-                .zip(&current)
-                .take_while(|(left, right)| left == right)
-                .count();
+        if let Some(prior) = previous_eligibility.as_ref() {
+            let prefix = token_lcp_len(prior, &current);
             eligible = eligible
                 .checked_add(u64::try_from(prefix).map_err(|_| {
                     AhrbError::Protocol("cache prefix count does not fit u64".to_owned())
                 })?)
                 .ok_or_else(|| AhrbError::Protocol("cache numerator overflow".to_owned()))?;
         }
-        previous = Some(current);
+        previous_eligibility = Some(current.clone());
+
+        if let Some((prior_array, prior_tokens)) = previous_stability.as_ref() {
+            let prefix = if message_array_preserves_prefix(prior_array, &message_array) {
+                prior_tokens.len()
+            } else {
+                token_lcp_len(prior_tokens, &current)
+            };
+            let invalidated =
+                u64::try_from(prior_tokens.len().saturating_sub(prefix)).map_err(|_| {
+                    AhrbError::Protocol("invalidated prefix count does not fit u64".to_owned())
+                })?;
+            invalidated_prefix_tokens = invalidated_prefix_tokens
+                .checked_add(invalidated)
+                .ok_or_else(|| {
+                    AhrbError::Protocol("invalidated prefix token total overflow".to_owned())
+                })?;
+            invalidated_prefix_tokens_per_turn.push(invalidated);
+        }
+        previous_stability = Some((message_array, current));
     }
-    Ok(if denominator == 0 {
+    let eligible_fraction = if denominator == 0 {
         0.0
     } else {
         eligible as f64 / denominator as f64
+    };
+    let cache_bust_count = invalidated_prefix_tokens_per_turn
+        .iter()
+        .filter(|invalidated| **invalidated > 0)
+        .count() as u64;
+    let measured_turns = invalidated_prefix_tokens_per_turn.len() as u64;
+    let stable_prefix_preserved_fraction = if measured_turns == 0 {
+        0.0
+    } else {
+        measured_turns.saturating_sub(cache_bust_count) as f64 / measured_turns as f64
+    };
+    Ok(CachePrefixMetrics {
+        eligible_fraction,
+        stable_prefix_preserved_fraction,
+        cache_bust_count,
+        invalidated_prefix_tokens,
+        invalidated_prefix_tokens_per_turn,
     })
+}
+
+fn message_array_preserves_prefix(prior: &Value, current: &Value) -> bool {
+    let (Value::Array(prior), Value::Array(current)) = (prior, current) else {
+        return false;
+    };
+    current.get(..prior.len()) == Some(prior.as_slice())
+}
+
+fn token_lcp_len(left: &[Vec<u8>], right: &[Vec<u8>]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 fn count_named_fields(value: &Value, field: &str) -> u64 {
@@ -1121,5 +1283,87 @@ mod tests {
             21
         );
         assert_eq!(tokenizer.pin.vocabulary_entries, 272);
+    }
+
+    #[test]
+    fn cache_regime_follows_provider_dialect_family() {
+        let openai = record(json!({"messages": []}));
+        let anthropic = ModelRequestRecord {
+            request: ModelRequest {
+                dialect: "anthropic-messages".to_owned(),
+                ..record(json!({})).request
+            },
+            ..record(json!({}))
+        };
+        let unknown = ModelRequestRecord {
+            request: ModelRequest {
+                dialect: "unknown".to_owned(),
+                ..record(json!({})).request
+            },
+            ..record(json!({}))
+        };
+
+        assert_eq!(cache_regime(&[&openai]), "automatic-prefix");
+        assert_eq!(cache_regime(&[&anthropic]), "explicit-cache-control");
+        assert_eq!(cache_regime(&[&unknown]), "none");
+        assert_eq!(cache_regime(&[&openai, &anthropic]), "none");
+    }
+
+    #[test]
+    fn prefix_stability_preserves_appends_and_detects_old_message_mutation() {
+        let first = record(json!({"messages": [{"role": "user", "content": "one"}]}));
+        let second = ModelRequestRecord {
+            request: ModelRequest {
+                canonical: json!({"messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "two"}
+                ]}),
+                ..record(json!({})).request
+            },
+            semantic_ordinal: 2,
+            received_ns: 2,
+            ..record(json!({}))
+        };
+        let third = ModelRequestRecord {
+            request: ModelRequest {
+                canonical: json!({"messages": [
+                    {"role": "user", "content": "rewritten"},
+                    {"role": "assistant", "content": "two"},
+                    {"role": "user", "content": "three"}
+                ]}),
+                ..record(json!({})).request
+            },
+            semantic_ordinal: 3,
+            received_ns: 3,
+            ..record(json!({}))
+        };
+        let tokenizer = ReferenceTokenizer::load().expect("load tokenizer");
+        let metrics = cache_prefix_metrics(&[&first, &second, &third], &tokenizer)
+            .expect("measure cache prefixes");
+        let prior = tokenizer
+            .encode(
+                &serde_json::to_vec(&primary_message_array(&second))
+                    .expect("serialize prior array"),
+            )
+            .expect("tokenize prior array");
+        let current = tokenizer
+            .encode(
+                &serde_json::to_vec(&primary_message_array(&third))
+                    .expect("serialize current array"),
+            )
+            .expect("tokenize current array");
+        let expected_invalidation = prior.len().saturating_sub(token_lcp_len(&prior, &current));
+
+        assert_eq!(metrics.invalidated_prefix_tokens_per_turn[0], 0);
+        assert_eq!(
+            metrics.invalidated_prefix_tokens_per_turn[1],
+            expected_invalidation as u64
+        );
+        assert_eq!(metrics.cache_bust_count, 1);
+        assert_eq!(metrics.stable_prefix_preserved_fraction, 0.5);
+        assert_eq!(
+            metrics.invalidated_prefix_tokens,
+            metrics.invalidated_prefix_tokens_per_turn[1]
+        );
     }
 }

@@ -2880,8 +2880,28 @@ async fn run_economy_inner(
                 economy_summary.reference_cost_usd,
             ),
             (
+                "economy.effective_reference_tokens".to_owned(),
+                economy_summary.effective_reference_tokens,
+            ),
+            (
+                "economy.effective_cost_usd".to_owned(),
+                economy_summary.effective_cost_usd,
+            ),
+            (
                 "economy.cache_eligible_fraction".to_owned(),
                 economy_summary.cache_eligible_fraction,
+            ),
+            (
+                "economy.stable_prefix_preserved_fraction".to_owned(),
+                economy_summary.stable_prefix_preserved_fraction,
+            ),
+            (
+                "economy.cache_bust_count".to_owned(),
+                economy_summary.cache_bust_count as f64,
+            ),
+            (
+                "economy.invalidated_prefix_tokens".to_owned(),
+                economy_summary.invalidated_prefix_tokens as f64,
             ),
             (
                 "economy.redundant_tokens".to_owned(),

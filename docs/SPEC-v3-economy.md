@@ -37,15 +37,19 @@ o200k-style reference BPE rather than OpenAI's full `o200k_base` vocabulary, so 
 public label is `reference tokens (o200k_base-style)`.
 
 The fixed reference tariff is USD 10.00 per million reference request tokens. It is
-a stable comparison tariff, not a bill or a claim about any provider's price.
+a stable comparison tariff, not a bill or a claim about any provider's price. The
+cache input discount is separately pinned at `0.90`: for the cache-adjusted proxy,
+an eligible token is assumed to be billed at 10% of full input price. This is a
+stated benchmark assumption, not a measured rate or a claim about a provider's
+current price.
 
-## `economy_summary` schema 2
+## `economy_summary` schema 3
 
 The report's optional `economy_summary` object has the following fields:
 
 | Field | Meaning |
 |---|---|
-| `schema` | Economy schema, currently `2`. Schema 2 only adds fields to schema 1. |
+| `schema` | Economy schema, currently `3`. Schema 3 only adds fields to schemas 1 and 2. |
 | `task`, `profile`, `turn_budget` | Task identity and execution envelope. |
 | `reference_tokenizer` | Encoding label, implementation version, vocabulary SHA-256, and vocabulary entry count. |
 | `reference_token_label` | Honest label for token-derived values. |
@@ -70,6 +74,18 @@ The report's optional `economy_summary` object has the following fields:
 | `per_turn_fixed_overhead_tokens` | **Fixed overhead / turn**, in reference tokens. Take the exact common block prefix, across every primary physical request, independently for leading system/developer instructions and tool-schema definitions; serialize those invariant parts in the dialect's canonical instruction/tool envelope and tokenize it. If the run changes dialect, no invariant overhead is claimed. |
 | `wasted_tool_call_count` | **Wasted tool calls (deterministic task-proven only)**. A unique accepted scripted call is counted only when a successful normalized result proves execution and the known scripted effect has neither a successful workspace mutation nor a result carried into a later primary request. Missing or failed evidence is not guessed to be waste. |
 | `retry_attempts`, `retry_reference_tokens`, `retry_label` | Retry attribution kept separate from the economy columns. `retry_attempts` reuses row 42's maximum declared attempt count per semantic request; `retry_reference_tokens` sums captured physical request attempts after attempt one. Schema-1 totals intentionally still include all captured physical attempts. |
+| `cache_regime` | Provider cache behavior derived from the captured primary-request dialect: OpenAI chat completions or Responses is `automatic-prefix`; Anthropic Messages is `explicit-cache-control`; mixed, empty, or unknown dialects are `none`. |
+| `cache_regime_label` | `provider cache regime; 0 cache_control breakpoints under automatic-prefix is expected, NOT no caching`. Explicit breakpoints are not expected for an automatic-prefix provider path. |
+| `cache_input_discount` | Pinned `0.90`, the stated fraction of full input price assumed not paid for a cache-eligible token. |
+| `cache_input_discount_label` | `STATED assumption: fraction of full input price not paid for a cache-eligible token; NOT a measured provider rate`. |
+| `effective_reference_tokens` | `total_reference_tokens * (1 - cache_eligible_fraction * cache_input_discount)`. This is a floating-point billable-equivalent token proxy, not a provider usage value. |
+| `effective_cost_usd` | `effective_reference_tokens * reference_tariff_usd_per_million_tokens / 1_000_000`. `reference_cost_usd` remains the unchanged worst-case uncached comparison value. |
+| `effective_cost_label` | `effective cost assuming automatic prefix caching of the eligible prefix at 90% input discount; UPPER-BOUND proxy from serialized-prefix reuse, NOT a measured server cache-hit rate`. |
+| `stable_prefix_preserved_fraction` | Number of measured consecutive primary-request transitions with zero invalidation divided by the number of transitions. It is `0.0` when there are fewer than two primary requests. |
+| `cache_bust_count` | Number of measured consecutive primary-request transitions with nonzero prefix invalidation. |
+| `invalidated_prefix_tokens` | Sum of prior-request reference tokens invalidated by cache busts. |
+| `invalidated_prefix_tokens_per_turn` | Ordered invalidation values for primary request transitions N>=2; its length is `model_turns - 1` when at least one primary request exists. |
+| `prefix_stability_label` | `consecutive primary-request serialized-message-prefix stability (reference-token LCP; ordered invalidation array covers turns N>=2)`. |
 
 The six MVP headline columns remain `model_turns`, `total_reference_tokens`, the paired
 `tool_calls`/`tool_batching_factor`, `last_context_size_tokens`, `completion`, and
@@ -78,6 +94,8 @@ a table suitable for cross-harness comparison. Schema 2 adds the five advanced
 headline columns `cache_eligible_fraction`, `redundant_tokens`,
 `context_token_curve` (with `context_token_curve_slope`),
 `per_turn_fixed_overhead_tokens`, and `wasted_tool_call_count`.
+Schema 3 leaves all eleven headline columns unchanged and adds cache-regime,
+cache-adjusted-cost, and prefix-stability diagnostics.
 
 Every advanced calculation uses the same fake-provider canonical bodies and
 normalized events as schema 1. Primary-request ordering is
@@ -87,11 +105,27 @@ their count and token contribution are also disclosed explicitly. No real-model
 inference, provider usage field, server cache observation, or harness
 instrumentation participates.
 
+Schema 3's prefix-stability calculation uses the same canonical message/input
+array selection, deterministic JSON serializer, and reference tokenizer as
+`cache_eligible_fraction`: the complete array is serialized and tokenized. For
+transition N, the benchmark takes the token LCP of N-1 and N. A structurally
+append-only array is assigned the prior array's full token length as its effective
+LCP, so the serializer's closing `]` framing cannot create a false one-token bust.
+If the effective LCP is shorter than N-1, invalidation is
+`tokens(N-1) - LCP`; otherwise it is zero. Reordering, deleting, or mutating an old
+message therefore invalidates the changed suffix, while clean append-only growth
+does not. The metric is still a provider-neutral serialized-prefix proxy; it does
+not observe a server cache.
+
 `hbench diff` adds typed scalar deltas for all five advanced columns and an
-element-wise typed delta for equal-length context curves. Economy numeric and
-curve deltas are suppressed when the tokenizer or tariff pins differ. Schema-1
-reports deserialize with absent schema-2 fields and do not manufacture advanced
-values.
+element-wise typed delta for equal-length context curves. Schema 3 adds typed
+deltas for effective reference tokens, effective cost, stable-prefix fraction,
+cache-bust count, invalidated-prefix tokens, and the ordered per-turn invalidation
+array, plus before/after/change values for `cache_regime`. Economy numeric and
+array deltas are suppressed when the tokenizer or tariff pins differ. Effective
+reference-token and cost deltas are additionally suppressed when
+`cache_input_discount` differs. Schema-1 and schema-2 reports deserialize with
+absent later-schema fields and do not manufacture those values.
 
 ## Boundary from v2 row 42
 
