@@ -6,7 +6,7 @@ operated by AUTOMATION. It drives harnesses through deterministic SIMULATED work
 against a FAKE model (no real inference) so it measures the harness's own behavior and
 overhead — not model intelligence, coding quality, tokens, or provider latency.
 
-Crate/binary: `ahrb`. License: dual MIT OR Apache-2.0. Rust stable. No DB, container,
+Crate/binary: `ahrb`. License: KOA-P-1.0 (Kingdom of Abraham Permissive, MIT-equivalent; see LICENSE.md). Rust stable. No DB, container,
 Python, or external service required. Deps limited to async HTTP/runtime (tokio +
 hyper/axum-lite or hyper directly), serde/toml/json, a hash (sha2/blake3), and thin
 platform FFI (libc / mach for macOS, procfs reads for Linux). Cross-platform: macOS
