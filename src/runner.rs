@@ -249,6 +249,7 @@ struct ContextRecoveryTrials {
     events: Vec<NormalizedEvent>,
     requests: Vec<crate::fake_model::ModelRequestRecord>,
     trials: Vec<ContextRecoveryTrial>,
+    compaction_trials: Vec<crate::wave4::CompactionTransparencyTrial>,
 }
 
 struct ResumeLatencyTrials {
@@ -934,6 +935,7 @@ struct DerivedRowEvaluations<'a> {
     usage_reporting: &'a crate::wave4::Wave4Evaluation,
     session_ops_cli: &'a crate::wave4::Wave4Evaluation,
     event_stream_completeness: &'a crate::wave4::Wave4Evaluation,
+    compaction_transparency: &'a crate::wave4::Wave4Evaluation,
     headless_permissions: &'a crate::wave4::Wave4Evaluation,
     secrets_hygiene: &'a SecretsHygieneEvaluation,
     model_request_efficiency: &'a crate::fake_model::ModelRequestEfficiencyEvaluation,
@@ -4615,7 +4617,7 @@ async fn run_inner(
     let mut cancel_cleanup_detail = None;
 
     for (row, actor_names) in &actors_by_row {
-        if (20..=29).contains(row) || matches!(*row, 42..=55 | 56..=58 | 60 | 63..=65) {
+        if (20..=29).contains(row) || matches!(*row, 42..=55 | 56..=58 | 60 | 63..=65 | 73) {
             continue;
         }
         if !matches!(
@@ -5573,9 +5575,12 @@ async fn run_inner(
     } else {
         None
     };
-    let row51_trials = if selected_rows.contains(&51)
+    let row51_trials = if (selected_rows.contains(&51) || selected_rows.contains(&73))
         && matches!(
-            crate::matrix_evidence::capability_for_row(&manifest, 51),
+            crate::matrix_evidence::capability_for_row(
+                &manifest,
+                if selected_rows.contains(&51) { 51 } else { 73 }
+            ),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
         match collect_context_recovery_trials(
@@ -5587,14 +5592,29 @@ async fn run_inner(
         .await
         {
             Ok(trials) => {
-                events.insert(51_u8, trials.events.clone());
+                if selected_rows.contains(&51) {
+                    events.insert(51_u8, trials.events.clone());
+                }
+                if selected_rows.contains(&73) {
+                    events.insert(73_u8, trials.events.clone());
+                }
                 Some(trials)
             }
             Err(error) => {
                 let detail = format!("context-limit-recovery evidence collection: {error}");
-                row_errors.insert(51, detail.clone());
+                for row in [51_u8, 73_u8]
+                    .into_iter()
+                    .filter(|row| selected_rows.contains(row))
+                {
+                    row_errors.insert(row, detail.clone());
+                }
                 progress.update(|state| {
-                    state.row_errors.insert(51, detail);
+                    for row in [51_u8, 73_u8]
+                        .into_iter()
+                        .filter(|row| selected_rows.contains(row))
+                    {
+                        state.row_errors.insert(row, detail.clone());
+                    }
                 })?;
                 None
             }
@@ -6581,10 +6601,19 @@ async fn run_inner(
     let row69_evaluation = crate::wave4::evaluate_event_stream_completeness(
         state.events.get(&69).map_or(&[][..], Vec::as_slice),
         manifest.events.metadata.as_ref(),
+        manifest.events.narrative.as_ref(),
         match options.profile {
             Profile::Quick => 3,
             Profile::Cert => 7,
         },
+    );
+    let row73_evaluation = crate::wave4::evaluate_compaction_transparency(
+        state.events.get(&73).map_or(&[][..], Vec::as_slice),
+        manifest.events.compaction.as_ref(),
+        row51_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.compaction_trials.as_slice()),
+        row51_repetitions,
     );
     let row71_evaluation = if selected_rows.contains(&71)
         && matches!(
@@ -6705,6 +6734,7 @@ async fn run_inner(
             usage_reporting: &row67_evaluation,
             session_ops_cli: &row68_evaluation,
             event_stream_completeness: &row69_evaluation,
+            compaction_transparency: &row73_evaluation,
             headless_permissions: &row70_evaluation,
             secrets_hygiene: &row71_evaluation,
             model_request_efficiency: &row42_evaluation,
@@ -6978,6 +7008,9 @@ async fn run_inner(
     if selected_rows.contains(&72) && row72_evaluation.measurement_complete {
         metrics.extend(row72_evaluation.metrics.clone());
     }
+    if selected_rows.contains(&73) && row73_evaluation.measurement_complete {
+        metrics.extend(row73_evaluation.metrics.clone());
+    }
     let mut details = ReportDetails::default();
     if selected_rows.contains(&47) {
         let mut disk_details = row47_evaluation.details.clone();
@@ -7165,6 +7198,12 @@ async fn run_inner(
         details.insert(
             "tool-result-role-fidelity".to_owned(),
             row72_evaluation.details.clone(),
+        );
+    }
+    if selected_rows.contains(&73) {
+        details.insert(
+            "compaction-transparency".to_owned(),
+            row73_evaluation.details.clone(),
         );
     }
     let automation = automation_score(&results);
@@ -14689,7 +14728,11 @@ async fn collect_context_recovery_repetition(
         route_marker(scenario, actor, "recover")
     );
     driver
-        .submit(&session, &recovery_prompt, "row-51-recover")
+        .submit(
+            &session,
+            &recovery_prompt,
+            &format!("row-51-recover-r{repetition}"),
+        )
         .await?;
     let recovery_events = collect_session_terminal(&mut driver, &session, after, timeout).await?;
     let terminal_received_ns = monotonic_timestamp_ns();
@@ -14720,33 +14763,22 @@ async fn collect_context_recovery_repetition(
                 && record.response_status == Some(400)
         })
         .collect::<Vec<_>>();
-    let faulting = context_error_records
+    let Some(faulting) = context_error_records
         .iter()
         .min_by_key(|record| record.received_ns)
         .copied()
-        .ok_or_else(|| {
-            let observed = requests
-                .iter()
-                .filter(|record| {
-                    record.received_ns >= public_turn_start_ns
-                        && record.received_ns <= terminal_received_ns
-                })
-                .map(|record| {
-                    format!(
-                        "{}:{}:{:?}:{:?}:{}",
-                        record.request.checkpoint,
-                        record.role,
-                        record.response_status,
-                        record.input_tokens,
-                        record.body_bytes,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            AhrbError::Protocol(format!(
-                "row-51 provider observed no context error; public-window requests [{observed}]"
-            ))
-        })?;
+    else {
+        return Ok(ContextRecoveryTrials {
+            events,
+            requests,
+            trials: Vec::new(),
+            compaction_trials: vec![crate::wave4::CompactionTransparencyTrial {
+                repetition,
+                compaction_observed: false,
+                omitted_markers: Vec::new(),
+            }],
+        });
+    };
     let error_final_byte_ns = faulting.response_last_frame_yield_ns.ok_or_else(|| {
         AhrbError::Protocol("row-51 context error lacks its final-byte boundary".to_owned())
     })?;
@@ -14764,10 +14796,19 @@ async fn collect_context_recovery_repetition(
                     .response_status
                     .is_some_and(|status| (200..300).contains(&status))
         })
-        .min_by_key(|record| record.received_ns)
-        .ok_or_else(|| {
-            AhrbError::Protocol("row-51 provider observed no accepted compacted request".to_owned())
-        })?;
+        .min_by_key(|record| record.received_ns);
+    let Some(accepted) = accepted else {
+        return Ok(ContextRecoveryTrials {
+            events,
+            requests,
+            trials: Vec::new(),
+            compaction_trials: vec![crate::wave4::CompactionTransparencyTrial {
+                repetition,
+                compaction_observed: false,
+                omitted_markers: Vec::new(),
+            }],
+        });
+    };
     if accepted.request.dialect != faulting.request.dialect {
         return Err(AhrbError::Protocol(
             "row-51 compacted candidate changed provider dialect".to_owned(),
@@ -14843,6 +14884,16 @@ async fn collect_context_recovery_repetition(
         &accepted.request.canonical,
         &normalization,
     );
+    let compaction_observed = faulting
+        .input_tokens
+        .zip(accepted.input_tokens)
+        .is_some_and(|(before, after)| before > after)
+        && !omitted_markers.is_empty();
+    let compaction_trial = crate::wave4::CompactionTransparencyTrial {
+        repetition,
+        compaction_observed,
+        omitted_markers: omitted_markers.clone(),
+    };
     let trial = ContextRecoveryTrial {
         repetition,
         window_tokens,
@@ -14907,6 +14958,7 @@ async fn collect_context_recovery_repetition(
         events,
         requests,
         trials: vec![trial],
+        compaction_trials: vec![compaction_trial],
     })
 }
 
@@ -14924,6 +14976,7 @@ async fn collect_context_recovery_trials(
         events: Vec::new(),
         requests: Vec::new(),
         trials: Vec::new(),
+        compaction_trials: Vec::new(),
     };
     for repetition in 1..=repetitions {
         let trial = collect_context_recovery_repetition(
@@ -14939,6 +14992,7 @@ async fn collect_context_recovery_trials(
         combined.events.extend(trial.events);
         combined.requests.extend(trial.requests);
         combined.trials.extend(trial.trials);
+        combined.compaction_trials.extend(trial.compaction_trials);
     }
     Ok(combined)
 }
@@ -20085,7 +20139,9 @@ fn scripted_row(
                 response(
                     "start",
                     json!({
+                        "text": "I will write the event-stream fixture.",
                         "tool_calls": [call],
+                        "_ahrb_reasoning": "prepare the requested tool call",
                         "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
                     }),
                     None,
@@ -20094,6 +20150,7 @@ fn scripted_row(
                     "terminal",
                     json!({
                         "text": "SUCCESS",
+                        "_ahrb_reasoning": "verify the tool result and conclude",
                         "_ahrb_usage": {"input_tokens": 140, "output_tokens": 30}
                     }),
                     None,
@@ -20104,6 +20161,7 @@ fn scripted_row(
             "start",
             json!({
                 "text": "{\"status\":\"FAILURE\",\"category\":\"scripted\"}",
+                "_ahrb_reasoning": "report the scripted failure",
                 "_ahrb_usage": {"input_tokens": 100, "output_tokens": 20}
             }),
             None,
@@ -20663,6 +20721,7 @@ fn evaluate_rows(
     let row67 = derived.usage_reporting;
     let row68 = derived.session_ops_cli;
     let row69 = derived.event_stream_completeness;
+    let row73 = derived.compaction_transparency;
     let row70 = derived.headless_permissions;
     let row71 = derived.secrets_hygiene;
     let row42 = derived.model_request_efficiency;
@@ -21728,13 +21787,14 @@ fn evaluate_rows(
                         name: definition.metric.to_owned(),
                         passed: row69.passed,
                         detail: format!(
-                            "tool-id={:.0}, correlation={:.0}, timestamps={:.0}, usage={:.0}, terminal={:.0}, schema={:.0}, score={:.6}",
+                            "tool-id={:.0}, correlation={:.0}, timestamps={:.0}, usage={:.0}, terminal={:.0}, schema={:.0}, narrative={:.0}, score={:.6}",
                             row69.metrics["event_stream_completeness.tool_call_id"],
                             row69.metrics["event_stream_completeness.correlated_result"],
                             row69.metrics["event_stream_completeness.timestamps"],
                             row69.metrics["event_stream_completeness.usage"],
                             row69.metrics["event_stream_completeness.terminal_typing"],
                             row69.metrics["event_stream_completeness.schema_version"],
+                            row69.metrics["event_stream_completeness.narrative_reconstructability"],
                             row69.metrics["event_stream_completeness.score"],
                         ),
                     }],
@@ -21853,6 +21913,59 @@ fn evaluate_rows(
                     }],
                     None,
                 );
+            }
+            if definition.row == 73 {
+                if !row73.measurement_complete {
+                    return classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(true),
+                        &[],
+                        Some(row73.measurement_error.clone().unwrap_or_else(|| {
+                            "compaction-transparency evidence is incomplete".to_owned()
+                        })),
+                    );
+                }
+                if row73.metrics["compaction_transparency.compactions_observed"] == 0.0 {
+                    let mut result = classify(
+                        definition.row,
+                        definition.id,
+                        definition.pillar,
+                        Some(false),
+                        &[],
+                        None,
+                    );
+                    result.evidence.push(
+                        "the forced long-context run completed without an externally observed compaction"
+                            .to_owned(),
+                    );
+                    return result;
+                }
+                let mut result = classify(
+                    definition.row,
+                    definition.id,
+                    definition.pillar,
+                    Some(true),
+                    &[Assertion {
+                        name: definition.metric.to_owned(),
+                        passed: row73.passed,
+                        detail: format!(
+                            "compactions={:.0}, announcements={:.0}, scoped={:.0}, correlated={:.0}, score={:.2}",
+                            row73.metrics["compaction_transparency.compactions_observed"],
+                            row73.metrics["compaction_transparency.announcements"],
+                            row73.metrics["compaction_transparency.scoped_announcements"],
+                            row73.metrics["compaction_transparency.correlated_announcements"],
+                            row73.metrics["compaction_transparency.score"],
+                        ),
+                    }],
+                    None,
+                );
+                result.metadata.score = row73
+                    .metrics
+                    .get("compaction_transparency.score")
+                    .copied();
+                return result;
             }
             let events = state.events.get(&definition.row).map_or(&[][..], Vec::as_slice);
             let success_count = events

@@ -636,6 +636,12 @@ pub struct EventMapping {
     /// Optional raw-event metadata locators used by Wave 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<EventMetadata>,
+    /// Adapter-declared locations that make model narrative reconstructable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<NarrativeCapture>,
+    /// Adapter-declared context-compaction signal and scope locations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionCapture>,
 }
 
 fn default_replay_mode() -> String {
@@ -678,6 +684,62 @@ pub struct EventMetadata {
     /// JSON pointer selecting completed semantic turns.
     #[serde(default)]
     pub turns_pointer: String,
+}
+
+/// Raw-event locations needed to reconstruct the model's own output.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NarrativeCapture {
+    /// Normalized event carrying assistant-visible text.
+    pub assistant_text_event: String,
+    /// JSON pointer selecting assistant-visible text from the raw event.
+    pub assistant_text_pointer: String,
+    /// Whether each event is complete or ordered deltas must be joined by item.
+    #[serde(default)]
+    pub assistant_text_aggregation: NarrativeAggregation,
+    /// JSON pointer selecting the item identity for assistant-text deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_text_item_pointer: Option<String>,
+    /// Normalized event carrying provider-emitted reasoning/thinking content.
+    pub reasoning_event: String,
+    /// JSON pointer selecting reasoning/thinking content from the raw event.
+    pub reasoning_pointer: String,
+    /// Whether each event is complete or ordered deltas must be joined by item.
+    #[serde(default)]
+    pub reasoning_aggregation: NarrativeAggregation,
+    /// JSON pointer selecting the item identity for reasoning/thinking deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_item_pointer: Option<String>,
+    /// JSON pointer correlating each narrative record to its producing turn.
+    pub turn_pointer: String,
+}
+
+/// How raw narrative records reconstruct one model-produced item.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NarrativeAggregation {
+    /// Each selected event contains one complete narrative item.
+    #[default]
+    CompleteEvent,
+    /// Concatenate selected values in event order, grouped by declared item ID.
+    ItemDeltas,
+}
+
+/// Raw-event locations used to score context-compaction transparency.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CompactionCapture {
+    /// Normalized event or declared marker carrying a compaction announcement.
+    pub event: String,
+    /// JSON pointer correlating the announcement to the affected turn.
+    pub turn_pointer: String,
+    /// JSON pointer selecting the claimed number of dropped history markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_count_pointer: Option<String>,
+    /// JSON pointer selecting the first claimed dropped history marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_span_start_pointer: Option<String>,
+    /// JSON pointer selecting the last claimed dropped history marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_span_end_pointer: Option<String>,
 }
 
 /// Supported raw timestamp representations.
@@ -2120,6 +2182,94 @@ fn validate_event_metadata(manifest: &Manifest) -> Result<()> {
             ));
         }
     }
+    if let Some(narrative) = manifest.events.narrative.as_ref() {
+        for (label, event) in [
+            ("assistant_text_event", &narrative.assistant_text_event),
+            ("reasoning_event", &narrative.reasoning_event),
+        ] {
+            if !normalized_event_name(event) {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{label} {event:?} is not a normalized event vocabulary value"
+                )));
+            }
+        }
+        for (label, pointer) in [
+            ("assistant_text_pointer", &narrative.assistant_text_pointer),
+            ("reasoning_pointer", &narrative.reasoning_pointer),
+            ("turn_pointer", &narrative.turn_pointer),
+        ] {
+            if !valid_json_pointer(pointer) {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{label} {pointer:?} is not a non-root JSON pointer"
+                )));
+            }
+        }
+        for (label, aggregation, item_pointer) in [
+            (
+                "assistant_text_item_pointer",
+                narrative.assistant_text_aggregation,
+                narrative.assistant_text_item_pointer.as_deref(),
+            ),
+            (
+                "reasoning_item_pointer",
+                narrative.reasoning_aggregation,
+                narrative.reasoning_item_pointer.as_deref(),
+            ),
+        ] {
+            if item_pointer.is_some_and(|pointer| !valid_json_pointer(pointer)) {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{label} {item_pointer:?} is not a non-root JSON pointer"
+                )));
+            }
+            if aggregation == NarrativeAggregation::ItemDeltas && item_pointer.is_none() {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{label} is required for item-deltas aggregation"
+                )));
+            }
+        }
+    }
+    if let Some(compaction) = manifest.events.compaction.as_ref() {
+        if compaction.event != "context-compacted" {
+            return Err(AhrbError::Validation(format!(
+                "events.compaction.event {:?} must normalize to \"context-compacted\"",
+                compaction.event
+            )));
+        }
+        if !valid_json_pointer(&compaction.turn_pointer) {
+            return Err(AhrbError::Validation(format!(
+                "events.compaction.turn_pointer {:?} is not a non-root JSON pointer",
+                compaction.turn_pointer
+            )));
+        }
+        for (label, pointer) in [
+            (
+                "dropped_count_pointer",
+                compaction.dropped_count_pointer.as_deref(),
+            ),
+            (
+                "dropped_span_start_pointer",
+                compaction.dropped_span_start_pointer.as_deref(),
+            ),
+            (
+                "dropped_span_end_pointer",
+                compaction.dropped_span_end_pointer.as_deref(),
+            ),
+        ] {
+            if pointer.is_some_and(|pointer| !valid_json_pointer(pointer)) {
+                return Err(AhrbError::Validation(format!(
+                    "events.compaction.{label} {pointer:?} is not a non-root JSON pointer"
+                )));
+            }
+        }
+        if compaction.dropped_span_start_pointer.is_some()
+            != compaction.dropped_span_end_pointer.is_some()
+        {
+            return Err(AhrbError::Validation(
+                "events.compaction dropped span start/end pointers must be declared together"
+                    .to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2342,6 +2492,7 @@ fn normalized_event_name(name: &str) -> bool {
         "turn-accepted"
             | "model-request"
             | "model-response"
+            | "context-compacted"
             | "tool-call"
             | "tool-result"
             | "agent-spawned"
@@ -2688,9 +2839,10 @@ fn resolve_executable(candidate: &str) -> Option<PathBuf> {
 mod version_tests {
     use super::{
         ArgvPosition, BudgetControls, DeleteMissingSemantics, EventMetadata, InjectionComponent,
-        InjectionMethod, InjectionSurface, Manifest, PermissionConfig, PermissionMode,
-        RequestRoleRule, SideChannelKind, TariffConfig, TariffSurface, TimestampFormat,
-        TruncationMarker, UsageScope, concise_version, render_session_store_paths, validate,
+        InjectionMethod, InjectionSurface, Manifest, NarrativeAggregation, PermissionConfig,
+        PermissionMode, RequestRoleRule, SideChannelKind, TariffConfig, TariffSurface,
+        TimestampFormat, TruncationMarker, UsageScope, concise_version, render_session_store_paths,
+        validate,
     };
     use std::collections::BTreeMap;
 
@@ -3073,6 +3225,89 @@ mod version_tests {
             .usage_event = "finished-ish".to_owned();
         let error = validate(&manifest).expect_err("unknown normalized usage carrier");
         assert!(error.to_string().contains("normalized event vocabulary"));
+    }
+
+    #[test]
+    fn observability_capture_requires_typed_events_pointers_and_delta_identity() {
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .narrative
+            .as_mut()
+            .expect("narrative")
+            .assistant_text_event = "assistant-ish".to_owned();
+        let error = validate(&manifest).expect_err("unknown narrative event");
+        assert!(error.to_string().contains("normalized event vocabulary"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .narrative
+            .as_mut()
+            .expect("narrative")
+            .reasoning_pointer = "/".to_owned();
+        let error = validate(&manifest).expect_err("root narrative pointer");
+        assert!(error.to_string().contains("non-root JSON pointer"));
+
+        let mut manifest = wave_4_manifest();
+        let narrative = manifest.events.narrative.as_mut().expect("narrative");
+        narrative.assistant_text_aggregation = NarrativeAggregation::ItemDeltas;
+        narrative.assistant_text_item_pointer = None;
+        let error = validate(&manifest).expect_err("delta aggregation needs item identity");
+        assert!(error.to_string().contains("required for item-deltas"));
+
+        let mut manifest = wave_4_manifest();
+        let narrative = manifest.events.narrative.as_mut().expect("narrative");
+        narrative.assistant_text_aggregation = NarrativeAggregation::ItemDeltas;
+        narrative.assistant_text_item_pointer = Some("/payload/item_id".to_owned());
+        validate(&manifest).expect("item-delta narrative capture is valid");
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .compaction
+            .as_mut()
+            .expect("compaction")
+            .event = "model-response".to_owned();
+        let error = validate(&manifest).expect_err("wrong compaction event");
+        assert!(error.to_string().contains("context-compacted"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .compaction
+            .as_mut()
+            .expect("compaction")
+            .turn_pointer = "/".to_owned();
+        let error = validate(&manifest).expect_err("root compaction turn pointer");
+        assert!(error.to_string().contains("non-root JSON pointer"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .compaction
+            .as_mut()
+            .expect("compaction")
+            .dropped_count_pointer = Some("not-a-pointer".to_owned());
+        let error = validate(&manifest).expect_err("bad compaction count pointer");
+        assert!(error.to_string().contains("non-root JSON pointer"));
+
+        let mut manifest = wave_4_manifest();
+        manifest
+            .events
+            .compaction
+            .as_mut()
+            .expect("compaction")
+            .dropped_span_end_pointer = None;
+        let error = validate(&manifest).expect_err("half compaction span");
+        assert!(error.to_string().contains("declared together"));
+
+        let mut manifest = wave_4_manifest();
+        let compaction = manifest.events.compaction.as_mut().expect("compaction");
+        compaction.dropped_count_pointer = None;
+        compaction.dropped_span_start_pointer = None;
+        compaction.dropped_span_end_pointer = None;
+        validate(&manifest).expect("announced-only compaction capture is valid");
     }
 
     #[test]

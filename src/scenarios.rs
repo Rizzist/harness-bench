@@ -58,7 +58,7 @@ pub enum BadgeFacetScope {
 impl TestDefinition {
     /// Return this row's certification role from authoritative matrix metadata.
     pub fn requirement(self) -> RequirementKind {
-        if matches!(self.row, 42 | 43 | 45 | 46 | 47 | 63 | 65 | 69) {
+        if matches!(self.row, 42 | 43 | 45 | 46 | 47 | 63 | 65) {
             return RequirementKind::Informational;
         }
         OPTIONAL_FACETS
@@ -214,7 +214,7 @@ const AR: Pillar = Pillar::AutomationReadiness;
 /// Matrix rows that must pass early in the implementation and verification loop.
 pub const PRIORITIZED_ROWS: &[u8] = &[1, 2, 3, 9, 10, 12, 20, 26, 30, 35, 40];
 
-const TESTS: [TestDefinition; 72] = [
+const TESTS: [TestDefinition; 73] = [
     test(
         1,
         "routing",
@@ -764,8 +764,8 @@ const TESTS: [TestDefinition; 72] = [
         "event-stream-completeness",
         "Event stream completeness",
         AR,
-        "tool IDs, result correlation, timestamps, usage, terminal typing, and schema version",
-        "at least four of six components pass including tool-call ID, correlated result, and terminal typing",
+        "tool IDs, result correlation, timestamps, usage, terminal typing, schema version, and model narrative",
+        "at least five of seven components pass including tool-call ID, correlated result, terminal typing, and narrative reconstructability",
     ),
     test(
         70,
@@ -790,6 +790,14 @@ const TESTS: [TestDefinition; 72] = [
         TC,
         "protocol-native successful and failed tool-result roles in subsequent requests",
         "exactly two checks per repetition with one matching typed result and zero violations",
+    ),
+    test(
+        73,
+        "compaction-transparency",
+        "Compaction transparency",
+        AR,
+        "externally observed compactions and correlated durable announcements with affected scope",
+        "every observed compaction emits exactly one turn-correlated announcement that identifies affected scope",
     ),
 ];
 
@@ -840,11 +848,7 @@ mod wave4_tests {
                     capability: "session_ops_cli",
                 },
             ),
-            (
-                69,
-                "event-stream-completeness",
-                RequirementKind::Informational,
-            ),
+            (69, "event-stream-completeness", RequirementKind::Core),
             (
                 70,
                 "headless-permission-model",
@@ -854,6 +858,7 @@ mod wave4_tests {
             ),
             (71, "secrets-hygiene-on-disk", RequirementKind::Core),
             (72, "tool-result-role-fidelity", RequirementKind::Core),
+            (73, "compaction-transparency", RequirementKind::Core),
         ];
         for (row, id, requirement) in expected {
             let definition = all()

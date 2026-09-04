@@ -154,6 +154,22 @@ total_tokens_pointer = "/payload/usage/total_tokens"
 cost_microusd_pointer = "/payload/usage/cost_microusd"
 turns_pointer = "/payload/usage/turns"
 
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/payload/assistant_text"
+assistant_text_aggregation = "complete-event"
+reasoning_event = "model-response"
+reasoning_pointer = "/payload/reasoning"
+reasoning_aggregation = "complete-event"
+turn_pointer = "/actor"
+
+[events.compaction]
+event = "context-compacted"
+turn_pointer = "/payload/turn_key"
+dropped_count_pointer = "/payload/dropped_count"
+dropped_span_start_pointer = "/payload/dropped_span/first"
+dropped_span_end_pointer = "/payload/dropped_span/last"
+
 [[events.rules]]
 matches = "turn-accepted"
 event = "turn-accepted"
@@ -161,6 +177,14 @@ event = "turn-accepted"
 [[events.rules]]
 matches = "tool-call"
 event = "tool-call"
+
+[[events.rules]]
+matches = "model-response"
+event = "model-response"
+
+[[events.rules]]
+matches = "context-compacted"
+event = "context-compacted"
 
 [[events.rules]]
 matches = "tool-result"

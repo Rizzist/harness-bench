@@ -252,9 +252,9 @@ pub fn automation_score(results: &[TestResult]) -> AutomationScoreEvaluation {
 }
 
 /// Row-69's reference envelope expressed with exact integer component counts.
-pub fn event_stream_reference_envelope(components: [bool; 6]) -> bool {
+pub fn event_stream_reference_envelope(components: [bool; 7]) -> bool {
     let passed = components.iter().filter(|value| **value).count();
-    passed >= 4 && components[0] && components[1] && components[4]
+    passed >= 5 && components[0] && components[1] && components[4] && components[6]
 }
 
 /// Row 70's exact count-sensitive PASS boundary.
@@ -648,13 +648,13 @@ mod automation_tests {
     #[test]
     fn event_stream_envelope_uses_integer_count_and_hard_trio() {
         assert!(event_stream_reference_envelope([
-            true, true, false, false, true, true
+            true, true, false, false, true, true, true
         ]));
         assert!(!event_stream_reference_envelope([
-            true, true, false, false, true, false
+            true, true, true, true, true, true, false
         ]));
         assert!(!event_stream_reference_envelope([
-            true, false, true, true, true, true
+            true, false, true, true, true, true, true
         ]));
     }
 

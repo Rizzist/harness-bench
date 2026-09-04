@@ -1,6 +1,6 @@
 # AHRB v2 — Agent Harness Readiness Benchmark specification
 
-Status: implementation specification, **revision 2.4 (2026-09-02)**.
+Status: implementation specification, **revision 2.5 (2026-09-04)**.
 `docs/SPEC.md` remains the authoritative v1 specification; this document defines the
 additive v2 contract. Revision 2.1 is a normative amendment: it does not renumber a row
 or change `spec_version = 2`, but implementations claiming v2 MUST implement this
@@ -24,10 +24,18 @@ repetition-scoped lifecycle records, exact event-component arithmetic and permis
 trial counts, nonempty credential-carrier declarations, and non-vacuous tool-role check
 counts.
 
+Revision 2.5 is the observability version bump from revision 2.4. It adds a seventh,
+model-narrative component to row 69, makes row 69 CORE, and adds CORE row 73 for
+context-compaction transparency. The report continues to use `spec_version = 2` and
+schema 3 because this is an additive v2 revision: old reports remain readable, while
+their missing row/component is unavailable rather than synthesized. The bar moved
+because tool-only metadata cannot explain whether a failing model turn hallucinated or
+lost relevant context, and silent compaction hid exactly that distinction.
+
 ### Revision 2.1 changelog
 
 - Added one authoritative result-state precedence, repetition, aggregation, and
-  missing-evidence contract for rows 42–72.
+  missing-evidence contract for rows 42–73.
 - Made rows 50, 51, 66, and 67 independently certifiable and corrected the row 46,
   50, 53, 56, and 69 implementation-path descriptions.
 - Reconciled numeric resource mirrors with typed `resource_summary` and `details`
@@ -35,11 +43,11 @@ counts.
 - Versioned `results/index.jsonl`, specified legacy-line migration, corrected `diff`
   compatibility/profile rules, and fixed the informational transition example.
 - Locked the row-specific clarifications recorded in the row tables below, including
-  rows 42–49 and 52–72.
+  rows 42–49 and 52–73.
 
 ## 1. Scope and compatibility
 
-AHRB v2 contains **72 matrix rows**: v1 rows 1–41, unchanged, plus rows 42–72
+AHRB v2 revision 2.5 contains **73 matrix rows**: v1 rows 1–41, unchanged, plus rows 42–73
 defined here. It also adds the `hbench diff` command and a topology-scoped automation
 score with latency and CPU badge classes. The implementation is split into four ordered
 waves so that each wave can be implemented and independently verified before the next
@@ -203,10 +211,11 @@ fixture starts is `ERROR` under the precedence table.
 | 66 | 3 quick / 7 cert independent token/cost/time cases. Cases pass per repetition; subscore is passed case kinds/3 only when each repetition of that kind passes. `overrun_count` is the sum of the exact per-case/per-repetition forbidden observations defined by row 66; it is never a median, maximum, or count of excess token/micro-USD units. | Undeclared optional capability is `UNSUPPORTED` score 0; missing declared controls/tariff is `ABSENT`; absent stop/effect boundaries are `ERROR`. |
 | 67 | 3 quick / 7 cert complete usage runs. Each repetition must equal the exact fixture totals; headline values are one per-repetition value (never sums across repetitions). Every completed semantic turn has exactly one declared usage carrier. Per-turn carriers are summed within a repetition; cumulative-run carriers are differenced for turn cross-checks and the final carrier supplies the headline. | Undeclared optional capability is `UNSUPPORTED` score 0; missing declared pointer, carrier, or scope is `ABSENT`; missing event evidence is `ERROR`. |
 | 68 | 1 quick / 5 cert lifecycles. Each lifecycle commits the required nonempty seed tool turn before resume or fork. Each `*_ok` is 1 only if every repetition passed that operation; score is the five booleans/5. | Undeclared optional capability is `UNSUPPORTED` score 0; missing declared operation is `ABSENT`; incomplete operation output is `ERROR`. |
-| 69 | 3 quick / 7 cert success+failure pairs. A component is 1 only if it passes every repetition; score is passed components/6. | Missing optional metadata is a measured component zero; missing required event/correlation evidence is `ERROR`. |
+| 69 | 3 quick / 7 cert success+failure pairs. A component is 1 only if it passes every repetition; score is passed components/7. | Missing optional timestamp/schema metadata is a measured component zero. No declared durable narrative capture points is badge-blocking `UNSUPPORTED`; a declared but missing/wrong narrative is measured zero/`FAIL`; missing required event/correlation evidence is `ERROR`. |
 | 70 | 1 quick / 5 cert trials per required case. Effect counters are sums and must equal repetitions for allow and each denial; score is the verified mode score only if every trial passes. | Undeclared optional capability is `UNSUPPORTED` score 0; missing declared command is `ABSENT`; missing effect evidence is `ERROR`. |
 | 71 | 1 quick / 3 cert success+failure pairs. Scan every required artifact in every repetition; byte/file/match counters are sums. | Missing required row capability declaration or an empty `capture.credential_carrier_paths` declaration is `ABSENT`. An unreadable/incomplete scan is `ERROR`; any observed leak is `FAIL`. |
 | 72 | 1 quick / 5 cert repetitions, each with one successful and one failed call. Counters are sums and `checks == 2 * repetitions`. | Missing next-request evidence is `ERROR`; a present malformed/missing/duplicate/untyped result is `FAIL`. |
+| 73 | Reuse row 51's 3 quick / 7 cert long-horizon repetitions, but retain one independent row-73 observation from every completed run even when row 51 cannot form a recovery trial. Count externally observed compactions and journal/stream announcements; every repetition must occupy the same tier. | If no compaction occurs in the complete forced run, the row is badge-blocking `UNSUPPORTED`, never a vacuous PASS. Partial compaction or incomplete provider/event evidence is `ERROR`; observed compaction without an accurate announcement is `FAIL`. |
 
 ## 4. New matrix rows
 
@@ -351,8 +360,8 @@ single synthetic-root occurrence and row 64 produces `identical=false`/`FAIL`.
 ### F. Automation-interface ergonomics
 
 Rows 65–70 are explicitly capability-aware. An adapter must declare its surface; AHRB
-verifies behavior rather than trusting the declaration. Rows 71–72 are CORE extensions
-of v1 security/correctness and cannot be opted out.
+verifies behavior rather than trusting the declaration. Rows 69 and 71–73 are CORE
+observability/security/correctness extensions and cannot earn a badge when unsupported.
 
 | Row / stable ID | Type, pillar, badge impact | Topology handling | Fixture and profile | Exact evidence | Oracle | Manifest and feasibility |
 |---|---|---|---|---|---|---|
@@ -360,10 +369,11 @@ of v1 security/correctness and cannot be opted out.
 | **66 `budget-enforcement`** | NEW; AutomationReadiness; **OPTIONAL FACET** `budgets` | Capability `budget_enforcement` absent -> `UNSUPPORTED` score 0 for either topology. Declared -> test all three budgets through the topology's public headless operation. | Independent token, cost, and time trials in 3/7 repetitions. Limits are quick `{total_tokens:128,cost:1,000 micro-USD,time:2,000 ms}` and cert `{1,024,10,000,5,000}`. “Token” is the fake provider's integer `input_tokens+output_tokens` across completed accepted responses in the semantic turn; cached/reasoning fields do not count unless already included in those two values. Token fixture is at `limit-16`, then one indivisible response `{input:8,output:16}`, so exact observed total at enforcement is `limit+8`. Cost is integer micro-USD `sum(input_tokens*2 + output_tokens*3)` with no rounding; fixture is at `limit-25`, then one response costing 50, so exact observed cost is `limit+25`. The harness receives the same `{input:2,output:3}` micro-USD/token tariff through the declared `[resources.budget_controls.tariff]` carrier; an AHRB-only price is invalid. Time starts immediately before one-shot spawn or accepted daemon submit and stops at AHRB receipt of the single typed terminal. Provider pacing crosses the limit at exactly the configured millisecond. The token/cost stop boundary is completion of the crossing response at the fake provider; the time stop boundary is `public_operation_start + time_limit_ms`. | `metrics.budget_enforcement.token_limit`, `.token_observed`, `.cost_limit_microusd`, `.cost_observed_microusd`, `.time_limit_ms`, `.time_observed_ms`, `.overrun_count`, `.structured_failures`, `.score`; `details.budget-enforcement.cases[]` records repetition, public-operation start, each usage boundary, tariff delivered, terminal receipt, effects, outer kill, and `overrun_observations[]`. For one case/repetition, an overrun observation is either (a) one distinct semantic provider request body completed strictly after that case's stop boundary or (b) one distinct fixture tool effect committed strictly after that boundary. Deduplicate each by its stable semantic request/effect ID; a provider request and an effect are two observations. `overrun_count` is the sum of these per-case counts across all three case kinds and all required repetitions. It does not count the crossing response, typed terminal, excess token units, excess micro-USD units, or elapsed milliseconds. Headline observed values are maxima; `structured_failures` and `overrun_count` are sums; score is the number of case kinds for which every repetition passes divided by 3. | Token/cost PASS only if the one expected crossing response is the last accepted unit, observed totals are exactly `limit+8` / `limit+25`, exactly one typed `budget-exceeded` terminal follows, and no post-boundary request/tool effect occurs. Time PASS iff the terminal receipt lies in `[time_limit_ms, time_limit_ms + max(250 ms, 0.10*time_limit_ms)]` from the defined start, no paced response triggers a later semantic request/effect after the limit, and no outer kill occurs. The observation remains open 1,000 ms after terminal. Every passing case has per-case `overrun_count=0`, and the passing row has aggregate `overrun_count=0`. All cases/repetitions are required. A missing declared control/tariff is `ABSENT`; if the architecture exposes token/time but cannot receive a harness-side tariff, cost is `UNSUPPORTED` and the whole optional row/facet is `UNSUPPORTED` score 0 while token/time diagnostics remain in details. | Add `[resources.budget_controls]` public argv/transport templates, its typed harness-side `tariff` carrier, and the capability key. The runner's outer deadline is only a guard and cannot satisfy this row. |
 | **67 `usage-reporting`** | NEW; AutomationReadiness; **OPTIONAL FACET** `usage` | Undeclared `usage_reporting` -> `UNSUPPORTED` score 0; declared -> measured for both. | Run 3 quick / 7 cert repetitions. Each direct turn has one response `{input_tokens:100,output_tokens:20,total:120}`. Exactly one tool turn has a tool-call response `{100,20,120}` plus final response `{140,30,170}`, so its per-turn usage is `{240,50,290}` and counts as one semantic turn. Quick has 3 turns (2 direct + tool): exact per-repetition totals `{input:440,output:90,total:530,cost_microusd:1,150,turns:3}`. Cert has 20 turns (19 direct + tool): `{input:2,140,output:430,total:2,570,cost_microusd:5,570,turns:20}`. Cost uses the same harness-delivered tariff `{input:2,output:3}` micro-USD/token as row 66, with exact integer arithmetic. Extract from structured event/output only, never request count. `[events.metadata].usage_event` names the normalized event vocabulary carrier and `usage_scope` is `turn` or `cumulative-run`; resolve all five pointers against the unmodified raw event that produced that normalized carrier. Exactly one carrier is required after every completed semantic turn. With `turn`, its values describe only that turn and are summed within the repetition. With `cumulative-run`, values describe the run through that turn, must be component-wise nondecreasing, consecutive differences describe each turn, and the last carrier supplies the repetition headline. | `metrics.usage_reporting.input_tokens`, `.output_tokens`, `.total_tokens`, `.cost_microusd`, `.turns`, `.crosscheck_errors`, `.score`; `details.usage-reporting.source_pointers`, `.usage_event`, `.usage_scope`, `.repetitions[]`, and ordered per-turn/per-response extracted values. Headline metrics are the one exact **per-repetition** total above, not a sum across repetitions; because all repetitions must agree, the report emits that common value. | Each of the five fields is correct only if it is a machine-readable nonnegative integer and equals the exact profile value in every repetition; total must also equal input+output and the tool-turn value (direct for `turn`, consecutive difference for `cumulative-run`) must equal its two-response sum. Cost must equal the harness-visible tariff calculation. A declared pointer, carrier, or scope whose field/event is absent or non-readable is missing evidence and produces `ERROR`; a present, readable but wrong value is `FAIL` with that field's score zero. Multiple carriers for one turn are contradictory evidence and `ERROR`. Score is correct fields/5 only for complete evidence; any crosscheck error prevents PASS. Repetitions must be byte/value identical after evidence ordering. | Add independent `[events.metadata]` usage pointers, `usage_event`, and `usage_scope`; reuse the declared harness-side tariff carrier and remove the ambiguous AHRB-only `resources.test_price_microusd_per_token`. Usage extraction must coexist with terminal normalization. |
 | **68 `session-ops-cli`** | NEW; AutomationReadiness; **OPTIONAL FACET** `session-cli` | Undeclared `session_ops_cli` -> `UNSUPPORTED`. A private daemon RPC is not a CLI. Declared operations are invoked as direct argv in both topology families. | One lifecycle quick, five cert: create -> submit and durably commit one nonempty seed tool turn -> list -> resume at the committed cursor and verify that seed -> fork from that committed cursor -> diverge original/fork -> delete both -> second delete. The seed contains a correlated tool call/result plus terminal, not an empty transcript, metadata-only session, or uncommitted pending call. | `metrics.session_ops_cli.create_ok`, `.list_ok`, `.resume_ok`, `.fork_ok`, `.delete_ok`, `.score`; each `*_ok` is 1 only if **every** required repetition passes that operation. `details.session-ops-cli.lifecycles[]` contains one record per repetition with `{repetition,original_id,fork_id,seed_call_id,seed_result_digest,committed_cursor,original_history_hashes,fork_history_hashes,operation_results[]}`; each operation result includes `{operation,exit_code,terminal_type,extracted_ids,cursor}`. Singular top-level `original_id`/`fork_id` fields are forbidden because they cannot represent cert repetitions. | PASS iff create returns stable ID; the seed tool turn is committed and replayable; list extraction yields an array containing the original ID exactly once; resume preserves identity/cursor and reproduces the committed seed call/result; fork returns a different ID whose nonempty transcript/event history at fork time is an **exact ordered prefix** of both later original and fork histories, followed by isolated divergence; delete removes each ID from list and prevents resume; repeated delete matches declared `delete_missing_semantics` (`typed-not-found` or `idempotent-success`). An empty history/cursor can never satisfy resume or fork. All five booleans must be 1; score=sum/5. | Extend `[sessions]` with `fork`, `delete`, `fork_id_pointer`, `list_array_pointer`, `list_item_id_pointer`, `delete_missing_semantics`, and, for typed failure, `not_found_pointer/value`. Existing create/list/resume/close are starting points. `Driver` lacks generic list/fork/delete-by-id. Daemon mock may honestly be UNSUPPORTED if it exposes only stdin-RPC; mock-exec must pass. |
-| **69 `event-stream-completeness`** | CHEAP; AutomationReadiness; INFORMATIONAL; automation-score component | Measured for both on their declared event stream. A topology with no machine event stream is `ABSENT` because v1 terminal/correlation rows already require structured evidence. | One successful tool turn plus one typed failure; quick/cert 3/7 repetitions. The external normalizer records `receipt_start_ns`, `receipt_end_ns`, and the corresponding wall-clock bounds around parsing each raw event; these are collector metadata, never harness fields or turn-path instrumentation. | Six 0/1 metrics: `metrics.event_stream_completeness.tool_call_id`, `.correlated_result`, `.timestamps`, `.usage`, `.terminal_typing`, `.schema_version`; plus `.score`. A component is 1 only if every repetition passes it. `details.event-stream-completeness.missing_components` and `.component_failures[]` include event receipt bounds. | Tool-call ID=1 iff nonempty and stable through exactly one correlated result. Correlated result=1 iff ID/order satisfy row 5. Timestamps=1 iff every call/result/terminal parses per `timestamp_format` and is nondecreasing call<=result<=terminal. For `rfc3339`, `unix-ms`, and `unix-ns`, each also lies within `[receipt_wall_start-1s,receipt_wall_end+1s]`; `monotonic-ns` is checked only for ordering/nonnegative adjacent durations. Usage=1 iff all five row-67 values cross-check exactly. Terminal typing=1 iff success/failure are structurally distinct. Schema version=1 iff every event equals the declared value. `passed_components` is the integer sum and score=`passed_components/6`. PASS envelope iff `passed_components >= 4` and the hard trio tool-call ID, correlated result, terminal typing are all 1; do not use the inexact comparison `score>=0.6666667`. | Add optional `[events.metadata]` timestamp/schema/usage locators and format/value. Missing optional metadata earns component zero unless row 67 is declared. `NormalizedEvent`/raw event evidence must retain the external receipt-before/after boundaries; existing event rules provide call/result/terminal semantics while usage extraction remains independent. |
+| **69 `event-stream-completeness`** | CHEAP; AutomationReadiness; **CORE**; automation-score component | Measured for both on their declared durable journal/event stream. No machine event stream is `ABSENT`. A stream whose adapter declares no assistant-text and reasoning capture points is badge-blocking `UNSUPPORTED`, not a fabricated narrative zero. | One successful tool turn plus one typed failure; quick/cert 3/7 repetitions. The fake provider emits deterministic assistant text on every response and deterministic reasoning/thinking content through every supported provider frontend; the latter is required only because this fixture emits it. The external normalizer records receipt monotonic/wall bounds as collector metadata. | Seven 0/1 metrics: `metrics.event_stream_completeness.tool_call_id`, `.correlated_result`, `.timestamps`, `.usage`, `.terminal_typing`, `.schema_version`, `.narrative_reconstructability`; plus `.score`. A component is 1 only if every repetition passes it. `details.event-stream-completeness.missing_components` and `.component_failures[]` retain receipt bounds. | The original six component definitions are unchanged. Narrative reconstructability=1 iff the durable stream reconstructs byte-exact assistant text and every provider-emitted reasoning/thinking item, in response order, with the declared turn locator resolving to the producing turn for both success and failure. A `complete-event` carrier contributes one complete item per record; `item-deltas` concatenates records in durable order per declared item identity and preserves first-item order. Merely recording tool calls/results or terminal metadata is insufficient. `passed_components` is the integer sum and score=`passed_components/7`. PASS iff `passed_components >= 5` and the hard quartet tool-call ID, correlated result, terminal typing, and narrative reconstructability are all 1. Thus a previously perfect metadata-only stream changes from 1.0 to 6/7 and fails the new CORE gate, while each legacy facet retains exactly its old value and meaning. | Add `[events.narrative]` with assistant-text/reasoning event and value pointers, `assistant_text_aggregation` / `reasoning_aggregation` (`complete-event` or `item-deltas`), conditional item-ID pointers for `item-deltas`, and `turn_pointer`. All event names are normalized vocabulary values; all pointers resolve against the unmodified raw durable record. `[events.metadata]` remains optional exactly as before. No engine branch may name a harness. |
 | **70 `headless-permission-model`** | NEW; AutomationReadiness; **OPTIONAL FACET** `permissions` | Undeclared `headless_permission_model` -> `UNSUPPORTED`; v1 row 34 remains CORE and still tests no prompting. Declared -> measured for both. | Closed stdin/no PTY. Run three independent cases: allowed write under `{{workspace}}`; denied write to `{{outside_path}}`; denied TCP connection to the AHRB-owned `{{blocked_host}}:{{blocked_port}}`. Quick once each, cert five each. Test scoped yolo in a fourth case only when declared; never grant host-wide access. Permission arrays are complete replacement argv commands, not appended fragments. | `metrics.headless_permission_model.score`, `.tty_prompts`, `.allowed_effects`, `.denied_filesystem_effects`, `.denied_network_effects`, `.scope_violations`; effect counters are sums over repetitions. `details.headless-permission-model.mode`, `.cases[]` with `{repetition,case,argv,exit_code,terminal_type,effect}` (credentials redacted). | Score 1.00 iff allow-list granularity is demonstrated and both filesystem/network denial cases pass; 0.75 iff a sandbox denies both classes but has no per-operation allow list; 0.50 iff workspace/profile-scoped yolo permits the allowed case without widening outside/network scope; 0.25 iff merely noninteractive with no enforceable control; 0 on prompt/hang. PASS iff score>=0.50, `allowed_effects == repetitions`, `denied_filesystem_effects == repetitions`, `denied_network_effects == repetitions`, TTY prompts=0, and scope violations=0. | Add `[permissions]` mode and complete replacement argv `allow`, `deny_filesystem`, `deny_network`, plus optional `yolo`. Each template has the matching required placeholder. Current `next_input`/tools do not describe permission flags. |
 | **71 `secrets-hygiene-on-disk`** | CHEAP; AutomationReadiness; **CORE** | Measured for both after successful and provider-failure runs. Daemon scan occurs after session close and again after shutdown. No N/A. | Inject a unique high-entropy credential. Before redaction, byte-scan stdout, stderr, journal, session files, and declared logs; scan regular files only and do not follow symlinks outside isolated roots. Quick one success+failure, cert three each. | `metrics.secrets_hygiene_on_disk.files_scanned`, `.bytes_scanned`, `.stdout_matches`, `.stderr_matches`, `.journal_matches`, `.session_matches`, `.log_matches`, `.declared_carrier_files`; `details.secrets-hygiene-on-disk.matches[]` contains category/path/offset with secret bytes omitted. | An omitted or empty `capture.credential_carrier_paths` is `ABSENT`, not a verified zero-carrier claim. Otherwise PASS iff every match count except `declared_carrier_files` is zero and credential is absent from argv. Exact 0600 generated provider/auth files whose templates contain `{{credential}}` are declared carriers and may be excluded by exact path only; no directory/glob exemption and no stdout/journal/session/log carrier is allowed. | Add nonempty `capture.credential_carrier_paths`, each profile-contained and matching a generated file. Existing profile roots, generated files, capture redaction, and raw artifacts make the scan cheap. `mock-exec` currently permits credential argv and must move it to environment/config injection. |
 | **72 `tool-result-role-fidelity`** | CHEAP; ToolCallCorrectness; **CORE** | Measured for both from what the fake model receives; no topology N/A. | Each repetition has one successful and one failed tool call; quick one repetition, cert five. Inspect the next accepted primary request after each. | `metrics.tool_result_role_fidelity.checks`, `.violations`, `.plain_user_text_violations`, `.missing_results`, `.duplicate_results`; counters are sums and `checks` must equal exactly `2 * repetitions`. `details.tool-result-role-fidelity.observations[]` has repetition/dialect/call ID/semantic role/raw pointer. | PASS iff `checks == 2*repetitions`, every call has exactly one matching structured tool result in the next legal request, and there are zero violations. Protocol-native TOOL semantics are: Chat `role:"tool"`; Responses `function_call_output`; Anthropic typed `tool_result` content (although its wire envelope has `role:"user"`). ID mismatch, duplicate, missing, or untyped pasted user text fails; omitted calls cannot yield vacuous PASS. | No new key. Canonical fake request logs already contain the needed bodies. The oracle must be dialect-aware; requiring the literal Chat role would incorrectly fail Anthropic. |
+| **73 `compaction-transparency`** | NEW; AutomationReadiness; **CORE**; not an automation-score component | Measured for both by reusing row 51's topology-neutral forced context-limit recovery. The provider request delta proves compaction independently of the harness signal. If all complete repetitions avoid compaction, the row is badge-blocking `UNSUPPORTED`; absence is never a PASS. | Quick/cert reuse the 3/7 row-51 growing sessions, provider request records, and durable events. Each completed repetition produces a row-73 observation even when no context error or accepted retry exists; row 51 may independently be `ERROR`. No second long workload is run when rows 51 and 73 are both selected. | `metrics.compaction_transparency.compactions_observed`, `.announcements`, `.scoped_announcements`, `.correlated_announcements`, `.score`; `details.compaction-transparency` has `measurement_complete`, `compaction_observed`, and `observations[]` entries `{repetition,announcement_id,correlated,scoped}`. | A compaction is externally observed when an accepted smaller request omits at least one old history marker. Tier 0 (score 0): no signal, duplicates, or a signal not correlated to its turn. Tier 1 (score 0.5): exactly one declared durable/stream marker per compaction, correlated to the affected turn, but none or not all accurately state what was affected. Tier 2 (score 1): every correlated announcement's declared count equals the externally omitted-marker count and/or its declared span endpoints equal the first/last omitted markers; if both forms are declared, both must agree. PASS requires tier 2 in every repetition: all four counts equal repetitions and score=1. Partial compaction is `ERROR`; a complete run with zero observed compactions is badge-blocking `UNSUPPORTED`; silent, announcement-only, or false-scope compaction is `FAIL`. | Add optional `[events.compaction]` with `event="context-compacted"`, required `turn_pointer`, optional `dropped_count_pointer`, and paired optional `dropped_span_start_pointer` / `dropped_span_end_pointer`. An empty scope declaration is valid announced-only data. Native signals or markers normalize to `context-compacted` through ordinary adapter rules. Omission does not suppress the trial: an observed compaction then scores tier 0. Engine code never special-cases a harness. |
 
 ### G. CLI features (not matrix rows)
 
@@ -475,13 +485,17 @@ resolution/schema/I/O errors.
 
 Each row 65–72 supplies a `[0,1]` subscore in its own topology:
 
+Revision 2.5 deliberately leaves this eight-component mean unchanged. Row 69's
+denominator changes from six to seven because narrative is a new component; row 73 is a
+direct CORE badge gate and does not become a ninth automation-score component.
+
 | Row | Subscore |
 |---:|---|
 | 65 | declared/verified injection aggregate |
 | 66 | passed token/cost/time cases divided by 3; undeclared=0 |
 | 67 | correct input/output/total/cost/turn fields divided by 5; undeclared=0 |
 | 68 | passed create/list/resume/fork/delete operations divided by 5; undeclared=0 |
-| 69 | six event components divided by 6 |
+| 69 | seven event components divided by 7 |
 | 70 | permission granularity score; undeclared=0 |
 | 71 | 1 on complete `PASS`, 0 on complete `FAIL`; otherwise unavailable |
 | 72 | 1 on complete `PASS`, 0 on complete `FAIL`; otherwise unavailable |
@@ -492,11 +506,13 @@ an integer: `floor(mean*100+0.5)`, `A0` through `A100`. Score-state mapping is e
 | Component row state | Value used by A |
 |---|---:|
 | complete `PASS` or `FAIL` with the row-defined valid `[0,1]` score | that score |
-| honest row-permitted `UNSUPPORTED` | 0 |
+| honest row-permitted `UNSUPPORTED` on rows 65–68/70 | 0 |
 | complete boolean row 71/72 `PASS` / `FAIL` | 1 / 0 |
 | `ERROR`, `ABSENT`, missing result, invalid/out-of-range score, or a score absent where the row requires one | A is `null`/unavailable |
 
-Rows 65 and 69 therefore retain a legitimately partial informational score on `FAIL`;
+Row 65 retains a legitimately partial informational score on `FAIL`; CORE row 69 also
+retains its exact partial diagnostic score on `FAIL`, but that failure withholds the badge.
+Row-69 `UNSUPPORTED` makes A unavailable rather than silently inserting zero.
 declared optional rows 66–68/70 retain their passed-case score on a complete behavioral
 `FAIL`; undeclared optional capability `UNSUPPORTED` is zero. A missing component never
 silently becomes zero. Any unavailable A prevents a v2 badge.
@@ -531,10 +547,10 @@ final separator and facet segment rather than printing an empty suffix.
 
 ### New-row certification roles
 
-- New CORE rows: **44, 48–55, 57–62, 64, 71, 72**.
+- New CORE rows: **44, 48–55, 57–62, 64, 69, 71–73**.
 - New OPTIONAL FACET rows: **56** (`native_delegation`), **66** (`budgets`),
   **67** (`usage`), **68** (`session-cli`), **70** (`permissions`).
-- New INFORMATIONAL rows: **42, 43, 45–47, 63, 65, 69**.
+- New INFORMATIONAL rows: **42, 43, 45–47, 63, 65**.
 
 Row 56 shares the existing `native-delegation` badge suffix with row 18: both must pass
 when the capability is declared. New suffixes appear after the v1 stable suffixes in this
@@ -736,7 +752,7 @@ fact rather than renaming old data.
 All non-null f64 topology-scoped fields named in this table are mirrored in
 `resource_metrics`. In particular `latency_class`, `cpu_class`, bools, nullable row-49/
 55 ratios, row-54 optional cliff Ns, and integer counts are excluded. There are no
-row-42–72 numeric resource-only aliases outside this exhaustive list.
+row-42–73 numeric resource-only aliases outside this exhaustive list.
 
 ### Exact new `metrics` keys
 
@@ -937,6 +953,7 @@ event_stream_completeness.timestamps
 event_stream_completeness.usage
 event_stream_completeness.terminal_typing
 event_stream_completeness.schema_version
+event_stream_completeness.narrative_reconstructability
 event_stream_completeness.score
 
 # 70
@@ -963,6 +980,13 @@ tool_result_role_fidelity.violations
 tool_result_role_fidelity.plain_user_text_violations
 tool_result_role_fidelity.missing_results
 tool_result_role_fidelity.duplicate_results
+
+# 73
+compaction_transparency.compactions_observed
+compaction_transparency.announcements
+compaction_transparency.scoped_announcements
+compaction_transparency.correlated_announcements
+compaction_transparency.score
 ```
 
 Rows 43, 45–50, 52, and 54–55 put their headline values directly in
@@ -1067,6 +1091,24 @@ total_tokens_pointer = "/usage/total_tokens"
 cost_microusd_pointer = "/usage/cost_microusd"
 turns_pointer = "/usage/turns"
 
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/payload/assistant_text"
+assistant_text_aggregation = "complete-event" # complete-event | item-deltas
+# assistant_text_item_pointer = "/payload/item_id" # required for item-deltas
+reasoning_event = "model-response"
+reasoning_pointer = "/payload/reasoning"
+reasoning_aggregation = "complete-event"      # complete-event | item-deltas
+# reasoning_item_pointer = "/payload/item_id" # required for item-deltas
+turn_pointer = "/actor"
+
+[events.compaction]
+event = "context-compacted"
+turn_pointer = "/payload/turn_key"
+dropped_count_pointer = "/payload/dropped_count"
+dropped_span_start_pointer = "/payload/dropped_span/first"
+dropped_span_end_pointer = "/payload/dropped_span/last"
+
 [permissions]
 mode = "allow-list-and-sandbox" # allow-list-and-sandbox | allow-list | sandbox | workspace-yolo | none
 allow = ["harness", "--allow", "{{workspace}}"]                  # complete replacement argv
@@ -1114,10 +1156,12 @@ The capability rationale maps gain these exact keys:
 | `capabilities.optional` | `session_ops_cli` | 68 |
 | `capabilities.optional` | `headless_permission_model` | 70 |
 
-Rows 65 and 69 are structurally declared and informational; they do not need rationale
-map entries. Row 52 uses existing required `resume`; row 53 uses existing required
-`durable_journal`. A missing declaration is `ABSENT`; an explicit architectural
-unavailability is badge-blocking `UNSUPPORTED`; neither is `FAIL`.
+Rows 65, 69, and 73 use typed structural declarations rather than capability-rationale
+map entries. Row 69 is CORE: omitted narrative capture points are badge-blocking
+`UNSUPPORTED`. Row 73 still runs when `[events.compaction]` is omitted so silent
+compaction is measured. Row 52 uses existing required `resume`; row 53 uses existing
+required `durable_journal`. A missing required declaration is `ABSENT`; an explicit
+architectural unavailability is badge-blocking `UNSUPPORTED`; neither is `FAIL`.
 
 Validation rules:
 
@@ -1169,6 +1213,14 @@ Validation rules:
    externally after marker rendering.
 10. A declared timestamp component requires pointer+format; a declared schema component
     requires pointer+expected value. Missing pairs are legal but score zero in row 69.
+    A present `[events.narrative]` requires two normalized event names, non-root
+    assistant-text/reasoning/turn pointers, and a non-root item pointer for each
+    `item-deltas` aggregation; its absence makes CORE row 69 `UNSUPPORTED`. A present
+    `[events.compaction]` requires `event="context-compacted"`, a non-root turn pointer,
+    optional non-root count pointer, and either both or neither non-root span endpoint
+    pointers. Declaring no scope pointers is valid announced-only data and can score only
+    0.5; omitting the block does not skip row 73 or convert observed silent compaction
+    into `UNSUPPORTED`.
 11. `resources.context_window.tokens` is positive. For `provider-metadata`, environment,
     argv, generated path, and JSON Pointer are empty. For `environment`, only a nonempty
     environment name is allowed and AHRB sets it to the profile token count in unsigned
@@ -1319,15 +1371,16 @@ prove 53 fails; inject a known cliff/starvation and prove 54/55 identify it.
 
 ### Wave 4 — ergonomics and all six bundled declarations
 
-Rows: **65–72** plus schema-2 declarations for the six adapters named above.
+Rows: **65–73** plus schema-2 declarations for the six adapters named above.
 
 Dependencies and owned deliverables:
 
 1. Wave 1 score/badge/report plumbing; Wave 2 time/usage fault fixtures; Wave 3 session
    lifecycle and forkable transcript setup.
-2. Typed manifest validation for injection, budgets/tariff, event metadata, permission
-   modes, session fork/delete, and credential carriers. Large-output validation already
-   shipped in Wave 2 and is only consumed, never re-owned, here.
+2. Typed manifest validation for injection, budgets/tariff, event metadata, narrative
+   and compaction capture points, permission modes, session fork/delete, and credential
+   carriers. Large-output validation already shipped in Wave 2 and is only consumed,
+   never re-owned, here.
 3. Generic budget, usage, CLI session-op, permission, secret-scan, and dialect-aware
    tool-result evaluators.
 4. Empirical declaration review for Claude Code, Codex, Haider, OpenCode, Pi, and Rick.
@@ -1335,7 +1388,8 @@ Dependencies and owned deliverables:
 Reference mock additions:
 
 - **Both mocks**: explicit injection declarations; token/cost/time budgets; exact usage;
-  timestamp/schema event metadata; scoped permissions; clean secret scan; protocol-native
+  timestamp/schema event metadata; durable assistant text and provider-emitted reasoning;
+  scoped compaction announcements; scoped permissions; clean secret scan; protocol-native
   tool results.
 - **Per-invocation mock** adds CLI create/list/resume/fork/delete and passes row 68.
 - **Daemon mock** may legitimately mark **row 68 `UNSUPPORTED`** because its public
@@ -1346,7 +1400,8 @@ Reference mock additions:
 
 Verification exit: v1->v2 manifest parse/validation tests; spoofed declarations fail
 behavioral trials; a secret in every artifact category fails 71 before redaction; plain
-user-text tool result fails 72; badge A/L/C/R and facet omission match goldens.
+user-text tool result fails 72; metadata-only narrative fails CORE row 69; silent
+compaction fails CORE row 73; badge A/L/C/R and facet omission match goldens.
 
 ## 9. Implementation feasibility summary by current code path
 
@@ -1370,7 +1425,7 @@ tables remain normative.
 
 V2 is complete only when:
 
-1. `list-tests` returns exactly 72 rows with the stable IDs in v1 plus this document;
+1. `list-tests` returns exactly 73 rows with the stable IDs in v1 plus this document;
 2. every new row emits its required metrics/details/raw evidence and has unit-tested
    boundary oracles for PASS, FAIL, ERROR, ABSENT, and applicable UNSUPPORTED behavior;
 3. both reference mocks satisfy the Wave 4 matrix with only the two intentional optional

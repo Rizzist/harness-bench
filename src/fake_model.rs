@@ -2646,6 +2646,9 @@ fn render_chat_value(response: &ModelResponse) -> Result<Value> {
             None => Value::Null,
         },
     );
+    if let Some(reasoning) = response.value.get("_ahrb_reasoning") {
+        message.insert("reasoning_content".to_owned(), reasoning.clone());
+    }
     if !tool_calls.is_empty() {
         message.insert(
             "tool_calls".to_owned(),
@@ -2713,6 +2716,14 @@ fn render_responses_value(response: &ModelResponse) -> Result<Value> {
     }
     let (text, tool_calls) = semantic_parts(&response.value)?;
     let mut output = Vec::new();
+    if let Some(reasoning) = response.value.get("_ahrb_reasoning") {
+        output.push(json!({
+            "id": stable_id("reasoning", response),
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
     if let Some(text) = text {
         output.push(json!({
             "id": stable_id("msg", response),
@@ -2770,6 +2781,13 @@ fn render_anthropic_value(response: &ModelResponse) -> Result<Value> {
     }
     let (text, tool_calls) = semantic_parts(&response.value)?;
     let mut content = Vec::new();
+    if let Some(reasoning) = response.value.get("_ahrb_reasoning") {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": reasoning,
+            "signature": stable_id("thinking", response)
+        }));
+    }
     if let Some(text) = text {
         content.push(json!({"type": "text", "text": text}));
     }
@@ -2994,6 +3012,9 @@ fn render_responses_sse(value: &Value) -> Result<Vec<u8>> {
             "function_call" => {
                 started.insert("arguments".to_owned(), Value::String(String::new()));
             }
+            "reasoning" => {
+                started.insert("summary".to_owned(), Value::Array(Vec::new()));
+            }
             _ => {}
         }
         push_responses_event(
@@ -3098,6 +3119,67 @@ fn render_responses_sse(value: &Value) -> Result<Vec<u8>> {
                     }),
                 )?;
             }
+            "reasoning" => {
+                let summary = item_object
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "OpenAI Responses reasoning item lacks summary[]".to_owned(),
+                        )
+                    })?;
+                for (summary_index, part) in summary.iter().enumerate() {
+                    let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "OpenAI Responses reasoning summary lacks text".to_owned(),
+                        )
+                    })?;
+                    push_responses_event(
+                        &mut body,
+                        &mut sequence_number,
+                        "response.reasoning_summary_part.added",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "summary_index": summary_index,
+                            "part": {"type":"summary_text","text":""}
+                        }),
+                    )?;
+                    push_responses_event(
+                        &mut body,
+                        &mut sequence_number,
+                        "response.reasoning_summary_text.delta",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "summary_index": summary_index,
+                            "delta": text,
+                        }),
+                    )?;
+                    push_responses_event(
+                        &mut body,
+                        &mut sequence_number,
+                        "response.reasoning_summary_text.done",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "summary_index": summary_index,
+                            "text": text,
+                        }),
+                    )?;
+                    push_responses_event(
+                        &mut body,
+                        &mut sequence_number,
+                        "response.reasoning_summary_part.done",
+                        json!({
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "summary_index": summary_index,
+                            "part": part,
+                        }),
+                    )?;
+                }
+            }
             _ => {}
         }
         push_responses_event(
@@ -3184,6 +3266,20 @@ fn render_chat_sse(value: &Value) -> Result<Vec<u8>> {
             None,
         )?;
 
+        if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+            push_chat_chunk(
+                &mut body,
+                id,
+                model,
+                &created,
+                json!([{
+                    "index": index,
+                    "delta": {"reasoning_content": reasoning},
+                    "finish_reason": null
+                }]),
+                None,
+            )?;
+        }
         if let Some(content) = message.get("content").and_then(Value::as_str) {
             push_chat_chunk(
                 &mut body,
@@ -3313,6 +3409,16 @@ fn render_anthropic_sse(value: &Value) -> Result<Vec<u8>> {
                 json!({
                     "type": "text_delta",
                     "text": block_object.get("text").and_then(Value::as_str).unwrap_or("")
+                }),
+            ),
+            "thinking" => (
+                json!({"type": "thinking", "thinking": "", "signature": ""}),
+                json!({
+                    "type": "thinking_delta",
+                    "thinking": block_object
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
                 }),
             ),
             "tool_use" => {
@@ -3917,6 +4023,15 @@ mod tests {
             retry: false,
             stream: true,
         }
+    }
+
+    fn reasoning_response() -> ModelResponse {
+        let mut response = streamed_tool_response();
+        response.value = json!({
+            "text": "answer",
+            "_ahrb_reasoning": "provider reasoning"
+        });
+        response
     }
 
     #[tokio::test]
@@ -4685,6 +4800,46 @@ mod tests {
                 .and_then(Value::as_u64)
                 .is_some_and(|tokens| tokens > 0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn every_frontend_preserves_fixture_reasoning_in_json_and_streams() -> Result<()> {
+        let response = reasoning_response();
+        let chat = render_chat_value(&response)?;
+        assert_eq!(
+            chat.pointer("/choices/0/message/reasoning_content")
+                .and_then(Value::as_str),
+            Some("provider reasoning")
+        );
+        let responses = render_responses_value(&response)?;
+        assert_eq!(
+            responses
+                .pointer("/output/0/summary/0/text")
+                .and_then(Value::as_str),
+            Some("provider reasoning")
+        );
+        let anthropic = render_anthropic_value(&response)?;
+        assert_eq!(
+            anthropic
+                .pointer("/content/0/thinking")
+                .and_then(Value::as_str),
+            Some("provider reasoning")
+        );
+        for (dialect, value) in [
+            ("chat", chat),
+            ("responses", responses),
+            ("anthropic", anthropic),
+        ] {
+            let streamed = render_json_or_sse(value, true, dialect)?;
+            assert!(
+                streamed
+                    .body
+                    .windows(b"provider reasoning".len())
+                    .any(|window| window == b"provider reasoning"),
+                "{dialect} stream discarded provider reasoning"
+            );
+        }
         Ok(())
     }
 

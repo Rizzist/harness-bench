@@ -5109,6 +5109,8 @@ mod tests {
                 },
             ],
             metadata: None,
+            narrative: None,
+            compaction: None,
         };
         let mut session = PersistedExecSession {
             local_id: "00000000-0000-4000-8000-000000000000".to_owned(),

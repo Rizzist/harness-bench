@@ -1,7 +1,9 @@
 //! Wave-4 automation-interface evidence evaluators.
 
 use crate::events::{EventVocab, NormalizedEvent};
-use crate::manifest::{EventMetadata, UsageScope};
+use crate::manifest::{
+    CompactionCapture, EventMetadata, NarrativeAggregation, NarrativeCapture, UsageScope,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -285,13 +287,91 @@ fn row69_actor(repetition: u32, success: bool) -> String {
     format!("r69p{repetition}{}", if success { "s" } else { "f" })
 }
 
+fn narrative_values(
+    stream: &[&NormalizedEvent],
+    expected_event: &str,
+    value_pointer: &str,
+    aggregation: NarrativeAggregation,
+    item_pointer: Option<&str>,
+) -> Option<Vec<String>> {
+    match aggregation {
+        NarrativeAggregation::CompleteEvent => stream
+            .iter()
+            .filter(|event| event_name(&event.event).as_deref() == Some(expected_event))
+            .filter_map(|event| {
+                let raw = raw_event(event);
+                raw.pointer(value_pointer)
+                    .map(|value| value.as_str().map(str::to_owned))
+            })
+            .collect(),
+        NarrativeAggregation::ItemDeltas => {
+            let item_pointer = item_pointer?;
+            let mut items = Vec::<(String, String)>::new();
+            let mut item_indexes = BTreeMap::<String, usize>::new();
+            for event in stream
+                .iter()
+                .filter(|event| event_name(&event.event).as_deref() == Some(expected_event))
+            {
+                let raw = raw_event(event);
+                let Some(value) = raw.pointer(value_pointer) else {
+                    continue;
+                };
+                let value = value.as_str()?;
+                let item = raw.pointer(item_pointer).and_then(Value::as_str)?;
+                if item.is_empty() {
+                    return None;
+                }
+                let index = match item_indexes.get(item).copied() {
+                    Some(index) => index,
+                    None => {
+                        let index = items.len();
+                        items.push((item.to_owned(), String::new()));
+                        item_indexes.insert(item.to_owned(), index);
+                        index
+                    }
+                };
+                items[index].1.push_str(value);
+            }
+            Some(items.into_iter().map(|(_, value)| value).collect())
+        }
+    }
+}
+
+fn narrative_turns_correlate(
+    stream: &[&NormalizedEvent],
+    capture: &NarrativeCapture,
+    actor: &str,
+) -> bool {
+    stream
+        .iter()
+        .filter(|event| {
+            let name = event_name(&event.event);
+            let raw = raw_event(event);
+            (name.as_deref() == Some(capture.assistant_text_event.as_str())
+                && raw
+                    .pointer(&capture.assistant_text_pointer)
+                    .is_some_and(Value::is_string))
+                || (name.as_deref() == Some(capture.reasoning_event.as_str())
+                    && raw
+                        .pointer(&capture.reasoning_pointer)
+                        .is_some_and(Value::is_string))
+        })
+        .all(|event| {
+            raw_event(event)
+                .pointer(&capture.turn_pointer)
+                .and_then(Value::as_str)
+                .is_some_and(|turn| turn == actor || turn.rsplit(':').next() == Some(actor))
+        })
+}
+
 /// Evaluate row 69 from the declared machine event stream.
 pub fn evaluate_event_stream_completeness(
     events: &[NormalizedEvent],
     metadata: Option<&EventMetadata>,
+    narrative: Option<&NarrativeCapture>,
     repetitions: u32,
 ) -> Wave4Evaluation {
-    let mut components = [true; 6];
+    let mut components = [true; 7];
     let mut failures = Vec::new();
     for repetition in 1..=repetitions {
         let success_actor = row69_actor(repetition, true);
@@ -412,6 +492,44 @@ pub fn evaluate_event_stream_completeness(
                 })
         });
         components[5] &= schema_ok;
+        let narrative_ok = narrative.is_some_and(|capture| {
+            narrative_values(
+                &success,
+                &capture.assistant_text_event,
+                &capture.assistant_text_pointer,
+                capture.assistant_text_aggregation,
+                capture.assistant_text_item_pointer.as_deref(),
+            ) == Some(vec![
+                "I will write the event-stream fixture.".to_owned(),
+                "SUCCESS".to_owned(),
+            ]) && narrative_values(
+                &failure,
+                &capture.assistant_text_event,
+                &capture.assistant_text_pointer,
+                capture.assistant_text_aggregation,
+                capture.assistant_text_item_pointer.as_deref(),
+            ) == Some(vec![
+                r#"{"status":"FAILURE","category":"scripted"}"#.to_owned(),
+            ]) && narrative_values(
+                &success,
+                &capture.reasoning_event,
+                &capture.reasoning_pointer,
+                capture.reasoning_aggregation,
+                capture.reasoning_item_pointer.as_deref(),
+            ) == Some(vec![
+                "prepare the requested tool call".to_owned(),
+                "verify the tool result and conclude".to_owned(),
+            ]) && narrative_values(
+                &failure,
+                &capture.reasoning_event,
+                &capture.reasoning_pointer,
+                capture.reasoning_aggregation,
+                capture.reasoning_item_pointer.as_deref(),
+            ) == Some(vec!["report the scripted failure".to_owned()])
+                && narrative_turns_correlate(&success, capture, &success_actor)
+                && narrative_turns_correlate(&failure, capture, &failure_actor)
+        });
+        components[6] &= narrative_ok;
         let receipt_bound = |pointer: &str, earliest: bool| {
             let values = metadata_events
                 .iter()
@@ -433,6 +551,7 @@ pub fn evaluate_event_stream_completeness(
             ("usage", usage_ok),
             ("terminal_typing", terminal_ok),
             ("schema_version", schema_ok),
+            ("narrative_reconstructability", narrative_ok),
         ]
         .into_iter()
         .enumerate()
@@ -458,10 +577,12 @@ pub fn evaluate_event_stream_completeness(
         "usage",
         "terminal_typing",
         "schema_version",
+        "narrative_reconstructability",
     ];
     let passed_components = components.iter().filter(|value| **value).count();
-    let score = passed_components as f64 / 6.0;
-    let passed = passed_components >= 4 && components[0] && components[1] && components[4];
+    let score = passed_components as f64 / 7.0;
+    let passed =
+        passed_components >= 5 && components[0] && components[1] && components[4] && components[6];
     let mut metrics = BTreeMap::new();
     for (name, passed) in names.into_iter().zip(components) {
         metrics.insert(
@@ -486,13 +607,475 @@ pub fn evaluate_event_stream_completeness(
     }
 }
 
+/// External evidence that one completed long-horizon run did or did not compact.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CompactionTransparencyTrial {
+    pub repetition: u32,
+    pub compaction_observed: bool,
+    pub omitted_markers: Vec<String>,
+}
+
+fn compaction_scope_matches(
+    raw: &Value,
+    capture: &CompactionCapture,
+    omitted_markers: &[String],
+) -> bool {
+    if omitted_markers.is_empty() {
+        return false;
+    }
+    let count_matches = capture.dropped_count_pointer.as_deref().map(|pointer| {
+        u64::try_from(omitted_markers.len())
+            .ok()
+            .is_some_and(|expected| raw.pointer(pointer).and_then(Value::as_u64) == Some(expected))
+    });
+    let span_matches = capture
+        .dropped_span_start_pointer
+        .as_deref()
+        .zip(capture.dropped_span_end_pointer.as_deref())
+        .map(|(start_pointer, end_pointer)| {
+            raw.pointer(start_pointer).and_then(Value::as_str)
+                == omitted_markers.first().map(String::as_str)
+                && raw.pointer(end_pointer).and_then(Value::as_str)
+                    == omitted_markers.last().map(String::as_str)
+        });
+    let declared = count_matches.is_some() || span_matches.is_some();
+    declared
+        && count_matches
+            .into_iter()
+            .chain(span_matches)
+            .all(|value| value)
+}
+
+/// Evaluate row 73 from externally proven compaction trials and the adapter's
+/// declared durable signal locations.
+pub fn evaluate_compaction_transparency(
+    events: &[NormalizedEvent],
+    capture: Option<&CompactionCapture>,
+    trials: &[CompactionTransparencyTrial],
+    expected_repetitions: u32,
+) -> Wave4Evaluation {
+    let incomplete = |message: String| Wave4Evaluation {
+        details: json!({
+            "measurement_complete": false,
+            "measurement_error": message,
+            "compaction_observed": false,
+            "observations": [],
+        }),
+        measurement_error: Some(message),
+        ..Wave4Evaluation::default()
+    };
+    if u32::try_from(trials.len()).ok() != Some(expected_repetitions) {
+        return incomplete("row-73 compaction trial set is incomplete".to_owned());
+    }
+    let mut repetitions = std::collections::BTreeSet::new();
+    let observed_repetitions = trials
+        .iter()
+        .filter(|trial| repetitions.insert(trial.repetition) && trial.compaction_observed)
+        .count();
+    if repetitions.len() != trials.len()
+        || trials
+            .iter()
+            .any(|trial| trial.repetition == 0 || trial.repetition > expected_repetitions)
+    {
+        return incomplete("row-73 has invalid or duplicate repetition evidence".to_owned());
+    }
+    if observed_repetitions != 0 && observed_repetitions != trials.len() {
+        return incomplete(
+            "row-73 observed compaction in only part of the required trial set".to_owned(),
+        );
+    }
+    let compactions_observed = observed_repetitions as u64;
+    let matching_events = capture.map_or_else(Vec::new, |capture| {
+        events
+            .iter()
+            .filter(|event| event_name(&event.event).as_deref() == Some(capture.event.as_str()))
+            .collect::<Vec<_>>()
+    });
+    let announcements = matching_events.len() as u64;
+    let mut correlated_announcements = 0_u64;
+    let mut scoped_announcements = 0_u64;
+    let mut observations = Vec::with_capacity(trials.len());
+    for trial in trials {
+        let expected_turn = format!("row-51-recover-r{}", trial.repetition);
+        let correlated = capture.map_or_else(Vec::new, |capture| {
+            matching_events
+                .iter()
+                .copied()
+                .filter(|event| {
+                    raw_event(event)
+                        .pointer(&capture.turn_pointer)
+                        .and_then(Value::as_str)
+                        == Some(expected_turn.as_str())
+                })
+                .collect::<Vec<_>>()
+        });
+        let correlated_once = correlated.len() == 1;
+        correlated_announcements =
+            correlated_announcements.saturating_add(u64::from(correlated_once));
+        let scoped = correlated_once
+            && capture.is_some_and(|capture| {
+                correlated.first().is_some_and(|event| {
+                    let raw = raw_event(event);
+                    compaction_scope_matches(&raw, capture, &trial.omitted_markers)
+                })
+            });
+        scoped_announcements = scoped_announcements.saturating_add(u64::from(scoped));
+        observations.push(json!({
+            "repetition": trial.repetition,
+            "announcement_id": correlated.first().map(|event| event.id.clone()),
+            "correlated": correlated_once,
+            "scoped": scoped,
+        }));
+    }
+    let expected = u64::from(expected_repetitions);
+    let score = if compactions_observed == expected
+        && announcements == expected
+        && correlated_announcements == expected
+        && scoped_announcements == expected
+    {
+        1.0
+    } else if compactions_observed == expected
+        && announcements == expected
+        && correlated_announcements == expected
+    {
+        0.5
+    } else {
+        0.0
+    };
+    Wave4Evaluation {
+        metrics: BTreeMap::from([
+            (
+                "compaction_transparency.compactions_observed".to_owned(),
+                compactions_observed as f64,
+            ),
+            (
+                "compaction_transparency.announcements".to_owned(),
+                announcements as f64,
+            ),
+            (
+                "compaction_transparency.scoped_announcements".to_owned(),
+                scoped_announcements as f64,
+            ),
+            (
+                "compaction_transparency.correlated_announcements".to_owned(),
+                correlated_announcements as f64,
+            ),
+            ("compaction_transparency.score".to_owned(), score),
+        ]),
+        details: json!({
+            "measurement_complete": true,
+            "compaction_observed": compactions_observed > 0,
+            "observations": observations,
+        }),
+        measurement_complete: true,
+        measurement_error: None,
+        passed: score == 1.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn row69_event(
+        id: &str,
+        cursor: u64,
+        actor: &str,
+        event: EventVocab,
+        payload: Value,
+    ) -> NormalizedEvent {
+        let mut payload = payload;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("timestamp_ns".to_owned(), json!(cursor));
+            object.insert("schema_version".to_owned(), json!(1));
+        }
+        NormalizedEvent {
+            id: id.to_owned(),
+            cursor,
+            session_id: actor.to_owned(),
+            actor: actor.to_owned(),
+            event,
+            payload,
+        }
+    }
+
+    fn row69_complete_events() -> Vec<NormalizedEvent> {
+        vec![
+            row69_event(
+                "s1",
+                1,
+                "r69p1s",
+                EventVocab::ModelResponse,
+                json!({"assistant_text":"I will write the event-stream fixture.","reasoning":"prepare the requested tool call"}),
+            ),
+            row69_event(
+                "s2",
+                2,
+                "r69p1s",
+                EventVocab::ToolCall,
+                json!({"call_id":"call-1"}),
+            ),
+            row69_event(
+                "s3",
+                3,
+                "r69p1s",
+                EventVocab::ToolResult,
+                json!({"call_id":"call-1"}),
+            ),
+            row69_event(
+                "s4",
+                4,
+                "r69p1s",
+                EventVocab::ModelResponse,
+                json!({"assistant_text":"SUCCESS","reasoning":"verify the tool result and conclude"}),
+            ),
+            row69_event(
+                "s5",
+                5,
+                "r69p1s",
+                EventVocab::TerminalSuccess,
+                json!({"usage":{"input_tokens":240,"output_tokens":50,"total_tokens":290,"cost_microusd":630,"turns":1}}),
+            ),
+            row69_event(
+                "f1",
+                1,
+                "r69p1f",
+                EventVocab::ModelResponse,
+                json!({"assistant_text":"{\"status\":\"FAILURE\",\"category\":\"scripted\"}","reasoning":"report the scripted failure"}),
+            ),
+            row69_event("f2", 2, "r69p1f", EventVocab::TerminalFailure, json!({})),
+        ]
+    }
+
+    fn row69_metadata() -> EventMetadata {
+        EventMetadata {
+            timestamp_pointer: "/payload/timestamp_ns".to_owned(),
+            timestamp_format: Some(crate::manifest::TimestampFormat::MonotonicNs),
+            schema_version_pointer: "/payload/schema_version".to_owned(),
+            schema_version_value: "1".to_owned(),
+            usage_event: "terminal-success".to_owned(),
+            usage_scope: Some(UsageScope::Turn),
+            input_tokens_pointer: "/payload/usage/input_tokens".to_owned(),
+            output_tokens_pointer: "/payload/usage/output_tokens".to_owned(),
+            total_tokens_pointer: "/payload/usage/total_tokens".to_owned(),
+            cost_microusd_pointer: "/payload/usage/cost_microusd".to_owned(),
+            turns_pointer: "/payload/usage/turns".to_owned(),
+        }
+    }
+
+    fn row69_narrative() -> NarrativeCapture {
+        NarrativeCapture {
+            assistant_text_event: "model-response".to_owned(),
+            assistant_text_pointer: "/payload/assistant_text".to_owned(),
+            assistant_text_aggregation: NarrativeAggregation::CompleteEvent,
+            assistant_text_item_pointer: None,
+            reasoning_event: "model-response".to_owned(),
+            reasoning_pointer: "/payload/reasoning".to_owned(),
+            reasoning_aggregation: NarrativeAggregation::CompleteEvent,
+            reasoning_item_pointer: None,
+            turn_pointer: "/actor".to_owned(),
+        }
+    }
+
+    fn compaction_trial(repetition: u32) -> CompactionTransparencyTrial {
+        CompactionTransparencyTrial {
+            repetition,
+            compaction_observed: true,
+            omitted_markers: vec!["old-1".to_owned(), "old-2".to_owned()],
+        }
+    }
+
     #[test]
-    fn row69_exact_integer_threshold_accepts_four_with_hard_trio() {
-        let components = [true, true, false, false, true, true];
+    fn row69_exact_integer_threshold_accepts_five_with_hard_quartet() {
+        let components = [true, true, false, false, true, true, true];
         let passed_components = components.iter().filter(|value| **value).count();
-        assert_eq!(passed_components, 4);
-        assert!(passed_components >= 4 && components[0] && components[1] && components[4]);
+        assert_eq!(passed_components, 5);
+        assert!(
+            passed_components >= 5
+                && components[0]
+                && components[1]
+                && components[4]
+                && components[6]
+        );
+    }
+
+    #[test]
+    fn row69_narrative_mock_discriminates_full_journal_from_tool_metadata_only() {
+        let complete = evaluate_event_stream_completeness(
+            &row69_complete_events(),
+            Some(&row69_metadata()),
+            Some(&row69_narrative()),
+            1,
+        );
+        assert_eq!(
+            complete.metrics["event_stream_completeness.narrative_reconstructability"],
+            1.0
+        );
+        assert_eq!(complete.metrics["event_stream_completeness.score"], 1.0);
+        assert!(complete.passed);
+
+        let mut metadata_only = row69_complete_events();
+        for event in &mut metadata_only {
+            if event.event == EventVocab::ModelResponse
+                && let Some(payload) = event.payload.as_object_mut()
+            {
+                payload.remove("assistant_text");
+                payload.remove("reasoning");
+            }
+        }
+        let metadata_only = evaluate_event_stream_completeness(
+            &metadata_only,
+            Some(&row69_metadata()),
+            Some(&row69_narrative()),
+            1,
+        );
+        for component in [
+            "tool_call_id",
+            "correlated_result",
+            "timestamps",
+            "usage",
+            "terminal_typing",
+            "schema_version",
+        ] {
+            assert_eq!(
+                complete.metrics[&format!("event_stream_completeness.{component}")],
+                metadata_only.metrics[&format!("event_stream_completeness.{component}")]
+            );
+        }
+        assert_eq!(
+            metadata_only.metrics["event_stream_completeness.narrative_reconstructability"],
+            0.0
+        );
+        assert_eq!(
+            metadata_only.metrics["event_stream_completeness.score"],
+            6.0 / 7.0
+        );
+        assert!(!metadata_only.passed);
+    }
+
+    #[test]
+    fn row69_reconstructs_adapter_declared_ordered_item_deltas() {
+        let mut events = Vec::new();
+        for event in row69_complete_events() {
+            if event.event != EventVocab::ModelResponse {
+                events.push(event);
+                continue;
+            }
+            let assistant = event.payload["assistant_text"].as_str().unwrap_or_default();
+            let reasoning = event.payload["reasoning"].as_str().unwrap_or_default();
+            let assistant_split = assistant.len() / 2;
+            let reasoning_split = reasoning.len() / 2;
+            for (index, (assistant_delta, reasoning_delta)) in [
+                (&assistant[..assistant_split], &reasoning[..reasoning_split]),
+                (&assistant[assistant_split..], &reasoning[reasoning_split..]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut delta = event.clone();
+                delta.id = format!("{}-delta-{index}", event.id);
+                delta.payload["assistant_text"] = json!(assistant_delta);
+                delta.payload["reasoning"] = json!(reasoning_delta);
+                delta.payload["item_id"] = json!(event.id);
+                events.push(delta);
+            }
+        }
+        let mut capture = row69_narrative();
+        capture.assistant_text_aggregation = NarrativeAggregation::ItemDeltas;
+        capture.assistant_text_item_pointer = Some("/payload/item_id".to_owned());
+        capture.reasoning_aggregation = NarrativeAggregation::ItemDeltas;
+        capture.reasoning_item_pointer = Some("/payload/item_id".to_owned());
+        let evaluation =
+            evaluate_event_stream_completeness(&events, Some(&row69_metadata()), Some(&capture), 1);
+        assert_eq!(
+            evaluation.metrics["event_stream_completeness.narrative_reconstructability"],
+            1.0
+        );
+        assert!(evaluation.passed);
+    }
+
+    #[test]
+    fn row73_mock_discriminates_scoped_announcement_from_silent_compaction() {
+        let capture = CompactionCapture {
+            event: "context-compacted".to_owned(),
+            turn_pointer: "/payload/turn_key".to_owned(),
+            dropped_count_pointer: Some("/payload/dropped_count".to_owned()),
+            dropped_span_start_pointer: Some("/payload/dropped_span/first".to_owned()),
+            dropped_span_end_pointer: Some("/payload/dropped_span/last".to_owned()),
+        };
+        let event = row69_event(
+            "compact-1",
+            1,
+            "r51-context",
+            EventVocab::ContextCompacted,
+            json!({
+                "turn_key":"row-51-recover-r1",
+                "dropped_count":2,
+                "dropped_span":{"first":"old-1","last":"old-2"}
+            }),
+        );
+        let scoped = evaluate_compaction_transparency(
+            std::slice::from_ref(&event),
+            Some(&capture),
+            &[compaction_trial(1)],
+            1,
+        );
+        assert_eq!(scoped.metrics["compaction_transparency.score"], 1.0);
+        assert!(scoped.passed);
+
+        let silent =
+            evaluate_compaction_transparency(&[], Some(&capture), &[compaction_trial(1)], 1);
+        assert_eq!(silent.metrics["compaction_transparency.score"], 0.0);
+        assert!(!silent.passed);
+
+        let announced_only_capture = CompactionCapture {
+            dropped_count_pointer: None,
+            dropped_span_start_pointer: None,
+            dropped_span_end_pointer: None,
+            ..capture.clone()
+        };
+        let announced_only = evaluate_compaction_transparency(
+            &[event],
+            Some(&announced_only_capture),
+            &[compaction_trial(1)],
+            1,
+        );
+        assert_eq!(announced_only.metrics["compaction_transparency.score"], 0.5);
+        assert!(!announced_only.passed);
+
+        let false_scope = row69_event(
+            "compact-false-scope",
+            1,
+            "r51-context",
+            EventVocab::ContextCompacted,
+            json!({
+                "turn_key":"row-51-recover-r1",
+                "dropped_count":99,
+                "dropped_span":{"first":null,"last":null}
+            }),
+        );
+        let false_scope = evaluate_compaction_transparency(
+            &[false_scope],
+            Some(&capture),
+            &[compaction_trial(1)],
+            1,
+        );
+        assert_eq!(false_scope.metrics["compaction_transparency.score"], 0.5);
+        assert!(!false_scope.passed);
+    }
+
+    #[test]
+    fn row73_complete_run_without_compaction_is_nonpassing_and_inapplicable() {
+        let mut trial = compaction_trial(1);
+        trial.compaction_observed = false;
+        trial.omitted_markers.clear();
+        let evaluation = evaluate_compaction_transparency(&[], None, &[trial], 1);
+        assert!(evaluation.measurement_complete);
+        assert_eq!(
+            evaluation.metrics["compaction_transparency.compactions_observed"],
+            0.0
+        );
+        assert_eq!(evaluation.details["compaction_observed"], false);
+        assert!(!evaluation.passed);
     }
 }

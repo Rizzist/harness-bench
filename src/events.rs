@@ -22,6 +22,8 @@ pub enum EventVocab {
     ModelRequest,
     /// A model response completed.
     ModelResponse,
+    /// The harness compacted or trimmed model context.
+    ContextCompacted,
     /// A tool call was fully assembled.
     ToolCall,
     /// A tool result was committed.
@@ -193,6 +195,7 @@ fn parse_vocab(name: &str) -> Result<EventVocab> {
         "turn-accepted" => Ok(EventVocab::TurnAccepted),
         "model-request" => Ok(EventVocab::ModelRequest),
         "model-response" => Ok(EventVocab::ModelResponse),
+        "context-compacted" => Ok(EventVocab::ContextCompacted),
         "tool-call" => Ok(EventVocab::ToolCall),
         "tool-result" => Ok(EventVocab::ToolResult),
         "agent-spawned" => Ok(EventVocab::AgentSpawned),

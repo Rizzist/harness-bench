@@ -52,6 +52,7 @@ pub const WAVE4_METRIC_KEYS: &[&str] = &[
     "event_stream_completeness.usage",
     "event_stream_completeness.terminal_typing",
     "event_stream_completeness.schema_version",
+    "event_stream_completeness.narrative_reconstructability",
     "event_stream_completeness.score",
     "headless_permission_model.score",
     "headless_permission_model.tty_prompts",
@@ -72,6 +73,11 @@ pub const WAVE4_METRIC_KEYS: &[&str] = &[
     "tool_result_role_fidelity.plain_user_text_violations",
     "tool_result_role_fidelity.missing_results",
     "tool_result_role_fidelity.duplicate_results",
+    "compaction_transparency.compactions_observed",
+    "compaction_transparency.announcements",
+    "compaction_transparency.scoped_announcements",
+    "compaction_transparency.correlated_announcements",
+    "compaction_transparency.score",
 ];
 
 /// One auditable recursive process-membership refresh boundary.
@@ -254,6 +260,10 @@ impl<'de> Deserialize<'de> for ReportDetails {
                 }
                 "tool-result-role-fidelity" => {
                     serde_json::from_value::<ToolResultRoleFidelityDetails>(value.clone())
+                        .map(|_| ())
+                }
+                "compaction-transparency" => {
+                    serde_json::from_value::<CompactionTransparencyDetails>(value.clone())
                         .map(|_| ())
                 }
                 _ => Ok(()),
@@ -753,6 +763,24 @@ struct ToolResultRoleObservationDetail {
     call_id: String,
     semantic_role: String,
     raw_pointer: String,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct CompactionTransparencyDetails {
+    measurement_complete: bool,
+    compaction_observed: bool,
+    #[serde(default)]
+    observations: Vec<CompactionTransparencyObservationDetail>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct CompactionTransparencyObservationDetail {
+    repetition: u32,
+    announcement_id: Option<String>,
+    correlated: bool,
+    scoped: bool,
 }
 
 /// One externally observed semantic-turn interval on the shared monotonic clock.
@@ -3580,7 +3608,7 @@ mod wave4_schema_tests {
 
     #[test]
     fn wave4_metric_schema_is_exact_and_has_no_dynamic_keys() {
-        assert_eq!(WAVE4_METRIC_KEYS.len(), 53);
+        assert_eq!(WAVE4_METRIC_KEYS.len(), 59);
         let unique = WAVE4_METRIC_KEYS.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), WAVE4_METRIC_KEYS.len());
         assert_eq!(
@@ -3589,7 +3617,7 @@ mod wave4_schema_tests {
         );
         assert_eq!(
             WAVE4_METRIC_KEYS.last().copied(),
-            Some("tool_result_role_fidelity.duplicate_results")
+            Some("compaction_transparency.score")
         );
     }
 

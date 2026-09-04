@@ -185,6 +185,8 @@ pub enum RowEvidence {
     SecretsHygieneOnDisk(ObservationSet),
     /// Row 72: protocol-native tool-result role fidelity.
     ToolResultRoleFidelity(ObservationSet),
+    /// Row 73: context-compaction transparency.
+    CompactionTransparency(ObservationSet),
 }
 
 impl RowEvidence {
@@ -240,6 +242,7 @@ impl RowEvidence {
             Self::HeadlessPermissionModel(_) => 70,
             Self::SecretsHygieneOnDisk(_) => 71,
             Self::ToolResultRoleFidelity(_) => 72,
+            Self::CompactionTransparency(_) => 73,
         }
     }
 
@@ -293,7 +296,8 @@ impl RowEvidence {
             | Self::EventStreamCompleteness(value)
             | Self::HeadlessPermissionModel(value)
             | Self::SecretsHygieneOnDisk(value)
-            | Self::ToolResultRoleFidelity(value) => value,
+            | Self::ToolResultRoleFidelity(value)
+            | Self::CompactionTransparency(value) => value,
         }
     }
 }
@@ -470,6 +474,11 @@ fn wave4_capability_for_row(manifest: &Manifest, row: u8) -> Option<CapabilitySt
                 || manifest.events.rules.is_empty()
             {
                 CapabilityStatus::Absent("machine-readable event stream is absent".to_owned())
+            } else if manifest.events.narrative.is_none() {
+                CapabilityStatus::Unsupported(
+                    "adapter declares no durable assistant-text/reasoning capture points"
+                        .to_owned(),
+                )
             } else {
                 CapabilityStatus::Supported
             },
@@ -486,6 +495,27 @@ fn wave4_capability_for_row(manifest: &Manifest, row: u8) -> Option<CapabilitySt
             ),
         }),
         72 => Some(CapabilityStatus::Supported),
+        73 => Some(
+            if manifest.events.source.trim().is_empty()
+                || manifest.events.framing.trim().is_empty()
+                || manifest.events.rules.is_empty()
+            {
+                CapabilityStatus::Absent("machine-readable event stream is absent".to_owned())
+            } else if !manifest
+                .capabilities
+                .required
+                .contains_key("context_limit_recovery")
+                || manifest.resources.context_window.is_none()
+                || !basic_session_surface(manifest)
+            {
+                CapabilityStatus::Unsupported(
+                    "architecture cannot run the forced long-context compaction stimulus"
+                        .to_owned(),
+                )
+            } else {
+                CapabilityStatus::Supported
+            },
+        ),
         _ => None,
     }
 }
@@ -599,7 +629,7 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
             row,
             id: format!("unknown-row-{row}"),
             pillar: crate::evaluate::Pillar::Functionality,
-            outcome: TestOutcome::Error(format!("matrix row {row} is outside 1..=41")),
+            outcome: TestOutcome::Error(format!("matrix row {row} is outside 1..=73")),
             evidence: Vec::new(),
             metadata: crate::evaluate::TestResultMetadata::for_row(
                 row,
@@ -666,7 +696,7 @@ pub fn evaluate_row(manifest: &Manifest, row: u8, evidence: Option<&RowEvidence>
         &[assertion],
         None,
     );
-    if matches!(row, 65..=70) {
+    if matches!(row, 65..=70 | 73) {
         result.metadata.score = numeric_f64(evidence.observations(), "score")
             .ok()
             .filter(|score| (0.0..=1.0).contains(score));
@@ -684,7 +714,7 @@ pub fn suite_exit_code(
 }
 
 fn exact_assertion(row: u8, values: &ObservationSet) -> Assertion {
-    if matches!(row, 65..=72) {
+    if matches!(row, 65..=73) {
         return wave4_exact_assertion(row, values);
     }
     let checks: Vec<Check<'_>> = match row {
@@ -997,6 +1027,7 @@ fn wave4_exact_assertion(row: u8, values: &ObservationSet) -> Assertion {
         70 => wave4_permission_passes(values),
         71 => wave4_secret_hygiene_passes(values),
         72 => wave4_tool_role_passes(values),
+        73 => wave4_compaction_transparency_passes(values),
         _ => Err(format!("row {row} has no Wave-4 evaluator")),
     };
     let (passed, detail) = match evaluated {
@@ -1062,11 +1093,23 @@ fn wave4_event_stream_passes(values: &ObservationSet) -> std::result::Result<boo
         component("usage")?,
         component("terminal_typing")?,
         component("schema_version")?,
+        component("narrative_reconstructability")?,
     ];
     let score = numeric_f64(values, "score")?;
-    let expected_score = components.iter().filter(|value| **value).count() as f64 / 6.0;
+    let expected_score = components.iter().filter(|value| **value).count() as f64 / 7.0;
     Ok((score - expected_score).abs() <= f64::EPSILON
         && crate::evaluate::event_stream_reference_envelope(components))
+}
+
+fn wave4_compaction_transparency_passes(
+    values: &ObservationSet,
+) -> std::result::Result<bool, String> {
+    let repetitions = numeric_u64(values, "compactions_observed")?;
+    Ok(repetitions > 0
+        && numeric_u64(values, "announcements")? == repetitions
+        && numeric_u64(values, "scoped_announcements")? == repetitions
+        && numeric_u64(values, "correlated_announcements")? == repetitions
+        && numeric_f64(values, "score")? == 1.0)
 }
 
 fn wave4_permission_passes(values: &ObservationSet) -> std::result::Result<bool, String> {
@@ -1216,7 +1259,33 @@ mod wave4_tests {
     use super::*;
 
     #[test]
-    fn event_stream_oracle_uses_integer_four_of_six_and_hard_trio() {
+    fn observability_capabilities_come_only_from_adapter_declarations() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/mock/manifest.toml");
+        let mut manifest = crate::manifest::load(&path).expect("load mock manifest");
+        assert!(matches!(
+            capability_for_row(&manifest, 69),
+            CapabilityStatus::Supported
+        ));
+        assert!(matches!(
+            capability_for_row(&manifest, 73),
+            CapabilityStatus::Supported
+        ));
+
+        manifest.events.narrative = None;
+        assert!(matches!(
+            capability_for_row(&manifest, 69),
+            CapabilityStatus::Unsupported(_)
+        ));
+        manifest.events.compaction = None;
+        assert!(matches!(
+            capability_for_row(&manifest, 73),
+            CapabilityStatus::Supported
+        ));
+    }
+
+    #[test]
+    fn event_stream_oracle_uses_integer_five_of_seven_and_hard_quartet() {
         let passing = ObservationSet::new()
             .with_u64("tool_call_id", 1)
             .with_u64("correlated_result", 1)
@@ -1224,7 +1293,8 @@ mod wave4_tests {
             .with_u64("usage", 0)
             .with_u64("terminal_typing", 1)
             .with_u64("schema_version", 1)
-            .with_f64("score", 4.0 / 6.0);
+            .with_u64("narrative_reconstructability", 1)
+            .with_f64("score", 5.0 / 7.0);
         assert!(wave4_event_stream_passes(&passing).expect("complete evidence"));
 
         let missing_hard_component = ObservationSet::new()
@@ -1234,7 +1304,8 @@ mod wave4_tests {
             .with_u64("usage", 1)
             .with_u64("terminal_typing", 1)
             .with_u64("schema_version", 1)
-            .with_f64("score", 5.0 / 6.0);
+            .with_u64("narrative_reconstructability", 1)
+            .with_f64("score", 6.0 / 7.0);
         assert!(!wave4_event_stream_passes(&missing_hard_component).expect("complete evidence"));
     }
 

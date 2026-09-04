@@ -391,6 +391,9 @@ struct MockConfig {
     compact_after_turn: Option<u64>,
     retain_recent_tool_results: Option<usize>,
     suppress_fixture_effects: bool,
+    suppress_narrative: bool,
+    silent_compaction: bool,
+    disable_compaction: bool,
     session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
@@ -2132,6 +2135,9 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     let mut compact_after_turn = None;
     let mut retain_recent_tool_results = None;
     let mut suppress_fixture_effects = false;
+    let mut suppress_narrative = false;
+    let mut silent_compaction = false;
+    let mut disable_compaction = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2254,6 +2260,15 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
             }
             "--suppress-fixture-effects" => {
                 suppress_fixture_effects = true;
+            }
+            "--suppress-narrative" => {
+                suppress_narrative = true;
+            }
+            "--silent-compaction" => {
+                silent_compaction = true;
+            }
+            "--disable-compaction" => {
+                disable_compaction = true;
             }
             option => {
                 return Err(AhrbError::Usage(format!("unknown option {option:?}")));
@@ -2423,6 +2438,9 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         compact_after_turn,
         retain_recent_tool_results,
         suppress_fixture_effects,
+        suppress_narrative,
+        silent_compaction,
+        disable_compaction,
         session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
@@ -3180,7 +3198,39 @@ async fn execute_turn(
                 && !compacted_after_context_error
                 && is_context_length_error(&response.body)
             {
-                messages = compact_context_messages(&messages)?;
+                if config.disable_compaction {
+                    let mut guard = harness.lock().await;
+                    guard.append_terminal(
+                        id,
+                        EventVocab::TerminalFailure,
+                        json!({
+                            "status": "failure",
+                            "category": "context-limit",
+                            "message": "context compaction is disabled",
+                        }),
+                    )?;
+                    return Ok(());
+                }
+                let (compacted_messages, omitted_markers) = compact_context_messages(&messages)?;
+                let dropped_count = u64::try_from(omitted_markers.len())
+                    .map_err(|_| AhrbError::Protocol("compaction scope exceeds u64".to_owned()))?;
+                let dropped_span = json!({
+                    "first": omitted_markers.first(),
+                    "last": omitted_markers.last(),
+                });
+                messages = compacted_messages;
+                if !config.silent_compaction {
+                    let mut guard = harness.lock().await;
+                    guard.append(
+                        id,
+                        EventVocab::ContextCompacted,
+                        json!({
+                            "turn_key": turn.key,
+                            "dropped_count": dropped_count,
+                            "dropped_span": dropped_span,
+                        }),
+                    )?;
+                }
                 request = json!({
                     "model": config.model,
                     "messages": messages,
@@ -3253,18 +3303,31 @@ async fn execute_turn(
             if session_should_stop(guard.session_mut(id)?)? {
                 return Ok(());
             }
-            guard.append(
-                id,
-                EventVocab::ModelResponse,
-                json!({
-                    "checkpoint": checkpoint,
-                    "usage": {
-                        "input_tokens": response_input_tokens,
-                        "output_tokens": response_output_tokens,
-                        "total_tokens": response_input_tokens.saturating_add(response_output_tokens)
-                    }
-                }),
-            )?;
+            let mut response_payload = json!({
+                "checkpoint": checkpoint,
+                "usage": {
+                    "input_tokens": response_input_tokens,
+                    "output_tokens": response_output_tokens,
+                    "total_tokens": response_input_tokens.saturating_add(response_output_tokens)
+                }
+            });
+            if !config.suppress_narrative
+                && message.get("reasoning_content").is_some()
+                && let Some(object) = response_payload.as_object_mut()
+            {
+                object.insert(
+                    "assistant_text".to_owned(),
+                    message.get("content").cloned().unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "reasoning".to_owned(),
+                    message
+                        .get("reasoning_content")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
+            guard.append(id, EventVocab::ModelResponse, response_payload)?;
         }
         let tool_calls = message
             .get("tool_calls")
@@ -3644,7 +3707,7 @@ fn build_context_overlimit_messages(
         .ok_or_else(|| AhrbError::Protocol("context fixture messages are absent".to_owned()))
 }
 
-fn compact_context_messages(messages: &[Value]) -> Result<Vec<Value>> {
+fn compact_context_messages(messages: &[Value]) -> Result<(Vec<Value>, Vec<String>)> {
     let mut ordinary = Vec::<(u32, Value)>::new();
     let mut output = Vec::new();
     let mut current_turn = Vec::new();
@@ -3679,6 +3742,7 @@ fn compact_context_messages(messages: &[Value]) -> Result<Vec<Value>> {
                         .find(|token| token.starts_with("AHRB-HISTORY-"))
                 })
         })
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     let retained = ordinary[retain_from..]
         .iter()
@@ -3695,7 +3759,7 @@ fn compact_context_messages(messages: &[Value]) -> Result<Vec<Value>> {
     output.insert(insertion, summary);
     output.extend(retained);
     output.extend(current_turn);
-    Ok(output)
+    Ok((output, omitted))
 }
 
 fn is_context_length_error(body: &[u8]) -> bool {
@@ -5187,6 +5251,9 @@ mod tests {
             compact_after_turn: None,
             retain_recent_tool_results: None,
             suppress_fixture_effects: false,
+            suppress_narrative: false,
+            silent_compaction: false,
+            disable_compaction: false,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
@@ -6318,6 +6385,9 @@ mod tests {
             compact_after_turn: None,
             retain_recent_tool_results: None,
             suppress_fixture_effects: false,
+            suppress_narrative: false,
+            silent_compaction: false,
+            disable_compaction: false,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
