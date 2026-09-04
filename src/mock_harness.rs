@@ -48,6 +48,7 @@ const MIB: u64 = 1024 * 1024;
 // quick fixture approach certification-scale duration.
 const LONG_HORIZON_MIN_TURN_MS: u64 = 350;
 const TURN_LATENCY_MIN_TURN_MS: u64 = 100;
+const MAX_MODEL_REQUESTS_PER_TURN: u64 = 64;
 const OWNED_EGRESS_BOUNDARY: &str = "reference-mock-loopback-connector-v1";
 static RECONCILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEW_FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -384,6 +385,11 @@ struct MockConfig {
     retry_max_delay_ms: u64,
     max_output_bytes: usize,
     context_window_tokens: Option<u64>,
+    model_request_ceiling: u64,
+    model_request_cap_exit_code: Option<i32>,
+    model_request_cap_stall_ms: Option<u64>,
+    compact_after_turn: Option<u64>,
+    retain_recent_tool_results: Option<usize>,
     session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
@@ -645,7 +651,7 @@ impl MockHarness {
             }
             let journal = DurableJournal::open(entry.path().join("journal.jsonl"))?;
             let events = journal.all()?;
-            reconcile_durable_tool_effects(&config.state_dir, &meta.id, &events)?;
+            reconcile_durable_tool_effects(&config, &meta.id, &events)?;
             let keys = events
                 .iter()
                 .filter(|event| event.event == EventVocab::TurnAccepted)
@@ -987,7 +993,10 @@ pub async fn run(args: &[String]) -> Result<i32> {
             println!(
                 "ahrb-mock-harness serve|rpc|status --state-dir PATH [--idle-timeout-ms N] \
                  [--session-memory-mib N] [--retry-max-attempts N] \
-                 [--retry-base-delay-ms N] [--retry-max-delay-ms N]\n\
+                 [--retry-base-delay-ms N] [--retry-max-delay-ms N] \
+                 [--model-request-ceiling N] \
+                 [--model-request-cap-exit-code N|--model-request-cap-stall-ms N] \
+                 [--compact-after-turn N --retain-recent-tool-results N]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
                  --session-id ID --prompt PROMPT --key KEY \
                  [--base-url URL]\n\
@@ -2115,6 +2124,11 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     let mut retry_max_attempts = None;
     let mut retry_base_delay_ms = None;
     let mut retry_max_delay_ms = None;
+    let mut model_request_ceiling = MAX_MODEL_REQUESTS_PER_TURN;
+    let mut model_request_cap_exit_code = None;
+    let mut model_request_cap_stall_ms = None;
+    let mut compact_after_turn = None;
+    let mut retain_recent_tool_results = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2171,6 +2185,68 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
                         })?
                         .parse::<u64>()
                         .map_err(|_| AhrbError::Usage("invalid retry maximum delay".to_owned()))?,
+                );
+            }
+            "--compact-after-turn" => {
+                index += 1;
+                compact_after_turn = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage("--compact-after-turn needs a value".to_owned())
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| AhrbError::Usage("invalid compaction turn".to_owned()))?,
+                );
+            }
+            "--model-request-ceiling" => {
+                index += 1;
+                model_request_ceiling = args
+                    .get(index)
+                    .ok_or_else(|| {
+                        AhrbError::Usage("--model-request-ceiling needs a value".to_owned())
+                    })?
+                    .parse::<u64>()
+                    .map_err(|_| AhrbError::Usage("invalid model-request ceiling".to_owned()))?;
+            }
+            "--model-request-cap-exit-code" => {
+                index += 1;
+                model_request_cap_exit_code = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage(
+                                "--model-request-cap-exit-code needs a value".to_owned(),
+                            )
+                        })?
+                        .parse::<i32>()
+                        .map_err(|_| AhrbError::Usage("invalid cap exit code".to_owned()))?,
+                );
+            }
+            "--model-request-cap-stall-ms" => {
+                index += 1;
+                model_request_cap_stall_ms = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage(
+                                "--model-request-cap-stall-ms needs a value".to_owned(),
+                            )
+                        })?
+                        .parse::<u64>()
+                        .map_err(|_| AhrbError::Usage("invalid cap stall duration".to_owned()))?,
+                );
+            }
+            "--retain-recent-tool-results" => {
+                index += 1;
+                retain_recent_tool_results = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            AhrbError::Usage(
+                                "--retain-recent-tool-results needs a value".to_owned(),
+                            )
+                        })?
+                        .parse::<usize>()
+                        .map_err(|_| {
+                            AhrbError::Usage("invalid retained tool-result count".to_owned())
+                        })?,
                 );
             }
             option => {
@@ -2276,12 +2352,48 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
             "mock maximum output bytes must be in 1..=1,048,576".to_owned(),
         ));
     }
+    match (compact_after_turn, retain_recent_tool_results) {
+        (Some(0), _) | (_, Some(0)) => {
+            return Err(AhrbError::Validation(
+                "mock compaction turn and retained tool-result count must be positive".to_owned(),
+            ));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(AhrbError::Validation(
+                "mock compaction requires both --compact-after-turn and --retain-recent-tool-results"
+                    .to_owned(),
+            ));
+        }
+        (Some(_), Some(_)) | (None, None) => {}
+    }
+    if model_request_ceiling == 0 {
+        return Err(AhrbError::Validation(
+            "mock model-request ceiling must be positive".to_owned(),
+        ));
+    }
+    if model_request_cap_exit_code == Some(0) {
+        return Err(AhrbError::Validation(
+            "mock cap exit code must be non-zero".to_owned(),
+        ));
+    }
+    if model_request_cap_stall_ms == Some(0) {
+        return Err(AhrbError::Validation(
+            "mock cap stall duration must be positive".to_owned(),
+        ));
+    }
+    if model_request_cap_exit_code.is_some() && model_request_cap_stall_ms.is_some() {
+        return Err(AhrbError::Validation(
+            "mock request cap accepts either exit or stall behavior, not both".to_owned(),
+        ));
+    }
     #[cfg(unix)]
     let provider_stream = inherited_provider_stream()?;
     let owned_egress_guard = OwnedEgressGuard::from_environment(&state_dir)?;
     Ok(MockConfig {
         state_dir,
-        workspace_override: std::env::var_os("AHRB_MOCK_WORKSPACE_OVERRIDE").map(PathBuf::from),
+        workspace_override: std::env::var_os("AHRB_MOCK_WORKSPACE_OVERRIDE")
+            .or_else(|| std::env::var_os("AHRB_FIDELITY_WORKSPACE"))
+            .map(PathBuf::from),
         base_url,
         unix_socket: std::env::var_os("AHRB_MOCK_UNIX_SOCKET").map(PathBuf::from),
         provider_mailbox,
@@ -2299,6 +2411,11 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         retry_max_delay_ms,
         max_output_bytes,
         context_window_tokens,
+        model_request_ceiling,
+        model_request_cap_exit_code,
+        model_request_cap_stall_ms,
+        compact_after_turn,
+        retain_recent_tool_results,
         session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
@@ -2474,8 +2591,16 @@ async fn handle_rpc(harness: Arc<Mutex<MockHarness>>, request: RpcRequest) -> Re
     match request.method.as_str() {
         "session.create" => {
             let marker = required_str(&request.params, "marker")?;
-            let id = harness.lock().await.create_session(marker)?;
-            Ok(json!({ "session_id": id }))
+            let (id, workspace_path) = {
+                let mut guard = harness.lock().await;
+                let id = guard.create_session(marker)?;
+                let workspace_path = guard.config.workspace_path(&id);
+                (id, workspace_path)
+            };
+            Ok(json!({
+                "session_id": id,
+                "workspace_path": workspace_path.to_string_lossy(),
+            }))
         }
         "session.submit" => {
             let id = required_str(&request.params, "session_id")?.to_owned();
@@ -2977,7 +3102,7 @@ async fn execute_turn(
     };
     let mut turn_input_tokens = 0_u64;
     let mut turn_output_tokens = 0_u64;
-    for checkpoint in 0..32_u64 {
+    for checkpoint in 0..config.model_request_ceiling {
         {
             let mut guard = harness.lock().await;
             let session = guard.session_mut(id)?;
@@ -2987,6 +3112,13 @@ async fn execute_turn(
             for prompt in std::mem::take(&mut session.injected) {
                 messages.push(json!({ "role": "user", "content": prompt }));
             }
+        }
+        if config
+            .compact_after_turn
+            .is_some_and(|turn| checkpoint.saturating_add(1) > turn)
+            && let Some(retain) = config.retain_recent_tool_results
+        {
+            messages = retain_recent_tool_result_pairs(&messages, retain);
         }
         let mut request = json!({
             "model": config.model,
@@ -3261,6 +3393,13 @@ async fn execute_turn(
             }));
         }
     }
+    if let Some(code) = config.model_request_cap_exit_code {
+        std::process::exit(code);
+    }
+    if let Some(stall_ms) = config.model_request_cap_stall_ms {
+        tokio::time::sleep(Duration::from_millis(stall_ms)).await;
+        return Ok(());
+    }
     let mut guard = harness.lock().await;
     guard.append_terminal(
         id,
@@ -3268,6 +3407,58 @@ async fn execute_turn(
         json!({ "status": "failure", "category": "turn-limit" }),
     )?;
     Ok(())
+}
+
+fn retain_recent_tool_result_pairs(messages: &[Value], retain: usize) -> Vec<Value> {
+    let result_ids = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let retained_ids = result_ids
+        .iter()
+        .skip(result_ids.len().saturating_sub(retain))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut compacted = Vec::new();
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("tool") => {
+                if message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| retained_ids.contains(id))
+                {
+                    compacted.push(message.clone());
+                }
+            }
+            Some("assistant")
+                if message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some() =>
+            {
+                let mut retained_message = message.clone();
+                let Some(calls) = retained_message
+                    .get_mut("tool_calls")
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                calls.retain(|call| {
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| retained_ids.contains(id))
+                });
+                if !calls.is_empty() {
+                    compacted.push(retained_message);
+                }
+            }
+            _ => compacted.push(message.clone()),
+        }
+    }
+    compacted
 }
 
 async fn wait_for_reference_terminal_floor(
@@ -3594,8 +3785,7 @@ async fn execute_prepared_tool_call(
         };
         if needs_reconcile {
             reconcile_fixture_effect(
-                &config.state_dir,
-                &session_id,
+                &config.workspace_path(&session_id),
                 &call_id,
                 &name,
                 &args,
@@ -4326,7 +4516,7 @@ async fn large_output_result(max_output_bytes: usize, args: &Value) -> Result<Va
 }
 
 fn reconcile_durable_tool_effects(
-    state_dir: &Path,
+    config: &MockConfig,
     session: &str,
     events: &[NormalizedEvent],
 ) -> Result<()> {
@@ -4354,14 +4544,13 @@ fn reconcile_durable_tool_effects(
                 continue;
             }
         }
-        reconcile_fixture_effect(state_dir, session, call_id, name, args, result)?;
+        reconcile_fixture_effect(&config.workspace_path(session), call_id, name, args, result)?;
     }
     Ok(())
 }
 
 fn reconcile_fixture_effect(
-    state_dir: &Path,
-    session: &str,
+    workspace: &Path,
     call_id: &str,
     name: &str,
     args: &Value,
@@ -4375,7 +4564,7 @@ fn reconcile_fixture_effect(
     }
     let relative = safe_relative(required_str(args, "path")?)?;
     let content = required_str(args, "content")?;
-    let path = state_dir.join("workspaces").join(session).join(relative);
+    let path = workspace.join(relative);
     match fs::read(&path) {
         Ok(existing) if existing == content.as_bytes() => return Ok(()),
         Ok(_) => {}
@@ -4966,6 +5155,11 @@ mod tests {
             retry_max_delay_ms: 50,
             max_output_bytes: 1_048_576,
             context_window_tokens: None,
+            model_request_ceiling: MAX_MODEL_REQUESTS_PER_TURN,
+            model_request_cap_exit_code: None,
+            model_request_cap_stall_ms: None,
+            compact_after_turn: None,
+            retain_recent_tool_results: None,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
@@ -5264,15 +5458,14 @@ mod tests {
         let result = json!({ "ok": true });
         let mut workers = Vec::new();
         for _ in 0..32 {
-            let worker_directory = directory.clone();
+            let worker_workspace = directory.join("workspaces/session");
             let worker_barrier = Arc::clone(&barrier);
             let worker_args = args.clone();
             let worker_result = result.clone();
             workers.push(std::thread::spawn(move || {
                 worker_barrier.wait();
                 reconcile_fixture_effect(
-                    &worker_directory,
-                    "session",
+                    &worker_workspace,
                     "shared-call",
                     "write_fixture",
                     &worker_args,
@@ -6092,6 +6285,11 @@ mod tests {
             retry_max_delay_ms: 50,
             max_output_bytes: 1_048_576,
             context_window_tokens: None,
+            model_request_ceiling: MAX_MODEL_REQUESTS_PER_TURN,
+            model_request_cap_exit_code: None,
+            model_request_cap_stall_ms: None,
+            compact_after_turn: None,
+            retain_recent_tool_results: None,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),

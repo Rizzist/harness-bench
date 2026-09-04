@@ -48,6 +48,9 @@ pub struct Manifest {
     pub process: ProcessOwnership,
     /// Resource control limits.
     pub resources: ResourceControls,
+    /// Optional declarations used only by the isolated context-fidelity pillar.
+    #[serde(default, skip_serializing_if = "FidelityConfig::is_absent")]
+    pub fidelity: FidelityConfig,
     /// Lifecycle hooks.
     #[serde(default)]
     pub hooks: Hooks,
@@ -778,6 +781,28 @@ pub struct ResourceControls {
     pub budget_controls: Option<BudgetControls>,
 }
 
+/// Typed adapter declarations for long-horizon end-state classification.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct FidelityConfig {
+    /// Harness-owned primary-request or agent-loop ceiling, when documented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_turn_ceiling: Option<u64>,
+    /// Numeric exits that unambiguously mean the harness stopped at its own ceiling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub internal_cap_exit_codes: Vec<i32>,
+    /// Profile-contained actor-workspace path for topologies that do not expose one via the driver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+}
+
+impl FidelityConfig {
+    fn is_absent(&self) -> bool {
+        self.declared_turn_ceiling.is_none()
+            && self.internal_cap_exit_codes.is_empty()
+            && self.workspace_path.is_none()
+    }
+}
+
 /// Typed context-window carrier declared by an adapter.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ContextWindowConfig {
@@ -1205,6 +1230,46 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         return Err(AhrbError::Validation(
             "idle timeout must be strictly less than turn timeout".to_owned(),
         ));
+    }
+    if manifest.fidelity.declared_turn_ceiling == Some(0) {
+        return Err(AhrbError::Validation(
+            "fidelity.declared_turn_ceiling must be positive".to_owned(),
+        ));
+    }
+    if manifest
+        .fidelity
+        .workspace_path
+        .as_ref()
+        .is_some_and(|path| path.trim().is_empty())
+    {
+        return Err(AhrbError::Validation(
+            "fidelity.workspace_path cannot be empty".to_owned(),
+        ));
+    }
+    if let Some(path) = manifest.fidelity.workspace_path.as_ref()
+        && std::path::Path::new(path).components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(AhrbError::Validation(
+            "fidelity.workspace_path cannot contain '.' or '..' components".to_owned(),
+        ));
+    }
+    let mut cap_exit_codes = std::collections::BTreeSet::new();
+    for code in &manifest.fidelity.internal_cap_exit_codes {
+        if *code == manifest.exit.success {
+            return Err(AhrbError::Validation(
+                "fidelity.internal_cap_exit_codes cannot contain exit.success".to_owned(),
+            ));
+        }
+        if !cap_exit_codes.insert(*code) {
+            return Err(AhrbError::Validation(format!(
+                "fidelity.internal_cap_exit_codes repeats {code}"
+            )));
+        }
     }
     validate_wave_2_resources(manifest)?;
     validate_wave_3_resources(manifest)?;
@@ -3182,6 +3247,14 @@ mod version_tests {
         manifest.resources.idle_timeout_ms = 1_000;
         let error = validate(&manifest).expect_err("retry envelope above turn timeout");
         assert!(error.to_string().contains("turn_timeout_ms"));
+    }
+
+    #[test]
+    fn fidelity_workspace_template_rejects_traversal_components() {
+        let mut manifest = wave_2_manifest();
+        manifest.fidelity.workspace_path = Some("{{profile}}/fidelity/../outside".to_owned());
+        let error = validate(&manifest).expect_err("workspace traversal must be rejected");
+        assert!(error.to_string().contains("cannot contain '.' or '..'"));
     }
 
     #[test]

@@ -60,6 +60,13 @@ fn markdown_sorts_rows_and_names_outcomes() {
 }
 
 #[test]
+fn absent_isolated_pillars_do_not_serialize_report_fields() {
+    let value = serde_json::to_value(Report::default()).expect("serialize default report");
+    assert!(value.get("economy_summary").is_none());
+    assert!(value.get("fidelity_summary").is_none());
+}
+
+#[test]
 fn report_details_validate_known_blocks_and_retain_future_blocks() {
     let mut value = serde_json::to_value(Report::default()).expect("serialize default report");
     value["details"] = serde_json::json!({

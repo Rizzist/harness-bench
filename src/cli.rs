@@ -15,6 +15,8 @@ pub enum Command {
     Run(RunOptions),
     /// Execute the isolated harness-economy task.
     Economy(RunOptions),
+    /// Execute the isolated long-horizon context-fidelity task.
+    Fidelity(RunOptions),
     /// Re-render an existing JSON report.
     Report {
         /// Existing `report.json` path.
@@ -94,15 +96,15 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 .transpose()?
                 .unwrap_or_default();
             let pillar = values.get("pillar").map(String::as_str).unwrap_or("matrix");
-            if !matches!(pillar, "matrix" | "economy") {
+            if !matches!(pillar, "matrix" | "economy" | "fidelity") {
                 return Err(AhrbError::Usage(format!(
-                    "--pillar must be matrix or economy, not {pillar:?}"
+                    "--pillar must be matrix, economy, or fidelity, not {pillar:?}"
                 )));
             }
-            if pillar == "economy" && !tests.is_empty() {
-                return Err(AhrbError::Usage(
-                    "--tests cannot be combined with --pillar economy".to_owned(),
-                ));
+            if pillar != "matrix" && !tests.is_empty() {
+                return Err(AhrbError::Usage(format!(
+                    "--tests cannot be combined with --pillar {pillar}"
+                )));
             }
             let options = RunOptions {
                 manifest: PathBuf::from(required(&values, "manifest")?),
@@ -117,10 +119,10 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 no_save: values.contains_key("no-save"),
                 harness_version: None,
             };
-            if pillar == "economy" {
-                Ok(Command::Economy(options))
-            } else {
-                Ok(Command::Run(options))
+            match pillar {
+                "economy" => Ok(Command::Economy(options)),
+                "fidelity" => Ok(Command::Fidelity(options)),
+                _ => Ok(Command::Run(options)),
             }
         }
         Some("report") => {
@@ -183,6 +185,7 @@ pub async fn execute(command: Command) -> Result<i32> {
         }
         Command::Run(options) => crate::runner::run(options).await,
         Command::Economy(options) => crate::runner::run_economy(options).await,
+        Command::Fidelity(options) => crate::runner::run_fidelity(options).await,
         Command::Report { input } => {
             let bytes = std::fs::read(input)?;
             let report: crate::report::Report = serde_json::from_slice(&bytes)?;
@@ -411,6 +414,28 @@ mod tests {
         ]
         .map(str::to_owned);
         assert!(parse(&args).is_err());
+    }
+
+    #[test]
+    fn parses_isolated_fidelity_pillar() -> Result<()> {
+        let args = [
+            "run",
+            "--pillar",
+            "fidelity",
+            "--manifest",
+            "mock.toml",
+            "--profile",
+            "cert",
+        ]
+        .map(str::to_owned);
+        let Command::Fidelity(options) = parse(&args)? else {
+            return Err(AhrbError::Protocol(
+                "fidelity command was not parsed".to_owned(),
+            ));
+        };
+        assert_eq!(options.profile, Profile::Cert);
+        assert!(options.tests.is_empty());
+        Ok(())
     }
 
     #[test]

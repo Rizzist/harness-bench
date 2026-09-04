@@ -185,6 +185,8 @@ struct DiffDocument {
     resource_summary_deltas: BTreeMap<String, ResourceDelta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     economy_summary_deltas: Option<EconomySummaryDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fidelity_summary_deltas: Option<FidelitySummaryDiff>,
 }
 
 #[derive(Debug, Serialize)]
@@ -209,6 +211,35 @@ struct EconomySummaryDiff {
 struct ContextTokenCurveDiff {
     before: Option<Vec<u64>>,
     after: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<Vec<f64>>,
+    change: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FidelitySummaryDiff {
+    comparison_scope: String,
+    task_profile_match: bool,
+    end_reason_before: Option<String>,
+    end_reason_after: Option<String>,
+    end_reason_change: String,
+    workspace_state_before: Option<String>,
+    workspace_state_after: Option<String>,
+    workspace_state_change: String,
+    internal_cap_detected_before: Option<bool>,
+    internal_cap_detected_after: Option<bool>,
+    internal_cap_detected_change: String,
+    values: BTreeMap<String, ResourceDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    survival_curve: Option<FractionCurveDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_tool_result_fraction: Option<FractionCurveDiff>,
+}
+
+#[derive(Debug, Serialize)]
+struct FractionCurveDiff {
+    before: Option<Vec<f64>>,
+    after: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     delta: Option<Vec<f64>>,
     change: String,
@@ -251,6 +282,10 @@ fn build_document(
         left_report.parsed.economy_summary.as_ref(),
         right_report.parsed.economy_summary.as_ref(),
     );
+    let fidelity_summary_deltas = compare_fidelity(
+        left_report.parsed.fidelity_summary.as_ref(),
+        right_report.parsed.fidelity_summary.as_ref(),
+    );
     Ok((
         DiffDocument {
             schema: 1,
@@ -260,9 +295,156 @@ fn build_document(
             rows,
             resource_summary_deltas,
             economy_summary_deltas,
+            fidelity_summary_deltas,
         },
         gating_regression,
     ))
+}
+
+fn compare_fidelity(
+    left: Option<&crate::fidelity::FidelitySummary>,
+    right: Option<&crate::fidelity::FidelitySummary>,
+) -> Option<FidelitySummaryDiff> {
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+    let task_profile_match = left
+        .zip(right)
+        .is_some_and(|(left, right)| left.task == right.task && left.profile == right.profile);
+    let numeric = |summary: &crate::fidelity::FidelitySummary, field: &str| match field {
+        "model_turns" => Some(summary.model_turns as f64),
+        "needle_survival_fraction" => Some(summary.needle_survival_fraction),
+        "first_loss_turn" => summary.first_loss_turn.map(|turn| turn as f64),
+        "end_turn" => Some(summary.end_turn as f64),
+        "declared_turn_ceiling" => summary.declared_turn_ceiling.map(|turn| turn as f64),
+        "retained_tool_result_fraction_final" => {
+            summary.retained_tool_result_fraction.last().copied()
+        }
+        _ => None,
+    };
+    let fields = [
+        "model_turns",
+        "needle_survival_fraction",
+        "first_loss_turn",
+        "end_turn",
+        "declared_turn_ceiling",
+        "retained_tool_result_fraction_final",
+    ];
+    let values = fields
+        .into_iter()
+        .map(|field| {
+            let before = left.and_then(|summary| numeric(summary, field));
+            let after = right.and_then(|summary| numeric(summary, field));
+            let delta = if task_profile_match {
+                numeric_delta(before, after)
+            } else {
+                ResourceDelta {
+                    before,
+                    after,
+                    delta: None,
+                    delta_pct: None,
+                    change: Some("not-comparable-task-or-profile".to_owned()),
+                }
+            };
+            (field.to_owned(), delta)
+        })
+        .collect();
+    let end_reason_before =
+        left.map(|summary| crate::fidelity::end_reason_name(summary.end_reason).to_owned());
+    let end_reason_after =
+        right.map(|summary| crate::fidelity::end_reason_name(summary.end_reason).to_owned());
+    let workspace_state_before = left
+        .map(|summary| crate::fidelity::workspace_state_name(summary.workspace_state).to_owned());
+    let workspace_state_after = right
+        .map(|summary| crate::fidelity::workspace_state_name(summary.workspace_state).to_owned());
+    let internal_cap_detected_before = left.map(|summary| summary.internal_cap_detected);
+    let internal_cap_detected_after = right.map(|summary| summary.internal_cap_detected);
+    Some(FidelitySummaryDiff {
+        comparison_scope: "same-task-and-profile-only".to_owned(),
+        task_profile_match,
+        end_reason_change: guarded_value_change(
+            &end_reason_before,
+            &end_reason_after,
+            task_profile_match,
+        ),
+        end_reason_before,
+        end_reason_after,
+        workspace_state_change: guarded_value_change(
+            &workspace_state_before,
+            &workspace_state_after,
+            task_profile_match,
+        ),
+        workspace_state_before,
+        workspace_state_after,
+        internal_cap_detected_change: guarded_value_change(
+            &internal_cap_detected_before,
+            &internal_cap_detected_after,
+            task_profile_match,
+        ),
+        internal_cap_detected_before,
+        internal_cap_detected_after,
+        values,
+        survival_curve: compare_fraction_curves(
+            left.map(|summary| summary.survival_curve.clone()),
+            right.map(|summary| summary.survival_curve.clone()),
+            task_profile_match,
+        ),
+        retained_tool_result_fraction: compare_fraction_curves(
+            left.map(|summary| summary.retained_tool_result_fraction.clone()),
+            right.map(|summary| summary.retained_tool_result_fraction.clone()),
+            task_profile_match,
+        ),
+    })
+}
+
+fn guarded_value_change<T: PartialEq>(
+    before: &Option<T>,
+    after: &Option<T>,
+    comparable: bool,
+) -> String {
+    if comparable || before.is_none() || after.is_none() {
+        value_change(before, after)
+    } else {
+        "not-comparable-task-or-profile".to_owned()
+    }
+}
+
+fn compare_fraction_curves(
+    before: Option<Vec<f64>>,
+    after: Option<Vec<f64>>,
+    comparable: bool,
+) -> Option<FractionCurveDiff> {
+    if before.is_none() && after.is_none() {
+        return None;
+    }
+    let (delta, change) = if !comparable {
+        (None, "not-comparable-task-or-profile")
+    } else if let (Some(before), Some(after)) = (&before, &after) {
+        if before.len() == after.len() {
+            (
+                Some(
+                    before
+                        .iter()
+                        .zip(after)
+                        .map(|(before, after)| after - before)
+                        .collect(),
+                ),
+                "comparable",
+            )
+        } else {
+            (None, "different-length")
+        }
+    } else if before.is_none() {
+        (None, "added")
+    } else {
+        (None, "removed")
+    };
+    Some(FractionCurveDiff {
+        before,
+        after,
+        delta,
+        change: change.to_owned(),
+    })
 }
 
 fn compare_economy(
@@ -931,6 +1113,7 @@ mod tests {
     use super::*;
     use crate::economy::{EconomyCompletion, EconomySummary, ReferenceTokenizerPin};
     use crate::evaluate::{Pillar, TestResultMetadata};
+    use crate::fidelity::{FidelityEndReason, FidelitySummary, HarnessExitStatus, WorkspaceState};
 
     fn result(row: u8, id: &str, outcome: TestOutcome) -> TestResult {
         TestResult {
@@ -1026,6 +1209,68 @@ mod tests {
             invalidated_prefix_tokens_per_turn: vec![0],
             prefix_stability_label: "reference-token LCP".to_owned(),
         }
+    }
+
+    fn fidelity(profile: &str, survival: f64) -> FidelitySummary {
+        FidelitySummary {
+            schema: 1,
+            task: crate::fidelity::FIDELITY_TASK_ID.to_owned(),
+            profile: profile.to_owned(),
+            turn_budget: 24,
+            model_turns: 24,
+            measurement_label: "provider bytes only".to_owned(),
+            needles: Vec::new(),
+            needle_survival_fraction: survival,
+            needle_survival_fraction_label: "final bytes".to_owned(),
+            survival_curve: vec![1.0, survival],
+            survival_curve_label: "ordered bytes".to_owned(),
+            first_loss_turn: (survival < 1.0).then_some(2),
+            retained_tool_result_fraction: vec![1.0, survival],
+            retained_tool_result_fraction_label: "canonical carriers".to_owned(),
+            end_reason: FidelityEndReason::ReachedScriptedTerminal,
+            end_reason_label: "script only".to_owned(),
+            end_turn: 24,
+            harness_exit_status: HarnessExitStatus::Running,
+            harness_exit_code: None,
+            internal_cap_detected: false,
+            declared_turn_ceiling: None,
+            workspace_state: WorkspaceState::Mutated,
+            workspace_state_label: "scripted effects".to_owned(),
+            workspace_receipt_before_sha256: "a".repeat(64),
+            workspace_receipt_after_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn fidelity_diff_requires_equal_task_and_profile() {
+        let before = fidelity("quick", 1.0);
+        let after = fidelity("quick", 0.0);
+        let compared = compare_fidelity(Some(&before), Some(&after)).expect("fidelity diff");
+        assert!(compared.task_profile_match);
+        assert_eq!(
+            compared.values["needle_survival_fraction"].delta,
+            Some(-1.0)
+        );
+        assert_eq!(
+            compared.survival_curve.expect("survival curve").delta,
+            Some(vec![0.0, -1.0])
+        );
+
+        let mismatch = fidelity("cert", 0.0);
+        let guarded = compare_fidelity(Some(&before), Some(&mismatch))
+            .expect("profile-guarded fidelity diff");
+        assert!(!guarded.task_profile_match);
+        assert_eq!(
+            guarded.values["needle_survival_fraction"].change.as_deref(),
+            Some("not-comparable-task-or-profile")
+        );
+        assert!(
+            guarded
+                .survival_curve
+                .expect("guarded survival curve")
+                .delta
+                .is_none()
+        );
     }
 
     #[test]

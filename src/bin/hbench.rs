@@ -40,6 +40,20 @@ async fn main() {
                 2
             }
         }
+    } else if args.first().is_some_and(|argument| argument == "fidelity") {
+        match ahrb::hbench::parse_fidelity(&args[1..]) {
+            Ok(options) => match ahrb::hbench::execute_fidelity(options).await {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("hbench: {error}");
+                    2
+                }
+            },
+            Err(error) => {
+                eprintln!("hbench: {error}");
+                2
+            }
+        }
     } else {
         match ahrb::hbench::parse(&args) {
             Ok(options) => match ahrb::hbench::execute(options).await {

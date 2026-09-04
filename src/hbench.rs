@@ -104,26 +104,40 @@ pub fn parse(args: &[String]) -> Result<Options> {
 
 /// Parse `hbench economy <name>` using the same adapter and output flags.
 pub fn parse_economy(args: &[String]) -> Result<Options> {
+    parse_isolated_pillar(args, "economy")
+}
+
+/// Parse `hbench fidelity <name>` using the same adapter and output flags.
+pub fn parse_fidelity(args: &[String]) -> Result<Options> {
+    parse_isolated_pillar(args, "fidelity")
+}
+
+fn parse_isolated_pillar(args: &[String], pillar: &str) -> Result<Options> {
     let options = parse(args)?;
     if !options.tests.is_empty() {
-        return Err(AhrbError::Usage(
-            "--tests cannot be combined with hbench economy".to_owned(),
-        ));
+        return Err(AhrbError::Usage(format!(
+            "--tests cannot be combined with hbench {pillar}"
+        )));
     }
     Ok(options)
 }
 
 /// Resolve, availability-check, and execute the complete matrix.
 pub async fn execute(options: Options) -> Result<i32> {
-    execute_pillar(options, false).await
+    execute_pillar(options, None).await
 }
 
 /// Resolve, availability-check, and execute the isolated economy pillar.
 pub async fn execute_economy(options: Options) -> Result<i32> {
-    execute_pillar(options, true).await
+    execute_pillar(options, Some("economy")).await
 }
 
-async fn execute_pillar(options: Options, economy: bool) -> Result<i32> {
+/// Resolve, availability-check, and execute the isolated fidelity pillar.
+pub async fn execute_fidelity(options: Options) -> Result<i32> {
+    execute_pillar(options, Some("fidelity")).await
+}
+
+async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
     let manifest = resolve_bundled_manifest(&options.name).map_err(|error| {
         unavailable_error(
             &options.name,
@@ -154,16 +168,19 @@ async fn execute_pillar(options: Options, economy: bool) -> Result<i32> {
         no_save: options.no_save,
         harness_version: doctor.version,
     };
-    if economy {
-        crate::runner::run_economy(run_options).await
-    } else {
-        crate::runner::run(run_options).await
+    match pillar {
+        Some("economy") => crate::runner::run_economy(run_options).await,
+        Some("fidelity") => crate::runner::run_fidelity(run_options).await,
+        Some(other) => Err(AhrbError::Usage(format!(
+            "unknown isolated pillar {other:?}"
+        ))),
+        None => crate::runner::run(run_options).await,
     }
 }
 
 /// One-line command synopsis.
 pub fn usage() -> &'static str {
-    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy <codex|claude-code|opencode|pi|rick|haider|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
+    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy|fidelity <codex|claude-code|opencode|pi|rick|haider|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
 }
 
 fn unavailable_error(name: &str, detail: &str) -> AhrbError {
@@ -258,6 +275,18 @@ mod tests {
         assert_eq!(parsed.profile, Profile::Cert);
         assert!(
             parse_economy(&["mock".to_owned(), "--tests".to_owned(), "1".to_owned(),]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fidelity_shorthand_accepts_mock_and_rejects_rows() -> Result<()> {
+        let parsed =
+            parse_fidelity(&["mock".to_owned(), "--profile".to_owned(), "cert".to_owned()])?;
+        assert_eq!(parsed.name, "mock");
+        assert_eq!(parsed.profile, Profile::Cert);
+        assert!(
+            parse_fidelity(&["mock".to_owned(), "--tests".to_owned(), "1".to_owned()]).is_err()
         );
         Ok(())
     }

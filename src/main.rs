@@ -7,9 +7,9 @@ async fn main() {
     let code = match ahrb::cli::parse(&args) {
         Ok(command) => {
             let run_options = match &command {
-                ahrb::cli::Command::Run(options) | ahrb::cli::Command::Economy(options) => {
-                    Some(options.clone())
-                }
+                ahrb::cli::Command::Run(options)
+                | ahrb::cli::Command::Economy(options)
+                | ahrb::cli::Command::Fidelity(options) => Some(options.clone()),
                 _ => None,
             };
             match ahrb::cli::execute(command).await {

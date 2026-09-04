@@ -2,6 +2,7 @@
 
 use crate::economy::EconomySummary;
 use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
+use crate::fidelity::FidelitySummary;
 use crate::manifest::Manifest;
 use crate::process::{ProcIdentity, ProcOwnership, ProcessSample, Sample};
 use crate::sampler::cadence_quality;
@@ -1197,6 +1198,9 @@ pub struct Report {
     /// Third-pillar harness-economy summary. Absent from ordinary v1/v2 runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub economy_summary: Option<EconomySummary>,
+    /// Long-horizon request-context fidelity summary. Absent from other pillars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity_summary: Option<FidelitySummary>,
     /// Raw resource samples.
     pub samples: Vec<Sample>,
     /// Raw row-46 continuous whole-tree counter samples.
@@ -1461,7 +1465,57 @@ pub fn render_markdown(report: &Report) -> String {
             }
         }
     }
-    if report.economy_summary.is_none() {
+    if let Some(summary) = &report.fidelity_summary {
+        let survival_curve = summary
+            .survival_curve
+            .iter()
+            .map(|fraction| format!("{fraction:.6}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tool_result_curve = summary
+            .retained_tool_result_fraction
+            .iter()
+            .map(|fraction| format!("{fraction:.6}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(output, "## Long-horizon context fidelity\n");
+        let _ = writeln!(output, "{}.\n", summary.measurement_label);
+        let _ = writeln!(
+            output,
+            "| Harness | Primary requests | Final needle survival | First loss turn | End reason | End turn | Internal cap | Workspace |"
+        );
+        let _ = writeln!(output, "|---|---:|---:|---:|---|---:|---|---|");
+        let _ = writeln!(
+            output,
+            "| `{}` | {} | {:.6} | {} | {} | {} | {} | {} |\n",
+            report.fingerprint.harness,
+            summary.model_turns,
+            summary.needle_survival_fraction,
+            summary
+                .first_loss_turn
+                .map_or_else(|| "none".to_owned(), |turn| turn.to_string()),
+            crate::fidelity::end_reason_name(summary.end_reason),
+            summary.end_turn,
+            summary.internal_cap_detected,
+            crate::fidelity::workspace_state_name(summary.workspace_state),
+        );
+        let _ = writeln!(
+            output,
+            "Needle curve: `[{}]`. {}.\n",
+            survival_curve, summary.survival_curve_label,
+        );
+        let _ = writeln!(
+            output,
+            "Tool-result retention curve: `[{}]`. {}.\n",
+            tool_result_curve, summary.retained_tool_result_fraction_label,
+        );
+        let _ = writeln!(
+            output,
+            "End-state note: {}. Workspace note: {}.\n",
+            summary.end_reason_label, summary.workspace_state_label,
+        );
+    }
+    if report.economy_summary.is_none() && report.fidelity_summary.is_none() {
         let _ = writeln!(output, "| Row | Pillar | Test | Outcome |");
         let _ = writeln!(output, "|---:|---|---|---|");
         let mut results: Vec<&TestResult> = report.results.iter().collect();

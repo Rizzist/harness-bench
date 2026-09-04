@@ -1173,6 +1173,10 @@ pub trait Driver: Send {
     }
     /// Create an isolated session.
     fn create_session(&mut self, marker: &str) -> DriverFuture<'_, SessionId>;
+    /// Driver-owned actor workspace for a created session, when this topology exposes it.
+    fn session_workspace(&self, _session: &SessionId) -> Option<PathBuf> {
+        None
+    }
     /// Submit a prompt with an idempotency key.
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()>;
     /// Path receiving the active invocation's live structured event stream,
@@ -1362,6 +1366,7 @@ pub struct GenericDriver<T: Transport> {
     /// Manifest-selected operation names.
     pub operations: DriverOperations,
     lifecycle_notes: Vec<String>,
+    session_workspaces: BTreeMap<String, PathBuf>,
 }
 
 /// Semantic operation names used by a transport-backed driver.
@@ -1443,6 +1448,7 @@ impl<T: Transport> GenericDriver<T> {
             transport,
             operations: DriverOperations::default(),
             lifecycle_notes: Vec::new(),
+            session_workspaces: BTreeMap::new(),
         }
     }
 
@@ -1483,8 +1489,17 @@ impl<T: Transport> Driver for GenericDriver<T> {
         let operation = self.operations.create_session.clone();
         Box::pin(async move {
             let value = self.call(&operation, json!({ "marker": marker })).await?;
-            extract_session_id(&value)
+            let session = extract_session_id(&value)?;
+            if let Some(workspace) = value.pointer("/workspace_path").and_then(Value::as_str) {
+                self.session_workspaces
+                    .insert(session.0.clone(), PathBuf::from(workspace));
+            }
+            Ok(session)
         })
+    }
+
+    fn session_workspace(&self, session: &SessionId) -> Option<PathBuf> {
+        self.session_workspaces.get(&session.0).cloned()
     }
 
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()> {
@@ -2952,6 +2967,10 @@ impl Driver for PerInvocationDriver {
             );
             Ok(SessionId(id))
         })
+    }
+
+    fn session_workspace(&self, session: &SessionId) -> Option<PathBuf> {
+        Some(self.session_directory(&session.0).join("workspace"))
     }
 
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()> {

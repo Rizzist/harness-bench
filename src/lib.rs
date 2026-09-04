@@ -11,6 +11,7 @@ pub mod evaluate;
 pub mod events;
 pub mod evidence_collectors;
 pub mod fake_model;
+pub mod fidelity;
 pub mod hbench;
 pub mod manifest;
 pub mod matrix_evidence;

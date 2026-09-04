@@ -4,7 +4,8 @@ AHRB is a standalone Rust benchmark for coding-agent harnesses. It replaces real
 inference with deterministic local responses, then checks tool-call correctness,
 functionality, whole-process-tree resources, and unattended automation readiness.
 The separate harness-economy pillar measures how economically a harness drives one
-standardized fake-model task to its scripted terminal.
+standardized fake-model task to its scripted terminal. The context-fidelity pillar
+measures exact long-horizon context retention at the fake-provider boundary.
 
 The benchmark never needs a model credential, database, container, Python runtime, or
 external service. A built-in reference harness exercises the complete pipeline.
@@ -19,6 +20,8 @@ cargo run --locked --bin ahrb -- doctor --manifest adapters/mock/manifest.toml
 cargo run --locked --bin ahrb -- list-tests
 cargo run --locked --bin ahrb -- run --manifest adapters/mock/manifest.toml --profile quick
 cargo run --locked --bin ahrb -- run --pillar economy \
+  --manifest adapters/mock/manifest.toml --profile quick
+cargo run --locked --bin ahrb -- run --pillar fidelity \
   --manifest adapters/mock/manifest.toml --profile quick
 ```
 
@@ -52,6 +55,13 @@ model turns, total reference request tokens, tool calls and batching factor, pea
 carried context, scripted-terminal completion, and reference cost. Reference-token
 and cost values are deterministic comparison proxies, not provider usage or a bill.
 The complete contract is in [`docs/SPEC-v3-economy.md`](docs/SPEC-v3-economy.md).
+
+Run the long-horizon fidelity pillar independently with `hbench fidelity mock` or
+`ahrb run --pillar fidelity`. Its 24-request quick and 44-request cert variants emit
+a typed `fidelity_summary` with structural-needle survival, byte-identical tool-result
+retention, and typed end/workspace evidence. These are serialized-request observations,
+not claims about model understanding or task success. The complete contract is in
+[`docs/SPEC-v3-fidelity.md`](docs/SPEC-v3-fidelity.md).
 
 ## Deadlines and saved results
 

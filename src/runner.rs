@@ -2669,31 +2669,55 @@ pub async fn run_economy(mut options: RunOptions) -> Result<i32> {
     }
 }
 
-async fn run_economy_inner(
-    options: RunOptions,
-    manifest: Manifest,
-    persistence: crate::results::RunPersistence,
-) -> Result<i32> {
-    let manifest_hash = crate::manifest::hash(&manifest)?;
-    let profile_root = persistence.profile_path.clone();
-    prepare_profile(&manifest, &profile_root)
-        .map_err(|error| AhrbError::Protocol(format!("prepare economy profile: {error}")))?;
-    let workflow = economy_workflow(&manifest)?;
-    workflow.validate()?;
+struct ScriptedPillarRuntime {
+    engine: Arc<FakeModelEngine>,
+    server: ModelServer,
+    driver: HarnessDriver,
+}
+
+async fn start_scripted_pillar_runtime(
+    manifest: &Manifest,
+    manifest_hash: &str,
+    workflow: &Workflow,
+    profile_root: &Path,
+    pillar: &str,
+    task_workspace: Option<&Path>,
+) -> Result<ScriptedPillarRuntime> {
     let engine = Arc::new(FakeModelEngine::with_request_roles(
-        &workflow,
+        workflow,
         &manifest.model_roles,
         &manifest.request_role_rules,
     )?);
+    start_scripted_pillar_runtime_with_engine(
+        manifest,
+        manifest_hash,
+        workflow,
+        profile_root,
+        pillar,
+        task_workspace,
+        engine,
+    )
+    .await
+}
+
+async fn start_scripted_pillar_runtime_with_engine(
+    manifest: &Manifest,
+    manifest_hash: &str,
+    workflow: &Workflow,
+    profile_root: &Path,
+    pillar: &str,
+    task_workspace: Option<&Path>,
+    engine: Arc<FakeModelEngine>,
+) -> Result<ScriptedPillarRuntime> {
     let (server, model_environment) = start_model(
         Arc::clone(&engine),
-        &workflow,
-        &profile_root,
+        workflow,
+        profile_root,
         false,
         &manifest.fake_model.base_url_env,
     )
     .await
-    .map_err(|error| AhrbError::Protocol(format!("start economy fake model: {error}")))?;
+    .map_err(|error| AhrbError::Protocol(format!("start {pillar} fake model: {error}")))?;
     let mut variables = BTreeMap::from([
         (
             "profile".to_owned(),
@@ -2701,9 +2725,9 @@ async fn run_economy_inner(
         ),
         ("endpoint".to_owned(), String::new()),
     ]);
-    let hash_prefix = manifest_hash.get(..16).unwrap_or(manifest_hash.as_str());
-    let credential = format!("ahrb-{hash_prefix}-economy-{}", std::process::id());
-    let mut environment = isolated_environment(&manifest, &variables)?;
+    let hash_prefix = manifest_hash.get(..16).unwrap_or(manifest_hash);
+    let credential = format!("ahrb-{hash_prefix}-{pillar}-{}", std::process::id());
+    let mut environment = isolated_environment(manifest, &variables)?;
     environment.extend(model_environment);
     environment.insert(
         manifest.fake_model.credential_env.clone(),
@@ -2721,7 +2745,13 @@ async fn run_economy_inner(
         "AHRB_MOCK_TURN_TIMEOUT_MS".to_owned(),
         manifest.resources.turn_timeout_ms.to_string(),
     );
-    inject_tariff_environment(&manifest, &mut environment);
+    if let Some(workspace) = task_workspace {
+        environment.insert(
+            "AHRB_FIDELITY_WORKSPACE".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        );
+    }
+    inject_tariff_environment(manifest, &mut environment);
     variables.insert(
         "base_url".to_owned(),
         environment
@@ -2731,7 +2761,7 @@ async fn run_economy_inner(
     );
     variables.insert("credential".to_owned(), credential);
     variables.insert("model".to_owned(), manifest.fake_model.model.clone());
-    write_generated_files(&manifest, &variables, &profile_root)?;
+    write_generated_files(manifest, &variables, profile_root)?;
     if !manifest.hooks.acceptance.is_empty() {
         let hook = render_argv(&manifest.hooks.acceptance, &variables)?;
         environment.insert(
@@ -2752,21 +2782,52 @@ async fn run_economy_inner(
         render_argv(&manifest.transport.command, &variables)?
     };
     let mut driver = make_driver_with_timeout(
-        &manifest,
+        manifest,
         &command,
         &environment,
         &variables,
-        &profile_root,
+        profile_root,
         false,
-        outer_turn_timeout(&manifest),
+        outer_turn_timeout(manifest),
     )?;
     driver
         .start()
         .await
-        .map_err(|error| AhrbError::Protocol(format!("start economy harness driver: {error}")))?;
+        .map_err(|error| AhrbError::Protocol(format!("start {pillar} harness driver: {error}")))?;
     driver.await_readiness().await.map_err(|error| {
-        AhrbError::Protocol(format!("await economy harness readiness: {error}"))
+        AhrbError::Protocol(format!("await {pillar} harness readiness: {error}"))
     })?;
+    Ok(ScriptedPillarRuntime {
+        engine,
+        server,
+        driver,
+    })
+}
+
+async fn run_economy_inner(
+    options: RunOptions,
+    manifest: Manifest,
+    persistence: crate::results::RunPersistence,
+) -> Result<i32> {
+    let manifest_hash = crate::manifest::hash(&manifest)?;
+    let profile_root = persistence.profile_path.clone();
+    prepare_profile(&manifest, &profile_root)
+        .map_err(|error| AhrbError::Protocol(format!("prepare economy profile: {error}")))?;
+    let workflow = economy_workflow(&manifest)?;
+    workflow.validate()?;
+    let ScriptedPillarRuntime {
+        engine,
+        server,
+        mut driver,
+    } = start_scripted_pillar_runtime(
+        &manifest,
+        &manifest_hash,
+        &workflow,
+        &profile_root,
+        "economy",
+        None,
+    )
+    .await?;
     let actor = workflow
         .actors
         .get("economy")
@@ -2945,6 +3006,937 @@ async fn run_economy_inner(
         println!("{}", crate::economy::render_summary(summary));
     }
     Ok(0)
+}
+
+/// Execute the isolated long-horizon context-fidelity task and persist its report.
+pub async fn run_fidelity(mut options: RunOptions) -> Result<i32> {
+    let manifest = crate::manifest::load(&options.manifest)?;
+    let persistence = crate::results::prepare(&options, &manifest)?;
+    options.output = persistence.output.clone();
+    let deadline_secs = crate::cli::deadline_secs(&options)?;
+    let started = tokio::time::Instant::now();
+    let deadline_at = started
+        .checked_add(Duration::from_secs(deadline_secs))
+        .ok_or_else(|| AhrbError::Validation("fidelity deadline overflows Instant".to_owned()))?;
+    let outcome = run_fidelity_inner(options, manifest, persistence, deadline_at).await;
+    let cleanup = ensure_owned_cleanup();
+    match (outcome, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(code), Ok(())) => Ok(code),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FidelityCollectionOutcome {
+    Terminal,
+    Deadline,
+    Failed,
+}
+
+struct FidelityCollection {
+    events: Vec<NormalizedEvent>,
+    outcome: FidelityCollectionOutcome,
+    failure_detail: Option<String>,
+}
+
+async fn collect_fidelity_terminal(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    deadline_at: tokio::time::Instant,
+) -> FidelityCollection {
+    let mut latest_events = Vec::new();
+    loop {
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return FidelityCollection {
+                events: latest_events,
+                outcome: FidelityCollectionOutcome::Deadline,
+                failure_detail: None,
+            };
+        }
+        let attachment = tokio::time::timeout(remaining, driver.attach(session, None)).await;
+        match attachment {
+            Ok(Ok(events)) => {
+                latest_events = events;
+                if latest_events.iter().any(|event| is_terminal(&event.event)) {
+                    return FidelityCollection {
+                        events: latest_events,
+                        outcome: FidelityCollectionOutcome::Terminal,
+                        failure_detail: None,
+                    };
+                }
+            }
+            Ok(Err(error)) => {
+                return FidelityCollection {
+                    events: latest_events,
+                    outcome: FidelityCollectionOutcome::Failed,
+                    failure_detail: Some(format!("attach failed: {error}")),
+                };
+            }
+            Err(_) => {
+                return FidelityCollection {
+                    events: latest_events,
+                    outcome: FidelityCollectionOutcome::Deadline,
+                    failure_detail: None,
+                };
+            }
+        }
+        if matches!(driver.client_exit(session), ClientExit::Exited(_)) {
+            return FidelityCollection {
+                events: latest_events,
+                outcome: FidelityCollectionOutcome::Failed,
+                failure_detail: Some("session client exited before a terminal".to_owned()),
+            };
+        }
+        match driver.harness_exit() {
+            Ok(ClientExit::Exited(_)) => {
+                return FidelityCollection {
+                    events: latest_events,
+                    outcome: FidelityCollectionOutcome::Failed,
+                    failure_detail: Some("harness process exited before a terminal".to_owned()),
+                };
+            }
+            Err(error) => {
+                return FidelityCollection {
+                    events: latest_events,
+                    outcome: FidelityCollectionOutcome::Failed,
+                    failure_detail: Some(format!("inspect harness exit: {error}")),
+                };
+            }
+            Ok(ClientExit::NotApplicable | ClientExit::Running) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(10).min(remaining)).await;
+    }
+}
+
+struct FidelityExecution {
+    runtime: Option<ScriptedPillarRuntime>,
+    session: Option<crate::driver::SessionId>,
+    collection: FidelityCollection,
+    workspace_path: Option<PathBuf>,
+    workspace_before: Option<Row61TreeSnapshot>,
+    filesystem_snapshots: Vec<FilesystemSnapshot>,
+}
+
+fn fidelity_execution_stopped(
+    runtime: Option<ScriptedPillarRuntime>,
+    session: Option<crate::driver::SessionId>,
+    outcome: FidelityCollectionOutcome,
+    detail: Option<String>,
+) -> FidelityExecution {
+    FidelityExecution {
+        runtime,
+        session,
+        collection: FidelityCollection {
+            events: Vec::new(),
+            outcome,
+            failure_detail: detail,
+        },
+        workspace_path: None,
+        workspace_before: None,
+        filesystem_snapshots: Vec::new(),
+    }
+}
+
+fn fidelity_actor_workspace(
+    manifest: &Manifest,
+    profile_root: &Path,
+    driver: &HarnessDriver,
+    session: &crate::driver::SessionId,
+) -> Result<PathBuf> {
+    let path = if let Some(path) = driver.session_workspace(session) {
+        path
+    } else if let Some(template) = manifest.fidelity.workspace_path.as_ref() {
+        let variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("session_id".to_owned(), session.0.clone()),
+        ]);
+        PathBuf::from(crate::manifest::render_template(template, &variables)?)
+    } else {
+        return Err(AhrbError::Validation(
+            "non-exec fidelity adapter must expose /workspace_path from session.create or declare fidelity.workspace_path"
+                .to_owned(),
+        ));
+    };
+    validate_fidelity_workspace_path(profile_root, &path)?;
+    Ok(path)
+}
+
+fn validate_fidelity_workspace_path(profile_root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(profile_root).map_err(|_| {
+        AhrbError::Validation(format!(
+            "fidelity actor workspace {} escapes fresh profile {}",
+            path.display(),
+            profile_root.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(AhrbError::Validation(format!(
+            "fidelity actor workspace {} is not a nonempty normalized child of fresh profile {}",
+            path.display(),
+            profile_root.display()
+        )));
+    }
+
+    if std::fs::symlink_metadata(profile_root)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(AhrbError::Validation(format!(
+            "fidelity profile root {} cannot be a symlink",
+            profile_root.display()
+        )));
+    }
+    let mut cursor = profile_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(AhrbError::Validation(
+                "fidelity actor workspace changed while validating components".to_owned(),
+            ));
+        };
+        cursor.push(part);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(AhrbError::Validation(format!(
+                    "fidelity actor workspace component {} cannot be a symlink",
+                    cursor.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_fidelity_run(
+    manifest: &Manifest,
+    manifest_hash: &str,
+    workflow: &Workflow,
+    profile_root: &Path,
+    task_workspace: &Path,
+    expected_fixture_paths: &BTreeSet<PathBuf>,
+    engine: Arc<FakeModelEngine>,
+    deadline_at: tokio::time::Instant,
+) -> FidelityExecution {
+    let runtime = match tokio::time::timeout_at(
+        deadline_at,
+        start_scripted_pillar_runtime_with_engine(
+            manifest,
+            manifest_hash,
+            workflow,
+            profile_root,
+            "fidelity",
+            (manifest.transport.kind != TransportKind::Exec).then_some(task_workspace),
+            engine,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(runtime)) => runtime,
+        Ok(Err(error)) => {
+            return fidelity_execution_stopped(
+                None,
+                None,
+                FidelityCollectionOutcome::Failed,
+                Some(format!("start fidelity runtime: {error}")),
+            );
+        }
+        Err(_) => {
+            return fidelity_execution_stopped(
+                None,
+                None,
+                FidelityCollectionOutcome::Deadline,
+                None,
+            );
+        }
+    };
+    let mut execution = FidelityExecution {
+        runtime: Some(runtime),
+        session: None,
+        collection: FidelityCollection {
+            events: Vec::new(),
+            outcome: FidelityCollectionOutcome::Failed,
+            failure_detail: None,
+        },
+        workspace_path: None,
+        workspace_before: None,
+        filesystem_snapshots: Vec::new(),
+    };
+    let scenario = workflow.scenario.clone();
+    let session = {
+        let runtime = match execution.runtime.as_mut() {
+            Some(runtime) => runtime,
+            None => return execution,
+        };
+        match tokio::time::timeout_at(
+            deadline_at,
+            runtime
+                .driver
+                .create_session(&format!("{scenario}:fidelity")),
+        )
+        .await
+        {
+            Ok(Ok(session)) => session,
+            Ok(Err(error)) => {
+                execution.collection.failure_detail =
+                    Some(format!("create fidelity session: {error}"));
+                return execution;
+            }
+            Err(_) => {
+                execution.collection.outcome = FidelityCollectionOutcome::Deadline;
+                return execution;
+            }
+        }
+    };
+    execution.session = Some(session.clone());
+    let workspace_path = {
+        let Some(runtime) = execution.runtime.as_ref() else {
+            return execution;
+        };
+        match fidelity_actor_workspace(manifest, profile_root, &runtime.driver, &session) {
+            Ok(path) => path,
+            Err(error) => {
+                execution.collection.failure_detail =
+                    Some(format!("resolve fidelity actor workspace: {error}"));
+                return execution;
+            }
+        }
+    };
+    let workspace_before = match row61_tree_snapshot(&workspace_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            execution.collection.failure_detail = Some(format!(
+                "snapshot fidelity actor workspace before submit: {error}"
+            ));
+            return execution;
+        }
+    };
+    if let Err(error) = fidelity_snapshot_expected_files(
+        profile_root,
+        &workspace_path,
+        expected_fixture_paths,
+        "fidelity-before",
+        &mut execution.filesystem_snapshots,
+    ) {
+        execution.collection.failure_detail = Some(format!(
+            "snapshot fidelity fixture files before submit: {error}"
+        ));
+        return execution;
+    }
+    execution.workspace_path = Some(workspace_path);
+    execution.workspace_before = Some(workspace_before);
+    let actor_prompt = workflow
+        .actors
+        .get("fidelity")
+        .map(|actor| actor.prompt.clone());
+    let Some(actor_prompt) = actor_prompt else {
+        execution.collection.failure_detail =
+            Some("fidelity workflow actor disappeared".to_owned());
+        return execution;
+    };
+    {
+        let runtime = match execution.runtime.as_mut() {
+            Some(runtime) => runtime,
+            None => return execution,
+        };
+        match tokio::time::timeout_at(
+            deadline_at,
+            runtime
+                .driver
+                .submit(&session, &actor_prompt, "fidelity-task"),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                execution.collection.failure_detail =
+                    Some(format!("submit fidelity task: {error}"));
+                return execution;
+            }
+            Err(_) => {
+                execution.collection.outcome = FidelityCollectionOutcome::Deadline;
+                return execution;
+            }
+        }
+    }
+    if let Some(runtime) = execution.runtime.as_mut() {
+        execution.collection =
+            collect_fidelity_terminal(&mut runtime.driver, &session, deadline_at).await;
+    }
+    execution
+}
+
+fn fidelity_harness_exit(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+) -> Result<(crate::fidelity::HarnessExitStatus, Option<i32>)> {
+    let observed = match driver.client_exit(session) {
+        ClientExit::NotApplicable => driver.harness_exit()?,
+        status => status,
+    };
+    Ok(match observed {
+        ClientExit::NotApplicable => (crate::fidelity::HarnessExitStatus::NotApplicable, None),
+        ClientExit::Running => (crate::fidelity::HarnessExitStatus::Running, None),
+        ClientExit::Exited(Some(code)) => {
+            (crate::fidelity::HarnessExitStatus::ExitCode, Some(code))
+        }
+        ClientExit::Exited(None) => (crate::fidelity::HarnessExitStatus::SignalOrUnknown, None),
+    })
+}
+
+fn fidelity_snapshot_expected_files(
+    profile_root: &Path,
+    task_workspace: &Path,
+    expected_paths: &BTreeSet<PathBuf>,
+    boundary: &str,
+    snapshots: &mut Vec<FilesystemSnapshot>,
+) -> Result<()> {
+    for relative in expected_paths {
+        let path = task_workspace.join(relative);
+        let _ = row47_snapshot_file(
+            &path,
+            profile_root,
+            1,
+            boundary,
+            "fidelity-scripted-fixture",
+            snapshots,
+        )?;
+    }
+    Ok(())
+}
+
+async fn run_fidelity_inner(
+    options: RunOptions,
+    manifest: Manifest,
+    persistence: crate::results::RunPersistence,
+    deadline_at: tokio::time::Instant,
+) -> Result<i32> {
+    let manifest_hash = crate::manifest::hash(&manifest)?;
+    let profile_root = persistence.profile_path.clone();
+    prepare_profile(&manifest, &profile_root)
+        .map_err(|error| AhrbError::Protocol(format!("prepare fidelity profile: {error}")))?;
+    let profile = format!("{:?}", options.profile).to_lowercase();
+    let turn_budget = fidelity_turn_budget(options.profile);
+    let mut task_workspace = profile_root.join("fidelity-workspace");
+    std::fs::create_dir(&task_workspace)?;
+    let task = fidelity_workflow(&manifest, options.profile, &task_workspace)?;
+    task.workflow.validate()?;
+    let mut filesystem_snapshots = Vec::new();
+    let mut before_receipt = row61_tree_snapshot(&task_workspace)?;
+    fidelity_snapshot_expected_files(
+        &profile_root,
+        &task_workspace,
+        &task.expected_fixture_paths,
+        "fidelity-before",
+        &mut filesystem_snapshots,
+    )?;
+    let engine = Arc::new(FakeModelEngine::with_request_roles(
+        &task.workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?);
+    let mut execution = execute_fidelity_run(
+        &manifest,
+        &manifest_hash,
+        &task.workflow,
+        &profile_root,
+        &task_workspace,
+        &task.expected_fixture_paths,
+        Arc::clone(&engine),
+        deadline_at,
+    )
+    .await;
+    if let Some(workspace) = execution.workspace_path.clone() {
+        if let Some(receipt) = execution.workspace_before.take() {
+            before_receipt = receipt;
+        }
+        filesystem_snapshots.append(&mut execution.filesystem_snapshots);
+        task_workspace = workspace;
+    }
+    let mut lifecycle_notes = execution
+        .collection
+        .failure_detail
+        .iter()
+        .map(|detail| format!("fidelity observation failed: {detail}"))
+        .collect::<Vec<_>>();
+    let (harness_exit_status, harness_exit_code) =
+        match (execution.runtime.as_mut(), execution.session.as_ref()) {
+            (Some(runtime), Some(session)) => {
+                match fidelity_harness_exit(&mut runtime.driver, session) {
+                    Ok(exit) => exit,
+                    Err(error) => {
+                        execution.collection.outcome = FidelityCollectionOutcome::Failed;
+                        lifecycle_notes.push(format!("inspect fidelity harness exit: {error}"));
+                        (crate::fidelity::HarnessExitStatus::SignalOrUnknown, None)
+                    }
+                }
+            }
+            (Some(runtime), None) => match runtime.driver.harness_exit() {
+                Ok(ClientExit::Running) => (crate::fidelity::HarnessExitStatus::Running, None),
+                Ok(ClientExit::Exited(Some(code))) => {
+                    (crate::fidelity::HarnessExitStatus::ExitCode, Some(code))
+                }
+                Ok(ClientExit::Exited(None)) => {
+                    (crate::fidelity::HarnessExitStatus::SignalOrUnknown, None)
+                }
+                Ok(ClientExit::NotApplicable) => {
+                    (crate::fidelity::HarnessExitStatus::NotApplicable, None)
+                }
+                Err(error) => {
+                    execution.collection.outcome = FidelityCollectionOutcome::Failed;
+                    lifecycle_notes.push(format!("inspect fidelity harness exit: {error}"));
+                    (crate::fidelity::HarnessExitStatus::SignalOrUnknown, None)
+                }
+            },
+            (None, _) => (crate::fidelity::HarnessExitStatus::NotApplicable, None),
+        };
+    validate_fidelity_workspace_path(&profile_root, &task_workspace)?;
+    let after_receipt = row61_tree_snapshot(&task_workspace)?;
+    fidelity_snapshot_expected_files(
+        &profile_root,
+        &task_workspace,
+        &task.expected_fixture_paths,
+        "fidelity-after",
+        &mut filesystem_snapshots,
+    )?;
+    let records = engine.request_records().await;
+    let primary_request_count = records
+        .iter()
+        .filter(|record| record.role == "primary")
+        .count();
+    let request_stream_stalled = execution.collection.outcome
+        == FidelityCollectionOutcome::Deadline
+        && manifest
+            .fidelity
+            .declared_turn_ceiling
+            .is_some_and(|ceiling| {
+                u64::try_from(primary_request_count).is_ok_and(|count| count >= ceiling)
+            });
+    if let Some(mut runtime) = execution.runtime.take() {
+        if execution.collection.outcome == FidelityCollectionOutcome::Deadline
+            && let Some(session) = execution.session.as_ref()
+        {
+            if let Err(error) = runtime.driver.cancel(session).await {
+                lifecycle_notes.push(format!(
+                    "fidelity session cancel failed after evidence: {error}"
+                ));
+            }
+        }
+        if let Some(session) = execution.session.as_ref()
+            && (manifest.transport.kind == TransportKind::Exec
+                || !manifest.sessions.close_delete.is_empty())
+            && let Err(error) = runtime.driver.close(session).await
+        {
+            lifecycle_notes.push(format!(
+                "fidelity session close failed after evidence: {error}"
+            ));
+        }
+        if let Err(error) = runtime.driver.shutdown().await {
+            lifecycle_notes.push(format!(
+                "fidelity harness shutdown failed after evidence: {error}"
+            ));
+        }
+        lifecycle_notes.extend(runtime.driver.lifecycle_notes());
+        if let Err(error) = runtime.server.shutdown().await {
+            lifecycle_notes.push(format!(
+                "fidelity fake-model shutdown failed after evidence: {error}"
+            ));
+        }
+    }
+    let workspace_state = if before_receipt.sha256 == after_receipt.sha256 {
+        crate::fidelity::WorkspaceState::Untouched
+    } else {
+        crate::fidelity::WorkspaceState::Mutated
+    };
+    let fidelity_summary = crate::fidelity::analyze(
+        &records,
+        &execution.collection.events,
+        &profile,
+        turn_budget,
+        crate::fidelity::FidelityRunEvidence {
+            deadline_reached: execution.collection.outcome == FidelityCollectionOutcome::Deadline,
+            collection_failed: execution.collection.outcome == FidelityCollectionOutcome::Failed,
+            request_stream_stalled,
+            harness_exit_status,
+            harness_exit_code,
+            declared_turn_ceiling: manifest.fidelity.declared_turn_ceiling,
+            internal_cap_exit_codes: manifest.fidelity.internal_cap_exit_codes.clone(),
+            workspace_state,
+            workspace_receipt_before_sha256: before_receipt.sha256,
+            workspace_receipt_after_sha256: after_receipt.sha256,
+        },
+    )?;
+    let workflow_bytes = serde_json::to_vec(&task.workflow)?;
+    let workflow_sha256 = format!("{:x}", Sha256::digest(workflow_bytes));
+    let mut run_digest = Sha256::new();
+    run_digest.update(manifest_hash.as_bytes());
+    run_digest.update(crate::fidelity::FIDELITY_TASK_ID.as_bytes());
+    run_digest.update(profile.as_bytes());
+    let run_hash = format!("{:x}", run_digest.finalize());
+    let run_prefix = run_hash.get(..16).unwrap_or(run_hash.as_str());
+    let model_requests = records
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let raw_events = execution
+        .collection
+        .events
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let metrics = BTreeMap::from([
+        (
+            "fidelity.model_turns".to_owned(),
+            fidelity_summary.model_turns as f64,
+        ),
+        (
+            "fidelity.needle_survival_fraction".to_owned(),
+            fidelity_summary.needle_survival_fraction,
+        ),
+        (
+            "fidelity.end_turn".to_owned(),
+            fidelity_summary.end_turn as f64,
+        ),
+        (
+            "fidelity.internal_cap_detected".to_owned(),
+            f64::from(u8::from(fidelity_summary.internal_cap_detected)),
+        ),
+        (
+            "fidelity.workspace_mutated".to_owned(),
+            f64::from(u8::from(
+                fidelity_summary.workspace_state == crate::fidelity::WorkspaceState::Mutated,
+            )),
+        ),
+    ]);
+    let report = Report {
+        schema: 3,
+        spec_version: 3,
+        run_id: format!("ahrb-fidelity-{run_prefix}"),
+        profile_path: profile_root.to_string_lossy().into_owned(),
+        fingerprint: Fingerprint {
+            harness: manifest.identity.id.clone(),
+            harness_version: persistence.harness_version.clone(),
+            manifest: manifest_hash,
+            workflows: workflow_sha256,
+            fake_model: env!("CARGO_PKG_VERSION").to_owned(),
+            normalizer: env!("CARGO_PKG_VERSION").to_owned(),
+            ahrb_revision: crate::results::ahrb_revision(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            host_memory_bytes: host_memory_bytes(),
+            profile: profile.clone(),
+        },
+        metrics,
+        lifecycle_notes,
+        resource_summary: ResourceSummary {
+            topology: manifest.concurrency.topology,
+            profile,
+            comparison_scope: "cross-topology-fidelity-only".to_owned(),
+            ..ResourceSummary::default()
+        },
+        fidelity_summary: Some(fidelity_summary),
+        events: raw_events,
+        model_requests,
+        filesystem_snapshots,
+        ..Report::default()
+    };
+    crate::results::persist_report(&persistence, &report, options.junit, false)?;
+    if let Some(summary) = &report.fidelity_summary {
+        println!("{}", crate::fidelity::render_summary(summary));
+    }
+    Ok(0)
+}
+
+fn fidelity_turn_budget(profile: Profile) -> u64 {
+    match profile {
+        Profile::Quick => 24,
+        Profile::Cert => 44,
+    }
+}
+
+struct FidelityTask {
+    workflow: Workflow,
+    expected_fixture_paths: BTreeSet<PathBuf>,
+}
+
+fn fidelity_workflow(
+    manifest: &Manifest,
+    profile: Profile,
+    task_workspace: &Path,
+) -> Result<FidelityTask> {
+    let scenario = crate::fidelity::FIDELITY_TASK_ID.to_owned();
+    let actor = "fidelity".to_owned();
+    let marker = |checkpoint: &str| route_marker(&scenario, &actor, checkpoint);
+    let response = |checkpoint: String, value: Value| ScriptedResponse {
+        scenario: scenario.clone(),
+        actor: actor.clone(),
+        checkpoint,
+        request_hash: String::new(),
+        response: value,
+        fault: None,
+        barrier: None,
+    };
+    let call = |semantic: &str,
+                id: String,
+                path: &str,
+                content: Option<String>,
+                next: &str|
+     -> Result<Value> {
+        let mut arguments = serde_json::Map::from_iter([
+            ("path".to_owned(), Value::String(path.to_owned())),
+            ("route".to_owned(), Value::String(marker(next))),
+        ]);
+        if let Some(content) = content {
+            arguments.insert("content".to_owned(), Value::String(content));
+        }
+        mapped_tool_call(manifest, semantic, id, Value::Object(arguments))
+    };
+    let definitions = crate::fidelity::needle_definitions();
+    let needle_files = [
+        (
+            "ahrb/fidelity/fixtures/api-contract.rs".to_owned(),
+            format!(
+                "pub trait DeltaContract {{\n    {};\n}}\n{}",
+                definitions[0].token,
+                "// structural signature retained for later contract derivation\n".repeat(8)
+            ),
+        ),
+        (
+            "ahrb/fidelity/fixtures/ledger-v1.toml".to_owned(),
+            format!(
+                "{}\n{}",
+                definitions[1].token,
+                "ledger-entry = \"retain exact task-root path\"\n".repeat(10)
+            ),
+        ),
+        (
+            "ahrb/fidelity/fixtures/applied-edit.sha256".to_owned(),
+            format!(
+                "{}\n{}",
+                definitions[2].token,
+                "receipt = \"verify the earlier applied edit\"\n".repeat(10)
+            ),
+        ),
+        (
+            "ahrb/fidelity/fixtures/checkpoint-0004.marker".to_owned(),
+            format!(
+                "{}\n{}",
+                definitions[3].token,
+                "ordinal-contract = \"the fourth request checkpoint\"\n".repeat(10)
+            ),
+        ),
+    ];
+    let applied_edit = crate::fidelity::APPLIED_EDIT_PAYLOAD;
+    let seed_content = format!(
+        "fidelity seed fixture v1\n{}",
+        "read-edit-verify-iterate retained seed material\n".repeat(20)
+    );
+    let ordinary_bootstrap_files = [
+        (
+            "ahrb/fidelity/work/applied-edit.txt".to_owned(),
+            applied_edit.to_owned(),
+        ),
+        (
+            "ahrb/fidelity/work/seed-00.txt".to_owned(),
+            seed_content.clone(),
+        ),
+    ];
+    let bootstrap_files = needle_files
+        .iter()
+        .chain(ordinary_bootstrap_files.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let bootstrap_calls = bootstrap_files
+        .iter()
+        .enumerate()
+        .map(|(index, (path, content))| {
+            call(
+                "write",
+                format!("fidelity-bootstrap-{:02}", index.saturating_add(1)),
+                path,
+                Some(content.clone()),
+                "plant-needles",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let needle_reads = needle_files
+        .iter()
+        .enumerate()
+        .map(|(index, (path, _))| {
+            call(
+                "read",
+                format!("fidelity-needle-read-{:02}", index.saturating_add(1)),
+                path,
+                None,
+                "cycle-01-read",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let cycle_count = match profile {
+        Profile::Quick => 5_u64,
+        Profile::Cert => 10_u64,
+    };
+    let mut responses = vec![
+        response(
+            "bootstrap".to_owned(),
+            json!({"tool_calls":bootstrap_calls}),
+        ),
+        response(
+            "plant-needles".to_owned(),
+            json!({"tool_calls":needle_reads}),
+        ),
+    ];
+    let mut contract_digest = Sha256::new();
+    for definition in definitions {
+        contract_digest.update(definition.token.as_bytes());
+        contract_digest.update(b"\n");
+    }
+    let contract_digest = format!("{:x}", contract_digest.finalize());
+    let mut cycle_files = Vec::new();
+    for cycle in 1..=cycle_count {
+        let read_checkpoint = format!("cycle-{cycle:02}-read");
+        let edit_checkpoint = if cycle == 1 {
+            "checkpoint-0004".to_owned()
+        } else {
+            format!("cycle-{cycle:02}-edit")
+        };
+        let verify_checkpoint = format!("cycle-{cycle:02}-verify");
+        let iterate_checkpoint = format!("cycle-{cycle:02}-iterate");
+        let next_checkpoint = if cycle == cycle_count {
+            "audit".to_owned()
+        } else {
+            format!("cycle-{:02}-read", cycle.saturating_add(1))
+        };
+        let previous_path = if cycle == 1 {
+            "ahrb/fidelity/work/seed-00.txt".to_owned()
+        } else {
+            format!(
+                "ahrb/fidelity/work/cycle-{:02}.txt",
+                cycle.saturating_sub(1)
+            )
+        };
+        let cycle_path = format!("ahrb/fidelity/work/cycle-{cycle:02}.txt");
+        let cycle_content = format!(
+            "fidelity cycle {cycle:02} applied edit\nsource={previous_path}\nstructural_contract_sha256={contract_digest}\n{}",
+            format!("cycle-{cycle:02} retained structural verification material\n").repeat(20)
+        );
+        let iterate_path = if cycle <= 2 {
+            "ahrb/fidelity/work/seed-00.txt".to_owned()
+        } else {
+            format!(
+                "ahrb/fidelity/work/cycle-{:02}.txt",
+                cycle.saturating_sub(2)
+            )
+        };
+        responses.push(response(
+            read_checkpoint,
+            json!({"tool_calls":[call(
+                "read",
+                format!("fidelity-cycle-{cycle:02}-read"),
+                &previous_path,
+                None,
+                &edit_checkpoint,
+            )?]}),
+        ));
+        responses.push(response(
+            edit_checkpoint,
+            json!({"tool_calls":[call(
+                "write",
+                format!("fidelity-cycle-{cycle:02}-edit"),
+                &cycle_path,
+                Some(cycle_content),
+                &verify_checkpoint,
+            )?]}),
+        ));
+        responses.push(response(
+            verify_checkpoint,
+            json!({"tool_calls":[call(
+                "read",
+                format!("fidelity-cycle-{cycle:02}-verify"),
+                &cycle_path,
+                None,
+                &iterate_checkpoint,
+            )?]}),
+        ));
+        responses.push(response(
+            iterate_checkpoint,
+            json!({"tool_calls":[call(
+                "read",
+                format!("fidelity-cycle-{cycle:02}-iterate"),
+                &iterate_path,
+                None,
+                &next_checkpoint,
+            )?]}),
+        ));
+        cycle_files.push(cycle_path);
+    }
+    let audit_calls = cycle_files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            call(
+                "read",
+                format!("fidelity-audit-{:02}", index.saturating_add(1)),
+                path,
+                None,
+                "terminal",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    responses.push(response(
+        "audit".to_owned(),
+        json!({"tool_calls":audit_calls}),
+    ));
+    responses.push(response("terminal".to_owned(), success_value()));
+    let turn_budget = fidelity_turn_budget(profile);
+    let response_count = u64::try_from(responses.len())
+        .map_err(|_| AhrbError::Protocol("fidelity response count does not fit u64".to_owned()))?;
+    if response_count != turn_budget {
+        return Err(AhrbError::Protocol(format!(
+            "fidelity workflow has {response_count} responses for turn budget {turn_budget}"
+        )));
+    }
+    let expected_fixture_paths = needle_files
+        .iter()
+        .map(|(path, _)| PathBuf::from(path))
+        .chain(
+            ordinary_bootstrap_files
+                .iter()
+                .map(|(path, _)| PathBuf::from(path)),
+        )
+        .chain(cycle_files.iter().map(PathBuf::from))
+        .collect::<BTreeSet<_>>();
+    Ok(FidelityTask {
+        workflow: Workflow {
+            version: WORKFLOW_SCHEMA_VERSION,
+            scenario: scenario.clone(),
+            actors: BTreeMap::from([(
+                actor.clone(),
+                Actor {
+                    id: actor.clone(),
+                    parent: None,
+                    prompt: format!(
+                        "Complete the standardized AHRB long-horizon context-fidelity task exactly as scripted. Preserve the exact API signature, virtual absolute ledger path, applied-edit digest, and ordinal checkpoint read from the bootstrap results; every later cycle derives and verifies one combined structural-contract digest from those four values. {}",
+                        marker("bootstrap")
+                    ),
+                    workspace: task_workspace.to_string_lossy().into_owned(),
+                },
+            )]),
+            barriers: BTreeMap::new(),
+            responses,
+        },
+        expected_fixture_paths,
+    })
 }
 
 fn economy_workflow(manifest: &Manifest) -> Result<Workflow> {
@@ -6217,6 +7209,7 @@ async fn run_inner(
         resource_metrics,
         resource_summary,
         economy_summary: None,
+        fidelity_summary: None,
         samples: state.samples,
         memory_time_samples: row46_trials
             .as_ref()
