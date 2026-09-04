@@ -48,6 +48,9 @@ pub struct Manifest {
     pub process: ProcessOwnership,
     /// Resource control limits.
     pub resources: ResourceControls,
+    /// Optional declarations used only by the isolated economy pillar.
+    #[serde(default, skip_serializing_if = "EconomyConfig::is_absent")]
+    pub economy: EconomyConfig,
     /// Optional declarations used only by the isolated context-fidelity pillar.
     #[serde(default, skip_serializing_if = "FidelityConfig::is_absent")]
     pub fidelity: FidelityConfig,
@@ -781,6 +784,20 @@ pub struct ResourceControls {
     pub budget_controls: Option<BudgetControls>,
 }
 
+/// Typed adapter declarations for economy workspace-effect observation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EconomyConfig {
+    /// Profile-contained task workspace; when present, overrides the driver-reported path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+}
+
+impl EconomyConfig {
+    fn is_absent(&self) -> bool {
+        self.workspace_path.is_none()
+    }
+}
+
 /// Typed adapter declarations for long-horizon end-state classification.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct FidelityConfig {
@@ -1070,6 +1087,26 @@ pub struct DoctorReport {
     pub ready: bool,
 }
 
+fn validate_scripted_workspace_template(path: Option<&str>, field: &str) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if path.trim().is_empty() {
+        return Err(AhrbError::Validation(format!("{field} cannot be empty")));
+    }
+    if std::path::Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(AhrbError::Validation(format!(
+            "{field} cannot contain '.' or '..' components"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate invariants that can be checked without starting a harness.
 pub fn validate(manifest: &Manifest) -> Result<()> {
     if !matches!(manifest.identity.schema, 1 | 2) {
@@ -1236,28 +1273,14 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
             "fidelity.declared_turn_ceiling must be positive".to_owned(),
         ));
     }
-    if manifest
-        .fidelity
-        .workspace_path
-        .as_ref()
-        .is_some_and(|path| path.trim().is_empty())
-    {
-        return Err(AhrbError::Validation(
-            "fidelity.workspace_path cannot be empty".to_owned(),
-        ));
-    }
-    if let Some(path) = manifest.fidelity.workspace_path.as_ref()
-        && std::path::Path::new(path).components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        return Err(AhrbError::Validation(
-            "fidelity.workspace_path cannot contain '.' or '..' components".to_owned(),
-        ));
-    }
+    validate_scripted_workspace_template(
+        manifest.economy.workspace_path.as_deref(),
+        "economy.workspace_path",
+    )?;
+    validate_scripted_workspace_template(
+        manifest.fidelity.workspace_path.as_deref(),
+        "fidelity.workspace_path",
+    )?;
     let mut cap_exit_codes = std::collections::BTreeSet::new();
     for code in &manifest.fidelity.internal_cap_exit_codes {
         if *code == manifest.exit.success {
@@ -3250,11 +3273,16 @@ mod version_tests {
     }
 
     #[test]
-    fn fidelity_workspace_template_rejects_traversal_components() {
+    fn scripted_workspace_templates_reject_traversal_components() {
         let mut manifest = wave_2_manifest();
+        manifest.economy.workspace_path = Some("{{profile}}/economy/../outside".to_owned());
+        let error = validate(&manifest).expect_err("economy workspace traversal must be rejected");
+        assert!(error.to_string().contains("economy.workspace_path"));
+
+        manifest.economy.workspace_path = None;
         manifest.fidelity.workspace_path = Some("{{profile}}/fidelity/../outside".to_owned());
-        let error = validate(&manifest).expect_err("workspace traversal must be rejected");
-        assert!(error.to_string().contains("cannot contain '.' or '..'"));
+        let error = validate(&manifest).expect_err("fidelity workspace traversal must be rejected");
+        assert!(error.to_string().contains("fidelity.workspace_path"));
     }
 
     #[test]

@@ -390,6 +390,7 @@ struct MockConfig {
     model_request_cap_stall_ms: Option<u64>,
     compact_after_turn: Option<u64>,
     retain_recent_tool_results: Option<usize>,
+    suppress_fixture_effects: bool,
     session_memory_bytes: u64,
     acceptance_hook: Vec<String>,
     completion_hook: Vec<String>,
@@ -996,7 +997,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  [--retry-base-delay-ms N] [--retry-max-delay-ms N] \
                  [--model-request-ceiling N] \
                  [--model-request-cap-exit-code N|--model-request-cap-stall-ms N] \
-                 [--compact-after-turn N --retain-recent-tool-results N]\n\
+                 [--compact-after-turn N --retain-recent-tool-results N] \
+                 [--suppress-fixture-effects]\n\
                  ahrb-mock-harness exec-turn --state-dir PATH --marker MARKER \
                  --session-id ID --prompt PROMPT --key KEY \
                  [--base-url URL]\n\
@@ -2129,6 +2131,7 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
     let mut model_request_cap_stall_ms = None;
     let mut compact_after_turn = None;
     let mut retain_recent_tool_results = None;
+    let mut suppress_fixture_effects = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -2248,6 +2251,9 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
                             AhrbError::Usage("invalid retained tool-result count".to_owned())
                         })?,
                 );
+            }
+            "--suppress-fixture-effects" => {
+                suppress_fixture_effects = true;
             }
             option => {
                 return Err(AhrbError::Usage(format!("unknown option {option:?}")));
@@ -2416,6 +2422,7 @@ fn parse_config(args: &[String]) -> Result<MockConfig> {
         model_request_cap_stall_ms,
         compact_after_turn,
         retain_recent_tool_results,
+        suppress_fixture_effects,
         session_memory_bytes,
         acceptance_hook: parse_hook_env("AHRB_MOCK_ACCEPTANCE_HOOK")?,
         completion_hook: parse_hook_env("AHRB_MOCK_COMPLETION_HOOK")?,
@@ -4392,6 +4399,13 @@ fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) 
         "write_fixture" | "fixture_write" => {
             let relative = safe_relative(required_str(args, "path")?)?;
             let content = required_str(args, "content")?;
+            if config.suppress_fixture_effects {
+                return Ok(json!({
+                    "ok": false,
+                    "error": "fixture effects suppressed by mock configuration",
+                    "path": required_str(args, "path")?
+                }));
+            }
             let workspace = config.workspace_path(session);
             let path = workspace.join(&relative);
             let parent = path.parent().ok_or_else(|| {
@@ -4431,8 +4445,20 @@ fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) 
         }
         "read_fixture" | "fixture_read" => {
             let relative = safe_relative(required_str(args, "path")?)?;
-            let content = fs::read_to_string(config.workspace_path(session).join(relative))?;
-            Ok(json!({ "ok": true, "content": content }))
+            match fs::read_to_string(config.workspace_path(session).join(relative)) {
+                Ok(content) => Ok(json!({ "ok": true, "content": content })),
+                Err(error)
+                    if config.suppress_fixture_effects
+                        && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(json!({
+                        "ok": false,
+                        "error": "fixture effects suppressed by mock configuration",
+                        "path": required_str(args, "path")?
+                    }))
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         "fail_fixture" | "fixture_fail" => Ok(json!({
             "ok": false,
@@ -5160,6 +5186,7 @@ mod tests {
             model_request_cap_stall_ms: None,
             compact_after_turn: None,
             retain_recent_tool_results: None,
+            suppress_fixture_effects: false,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),
@@ -6290,6 +6317,7 @@ mod tests {
             model_request_cap_stall_ms: None,
             compact_after_turn: None,
             retain_recent_tool_results: None,
+            suppress_fixture_effects: false,
             session_memory_bytes: DEFAULT_SESSION_MEMORY_MIB * MIB,
             acceptance_hook: Vec::new(),
             completion_hook: Vec::new(),

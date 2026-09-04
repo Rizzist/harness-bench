@@ -2835,6 +2835,18 @@ async fn run_economy_inner(
     let session = driver
         .create_session(&format!("{}:economy", workflow.scenario))
         .await?;
+    let task_workspace = economy_actor_workspace(&manifest, &profile_root, &driver, &session)?;
+    let before_receipt = row61_tree_snapshot(&task_workspace)?;
+    let mut filesystem_snapshots = Vec::new();
+    let output_path = task_workspace.join(crate::economy::ECONOMY_OUTPUT_PATH);
+    let output_before = row47_snapshot_file(
+        &output_path,
+        &profile_root,
+        1,
+        "economy-before",
+        "economy-scripted-effect",
+        &mut filesystem_snapshots,
+    )?;
     driver
         .submit(&session, &actor.prompt, "economy-task")
         .await?;
@@ -2858,6 +2870,15 @@ async fn run_economy_inner(
             }
             Err(error) => return Err(error),
         };
+    let after_receipt = row61_tree_snapshot(&task_workspace)?;
+    let output_after = row47_snapshot_file(
+        &output_path,
+        &profile_root,
+        1,
+        "economy-after",
+        "economy-scripted-effect",
+        &mut filesystem_snapshots,
+    )?;
     if manifest.transport.kind == TransportKind::Exec || !manifest.sessions.close_delete.is_empty()
     {
         let close_result = driver.close(&session).await;
@@ -2880,8 +2901,14 @@ async fn run_economy_inner(
         &events,
         &profile,
         turn_budget,
-        collector_timed_out,
         &manifest.concurrency.topology,
+        crate::economy::EconomyRunEvidence {
+            collector_timed_out,
+            workspace_receipt_before_sha256: before_receipt.sha256,
+            workspace_receipt_after_sha256: after_receipt.sha256,
+            output_before_sha256: output_before.map(|state| state.sha256),
+            output_after_sha256: output_after.map(|state| state.sha256),
+        },
     )?;
     let workflow_bytes = serde_json::to_vec(&workflow)?;
     let workflow_sha256 = format!("{:x}", Sha256::digest(workflow_bytes));
@@ -2999,6 +3026,7 @@ async fn run_economy_inner(
         economy_summary: Some(economy_summary),
         events: raw_events,
         model_requests,
+        filesystem_snapshots,
         ..Report::default()
     };
     crate::results::persist_report(&persistence, &report, options.junit, false)?;
@@ -3119,6 +3147,33 @@ struct FidelityExecution {
     filesystem_snapshots: Vec<FilesystemSnapshot>,
 }
 
+fn economy_actor_workspace(
+    manifest: &Manifest,
+    profile_root: &Path,
+    driver: &HarnessDriver,
+    session: &crate::driver::SessionId,
+) -> Result<PathBuf> {
+    let path = if let Some(template) = manifest.economy.workspace_path.as_ref() {
+        let variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                profile_root.to_string_lossy().into_owned(),
+            ),
+            ("session_id".to_owned(), session.0.clone()),
+        ]);
+        PathBuf::from(crate::manifest::render_template(template, &variables)?)
+    } else if let Some(path) = driver.session_workspace(session) {
+        path
+    } else {
+        return Err(AhrbError::Validation(
+            "economy adapter must expose /workspace_path from session.create or declare economy.workspace_path"
+                .to_owned(),
+        ));
+    };
+    validate_scripted_workspace_path(profile_root, &path, "economy")?;
+    Ok(path)
+}
+
 fn fidelity_execution_stopped(
     runtime: Option<ScriptedPillarRuntime>,
     session: Option<crate::driver::SessionId>,
@@ -3162,14 +3217,14 @@ fn fidelity_actor_workspace(
                 .to_owned(),
         ));
     };
-    validate_fidelity_workspace_path(profile_root, &path)?;
+    validate_scripted_workspace_path(profile_root, &path, "fidelity")?;
     Ok(path)
 }
 
-fn validate_fidelity_workspace_path(profile_root: &Path, path: &Path) -> Result<()> {
+fn validate_scripted_workspace_path(profile_root: &Path, path: &Path, pillar: &str) -> Result<()> {
     let relative = path.strip_prefix(profile_root).map_err(|_| {
         AhrbError::Validation(format!(
-            "fidelity actor workspace {} escapes fresh profile {}",
+            "{pillar} actor workspace {} escapes fresh profile {}",
             path.display(),
             profile_root.display()
         ))
@@ -3180,7 +3235,7 @@ fn validate_fidelity_workspace_path(profile_root: &Path, path: &Path) -> Result<
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return Err(AhrbError::Validation(format!(
-            "fidelity actor workspace {} is not a nonempty normalized child of fresh profile {}",
+            "{pillar} actor workspace {} is not a nonempty normalized child of fresh profile {}",
             path.display(),
             profile_root.display()
         )));
@@ -3191,22 +3246,22 @@ fn validate_fidelity_workspace_path(profile_root: &Path, path: &Path) -> Result<
         .is_symlink()
     {
         return Err(AhrbError::Validation(format!(
-            "fidelity profile root {} cannot be a symlink",
+            "{pillar} profile root {} cannot be a symlink",
             profile_root.display()
         )));
     }
     let mut cursor = profile_root.to_path_buf();
     for component in relative.components() {
         let std::path::Component::Normal(part) = component else {
-            return Err(AhrbError::Validation(
-                "fidelity actor workspace changed while validating components".to_owned(),
-            ));
+            return Err(AhrbError::Validation(format!(
+                "{pillar} actor workspace changed while validating components"
+            )));
         };
         cursor.push(part);
         match std::fs::symlink_metadata(&cursor) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(AhrbError::Validation(format!(
-                    "fidelity actor workspace component {} cannot be a symlink",
+                    "{pillar} actor workspace component {} cannot be a symlink",
                     cursor.display()
                 )));
             }
@@ -3501,7 +3556,7 @@ async fn run_fidelity_inner(
             },
             (None, _) => (crate::fidelity::HarnessExitStatus::NotApplicable, None),
         };
-    validate_fidelity_workspace_path(&profile_root, &task_workspace)?;
+    validate_scripted_workspace_path(&profile_root, &task_workspace, "fidelity")?;
     let after_receipt = row61_tree_snapshot(&task_workspace)?;
     fidelity_snapshot_expected_files(
         &profile_root,
@@ -4009,20 +4064,20 @@ fn economy_workflow(manifest: &Manifest) -> Result<Workflow> {
     let edit_call = mapped_tool_call(
         manifest,
         "write",
-        "economy-edit".to_owned(),
+        crate::economy::ECONOMY_EDIT_CALL_ID.to_owned(),
         json!({
-            "path":"economy-output.txt",
-            "content":"AHRB economy fixture edit v1\n",
+            "path":crate::economy::ECONOMY_OUTPUT_PATH,
+            "content":crate::economy::ECONOMY_OUTPUT_CONTENT,
             "route":marker("verify")
         }),
     )?;
     let verify_call = mapped_tool_call(
         manifest,
         "read",
-        "economy-verify".to_owned(),
+        crate::economy::ECONOMY_VERIFY_CALL_ID.to_owned(),
         json!({
-            "path":"economy-output.txt",
-            "expected_from_a":"AHRB economy fixture edit v1\n",
+            "path":crate::economy::ECONOMY_OUTPUT_PATH,
+            "expected_from_a":crate::economy::ECONOMY_OUTPUT_CONTENT,
             "route":marker("iterate-one")
         }),
     )?;

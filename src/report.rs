@@ -1354,10 +1354,25 @@ pub fn render_markdown(report: &Report) -> String {
             "Reference tariff: `${:.2}` per 1M reference request tokens. Completion means **{}**; it is not real-task success.\n",
             summary.reference_tariff_usd_per_million_tokens, summary.completion_label,
         );
+        if summary.schema >= 4 {
+            let _ = writeln!(
+                output,
+                "Cost interpretation: {}.\n",
+                summary.cost_outcome_label,
+            );
+        }
+        let (reference_cost_heading, per_completion_heading) = if summary.schema >= 4 {
+            ("Run reference cost", "Tokens / verified-effect completion")
+        } else {
+            ("Reference cost", "Tokens / completed task")
+        };
         let _ = writeln!(
             output,
-            "| Harness | Model turns | Total {} | Tool calls / batching factor | Last context {} | Completion | Reference cost | Tokens / completed task |",
-            summary.reference_token_label, summary.reference_token_label,
+            "| Harness | Model turns | Total {} | Tool calls / batching factor | Last context {} | Completion | {} | {} |",
+            summary.reference_token_label,
+            summary.reference_token_label,
+            reference_cost_heading,
+            per_completion_heading,
         );
         let _ = writeln!(output, "|---|---:|---:|---:|---:|---|---:|---:|");
         let tokens_per_task = summary
@@ -1376,6 +1391,56 @@ pub fn render_markdown(report: &Report) -> String {
             summary.reference_cost_usd,
             tokens_per_task,
         );
+        if summary.schema >= 4 {
+            let _ = writeln!(output, "### Scripted workspace-effect evidence\n");
+            let _ = writeln!(
+                output,
+                "Verified: `{}`. {}.\n",
+                summary.effects_verified.all_verified, summary.effects_verified.label,
+            );
+            for expected in &summary.effects_verified.expected {
+                let _ = writeln!(
+                    output,
+                    "Expected `{}` SHA-256 `{}`, edit call `{}`, and read-back call `{}`.",
+                    expected.path,
+                    expected.content_sha256,
+                    expected.edit_call_id,
+                    expected.read_back_call_id,
+                );
+            }
+            for observed in &summary.effects_verified.observed {
+                let before = observed
+                    .before_content_sha256
+                    .as_deref()
+                    .map_or("absent", |digest| digest);
+                let after = observed
+                    .after_content_sha256
+                    .as_deref()
+                    .map_or("absent", |digest| digest);
+                let read_back = observed
+                    .read_back_content_sha256
+                    .as_deref()
+                    .map_or("absent", |digest| digest);
+                let _ = writeln!(
+                    output,
+                    "Observed `{}`: before `{}`, after `{}`, edit success `{}` ({} correlated result(s)), read-back path verified `{}`, read-back `{}` ({} correlated result(s)).",
+                    observed.path,
+                    before,
+                    after,
+                    observed.edit_reported_success,
+                    observed.edit_observations,
+                    observed.read_back_path_verified,
+                    read_back,
+                    observed.read_back_observations,
+                );
+            }
+            let _ = writeln!(
+                output,
+                "Workspace receipts: before `{}`, after `{}`.\n",
+                summary.effects_verified.workspace_receipt_before_sha256,
+                summary.effects_verified.workspace_receipt_after_sha256,
+            );
+        }
         if summary.schema >= 2 {
             let curve = summary
                 .context_token_curve

@@ -11,9 +11,17 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Stable economy-task and analysis schema.
-pub const ECONOMY_SCHEMA_VERSION: u32 = 3;
+pub const ECONOMY_SCHEMA_VERSION: u32 = 4;
 /// Stable identifier for the single standardized MVP task.
 pub const ECONOMY_TASK_ID: &str = "ahrb-harness-economy-mvp-v1";
+/// Required workspace artifact produced by the standardized task.
+pub const ECONOMY_OUTPUT_PATH: &str = "economy-output.txt";
+/// Exact required content of the standardized workspace artifact.
+pub const ECONOMY_OUTPUT_CONTENT: &str = "AHRB economy fixture edit v1\n";
+/// Stable scripted call that produces the required workspace artifact.
+pub const ECONOMY_EDIT_CALL_ID: &str = "economy-edit";
+/// Stable scripted call that reads the required workspace artifact back.
+pub const ECONOMY_VERIFY_CALL_ID: &str = "economy-verify";
 /// Human-readable reference-token label. This is intentionally not a bill.
 pub const REFERENCE_TOKEN_LABEL: &str = "reference tokens (o200k_base-style)";
 /// Pinned tokenizer implementation/vocabulary version.
@@ -41,15 +49,21 @@ pub const CACHE_INPUT_DISCOUNT_LABEL: &str = "STATED assumption: fraction of ful
 pub const EFFECTIVE_COST_LABEL: &str = "effective cost assuming automatic prefix caching of the eligible prefix at 90% input discount; UPPER-BOUND proxy from serialized-prefix reuse, NOT a measured server cache-hit rate";
 /// Honest public interpretation of the consecutive-request cache-bust measurements.
 pub const PREFIX_STABILITY_LABEL: &str = "consecutive primary-request serialized-message-prefix stability (reference-token LCP; ordered invalidation array covers turns N>=2)";
+/// Honest public interpretation of the scripted-effect evidence.
+pub const EFFECTS_VERIFIED_LABEL: &str = "verified scripted workspace mutation and read-back; proves the benchmark fixture landed, NOT that a real task was solved";
+/// Honest public interpretation of cost when completion is evidence-backed.
+pub const COST_OUTCOME_LABEL: &str = "run cost; tokens_per_completed_task is available only with a verified scripted workspace effect";
 /// The in-repository BPE merge vocabulary. Single-byte tokens are normative and implicit.
 const REFERENCE_VOCABULARY: &[u8] = include_bytes!("../assets/ahrb_o200k_base_style_v1.tiktoken");
 
-/// Script-terminal classification. It describes orchestration behavior, not real task success.
+/// Script and effect classification. It does not claim real task success.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EconomyCompletion {
-    /// The harness consumed the scripted terminal within the primary-request budget.
+    /// The harness consumed the scripted terminal within budget and the required effect verified.
     Completed,
+    /// The harness consumed the scripted terminal but the required effect did not verify.
+    TerminalWithoutEffect,
     /// The harness emitted a failure/cancellation terminal before following the script.
     Aborted,
     /// No harness terminal and no positive loop evidence were observed.
@@ -58,6 +72,72 @@ pub enum EconomyCompletion {
     Looped,
     /// The scripted terminal was not followed within the profile's primary-request budget.
     OverBudget,
+}
+
+/// Runner-captured workspace evidence supplied to the pure economy analysis.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EconomyRunEvidence {
+    /// Whether the terminal collector exhausted its observation deadline.
+    pub collector_timed_out: bool,
+    /// Digest of the complete workspace tree before task submission.
+    pub workspace_receipt_before_sha256: String,
+    /// Digest of the complete workspace tree after the terminal observation.
+    pub workspace_receipt_after_sha256: String,
+    /// Target-file digest before task submission, or null when absent.
+    pub output_before_sha256: Option<String>,
+    /// Target-file digest after the terminal observation, or null when absent.
+    pub output_after_sha256: Option<String>,
+}
+
+/// One required deterministic effect of the standardized economy script.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EconomyExpectedEffect {
+    /// Workspace-relative target path.
+    pub path: String,
+    /// Required SHA-256 of the exact file bytes.
+    pub content_sha256: String,
+    /// Scripted call that must report performing the edit.
+    pub edit_call_id: String,
+    /// Scripted call whose result must return the same bytes.
+    pub read_back_call_id: String,
+}
+
+/// Direct observations for one required deterministic effect.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EconomyObservedEffect {
+    /// Workspace-relative target path.
+    pub path: String,
+    /// Target-file digest before task submission, or null when absent.
+    pub before_content_sha256: Option<String>,
+    /// Target-file digest after the terminal observation, or null when absent.
+    pub after_content_sha256: Option<String>,
+    /// Number of correlated scripted edit results observed.
+    pub edit_observations: u64,
+    /// Whether the single correlated edit result reported success for the expected path.
+    pub edit_reported_success: bool,
+    /// Whether the single correlated read-back targeted the expected path.
+    pub read_back_path_verified: bool,
+    /// SHA-256 of content returned by the scripted read-back, or null when unavailable.
+    pub read_back_content_sha256: Option<String>,
+    /// Number of correlated scripted read-back results observed.
+    pub read_back_observations: u64,
+}
+
+/// Auditable proof of the narrow scripted workspace effect required for completion.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EconomyEffectsVerified {
+    /// Honest boundary: this is a fixture-effect oracle, not real-task evaluation.
+    pub label: String,
+    /// Effects required by the standardized script.
+    pub expected: Vec<EconomyExpectedEffect>,
+    /// Filesystem and read-back evidence observed for those effects.
+    pub observed: Vec<EconomyObservedEffect>,
+    /// Digest of the complete workspace tree before task submission.
+    pub workspace_receipt_before_sha256: String,
+    /// Digest of the complete workspace tree after the terminal observation.
+    pub workspace_receipt_after_sha256: String,
+    /// True only when every required mutation and read-back matches exactly.
+    pub all_verified: bool,
 }
 
 /// Tokenizer identity echoed into every economy report so stored runs remain comparable.
@@ -73,7 +153,7 @@ pub struct ReferenceTokenizerPin {
     pub vocabulary_entries: u64,
 }
 
-/// The schema-3 economy result plus the metadata needed to audit each value.
+/// The schema-4 economy result plus the metadata needed to audit each value.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EconomySummary {
     /// Economy summary schema.
@@ -106,11 +186,17 @@ pub struct EconomySummary {
     pub completion: EconomyCompletion,
     /// Honest interpretation of `completion`.
     pub completion_label: String,
+    /// Evidence for the narrow scripted workspace mutation required by `Completed`.
+    #[serde(default)]
+    pub effects_verified: EconomyEffectsVerified,
     /// Fixed tariff used by `reference_cost_usd`.
     pub reference_tariff_usd_per_million_tokens: f64,
     /// `total_reference_tokens * reference_tariff / 1_000_000`.
     pub reference_cost_usd: f64,
-    /// Total reference tokens when completed; null when no task completed.
+    /// Honest relationship between run cost and verified-effect completion.
+    #[serde(default)]
+    pub cost_outcome_label: String,
+    /// Total reference tokens for a verified-effect completion; otherwise null.
     pub tokens_per_completed_task: Option<u64>,
     /// Consecutive-primary-request message-prefix reuse upper bound.
     #[serde(default)]
@@ -208,7 +294,7 @@ pub struct EconomySummary {
 }
 
 impl EconomySummary {
-    /// Whether this run followed the scripted terminal within budget.
+    /// Whether this run reached the scripted terminal and verified its required effect.
     pub fn completed(&self) -> bool {
         self.completion == EconomyCompletion::Completed
     }
@@ -221,8 +307,8 @@ pub fn analyze(
     events: &[NormalizedEvent],
     profile: &str,
     turn_budget: u64,
-    collector_timed_out: bool,
     topology: &str,
+    run_evidence: EconomyRunEvidence,
 ) -> Result<EconomySummary> {
     let tokenizer = ReferenceTokenizer::load()?;
     let mut ordered = records.iter().collect::<Vec<_>>();
@@ -301,11 +387,17 @@ pub fn analyze(
                 .response_status
                 .is_some_and(|status| (200..300).contains(&status))
     });
+    let collector_timed_out = run_evidence.collector_timed_out;
+    let effects_verified = verify_effects(events, run_evidence);
     let completion =
         if model_turns > turn_budget || (!scripted_terminal && model_turns >= turn_budget) {
             EconomyCompletion::OverBudget
         } else if scripted_terminal && terminal_success {
-            EconomyCompletion::Completed
+            if effects_verified.all_verified {
+                EconomyCompletion::Completed
+            } else {
+                EconomyCompletion::TerminalWithoutEffect
+            }
         } else if successful_route_repeated {
             EconomyCompletion::Looped
         } else if collector_timed_out {
@@ -358,9 +450,13 @@ pub fn analyze(
         tool_batching_factor,
         last_context_size_tokens,
         completion,
-        completion_label: "followed scripted terminal".to_owned(),
+        completion_label:
+            "scripted terminal plus verified scripted workspace effect; not real-task success"
+                .to_owned(),
+        effects_verified,
         reference_tariff_usd_per_million_tokens: REFERENCE_TARIFF_USD_PER_MILLION_TOKENS,
         reference_cost_usd,
+        cost_outcome_label: COST_OUTCOME_LABEL.to_owned(),
         tokens_per_completed_task,
         cache_eligible_fraction,
         cache_eligible_fraction_label: CACHE_ELIGIBLE_LABEL.to_owned(),
@@ -406,8 +502,61 @@ pub fn render_summary(summary: &EconomySummary) -> String {
     let cache_control_breakpoints =
         render_u64_array(&summary.cache_control_breakpoints_per_request);
     let invalidated_prefix_tokens = render_u64_array(&summary.invalidated_prefix_tokens_per_turn);
+    let effect_fields = if summary.schema >= 4 {
+        let expected = summary
+            .effects_verified
+            .expected
+            .iter()
+            .map(|effect| format!("{}:{}", effect.path, effect.content_sha256))
+            .collect::<Vec<_>>()
+            .join(",");
+        let observed = summary
+            .effects_verified
+            .observed
+            .iter()
+            .map(|effect| {
+                format!(
+                    "{}:before={}:after={}:edit-success={}:edit-observations={}:read-back-path={}:read-back={}:read-back-observations={}",
+                    effect.path,
+                    effect
+                        .before_content_sha256
+                        .as_deref()
+                        .map_or("absent", |digest| digest),
+                    effect
+                        .after_content_sha256
+                        .as_deref()
+                        .map_or("absent", |digest| digest),
+                    effect.edit_reported_success,
+                    effect.edit_observations,
+                    effect.read_back_path_verified,
+                    effect
+                        .read_back_content_sha256
+                        .as_deref()
+                        .map_or("absent", |digest| digest),
+                    effect.read_back_observations,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            " effects_verified={} effects_verified_label=\"{}\" expected_effect_digests=[{}] observed_effect_digests=[{}] workspace_receipt_before_sha256={} workspace_receipt_after_sha256={}",
+            summary.effects_verified.all_verified,
+            summary.effects_verified.label,
+            expected,
+            observed,
+            summary.effects_verified.workspace_receipt_before_sha256,
+            summary.effects_verified.workspace_receipt_after_sha256,
+        )
+    } else {
+        String::new()
+    };
+    let cost_outcome_field = if summary.schema >= 4 {
+        format!(" cost_outcome_label=\"{}\"", summary.cost_outcome_label)
+    } else {
+        String::new()
+    };
     format!(
-        "economy_summary schema={} task={} model_turns={} total_reference_tokens={} tool_calls={} tool_batching_factor={:.6} last_context_size_tokens={} completion={} completion_label=\"{}\" reference_cost_usd={:.8} tokens_per_completed_task={} reference_tariff_usd_per_million_tokens={:.2} reference_tokenizer={} reference_vocabulary_sha256={} cache_eligible_fraction={:.6} cache_eligible_label=\"{}\" cache_control_breakpoints={} cache_control_breakpoints_per_request={} redundant_tokens={} redundant_tokens_label=\"{}\" context_token_curve={} context_token_curve_slope={:.6} context_token_curve_label=\"{}\" per_turn_fixed_overhead_tokens={} per_turn_fixed_overhead_label=\"{}\" wasted_tool_call_count={} wasted_tool_call_label=\"{}\" retry_attempts={} retry_reference_tokens={} cache_regime={} cache_regime_label=\"{}\" cache_input_discount={:.2} cache_input_discount_label=\"{}\" effective_reference_tokens={:.6} effective_cost_usd={:.8} effective_cost_label=\"{}\" stable_prefix_preserved_fraction={:.6} cache_bust_count={} invalidated_prefix_tokens={} invalidated_prefix_tokens_per_turn={} prefix_stability_label=\"{}\"",
+        "economy_summary schema={} task={} model_turns={} total_reference_tokens={} tool_calls={} tool_batching_factor={:.6} last_context_size_tokens={} completion={} completion_label=\"{}\"{} reference_cost_usd={:.8}{} tokens_per_completed_task={} reference_tariff_usd_per_million_tokens={:.2} reference_tokenizer={} reference_vocabulary_sha256={} cache_eligible_fraction={:.6} cache_eligible_label=\"{}\" cache_control_breakpoints={} cache_control_breakpoints_per_request={} redundant_tokens={} redundant_tokens_label=\"{}\" context_token_curve={} context_token_curve_slope={:.6} context_token_curve_label=\"{}\" per_turn_fixed_overhead_tokens={} per_turn_fixed_overhead_label=\"{}\" wasted_tool_call_count={} wasted_tool_call_label=\"{}\" retry_attempts={} retry_reference_tokens={} cache_regime={} cache_regime_label=\"{}\" cache_input_discount={:.2} cache_input_discount_label=\"{}\" effective_reference_tokens={:.6} effective_cost_usd={:.8} effective_cost_label=\"{}\" stable_prefix_preserved_fraction={:.6} cache_bust_count={} invalidated_prefix_tokens={} invalidated_prefix_tokens_per_turn={} prefix_stability_label=\"{}\"",
         summary.schema,
         summary.task,
         summary.model_turns,
@@ -417,7 +566,9 @@ pub fn render_summary(summary: &EconomySummary) -> String {
         summary.last_context_size_tokens,
         completion_name(&summary.completion),
         summary.completion_label,
+        effect_fields,
         summary.reference_cost_usd,
+        cost_outcome_field,
         summary
             .tokens_per_completed_task
             .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
@@ -463,10 +614,133 @@ fn render_u64_array(values: &[u64]) -> String {
 pub fn completion_name(completion: &EconomyCompletion) -> &'static str {
     match completion {
         EconomyCompletion::Completed => "completed",
+        EconomyCompletion::TerminalWithoutEffect => "terminal-without-effect",
         EconomyCompletion::Aborted => "aborted",
         EconomyCompletion::Stalled => "stalled",
         EconomyCompletion::Looped => "looped",
         EconomyCompletion::OverBudget => "over-budget",
+    }
+}
+
+fn verify_effects(
+    events: &[NormalizedEvent],
+    run_evidence: EconomyRunEvidence,
+) -> EconomyEffectsVerified {
+    let expected_sha256 = format!("{:x}", Sha256::digest(ECONOMY_OUTPUT_CONTENT.as_bytes()));
+    let edit_results = events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolResult)
+        .filter(|event| event_call_id(event) == Some(ECONOMY_EDIT_CALL_ID))
+        .collect::<Vec<_>>();
+    let edit_observations = u64::try_from(edit_results.len()).map_or(u64::MAX, |count| count);
+    let edit_reported_success = match edit_results.as_slice() {
+        [event] => {
+            event
+                .payload
+                .pointer("/arguments/path")
+                .or_else(|| event.payload.pointer("/payload/arguments/path"))
+                .and_then(Value::as_str)
+                == Some(ECONOMY_OUTPUT_PATH)
+                && event_result(event)
+                    .and_then(|result| result.get("ok"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        }
+        _ => false,
+    };
+    let read_back_results = events
+        .iter()
+        .filter(|event| event.event == EventVocab::ToolResult)
+        .filter(|event| event_call_id(event) == Some(ECONOMY_VERIFY_CALL_ID))
+        .collect::<Vec<_>>();
+    let read_back_digests = read_back_results
+        .iter()
+        .filter_map(|event| {
+            let result = event_result(event)?;
+            (result.get("ok").and_then(Value::as_bool) == Some(true))
+                .then(|| result_text(result))
+                .flatten()
+                .map(|content| format!("{:x}", Sha256::digest(content.as_bytes())))
+        })
+        .collect::<Vec<_>>();
+    let read_back_observations =
+        u64::try_from(read_back_results.len()).map_or(u64::MAX, |count| count);
+    let read_back_path_verified = match read_back_results.as_slice() {
+        [event] => {
+            event
+                .payload
+                .pointer("/arguments/path")
+                .or_else(|| event.payload.pointer("/payload/arguments/path"))
+                .and_then(Value::as_str)
+                == Some(ECONOMY_OUTPUT_PATH)
+        }
+        _ => false,
+    };
+    let read_back_content_sha256 = match read_back_digests.as_slice() {
+        [digest] => Some(digest.clone()),
+        _ => None,
+    };
+    let all_verified = run_evidence.output_before_sha256.is_none()
+        && run_evidence.output_after_sha256.as_deref() == Some(expected_sha256.as_str())
+        && edit_observations == 1
+        && edit_reported_success
+        && read_back_observations == 1
+        && read_back_path_verified
+        && read_back_content_sha256.as_deref() == Some(expected_sha256.as_str())
+        && !run_evidence.workspace_receipt_before_sha256.is_empty()
+        && !run_evidence.workspace_receipt_after_sha256.is_empty()
+        && run_evidence.workspace_receipt_before_sha256
+            != run_evidence.workspace_receipt_after_sha256;
+    EconomyEffectsVerified {
+        label: EFFECTS_VERIFIED_LABEL.to_owned(),
+        expected: vec![EconomyExpectedEffect {
+            path: ECONOMY_OUTPUT_PATH.to_owned(),
+            content_sha256: expected_sha256,
+            edit_call_id: ECONOMY_EDIT_CALL_ID.to_owned(),
+            read_back_call_id: ECONOMY_VERIFY_CALL_ID.to_owned(),
+        }],
+        observed: vec![EconomyObservedEffect {
+            path: ECONOMY_OUTPUT_PATH.to_owned(),
+            before_content_sha256: run_evidence.output_before_sha256,
+            after_content_sha256: run_evidence.output_after_sha256,
+            edit_observations,
+            edit_reported_success,
+            read_back_path_verified,
+            read_back_content_sha256,
+            read_back_observations,
+        }],
+        workspace_receipt_before_sha256: run_evidence.workspace_receipt_before_sha256,
+        workspace_receipt_after_sha256: run_evidence.workspace_receipt_after_sha256,
+        all_verified,
+    }
+}
+
+fn event_result(event: &NormalizedEvent) -> Option<&Value> {
+    event
+        .payload
+        .get("result")
+        .or_else(|| event.payload.pointer("/payload/result"))
+}
+
+fn result_text(result: &Value) -> Option<&str> {
+    match result {
+        Value::String(content) => Some(content),
+        Value::Object(_) | Value::Array(_) => [
+            "/content",
+            "/stdout",
+            "/output",
+            "/aggregated_output",
+            "/result/content",
+            "/result/stdout",
+            "/result/output",
+            "/state/output",
+            "/tool/output",
+            "/item/aggregated_output",
+            "/preview_record/output",
+        ]
+        .into_iter()
+        .find_map(|pointer| result.pointer(pointer).and_then(Value::as_str)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
     }
 }
 
@@ -1240,6 +1514,21 @@ mod tests {
         }
     }
 
+    fn tool_result_event(cursor: u64, call_id: &str, path: &str, result: Value) -> NormalizedEvent {
+        NormalizedEvent {
+            id: format!("event-{cursor}"),
+            cursor,
+            session_id: "session".to_owned(),
+            actor: "agent".to_owned(),
+            event: EventVocab::ToolResult,
+            payload: json!({
+                "call_id": call_id,
+                "arguments": {"path": path},
+                "result": result,
+            }),
+        }
+    }
+
     #[test]
     fn batching_counts_only_first_occurrence_of_accumulated_results() {
         let records = vec![
@@ -1263,13 +1552,26 @@ mod tests {
             &[],
             "quick",
             8,
-            false,
             "shared-daemon-sessions",
+            EconomyRunEvidence::default(),
         )
         .expect("analyze");
         assert_eq!(summary.tool_results, 3);
         assert_eq!(summary.tool_result_requests, 2);
         assert_eq!(summary.tool_batching_factor, 1.5);
+
+        let mut legacy = summary;
+        legacy.schema = 3;
+        legacy.effects_verified.label = "schema-4-only-marker".to_owned();
+        legacy.cost_outcome_label = "schema-4-cost-marker".to_owned();
+        assert!(!render_summary(&legacy).contains("effects_verified="));
+        let markdown = crate::report::render_markdown(&crate::report::Report {
+            economy_summary: Some(legacy),
+            ..crate::report::Report::default()
+        });
+        assert!(markdown.contains("| Reference cost | Tokens / completed task |"));
+        assert!(!markdown.contains("Tokens / verified-effect completion"));
+        assert!(!markdown.contains("schema-4-only-marker"));
     }
 
     #[test]
@@ -1307,6 +1609,61 @@ mod tests {
         assert_eq!(cache_regime(&[&anthropic]), "explicit-cache-control");
         assert_eq!(cache_regime(&[&unknown]), "none");
         assert_eq!(cache_regime(&[&openai, &anthropic]), "none");
+    }
+
+    #[test]
+    fn effect_result_text_uses_only_explicit_adapter_output_carriers() {
+        let haider = json!({
+            "preview": "{\"exit_code\":0,\"status\":\"completed\",\"output\":\"wrong wrapper\"}",
+            "preview_record": {"output": ECONOMY_OUTPUT_CONTENT},
+            "truncated": false,
+        });
+        assert_eq!(result_text(&haider), Some(ECONOMY_OUTPUT_CONTENT));
+        assert_eq!(
+            result_text(&json!({"state": {"output": ECONOMY_OUTPUT_CONTENT}})),
+            Some(ECONOMY_OUTPUT_CONTENT)
+        );
+        assert_eq!(
+            result_text(&json!({"metadata": {"description": ECONOMY_OUTPUT_CONTENT}})),
+            None
+        );
+    }
+
+    #[test]
+    fn effect_verification_requires_the_correlated_read_back_path() {
+        let expected_sha256 = format!("{:x}", Sha256::digest(ECONOMY_OUTPUT_CONTENT.as_bytes()));
+        let evidence = || EconomyRunEvidence {
+            collector_timed_out: false,
+            workspace_receipt_before_sha256: "before".to_owned(),
+            workspace_receipt_after_sha256: "after".to_owned(),
+            output_before_sha256: None,
+            output_after_sha256: Some(expected_sha256.clone()),
+        };
+        let edit = tool_result_event(
+            1,
+            ECONOMY_EDIT_CALL_ID,
+            ECONOMY_OUTPUT_PATH,
+            json!({"ok": true}),
+        );
+        let wrong_path = tool_result_event(
+            2,
+            ECONOMY_VERIFY_CALL_ID,
+            "other.txt",
+            json!({"ok": true, "content": ECONOMY_OUTPUT_CONTENT}),
+        );
+        let wrong = verify_effects(&[edit.clone(), wrong_path], evidence());
+        assert!(!wrong.all_verified);
+        assert!(!wrong.observed[0].read_back_path_verified);
+
+        let correct = tool_result_event(
+            2,
+            ECONOMY_VERIFY_CALL_ID,
+            ECONOMY_OUTPUT_PATH,
+            json!({"ok": true, "content": ECONOMY_OUTPUT_CONTENT}),
+        );
+        let verified = verify_effects(&[edit, correct], evidence());
+        assert!(verified.all_verified);
+        assert!(verified.observed[0].read_back_path_verified);
     }
 
     #[test]

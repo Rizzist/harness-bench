@@ -21,11 +21,27 @@ The reference mock reaches the terminal on primary request 8. The primary-reques
 budget is 8 for `quick` and 20 for `cert`. Bootstrap is part of the measured request
 stream and makes fixture materialization portable across harness-owned workspaces.
 
+`completed` requires both the successful scripted terminal within that budget and
+verified workspace effect evidence: `economy-output.txt` was absent before the
+task, exists afterward with the SHA-256 of
+`AHRB economy fixture edit v1\n`, the whole-workspace receipt changed, and the
+single correlated `economy-verify` result returned those exact bytes. Reaching the
+terminal without all of that evidence is `terminal-without-effect`, not
+`completed`. This oracle proves only that the standardized scripted mutation
+landed and was read back; it does not evaluate whether a real task was solved.
+
 ## Analysis boundary
 
-All economy values are derived after the run from the canonical request bodies
-already retained by the fake model and from its normalized terminal events. No
-harness instrumentation or provider-reported usage is used. Primary versus
+Token, request, retry, and cache values are derived after the run from the canonical
+request bodies already retained by the fake model and from its normalized events.
+Schema 4 additionally uses AHRB's out-of-process before/after workspace receipts,
+target-file filesystem snapshot, and the correlated normalized read-back result.
+The runner uses `economy.workspace_path` when an adapter declares it (rendered
+from `{{profile}}` and `{{session_id}}`); otherwise it uses the workspace reported
+by the session driver. The resolved path must be a normalized child of the fresh
+profile.
+
+No harness instrumentation or provider-reported usage is used. Primary versus
 side-channel classification is the same classification used by v2 row 42.
 
 The pinned tokenizer implementation is
@@ -43,13 +59,13 @@ an eligible token is assumed to be billed at 10% of full input price. This is a
 stated benchmark assumption, not a measured rate or a claim about a provider's
 current price.
 
-## `economy_summary` schema 3
+## `economy_summary` schema 4
 
 The report's optional `economy_summary` object has the following fields:
 
 | Field | Meaning |
 |---|---|
-| `schema` | Economy schema, currently `3`. Schema 3 only adds fields to schemas 1 and 2. |
+| `schema` | Economy schema, currently `4`. Every revision is additive; schema 4 adds effect evidence to schemas 1–3. |
 | `task`, `profile`, `turn_budget` | Task identity and execution envelope. |
 | `reference_tokenizer` | Encoding label, implementation version, vocabulary SHA-256, and vocabulary entry count. |
 | `reference_token_label` | Honest label for token-derived values. |
@@ -60,11 +76,13 @@ The report's optional `economy_summary` object has the following fields:
 | `tool_result_requests` | Following requests that first carry one or more results. |
 | `tool_batching_factor` | `tool_results / tool_result_requests`. |
 | `last_context_size_tokens` | Largest primary request in reference tokens: the carried-context peak. |
-| `completion` | `completed`, `aborted`, `stalled`, `looped`, or `over-budget`. |
-| `completion_label` | Always `followed scripted terminal`; this is not real-task success. |
+| `completion` | `completed`, `terminal-without-effect`, `aborted`, `stalled`, `looped`, or `over-budget`. `completed` alone requires both the scripted terminal within budget and verified scripted effects. |
+| `completion_label` | Defines completion as the scripted terminal plus verified scripted workspace effect, and disclaims real-task success. |
+| `effects_verified` | Evidence object containing its honesty label, the expected path/content digest/edit and read-back calls, observed before/after filesystem and read-back digests, correlated edit/read-back counts, edit status, read-back path verification, before/after whole-workspace receipt digests, and `all_verified`. This proves the scripted mutation landed and was read back, not that a real task was solved. |
 | `reference_tariff_usd_per_million_tokens` | Fixed comparison tariff. |
 | `reference_cost_usd` | `total_reference_tokens * tariff / 1_000_000`. |
-| `tokens_per_completed_task` | Total reference tokens for `completed`; otherwise null. |
+| `cost_outcome_label` | Labels cost as run spend and states that per-completed-task cost is available only for a verified scripted effect. |
+| `tokens_per_completed_task` | Total reference tokens only for strict, verified-effect `completed`; otherwise null. |
 | `cache_eligible_fraction` | **Cache-eligible fraction (prefix upper bound)**. For each ordered primary physical request, tokenize the canonical serialization of its message array. Sum the reference-token longest common prefix with the preceding primary request (zero for the first), then divide by all message-array reference tokens in the primary request stream. This is not a realized cache hit rate. |
 | `cache_eligible_fraction_label`, `cache_eligibility_note` | The normative honest label and a topology-aware cache-persistence caveat. A per-invocation harness has no cross-turn server cache, so the number only describes repeated prefixes serialized within its requests. |
 | `cache_control_breakpoints`, `cache_control_breakpoints_per_request`, `cache_control_breakpoints_label` | Recursive counts of harness-declared JSON fields named `cache_control`, totaled and ordered per primary physical request. Property-name occurrences inside JSON Schema `properties`/`$defs` maps are excluded. These declarations are reported separately and never treated as observed cache hits. |
@@ -95,7 +113,10 @@ headline columns `cache_eligible_fraction`, `redundant_tokens`,
 `context_token_curve` (with `context_token_curve_slope`),
 `per_turn_fixed_overhead_tokens`, and `wasted_tool_call_count`.
 Schema 3 leaves all eleven headline columns unchanged and adds cache-regime,
-cache-adjusted-cost, and prefix-stability diagnostics.
+cache-adjusted-cost, and prefix-stability diagnostics. Schema 4 retains every
+prior field and adds `effects_verified` and `cost_outcome_label`; it deliberately
+tightens the value represented by `completed` and therefore by
+`tokens_per_completed_task`.
 
 Every advanced calculation uses the same fake-provider canonical bodies and
 normalized events as schema 1. Primary-request ordering is
@@ -116,6 +137,18 @@ If the effective LCP is shorter than N-1, invalidation is
 message therefore invalidates the changed suffix, while clean append-only growth
 does not. The metric is still a provider-neutral serialized-prefix proxy; it does
 not observe a server cache.
+
+## Honesty boundary: model work is not a harness metric
+
+The fake model deterministically scripts every tool call. Consequently this pillar
+cannot measure a real model re-deriving dropped context, such as repeatedly listing
+the same directory after compaction, without manufacturing that behavior in AHRB's
+own script. Schema 4 adds no repeat-work or re-derivation score. The measurable
+degraded-context cause remains the independent fidelity pillar's needle-survival
+evidence. A future duplication metric is valid only for genuinely harness-side
+behavior, such as executing one scripted call twice or re-sending an identical
+request outside the declared retry path, and must be pinned by an adapter fixture
+that actually exhibits it.
 
 `hbench diff` adds typed scalar deltas for all five advanced columns and an
 element-wise typed delta for equal-length context curves. Schema 3 adds typed

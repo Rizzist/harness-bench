@@ -158,6 +158,9 @@ retry_max_delay_ms = 200
 log_paths = []
 journal_paths = []
 
+[economy]
+workspace_path = "{{profile}}/state/workspaces/{{session_id}}"
+
 [resources.context_window]
 surface = "environment"
 tokens = 4096
