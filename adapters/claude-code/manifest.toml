@@ -91,6 +91,23 @@ fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
 source = "stdout"
 framing = "jsonl"
 
+# Stored real-run evidence:
+# results/claude-code/2026-09-02T12:59:20Z-4774d870/report.json. Expanded
+# assistant content blocks of type=text carry one complete item at
+# /_ahrb_expanded/text and the source envelope carries /actor. That run predates
+# the row-69 thinking fixture; Claude's documented Messages-shaped assistant
+# content also carries complete type=thinking blocks at /_ahrb_expanded/thinking.
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/_ahrb_expanded/text"
+assistant_text_match_fields = { "/_ahrb_expanded/type" = "text" }
+assistant_text_aggregation = "complete-event"
+reasoning_event = "model-response"
+reasoning_pointer = "/_ahrb_expanded/thinking"
+reasoning_match_fields = { "/_ahrb_expanded/type" = "thinking" }
+reasoning_aggregation = "complete-event"
+turn_pointer = "/actor"
+
 [[events.rules]]
 matches = "system"
 match_fields = { "/subtype" = "init" }
@@ -121,6 +138,13 @@ payload_bindings = { call_id = "/_ahrb_expanded/tool_use_id", result = "/_ahrb_e
 matches = "assistant"
 expand_pointer = "/message/content"
 match_fields = { "/_ahrb_expanded/type" = "text" }
+event = "model-response"
+payload_pointer = "/_ahrb_expanded"
+
+[[events.rules]]
+matches = "assistant"
+expand_pointer = "/message/content"
+match_fields = { "/_ahrb_expanded/type" = "thinking" }
 event = "model-response"
 payload_pointer = "/_ahrb_expanded"
 

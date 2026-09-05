@@ -116,6 +116,17 @@ source = "stdout"
 framing = "jsonl"
 id_pointer = "/part/id"
 
+# Stored real-run evidence:
+# results/opencode/2026-09-02T14:13:54Z-d5342cc3/report.json. `text` records
+# carry one complete assistant part at /part/text and the source envelope
+# carries /actor. No stored reasoning part exists, so reasoning is omitted.
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/part/text"
+assistant_text_match_fields = { "/part/type" = "text" }
+assistant_text_aggregation = "complete-event"
+turn_pointer = "/actor"
+
 [[events.rules]]
 matches = "step_start"
 event = "turn-accepted"

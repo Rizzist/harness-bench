@@ -92,6 +92,17 @@ source = "stdout"
 framing = "jsonl"
 id_pointer = "/session_id"
 
+# Stored real-run evidence: results/rick/2026-09-02T13:19:20Z-6208e81c/report.json.
+# `text` records carry one complete assistant item at /text and the source
+# envelope carries /actor. No stored reasoning/thinking record exists, so
+# reasoning is intentionally omitted.
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/text"
+assistant_text_match_fields = { "/type" = "text" }
+assistant_text_aggregation = "complete-event"
+turn_pointer = "/actor"
+
 [[events.rules]]
 matches = "done"
 event = "turn-accepted"

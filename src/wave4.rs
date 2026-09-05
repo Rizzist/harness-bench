@@ -291,6 +291,7 @@ fn narrative_values(
     stream: &[&NormalizedEvent],
     expected_event: &str,
     value_pointer: &str,
+    match_fields: &BTreeMap<String, String>,
     aggregation: NarrativeAggregation,
     item_pointer: Option<&str>,
 ) -> Option<Vec<String>> {
@@ -300,6 +301,9 @@ fn narrative_values(
             .filter(|event| event_name(&event.event).as_deref() == Some(expected_event))
             .filter_map(|event| {
                 let raw = raw_event(event);
+                if !narrative_record_matches(&raw, match_fields) {
+                    return None;
+                }
                 raw.pointer(value_pointer)
                     .map(|value| value.as_str().map(str::to_owned))
             })
@@ -313,6 +317,9 @@ fn narrative_values(
                 .filter(|event| event_name(&event.event).as_deref() == Some(expected_event))
             {
                 let raw = raw_event(event);
+                if !narrative_record_matches(&raw, match_fields) {
+                    continue;
+                }
                 let Some(value) = raw.pointer(value_pointer) else {
                     continue;
                 };
@@ -337,6 +344,17 @@ fn narrative_values(
     }
 }
 
+fn narrative_record_matches(raw: &Value, fields: &BTreeMap<String, String>) -> bool {
+    fields.iter().all(|(pointer, expected)| {
+        raw.pointer(pointer).is_some_and(|actual| match actual {
+            Value::String(value) => value == expected,
+            Value::Bool(value) => value.to_string() == *expected,
+            Value::Number(value) => value.to_string() == *expected,
+            _ => false,
+        })
+    })
+}
+
 fn narrative_turns_correlate(
     stream: &[&NormalizedEvent],
     capture: &NarrativeCapture,
@@ -347,11 +365,15 @@ fn narrative_turns_correlate(
         .filter(|event| {
             let name = event_name(&event.event);
             let raw = raw_event(event);
-            (name.as_deref() == Some(capture.assistant_text_event.as_str())
+            (!capture.assistant_text_event.is_empty()
+                && name.as_deref() == Some(capture.assistant_text_event.as_str())
+                && narrative_record_matches(&raw, &capture.assistant_text_match_fields)
                 && raw
                     .pointer(&capture.assistant_text_pointer)
                     .is_some_and(Value::is_string))
-                || (name.as_deref() == Some(capture.reasoning_event.as_str())
+                || (!capture.reasoning_event.is_empty()
+                    && name.as_deref() == Some(capture.reasoning_event.as_str())
+                    && narrative_record_matches(&raw, &capture.reasoning_match_fields)
                     && raw
                         .pointer(&capture.reasoning_pointer)
                         .is_some_and(Value::is_string))
@@ -492,43 +514,57 @@ pub fn evaluate_event_stream_completeness(
                 })
         });
         components[5] &= schema_ok;
-        let narrative_ok = narrative.is_some_and(|capture| {
-            narrative_values(
-                &success,
-                &capture.assistant_text_event,
-                &capture.assistant_text_pointer,
-                capture.assistant_text_aggregation,
-                capture.assistant_text_item_pointer.as_deref(),
-            ) == Some(vec![
-                "I will write the event-stream fixture.".to_owned(),
-                "SUCCESS".to_owned(),
-            ]) && narrative_values(
-                &failure,
-                &capture.assistant_text_event,
-                &capture.assistant_text_pointer,
-                capture.assistant_text_aggregation,
-                capture.assistant_text_item_pointer.as_deref(),
-            ) == Some(vec![
-                r#"{"status":"FAILURE","category":"scripted"}"#.to_owned(),
-            ]) && narrative_values(
-                &success,
-                &capture.reasoning_event,
-                &capture.reasoning_pointer,
-                capture.reasoning_aggregation,
-                capture.reasoning_item_pointer.as_deref(),
-            ) == Some(vec![
-                "prepare the requested tool call".to_owned(),
-                "verify the tool result and conclude".to_owned(),
-            ]) && narrative_values(
-                &failure,
-                &capture.reasoning_event,
-                &capture.reasoning_pointer,
-                capture.reasoning_aggregation,
-                capture.reasoning_item_pointer.as_deref(),
-            ) == Some(vec!["report the scripted failure".to_owned()])
-                && narrative_turns_correlate(&success, capture, &success_actor)
+        let assistant_text_ok = narrative.is_some_and(|capture| {
+            !capture.assistant_text_event.is_empty()
+                && narrative_values(
+                    &success,
+                    &capture.assistant_text_event,
+                    &capture.assistant_text_pointer,
+                    &capture.assistant_text_match_fields,
+                    capture.assistant_text_aggregation,
+                    capture.assistant_text_item_pointer.as_deref(),
+                ) == Some(vec![
+                    "I will write the event-stream fixture.".to_owned(),
+                    "SUCCESS".to_owned(),
+                ])
+                && narrative_values(
+                    &failure,
+                    &capture.assistant_text_event,
+                    &capture.assistant_text_pointer,
+                    &capture.assistant_text_match_fields,
+                    capture.assistant_text_aggregation,
+                    capture.assistant_text_item_pointer.as_deref(),
+                ) == Some(vec![
+                    r#"{"status":"FAILURE","category":"scripted"}"#.to_owned(),
+                ])
+        });
+        let reasoning_ok = narrative.is_some_and(|capture| {
+            !capture.reasoning_event.is_empty()
+                && narrative_values(
+                    &success,
+                    &capture.reasoning_event,
+                    &capture.reasoning_pointer,
+                    &capture.reasoning_match_fields,
+                    capture.reasoning_aggregation,
+                    capture.reasoning_item_pointer.as_deref(),
+                ) == Some(vec![
+                    "prepare the requested tool call".to_owned(),
+                    "verify the tool result and conclude".to_owned(),
+                ])
+                && narrative_values(
+                    &failure,
+                    &capture.reasoning_event,
+                    &capture.reasoning_pointer,
+                    &capture.reasoning_match_fields,
+                    capture.reasoning_aggregation,
+                    capture.reasoning_item_pointer.as_deref(),
+                ) == Some(vec!["report the scripted failure".to_owned()])
+        });
+        let turns_correlate = narrative.is_some_and(|capture| {
+            narrative_turns_correlate(&success, capture, &success_actor)
                 && narrative_turns_correlate(&failure, capture, &failure_actor)
         });
+        let narrative_ok = assistant_text_ok && reasoning_ok && turns_correlate;
         components[6] &= narrative_ok;
         let receipt_bound = |pointer: &str, earliest: bool| {
             let values = metadata_events
@@ -594,6 +630,10 @@ pub fn evaluate_event_stream_completeness(
     Wave4Evaluation {
         metrics,
         details: json!({
+            "narrative_declaration": {
+                "assistant_text": narrative.is_some_and(|capture| !capture.assistant_text_event.is_empty()),
+                "reasoning": narrative.is_some_and(|capture| !capture.reasoning_event.is_empty()),
+            },
             "missing_components": names
                 .into_iter()
                 .zip(components)
@@ -867,10 +907,12 @@ mod tests {
         NarrativeCapture {
             assistant_text_event: "model-response".to_owned(),
             assistant_text_pointer: "/payload/assistant_text".to_owned(),
+            assistant_text_match_fields: BTreeMap::new(),
             assistant_text_aggregation: NarrativeAggregation::CompleteEvent,
             assistant_text_item_pointer: None,
             reasoning_event: "model-response".to_owned(),
             reasoning_pointer: "/payload/reasoning".to_owned(),
+            reasoning_match_fields: BTreeMap::new(),
             reasoning_aggregation: NarrativeAggregation::CompleteEvent,
             reasoning_item_pointer: None,
             turn_pointer: "/actor".to_owned(),
@@ -951,6 +993,71 @@ mod tests {
             6.0 / 7.0
         );
         assert!(!metadata_only.passed);
+    }
+
+    #[test]
+    fn row69_text_only_declaration_is_measured_partial_evidence() {
+        let mut capture = row69_narrative();
+        capture.reasoning_event.clear();
+        capture.reasoning_pointer.clear();
+        let evaluation = evaluate_event_stream_completeness(
+            &row69_complete_events(),
+            Some(&row69_metadata()),
+            Some(&capture),
+            1,
+        );
+        assert!(evaluation.measurement_complete);
+        assert_eq!(
+            evaluation.metrics["event_stream_completeness.narrative_reconstructability"],
+            0.0
+        );
+        assert_eq!(
+            evaluation.details["narrative_declaration"],
+            json!({"assistant_text": true, "reasoning": false})
+        );
+        assert!(!evaluation.passed);
+    }
+
+    #[test]
+    fn row69_match_fields_separate_same_pointer_carriers() {
+        let mut events = Vec::new();
+        for event in row69_complete_events() {
+            if event.event != EventVocab::ModelResponse {
+                events.push(event);
+                continue;
+            }
+            for (suffix, kind, value) in [
+                (
+                    "text",
+                    "agent_message",
+                    event.payload["assistant_text"].clone(),
+                ),
+                ("reasoning", "reasoning", event.payload["reasoning"].clone()),
+            ] {
+                let mut carrier = event.clone();
+                carrier.id = format!("{}-{suffix}", event.id);
+                carrier.payload = json!({
+                    "_ahrb_source_raw": {
+                        "actor": event.actor.clone(),
+                        "item": {"type": kind, "text": value},
+                    }
+                });
+                events.push(carrier);
+            }
+        }
+        let mut capture = row69_narrative();
+        capture.assistant_text_pointer = "/item/text".to_owned();
+        capture.assistant_text_match_fields =
+            BTreeMap::from([("/item/type".to_owned(), "agent_message".to_owned())]);
+        capture.reasoning_pointer = "/item/text".to_owned();
+        capture.reasoning_match_fields =
+            BTreeMap::from([("/item/type".to_owned(), "reasoning".to_owned())]);
+        let evaluation =
+            evaluate_event_stream_completeness(&events, Some(&row69_metadata()), Some(&capture), 1);
+        assert_eq!(
+            evaluation.metrics["event_stream_completeness.narrative_reconstructability"],
+            1.0
+        );
     }
 
     #[test]

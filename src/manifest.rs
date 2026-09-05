@@ -690,9 +690,14 @@ pub struct EventMetadata {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct NarrativeCapture {
     /// Normalized event carrying assistant-visible text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub assistant_text_event: String,
     /// JSON pointer selecting assistant-visible text from the raw event.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub assistant_text_pointer: String,
+    /// Optional raw-record predicates that distinguish assistant-text carriers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub assistant_text_match_fields: BTreeMap<String, String>,
     /// Whether each event is complete or ordered deltas must be joined by item.
     #[serde(default)]
     pub assistant_text_aggregation: NarrativeAggregation,
@@ -700,9 +705,14 @@ pub struct NarrativeCapture {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_text_item_pointer: Option<String>,
     /// Normalized event carrying provider-emitted reasoning/thinking content.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning_event: String,
     /// JSON pointer selecting reasoning/thinking content from the raw event.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning_pointer: String,
+    /// Optional raw-record predicates that distinguish reasoning carriers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_match_fields: BTreeMap<String, String>,
     /// Whether each event is complete or ordered deltas must be joined by item.
     #[serde(default)]
     pub reasoning_aggregation: NarrativeAggregation,
@@ -2183,49 +2193,109 @@ fn validate_event_metadata(manifest: &Manifest) -> Result<()> {
         }
     }
     if let Some(narrative) = manifest.events.narrative.as_ref() {
-        for (label, event) in [
-            ("assistant_text_event", &narrative.assistant_text_event),
-            ("reasoning_event", &narrative.reasoning_event),
-        ] {
-            if !normalized_event_name(event) {
-                return Err(AhrbError::Validation(format!(
-                    "events.narrative.{label} {event:?} is not a normalized event vocabulary value"
-                )));
-            }
-        }
-        for (label, pointer) in [
-            ("assistant_text_pointer", &narrative.assistant_text_pointer),
-            ("reasoning_pointer", &narrative.reasoning_pointer),
-            ("turn_pointer", &narrative.turn_pointer),
-        ] {
-            if !valid_json_pointer(pointer) {
-                return Err(AhrbError::Validation(format!(
-                    "events.narrative.{label} {pointer:?} is not a non-root JSON pointer"
-                )));
-            }
-        }
-        for (label, aggregation, item_pointer) in [
+        let captures = [
             (
+                "assistant text",
+                "assistant_text_event",
+                &narrative.assistant_text_event,
+                "assistant_text_pointer",
+                &narrative.assistant_text_pointer,
+                &narrative.assistant_text_match_fields,
                 "assistant_text_item_pointer",
                 narrative.assistant_text_aggregation,
                 narrative.assistant_text_item_pointer.as_deref(),
             ),
             (
+                "reasoning",
+                "reasoning_event",
+                &narrative.reasoning_event,
+                "reasoning_pointer",
+                &narrative.reasoning_pointer,
+                &narrative.reasoning_match_fields,
                 "reasoning_item_pointer",
                 narrative.reasoning_aggregation,
                 narrative.reasoning_item_pointer.as_deref(),
             ),
-        ] {
-            if item_pointer.is_some_and(|pointer| !valid_json_pointer(pointer)) {
+        ];
+        let mut declared_captures = 0_u8;
+        for (
+            capture_label,
+            event_label,
+            event,
+            pointer_label,
+            pointer,
+            match_fields,
+            item_label,
+            aggregation,
+            item_pointer,
+        ) in captures
+        {
+            let event_declared = !event.is_empty();
+            let pointer_declared = !pointer.is_empty();
+            if event_declared != pointer_declared {
                 return Err(AhrbError::Validation(format!(
-                    "events.narrative.{label} {item_pointer:?} is not a non-root JSON pointer"
+                    "events.narrative {capture_label} capture requires both {event_label} and {pointer_label}"
+                )));
+            }
+            if !event_declared {
+                if !match_fields.is_empty()
+                    || item_pointer.is_some()
+                    || aggregation == NarrativeAggregation::ItemDeltas
+                {
+                    return Err(AhrbError::Validation(format!(
+                        "events.narrative match fields, {item_label}, and item-deltas aggregation require a declared {capture_label} capture"
+                    )));
+                }
+                continue;
+            }
+            declared_captures = declared_captures.saturating_add(1);
+            if !normalized_event_name(event) {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{event_label} {event:?} is not a normalized event vocabulary value"
+                )));
+            }
+            if !valid_json_pointer(pointer) {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{pointer_label} {pointer:?} is not a non-root JSON pointer"
+                )));
+            }
+            if item_pointer.is_some_and(|value| !valid_json_pointer(value)) {
+                return Err(AhrbError::Validation(format!(
+                    "events.narrative.{item_label} {item_pointer:?} is not a non-root JSON pointer"
                 )));
             }
             if aggregation == NarrativeAggregation::ItemDeltas && item_pointer.is_none() {
                 return Err(AhrbError::Validation(format!(
-                    "events.narrative.{label} is required for item-deltas aggregation"
+                    "events.narrative.{item_label} is required for item-deltas aggregation"
                 )));
             }
+        }
+        for (label, fields) in [
+            (
+                "assistant_text_match_fields",
+                &narrative.assistant_text_match_fields,
+            ),
+            ("reasoning_match_fields", &narrative.reasoning_match_fields),
+        ] {
+            for pointer in fields.keys() {
+                if !valid_json_pointer(pointer) {
+                    return Err(AhrbError::Validation(format!(
+                        "events.narrative.{label} key {pointer:?} is not a non-root JSON pointer"
+                    )));
+                }
+            }
+        }
+        if declared_captures == 0 {
+            return Err(AhrbError::Validation(
+                "events.narrative requires assistant-text and/or reasoning capture points"
+                    .to_owned(),
+            ));
+        }
+        if !valid_json_pointer(&narrative.turn_pointer) {
+            return Err(AhrbError::Validation(format!(
+                "events.narrative.turn_pointer {:?} is not a non-root JSON pointer",
+                narrative.turn_pointer
+            )));
         }
     }
     if let Some(compaction) = manifest.events.compaction.as_ref() {
@@ -3261,6 +3331,41 @@ mod version_tests {
         narrative.assistant_text_aggregation = NarrativeAggregation::ItemDeltas;
         narrative.assistant_text_item_pointer = Some("/payload/item_id".to_owned());
         validate(&manifest).expect("item-delta narrative capture is valid");
+
+        let mut manifest = wave_4_manifest();
+        let narrative = manifest.events.narrative.as_mut().expect("narrative");
+        narrative.reasoning_event.clear();
+        narrative.reasoning_pointer.clear();
+        validate(&manifest).expect("assistant-text-only narrative capture is valid");
+
+        let mut manifest = wave_4_manifest();
+        let narrative = manifest.events.narrative.as_mut().expect("narrative");
+        narrative.assistant_text_event.clear();
+        narrative.assistant_text_pointer.clear();
+        narrative.reasoning_event.clear();
+        narrative.reasoning_pointer.clear();
+        let error = validate(&manifest).expect_err("empty narrative block is invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("assistant-text and/or reasoning")
+        );
+
+        let mut manifest = wave_4_manifest();
+        let narrative = manifest.events.narrative.as_mut().expect("narrative");
+        narrative.reasoning_event.clear();
+        let error = validate(&manifest).expect_err("half reasoning capture is invalid");
+        assert!(error.to_string().contains("requires both reasoning_event"));
+
+        let mut manifest = wave_4_manifest();
+        let narrative = manifest.events.narrative.as_mut().expect("narrative");
+        narrative.reasoning_event.clear();
+        narrative.reasoning_pointer.clear();
+        narrative
+            .reasoning_match_fields
+            .insert("/item/type".to_owned(), "reasoning".to_owned());
+        let error = validate(&manifest).expect_err("orphan reasoning selector is invalid");
+        assert!(error.to_string().contains("match fields"));
 
         let mut manifest = wave_4_manifest();
         manifest

@@ -146,6 +146,14 @@ schema_version_pointer = "/schema_version"
 schema_versions = [1]
 warn_unmapped_payload_kinds = true
 
+# Narrative is intentionally undeclared. The saved row-69 journals (for example
+# results/haider-agent/2026-09-02T17:06:20Z-3eac4351/report.json) retain only a
+# final completed agent_message at /payload/item/text, omit the pre-tool
+# assistant item, and contain no reasoning item; run_state state="thinking" is
+# lifecycle metadata, not model reasoning. The 40-run real-model study using
+# `haider run --output json` likewise exposed no text-stream or reasoning
+# events. Row 69 therefore remains honestly UNSUPPORTED until Haider journals
+# the complete model narrative.
 [events.metadata]
 schema_version_pointer = "/schema_version"
 schema_version_value = "1"

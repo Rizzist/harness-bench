@@ -111,6 +111,22 @@ source = "stdout"
 framing = "jsonl"
 id_pointer = "/toolCallId"
 
+# Stored real-run evidence: results/pi/2026-09-02T13:13:12Z-ca742db2/report.json.
+# Authoritative `message_end` records carry complete typed content blocks and
+# the source envelope carries /actor. The saved run has text but predates the
+# row-69 thinking fixture. Pi 0.84.4 docs/json.md and docs/session-format.md
+# define final text and thinking blocks; expansion avoids a fragile array index.
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/_ahrb_expanded/text"
+assistant_text_match_fields = { "/_ahrb_expanded/type" = "text" }
+assistant_text_aggregation = "complete-event"
+reasoning_event = "model-response"
+reasoning_pointer = "/_ahrb_expanded/thinking"
+reasoning_match_fields = { "/_ahrb_expanded/type" = "thinking" }
+reasoning_aggregation = "complete-event"
+turn_pointer = "/actor"
+
 # TODO(orchestrator): capture one real 0.84.x JSON transcript to reconfirm final
 # assistant/agent_settled ordering, decide policy for the rare deferred stop
 # reason, and determine whether retries need disabling for fault rows. JSON mode
@@ -136,9 +152,17 @@ payload_bindings = { call_id = "/toolCallId", name = "/toolName", result = "" }
 
 [[events.rules]]
 matches = "message_end"
-match_fields = { "/message/role" = "assistant" }
+expand_pointer = "/message/content"
+match_fields = { "/message/role" = "assistant", "/_ahrb_expanded/type" = "text" }
 event = "model-response"
-payload_pointer = "/message"
+payload_pointer = "/_ahrb_expanded"
+
+[[events.rules]]
+matches = "message_end"
+expand_pointer = "/message/content"
+match_fields = { "/message/role" = "assistant", "/_ahrb_expanded/type" = "thinking" }
+event = "model-response"
+payload_pointer = "/_ahrb_expanded"
 
 [[events.rules]]
 matches = "message_end"

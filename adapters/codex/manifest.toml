@@ -101,6 +101,23 @@ source = "stdout"
 framing = "jsonl"
 id_pointer = "/item/id"
 
+# Stored real-run evidence: results/codex/2026-09-02T13:22:50Z-0815bb8f/report.json.
+# `item.completed` agent_message records carry one complete assistant item at
+# /item/text and AHRB's per-turn source envelope carries /actor. That run has no
+# reasoning record because it predates the row-69 reasoning fixture. Codex's
+# exec JSONL schema also defines `item.completed` reasoning items with complete
+# text at /item/text (codex-rs/exec/src/exec_events.rs, ReasoningItem).
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/item/text"
+assistant_text_match_fields = { "/item/type" = "agent_message" }
+assistant_text_aggregation = "complete-event"
+reasoning_event = "model-response"
+reasoning_pointer = "/item/text"
+reasoning_match_fields = { "/item/type" = "reasoning" }
+reasoning_aggregation = "complete-event"
+turn_pointer = "/actor"
+
 [[events.rules]]
 matches = "thread.started"
 event = "turn-accepted"
@@ -182,6 +199,12 @@ payload_bindings = { call_id = "/item/id", result = "/item" }
 [[events.rules]]
 matches = "item.completed"
 match_fields = { "/item/type" = "agent_message" }
+event = "model-response"
+payload_pointer = "/item"
+
+[[events.rules]]
+matches = "item.completed"
+match_fields = { "/item/type" = "reasoning" }
 event = "model-response"
 payload_pointer = "/item"
 

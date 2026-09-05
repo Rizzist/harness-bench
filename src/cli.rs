@@ -22,6 +22,13 @@ pub enum Command {
         /// Existing `report.json` path.
         input: PathBuf,
     },
+    /// Re-evaluate row 69 from a saved report without starting a harness.
+    Replay {
+        /// Adapter manifest used to interpret raw narrative records.
+        manifest: PathBuf,
+        /// Existing `report.json` path containing normalized events.
+        input: PathBuf,
+    },
     /// Print the versioned test matrix.
     ListTests,
     /// Print durable result history.
@@ -131,13 +138,20 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 input: PathBuf::from(required(&values, "input")?),
             })
         }
+        Some("replay") => {
+            let values = parse_flags(&args[1..], &["manifest", "input"], &[])?;
+            Ok(Command::Replay {
+                manifest: PathBuf::from(required(&values, "manifest")?),
+                input: PathBuf::from(required(&values, "input")?),
+            })
+        }
         Some("results") => {
             let (harness, all) = parse_results_args(&args[1..])?;
             Ok(Command::Results { harness, all })
         }
         Some(other) => Err(AhrbError::Usage(format!("unknown subcommand {other:?}"))),
         None => Err(AhrbError::Usage(
-            "expected doctor, run, report, results, or list-tests".to_owned(),
+            "expected doctor, run, replay, report, results, or list-tests".to_owned(),
         )),
     }
 }
@@ -192,11 +206,96 @@ pub async fn execute(command: Command) -> Result<i32> {
             print!("{}", crate::report::render_markdown(&report));
             Ok(0)
         }
+        Command::Replay { manifest, input } => replay_row69(&manifest, &input),
         Command::Results { harness, all } => {
             crate::results::print_history(harness.as_deref(), all)?;
             Ok(0)
         }
     }
+}
+
+fn replay_row69(manifest_path: &std::path::Path, input: &std::path::Path) -> Result<i32> {
+    let manifest = crate::manifest::load(manifest_path)?;
+    let bytes = std::fs::read(input)?;
+    let report: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let profile = report
+        .pointer("/fingerprint/profile")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AhrbError::Validation(
+                "saved report lacks string fingerprint.profile required for replay".to_owned(),
+            )
+        })?
+        .to_owned();
+    let repetitions = match profile.as_str() {
+        "quick" => 3,
+        "cert" => 7,
+        other => {
+            return Err(AhrbError::Validation(format!(
+                "saved report has unsupported profile {other:?}; expected quick or cert"
+            )));
+        }
+    };
+    if manifest.events.narrative.is_none() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": 1,
+                "row": 69,
+                "id": "event-stream-completeness",
+                "manifest": manifest_path,
+                "report": input,
+                "profile": profile,
+                "repetitions": repetitions,
+                "outcome": "UNSUPPORTED",
+                "detail": "adapter declares no durable assistant-text/reasoning capture points",
+            }))?
+        );
+        return Ok(1);
+    }
+    let saved_events = report
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            AhrbError::Validation("saved report lacks events array required for replay".to_owned())
+        })?;
+    let events = saved_events
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<std::result::Result<Vec<crate::events::NormalizedEvent>, _>>()?;
+    let evaluation = crate::wave4::evaluate_event_stream_completeness(
+        &events,
+        manifest.events.metadata.as_ref(),
+        manifest.events.narrative.as_ref(),
+        repetitions,
+    );
+    let outcome = if !evaluation.measurement_complete {
+        "ERROR"
+    } else if evaluation.passed {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "row": 69,
+            "id": "event-stream-completeness",
+            "manifest": manifest_path,
+            "report": input,
+            "profile": profile,
+            "repetitions": repetitions,
+            "outcome": outcome,
+            "measurement_complete": evaluation.measurement_complete,
+            "measurement_error": evaluation.measurement_error,
+            "passed": evaluation.passed,
+            "metrics": evaluation.metrics,
+            "details": evaluation.details,
+        }))?
+    );
+    Ok(if evaluation.passed { 0 } else { 1 })
 }
 
 /// Parse `[HARNESS] [--all]` for both `ahrb results` and `hbench results`.
@@ -462,6 +561,26 @@ mod tests {
             Command::Results {
                 harness: Some("mock".to_owned()),
                 all: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_offline_row69_replay() -> Result<()> {
+        let args = [
+            "replay",
+            "--manifest",
+            "adapters/codex/manifest.toml",
+            "--input",
+            "results/codex/example/report.json",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            parse(&args)?,
+            Command::Replay {
+                manifest: PathBuf::from("adapters/codex/manifest.toml"),
+                input: PathBuf::from("results/codex/example/report.json"),
             }
         );
         Ok(())

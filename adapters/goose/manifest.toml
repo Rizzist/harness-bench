@@ -33,6 +33,9 @@ fanout_mode = "client"
 [events]
 source = "stdout"
 framing = "jsonl"
+# Narrative intentionally undeclared: no results/goose saved run or documented
+# event rule exists from which to prove text, reasoning, or a turn pointer. Row
+# 69 remains UNSUPPORTED pending captured evidence.
 [exit]
 success = 0
 failures = { provider = 20, timeout = 21, cancelled = 22, invalid = 23 }
@@ -50,4 +53,3 @@ max_bytes = 1048576
 [capabilities]
 required = { routing = "core", headless = "core", sessions = "core" }
 optional = { native_delegation = "facet", hooks = "facet", subturn = "facet" }
-
