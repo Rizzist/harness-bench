@@ -68,3 +68,22 @@ fn haider_requires_both_client_and_daemon_executables() {
     assert!(stderr.contains("required executable \"haiderd\" does not exist"));
     assert!(!stderr.to_ascii_lowercase().contains("panicked"));
 }
+
+#[test]
+fn extra_names_resolve_the_bundled_adapter_before_availability_checks() {
+    for name in ["aider", "goose", "cline", "cline-cli"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_hbench"))
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .env("PATH", "")
+            .arg(name)
+            .output()
+            .expect("execute extra harness shorthand");
+        assert_ne!(result.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("no candidate executable exists"),
+            "{name}: {stderr}"
+        );
+        assert!(!stderr.contains("no bundled adapter"), "{name}: {stderr}");
+    }
+}

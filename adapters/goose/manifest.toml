@@ -1,55 +1,197 @@
+# Verified target: Goose 1.49.0. See adapters/README.md for limitations.
 [identity]
-schema = 1
+schema = 2
 id = "goose"
 name = "Goose"
-revision = "v1"
+revision = "1.49.0-headless-v2"
+
 [availability]
 exec_paths = ["goose"]
 version_probe = ["goose", "--version"]
-version_pattern = "goose"
+version_pattern = "1.49.0"
+
 [fake_model]
 dialect = "open-ai-chat-completions"
-base_url_env = "OPENAI_BASE_URL"
+base_url_env = "OPENAI_HOST"
 credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
-allowed_paths = ["/v1/chat/completions"]
+allowed_paths = ["/v1/chat/completions", "/v1/models"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_CACHE_HOME = "{{profile}}/cache"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+GOOSE_PATH_ROOT = "{{profile}}/goose"
+
 [isolation]
-roots = { HOME = "{{profile}}/home", XDG_CONFIG_HOME = "{{profile}}/config", XDG_DATA_HOME = "{{profile}}/data", XDG_STATE_HOME = "{{profile}}/state", XDG_RUNTIME_DIR = "{{profile}}/runtime", TMPDIR = "{{profile}}/tmp" }
-forbidden_roots = ["~/.config/goose"]
+forbidden_roots = ["~/.config/goose", "~/.local/share/goose", "~/.local/state/goose", "~/Library/Application Support/Block/goose"]
+[isolation.environment]
+OPENAI_BASE_PATH = "v1/chat/completions"
+GOOSE_DISABLE_KEYRING = "1"
+GOOSE_MODE = "auto"
+GOOSE_TELEMETRY_ENABLED = "false"
+GOOSE_DISABLE_SESSION_NAMING = "true"
+GOOSE_PROVIDER = "openai"
+GOOSE_MODEL = "ahrb-fake-v1"
+GOOSE_FAST_MODEL = "ahrb-fake-v1"
+
 [daemon]
 persistent = false
+
 [transport]
 kind = "exec"
-command = ["goose"]
+command = [
+  "goose", "run", "--text", "{{prompt}}", "--name", "{{session_id}}", "--no-profile",
+  "--with-builtin", "developer", "--output-format", "stream-json"
+]
 timeout_ms = 30000
+
 [sessions]
+# The AHRB handle is supplied as a unique native name, then reopened by name.
+resume = [
+  "goose", "run", "--text", "{{prompt}}", "--name", "{{session_id}}", "--resume",
+  "--no-profile", "--with-builtin", "developer", "--output-format", "stream-json"
+]
+# session remove prompts even with --name and closed stdin: no close_delete.
+store_paths = ["{{profile}}/goose/data/sessions"]
+
 [next_input]
 [agents]
+
 [concurrency]
 topology = "client-process-fanout"
+# Benchmark fanout ceiling, not a native coordinator limit.
 max_agents = 8
 fanout_mode = "client"
-[tools]
+
+[tools.aliases]
+write = "shell"
+read = "shell"
+fail = "shell"
+large_output = "shell"
+
+[tools.bindings]
+"shell.command" = "command"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+large_output = ["{{ahrb_fixture}}", "emit", "--bytes", "{{bytes}}"]
+
 [events]
 source = "stdout"
 framing = "jsonl"
-# Narrative intentionally undeclared: no results/goose saved run or documented
-# event rule exists from which to prove text, reasoning, or a turn pointer. Row
-# 69 remains UNSUPPORTED pending captured evidence.
+id_pointer = "/message/id"
+# 1.49.0 stream-json message records carry native content blocks. The complete
+# record is stream termination, even after a provider error, not typed SUCCESS.
+# AHRB's generic process-exit contract handles completion; do not map it twice.
+
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/_ahrb_expanded/text"
+assistant_text_match_fields = { "/_ahrb_expanded/type" = "text" }
+assistant_text_aggregation = "complete-event"
+turn_pointer = "/actor"
+# Native created timestamps are seconds, not one of schema 2's timestamp units.
+# Reasoning and compaction scopes have not been established by these captures.
+
+[[events.rules]]
+matches = "message"
+expand_pointer = "/message/content"
+match_fields = { "/_ahrb_expanded/type" = "toolRequest", "/_ahrb_expanded/toolCall/status" = "success" }
+event = "tool-call"
+payload_pointer = "/_ahrb_expanded"
+payload_bindings = { call_id = "/_ahrb_expanded/id", name = "/_ahrb_expanded/toolCall/value/name", arguments = "/_ahrb_expanded/toolCall/value/arguments" }
+
+[[events.rules]]
+matches = "message"
+expand_pointer = "/message/content"
+match_fields = { "/_ahrb_expanded/type" = "toolResponse", "/_ahrb_expanded/toolResult/status" = "success" }
+event = "tool-result"
+payload_pointer = "/_ahrb_expanded"
+payload_bindings = { call_id = "/_ahrb_expanded/id", result = "/_ahrb_expanded/toolResult/value/structuredContent" }
+
+[[events.rules]]
+matches = "message"
+expand_pointer = "/message/content"
+match_fields = { "/_ahrb_expanded/type" = "toolResponse", "/_ahrb_expanded/toolResult/status" = "error" }
+event = "tool-result"
+payload_pointer = "/_ahrb_expanded"
+payload_bindings = { call_id = "/_ahrb_expanded/id", result = "/_ahrb_expanded/toolResult" }
+
+[[events.rules]]
+matches = "message"
+expand_pointer = "/message/content"
+match_fields = { "/message/role" = "assistant", "/_ahrb_expanded/type" = "text" }
+event = "model-response"
+payload_pointer = "/_ahrb_expanded"
+
+[[events.rules]]
+matches = "message"
+expand_pointer = "/message/content"
+match_fields = { "/_ahrb_expanded/type" = "error" }
+event = "terminal-failure"
+payload_pointer = "/_ahrb_expanded"
+
 [exit]
 success = 0
-failures = { provider = 20, timeout = 21, cancelled = 22, invalid = 23 }
+success_stdout = ['"type":"complete"']
+failure_stdout = ['"type":"error"']
+# The installed CLI exits zero even after an injected HTTP 401. No nonzero
+# provider category is invented; row 10/19 must retain that finding.
+# No invented typed failure categories: observe native terminal records/exit status.
+
 [process]
 executable_names = ["goose"]
+
 [resources]
+# These are AHRB observation deadlines/capture caps, not a native budget claim.
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
+log_paths = ["{{profile}}/goose/state/logs"]
+journal_paths = ["{{profile}}/goose/data/sessions"]
+# Retry policy, context injection, budgets and tariffs are absent until proven.
+
+[input]
+prompt_uses_stdin = false
+
 [hooks]
 [cleanup]
+paths = ["{{profile}}"]
+
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
-[capabilities]
-required = { routing = "core", headless = "core", sessions = "core" }
-optional = { native_delegation = "facet", hooks = "facet", subturn = "facet" }
+credential_carrier_paths = []
+
+
+[capabilities.injection_surface.provider]
+method = "environment"
+environment = "GOOSE_MODEL"
+
+[capabilities.injection_surface.base_url]
+method = "environment"
+environment = "OPENAI_HOST"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "OPENAI_API_KEY"
+
+[capabilities.required]
+sessions = "Named sessions persist in the isolated SQLite store"
+resume = "Captured goose run --resume --name reopens the same session and prior conversation"
+tool_result_role_fidelity = "Captured tool results return to the fake endpoint with the native OpenAI tool role"
+headless = "Explicit one-shot prompt with stdin closed and no PTY"
+
+[capabilities.optional]
+# No native delegation, session-ops, permissions, budget or usage claim from flags alone.

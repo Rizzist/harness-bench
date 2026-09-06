@@ -12,7 +12,7 @@ fn external_reference_manifests_parse_and_validate() -> Result<()> {
         "haider-agent",
         "pi",
         "rick",
-        "cline-cli",
+        "cline",
         "opencode",
         "goose",
         "oh-my-pi",
@@ -37,6 +37,9 @@ fn wave4_target_manifests_parse_and_declare_typed_injection_surfaces() -> Result
         "haider-agent",
         "mock",
         "mock-exec",
+        "aider",
+        "goose",
+        "cline",
     ] {
         let path = format!("adapters/{adapter}/manifest.toml");
         let manifest = ahrb::manifest::load(Path::new(&path))?;
@@ -45,6 +48,114 @@ fn wave4_target_manifests_parse_and_declare_typed_injection_surfaces() -> Result
             "{adapter} must declare the typed Wave-4 injection surface"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn extra_adapters_use_schema_two_and_isolated_headless_profiles() -> Result<()> {
+    for adapter in ["aider", "goose", "cline"] {
+        let path = format!("adapters/{adapter}/manifest.toml");
+        let manifest = ahrb::manifest::load(Path::new(&path))?;
+        assert_eq!(manifest.identity.schema, 2, "{adapter}");
+        assert_eq!(manifest.transport.kind, TransportKind::Exec, "{adapter}");
+        assert!(!manifest.daemon.persistent, "{adapter}");
+        assert!(
+            manifest
+                .transport
+                .command
+                .iter()
+                .any(|arg| arg == "{{prompt}}")
+        );
+        assert!(
+            !manifest
+                .transport
+                .command
+                .iter()
+                .any(|arg| arg.contains("{{credential}}"))
+        );
+        assert!(manifest.isolation.roots.contains_key("XDG_CACHE_HOME"));
+        assert!(manifest.capabilities.injection_surface.is_some());
+        assert_eq!(manifest.input.prompt_uses_stdin, Some(false));
+        assert!(
+            manifest.capabilities.optional.is_empty(),
+            "{adapter}: optional support needs evidence"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn extra_adapter_result_rules_preserve_command_and_protocol_errors() -> Result<()> {
+    use ahrb::events::{EventNormalizer, EventVocab};
+    use serde_json::json;
+
+    let mut goose = ahrb::manifest::load(Path::new("adapters/goose/manifest.toml"))?;
+    // The exec driver supplies a numeric observation cursor before normalization.
+    goose.events.cursor_pointer = "/cursor".to_owned();
+    for (native, expected) in [
+        (
+            json!({"status":"success","value":{"structuredContent":{
+                "exit_code":1,"stdout":"","stderr":"command failed"
+            }}}),
+            json!({"exit_code":1,"stdout":"","stderr":"command failed"}),
+        ),
+        (
+            json!({"status":"error","error":"invalid tool arguments"}),
+            json!({"status":"error","error":"invalid tool arguments"}),
+        ),
+    ] {
+        let raw = json!({
+            "type":"message","message":{"id":"record"},"cursor":1,
+            "_ahrb_expanded":{"type":"toolResponse","id":"call","toolResult":native}
+        });
+        let event = EventNormalizer::default()
+            .normalize(&raw, &goose.events)?
+            .expect("tool response must normalize");
+        assert_eq!(event.event, EventVocab::ToolResult);
+        assert_eq!(event.payload["call_id"], "call");
+        assert_eq!(event.payload["result"], expected);
+    }
+
+    let mut cline = ahrb::manifest::load(Path::new("adapters/cline/manifest.toml"))?;
+    cline.events.cursor_pointer = "/cursor".to_owned();
+    // The exec driver applies every matching rule, rather than stopping after
+    // the first. Both native shapes must therefore match exactly one result rule.
+    let normalize_all_results = |raw: &serde_json::Value| {
+        cline
+            .events
+            .rules
+            .iter()
+            .filter(|rule| rule.event == "tool-result")
+            .filter_map(|rule| {
+                let mut mapping = cline.events.clone();
+                mapping.rules = vec![rule.clone()];
+                EventNormalizer::default()
+                    .normalize(raw, &mapping)
+                    .ok()
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+    };
+    let result = json!({"success":false,"result":"command failed"});
+    let raw = json!({"type":"agent_event","cursor":1,"event":{
+        "type":"content_end","contentType":"tool","toolCallId":"call",
+        "toolName":"run_commands","output":[result.clone()]
+    }});
+    let events = normalize_all_results(&raw);
+    assert_eq!(events.len(), 1, "command result must not be duplicated");
+    let event = &events[0];
+    assert_eq!(event.event, EventVocab::ToolResult);
+    assert_eq!(event.payload["result"], json!([result]));
+    let error = json!({"error":"invalid JSON arguments"});
+    let raw = json!({"type":"agent_event","cursor":1,"event":{
+        "type":"content_end","contentType":"tool","toolCallId":"call",
+        "toolName":"unknown_fixture","output":error.clone(),
+        "error":"invalid JSON arguments"
+    }});
+    let events = normalize_all_results(&raw);
+    assert_eq!(events.len(), 1, "protocol error must normalize once");
+    let event = &events[0];
+    assert_eq!(event.payload["result"], error);
     Ok(())
 }
 

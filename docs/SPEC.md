@@ -49,8 +49,9 @@ correctness is first-class and cannot be compensated for by good resource number
 - `report`: Markdown + JSON + raw evidence (samples.jsonl, processes.jsonl, events.jsonl,
   model-requests.jsonl), fingerprints, optional JUnit.
 - `scenarios`: versioned declarative workflow definitions.
-- `adapters`: reference manifests for the 9 harnesses (haider-agent, pi, rick, cline-cli,
-  opencode, goose, oh-my-pi, deepseek-harness, aider) — as data.
+- `adapters`: reference manifests for the 9 harnesses (claude-code, codex, haider-agent,
+  opencode, pi, rick, aider, goose, cline) — as data. Oh-my-pi and deepseek-harness
+  remain legacy placeholders outside this reference set.
 - **`mock_harness`** (REQUIRED, see below): a built-in reference harness so AHRB tests
   itself end-to-end with zero external harness.
 

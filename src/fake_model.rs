@@ -1358,18 +1358,22 @@ fn render_native_arguments(
     argv: &[String],
     bindings: &Map<String, Value>,
 ) -> Result<Value> {
-    for (style, expected_type) in [("command", "string"), ("command_argv", "array")] {
+    for (style, expected_type) in [
+        ("command", "string"),
+        ("command_argv", "array"),
+        ("command_list", "array"),
+    ] {
         let Some(field) = binding_for(bindings, &tool.name, style)? else {
             continue;
         };
         require_schema_property_type(&tool.schema, &field, expected_type)?;
         let metadata =
             native_fixture_metadata(abstract_call_id, abstract_name, semantic_arguments)?;
-        let script = shell_command(argv, semantic_arguments, &metadata);
-        let command = if style == "command" {
-            Value::String(script)
-        } else {
-            json!(["/bin/sh", "-c", script])
+        let script = shell_command(argv, semantic_arguments, &metadata, style == "command_list");
+        let command = match style {
+            "command" => Value::String(script),
+            "command_list" => json!([script]),
+            _ => json!(["/bin/sh", "-c", script]),
         };
         let mut arguments = Map::new();
         arguments.insert(field.clone(), command);
@@ -1498,12 +1502,21 @@ fn shell_command(
     argv: &[String],
     semantic_arguments: &Map<String, Value>,
     metadata: &str,
+    leading_metadata: bool,
 ) -> String {
-    let mut command = argv
+    let quoted = argv
         .iter()
         .map(|argument| format!("'{}'", argument.replace('\'', "'\"'\"'")))
         .collect::<Vec<_>>()
         .join(" ");
+    // Batch-command tools can echo a truncated preview of each script in their
+    // result. Put inert hex metadata first so that preview cannot cut a route
+    // marker embedded in the command's arguments. The full call keeps the route.
+    let mut command = if leading_metadata {
+        format!(": '{metadata}'; {quoted}")
+    } else {
+        quoted
+    };
     command.push_str(" # ");
     for context in semantic_arguments
         .values()
@@ -1513,7 +1526,9 @@ fn shell_command(
         command.push_str(&context.replace(['\n', '\r'], " "));
         command.push(' ');
     }
-    command.push_str(metadata);
+    if !leading_metadata {
+        command.push_str(metadata);
+    }
     command
 }
 
@@ -4556,6 +4571,85 @@ mod tests {
                 .get("command")
                 .and_then(Value::as_str),
             Some(command)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_list_previews_do_not_cut_routing_annotations() -> Result<()> {
+        let marker = RouteMarker::new("preview", "actor", "next")?;
+        let content = format!("{}{}", "x".repeat(150), marker.encode());
+        let arguments = Map::from_iter([("content".to_owned(), json!(content))]);
+        let metadata = native_fixture_metadata("call-preview", "write_fixture", &arguments)?;
+        let argv = ["printf".to_owned(), "%s".to_owned(), content.clone()];
+        let old = shell_command(&argv, &arguments, &metadata, false);
+        let old_preview: String = old.chars().take(200).collect();
+        assert!(RouteMarker::extract(&old_preview).is_err());
+
+        let script = shell_command(&argv, &arguments, &metadata, true);
+        let preview: String = script.chars().take(200).collect();
+        assert_eq!(RouteMarker::extract(&preview)?, None);
+        assert_eq!(
+            RouteMarker::extract(&format!("{script}\n{preview}"))?,
+            Some(marker)
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, content.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn native_command_lists_keep_one_complete_script_per_array_entry() -> Result<()> {
+        let tool = DeclaredTool {
+            name: "batch_shell".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {"commands": {"type": "array", "items": {"type": "string"}}},
+                "required": ["commands"],
+                "additionalProperties": false
+            }),
+        };
+        let bindings = Map::from_iter([("batch_shell.command_list".to_owned(), json!("commands"))]);
+        let arguments = render_native_arguments(
+            &tool,
+            "call-list",
+            "read_fixture",
+            &Map::new(),
+            &[
+                "printf".to_owned(),
+                "%s".to_owned(),
+                "one; two $(false)".to_owned(),
+            ],
+            &bindings,
+        )?;
+        let commands = arguments["commands"].as_array().expect("command list");
+        assert_eq!(
+            commands.len(),
+            1,
+            "an argv must not become separate shell commands"
+        );
+        let command = commands[0].as_str().expect("complete shell script");
+        assert!(command.contains(crate::events::NATIVE_FIXTURE_METADATA_PREFIX));
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", command])
+            .output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"one; two $(false)");
+        let mut wrong_shape = tool;
+        wrong_shape.schema["properties"]["commands"]["type"] = json!("string");
+        assert!(
+            render_native_arguments(
+                &wrong_shape,
+                "call-list",
+                "read_fixture",
+                &Map::new(),
+                &[],
+                &bindings,
+            )
+            .is_err()
         );
         Ok(())
     }

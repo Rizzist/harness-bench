@@ -1,55 +1,167 @@
+# Verified target: Aider 0.86.2. See adapters/README.md for limitations.
 [identity]
-schema = 1
+schema = 2
 id = "aider"
 name = "Aider"
-revision = "v1"
+revision = "0.86.2-headless-v2"
+
 [availability]
 exec_paths = ["aider"]
 version_probe = ["aider", "--version"]
-version_pattern = "aider"
+version_pattern = "0.86.2"
+
 [fake_model]
 dialect = "open-ai-chat-completions"
-base_url_env = "OPENAI_BASE_URL"
+base_url_env = "OPENAI_API_BASE"
 credential_env = "OPENAI_API_KEY"
 model = "ahrb-fake-v1"
-allowed_paths = ["/v1/chat/completions"]
+allowed_paths = ["/v1/chat/completions", "/v1/models"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_CACHE_HOME = "{{profile}}/cache"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+
 [isolation]
-roots = { HOME = "{{profile}}/home", XDG_CONFIG_HOME = "{{profile}}/config", XDG_DATA_HOME = "{{profile}}/data", XDG_STATE_HOME = "{{profile}}/state", XDG_RUNTIME_DIR = "{{profile}}/runtime", TMPDIR = "{{profile}}/tmp" }
-forbidden_roots = ["~/.aider"]
+forbidden_roots = ["~/.aider", "~/.aider.conf.yml", "~/.aider.chat.history.md", "~/.aider.input.history", "~/.cache/aider"]
+[isolation.environment]
+# Fail closed for optional HTTPS metadata/tokenizer downloads; inference is loopback.
+HTTPS_PROXY = "http://127.0.0.1:9"
+HTTP_PROXY = "http://127.0.0.1:9"
+NO_PROXY = "127.0.0.1,localhost"
+HF_HUB_OFFLINE = "1"
+LITELLM_LOCAL_MODEL_COST_MAP = "True"
+
+# Fresh disposable HOME/workspace roots contain no real dotenv or account config.
+# --env-file adds a dotenv source after discovered files; this empty file cannot
+# undo variables loaded earlier. Isolation relies on the fresh roots.
+[[isolation.generated_files]]
+path = "{{profile}}/config/aider.env"
+mode = "0600"
+content = ''''''
+
+[[isolation.generated_files]]
+path = "{{profile}}/config/aider.yml"
+mode = "0600"
+content = '''{}
+'''
+
+# Local metadata prevents aider's startup model-price download.
+[[isolation.generated_files]]
+path = "{{profile}}/config/aider-models.json"
+mode = "0600"
+content = '{"openai/{{model}}":{"max_input_tokens":128000,"max_output_tokens":4096,"input_cost_per_token":0,"output_cost_per_token":0,"litellm_provider":"openai","mode":"chat"}}'
+
 [daemon]
 persistent = false
+
 [transport]
 kind = "exec"
-command = ["aider"]
+command = [
+  "aider", "--model", "openai/{{model}}", "--weak-model", "openai/{{model}}",
+  "--editor-model", "openai/{{model}}", "--openai-api-base", "{{base_url}}/v1", "--message",
+  "{{prompt}}", "--yes-always", "--no-git", "--no-auto-commits", "--no-check-update",
+  "--no-show-release-notes", "--no-analytics", "--no-pretty", "--no-fancy-input",
+  "--no-stream", "--no-detect-urls", "--disable-playwright", "--no-suggest-shell-commands",
+  "--map-tokens", "0", "--no-show-model-warnings", "--timeout", "20", "--model-metadata-file",
+  "{{profile}}/config/aider-models.json", "--env-file", "{{profile}}/config/aider.env",
+  "--config", "{{profile}}/config/aider.yml", "--chat-history-file",
+  "{{profile}}/state/{{session_id}}.chat.history.md", "--input-history-file",
+  "{{profile}}/state/{{session_id}}.input.history"
+]
 timeout_ms = 30000
+
 [sessions]
+# Public Markdown-history restore, addressed by the per-session history filename.
+resume = [
+  "aider", "--model", "openai/{{model}}", "--weak-model", "openai/{{model}}",
+  "--editor-model", "openai/{{model}}", "--openai-api-base", "{{base_url}}/v1", "--message",
+  "{{prompt}}", "--yes-always", "--no-git", "--no-auto-commits", "--no-check-update",
+  "--no-show-release-notes", "--no-analytics", "--no-pretty", "--no-fancy-input",
+  "--no-stream", "--no-detect-urls", "--disable-playwright", "--no-suggest-shell-commands",
+  "--map-tokens", "0", "--no-show-model-warnings", "--timeout", "20", "--model-metadata-file",
+  "{{profile}}/config/aider-models.json", "--env-file", "{{profile}}/config/aider.env",
+  "--config", "{{profile}}/config/aider.yml", "--chat-history-file",
+  "{{profile}}/state/{{session_id}}.chat.history.md", "--input-history-file",
+  "{{profile}}/state/{{session_id}}.input.history", "--restore-chat-history"
+]
+store_paths = ["{{profile}}/state"]
+
 [next_input]
 [agents]
+
 [concurrency]
 topology = "client-process-fanout"
+# Benchmark fanout ceiling, not a native coordinator limit.
 max_agents = 8
 fanout_mode = "client"
+
 [tools]
+
 [events]
 source = "stdout"
 framing = "jsonl"
-# Narrative intentionally undeclared: no results/aider saved run or documented
-# event rule exists from which to prove text, reasoning, or a turn pointer. Row
-# 69 remains UNSUPPORTED pending captured evidence.
+# Aider emits plaintext and Markdown history, not a native JSONL event stream.
+# JSONL collection yields no native events; only the generic exit observation
+# is available. Do not fabricate tool, narrative, or structured terminal rules.
+
 [exit]
 success = 0
-failures = { provider = 20, timeout = 21, cancelled = 22, invalid = 23 }
+failure_stdout = ["litellm.AuthenticationError:"]
+# An injected HTTP 401 prints this diagnostic but still exits zero.
+# No invented typed failure categories: observe native terminal records/exit status.
+
 [process]
-executable_names = ["aider"]
+executable_names = ["aider", "python", "python3.12"]
+
 [resources]
+# These are AHRB observation deadlines/capture caps, not a native budget claim.
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
+log_paths = []
+journal_paths = ["{{profile}}/state"]
+# Retry policy, context injection, budgets and tariffs are absent until proven.
+
+[input]
+prompt_uses_stdin = false
+
 [hooks]
 [cleanup]
+paths = ["{{profile}}"]
+
 [capture]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
-[capabilities]
-required = { routing = "core", headless = "core", sessions = "core" }
-optional = { native_delegation = "facet", hooks = "facet", subturn = "facet" }
+credential_carrier_paths = []
+
+
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "openai/{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "cli"
+argv = ["--openai-api-base", "{{base_url}}/v1"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "OPENAI_API_KEY"
+
+[capabilities.required]
+sessions = "Each AHRB handle selects its own native Markdown history file"
+resume = "Captured --restore-chat-history reloads previous user and assistant content"
+headless = "Explicit one-shot prompt with stdin closed and no PTY"
+
+[capabilities.optional]
+# No native delegation, session-ops, permissions, budget or usage claim from flags alone.

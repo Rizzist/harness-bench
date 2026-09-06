@@ -1986,6 +1986,13 @@ fn nested_value<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
 }
 
 fn canonical_native_result(native: Value) -> Value {
+    // Preserve the original carrier in `native_result` at the call site. A
+    // singleton command-result array has one unambiguous canonical record;
+    // multiple results must retain their aggregate shape.
+    let native = match native {
+        Value::Array(mut values) if values.len() == 1 && values[0].is_object() => values.remove(0),
+        value => value,
+    };
     let mut result = match native {
         Value::Object(object) => object,
         value => BTreeMap::from([("native".to_owned(), value)])
@@ -2012,8 +2019,9 @@ fn canonical_native_result(native: Value) -> Value {
             .and_then(Value::as_bool);
         let exit_code = nested_value(&value, "exit_code").and_then(Value::as_i64);
         let status = nested_value(&value, "status").and_then(Value::as_str);
+        let success = result.get("success").and_then(Value::as_bool);
         let has_output = nested_value(&value, "output").is_some();
-        let ok = is_error.map(|is_error| !is_error).or_else(|| {
+        let ok = is_error.map(|is_error| !is_error).or(success).or_else(|| {
             exit_code.map(|code| code == 0).or_else(|| {
                 status
                     .and_then(|status| match status {
@@ -2027,6 +2035,13 @@ fn canonical_native_result(native: Value) -> Value {
         if let Some(ok) = ok {
             result.insert("ok".to_owned(), Value::Bool(ok));
         }
+    }
+    // A command record can name its captured text `result`. Preserve the native
+    // field while exposing the same text through the canonical content carrier.
+    if !result.contains_key("content")
+        && let Some(content) = result.get("result").and_then(Value::as_str)
+    {
+        result.insert("content".to_owned(), Value::String(content.to_owned()));
     }
     Value::Object(result)
 }
@@ -2631,6 +2646,7 @@ impl PerInvocationDriver {
                 );
             }
             let turn_prefix = format!("{}:turn-{}", session.local_id, active.turn);
+            let turn_event_prefix = format!("{turn_prefix}:");
             if let Some(mapped) = additions.iter_mut().rev().find(|event| {
                 matches!(
                     event.event,
@@ -2649,6 +2665,13 @@ impl PerInvocationDriver {
                 }
             }
             let mapped_terminal = additions.iter().chain(cached.iter()).rev().find(|event| {
+                // Stdout records belong to one invocation. An earlier turn's
+                // terminal cannot replace this invocation's exit observation.
+                if self.config.events.source == "stdout"
+                    && !event.id.starts_with(&turn_event_prefix)
+                {
+                    return false;
+                }
                 matches!(
                     event.event,
                     EventVocab::TerminalSuccess
@@ -5562,6 +5585,12 @@ mod tests {
             (json!({"isError": false}), true),
             (json!({"isError": true}), false),
             (json!({"output": "completed"}), true),
+            (json!({"success": true, "result": "A"}), true),
+            (json!({"success": false, "output": "command failed"}), false),
+            (
+                json!([{"success": false, "result": "command failed"}]),
+                false,
+            ),
         ] {
             assert_eq!(
                 canonical_native_result(native)
@@ -5570,6 +5599,17 @@ mod tests {
                 Some(expected)
             );
         }
+        let result = canonical_native_result(json!({"success": true, "result": "A"}));
+        assert_eq!(result.get("content"), Some(&json!("A")));
+        assert_eq!(result.get("result"), Some(&json!("A")));
+        let result = canonical_native_result(json!({"content": "original", "result": "other"}));
+        assert_eq!(result.get("content"), Some(&json!("original")));
+        let result = canonical_native_result(json!([{"success":true,"result":"A"}]));
+        assert_eq!(result.get("content"), Some(&json!("A")));
+        let batch = json!([{"success":true,"result":"A"},{"success":false,"result":"B"}]);
+        let result = canonical_native_result(batch.clone());
+        assert_eq!(result.get("native"), Some(&batch));
+        assert!(result.get("content").is_none());
     }
 
     #[test]
@@ -5804,6 +5844,78 @@ mod tests {
             .expect("existing marker skips repeated initialization");
         transport.stop().await.expect("stop restarted daemon");
         std::fs::remove_dir_all(logs).expect("remove daemon init logs");
+    }
+
+    #[tokio::test]
+    async fn stdout_exit_terminals_are_scoped_to_each_invocation() {
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-stdout-terminal-turns-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut manifest = crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml"))
+            .expect("load exec reference manifest");
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.rules.clear();
+        manifest.exit.success_stdout.clear();
+        let mut driver = PerInvocationDriver::new(PerInvocationConfig {
+            daemon: None,
+            command: vec!["/usr/bin/true".to_owned()],
+            resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
+            close_delete_command: Vec::new(),
+            release_command: Vec::new(),
+            cancel_command: Vec::new(),
+            replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
+            environment: BTreeMap::new(),
+            base_variables: BTreeMap::new(),
+            profile_root: profile.clone(),
+            events: manifest.events,
+            exit: manifest.exit,
+            session_id_pointer: String::new(),
+            run_id_pointer: String::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4_096,
+            gate_launch: false,
+        });
+        driver.start().await.expect("start stdout driver");
+        let session = driver
+            .create_session("stdout-turns")
+            .await
+            .expect("session");
+        let mut cursor = None;
+        for turn in 1..=3 {
+            driver
+                .submit(&session, "ignored", &format!("turn-{turn}"))
+                .await
+                .expect("submit next invocation");
+            let events = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let events = driver.attach(&session, cursor).await.expect("attach");
+                    if !events.is_empty() {
+                        break events;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("each completed invocation must expose its own exit terminal");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, EventVocab::TerminalSuccess);
+            assert_eq!(events[0].cursor, turn);
+            cursor = Some(Cursor(events[0].cursor));
+            assert!(
+                driver
+                    .attach(&session, cursor)
+                    .await
+                    .expect("reattach")
+                    .is_empty()
+            );
+        }
+        driver.shutdown().await.expect("shutdown stdout driver");
+        std::fs::remove_dir_all(profile).expect("remove stdout test profile");
     }
 
     #[tokio::test]

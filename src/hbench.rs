@@ -180,7 +180,7 @@ async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
 
 /// One-line command synopsis.
 pub fn usage() -> &'static str {
-    "hbench <codex|claude-code|opencode|pi|rick|haider> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy|fidelity <codex|claude-code|opencode|pi|rick|haider|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
+    "hbench <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy|fidelity <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
 }
 
 fn unavailable_error(name: &str, detail: &str) -> AhrbError {
@@ -196,6 +196,9 @@ fn adapter_directory(name: &str) -> Result<&'static str> {
         "opencode" => Ok("opencode"),
         "pi" => Ok("pi"),
         "rick" => Ok("rick"),
+        "aider" => Ok("aider"),
+        "goose" => Ok("goose"),
+        "cline" | "cline-cli" => Ok("cline"),
         "haider" | "haider-agent" => Ok("haider-agent"),
         "mock" => Ok("mock"),
         "mock-exec" => Ok("mock-exec"),

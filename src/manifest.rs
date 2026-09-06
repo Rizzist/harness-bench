@@ -2917,7 +2917,7 @@ mod version_tests {
     use std::collections::BTreeMap;
 
     fn wave_2_manifest() -> Manifest {
-        let mut manifest = super::load(std::path::Path::new("adapters/aider/manifest.toml"))
+        let mut manifest = super::load(std::path::Path::new("adapters/oh-my-pi/manifest.toml"))
             .expect("load schema-1 reference manifest");
         manifest.identity.schema = 2;
         manifest
@@ -3118,7 +3118,7 @@ mod version_tests {
 
     #[test]
     fn wave_4_optional_blocks_preserve_schema_1_typed_absence() {
-        let manifest = super::load(std::path::Path::new("adapters/aider/manifest.toml"))
+        let manifest = super::load(std::path::Path::new("adapters/oh-my-pi/manifest.toml"))
             .expect("load schema-1 reference manifest");
         assert!(manifest.capabilities.injection_surface.is_none());
         assert!(manifest.resources.budget_controls.is_none());

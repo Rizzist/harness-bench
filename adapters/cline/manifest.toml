@@ -1,0 +1,208 @@
+# Verified target: Cline CLI 3.0.61. See adapters/README.md for limitations.
+[identity]
+schema = 2
+id = "cline"
+name = "Cline CLI"
+revision = "3.0.61-headless-v2"
+
+[availability]
+exec_paths = ["cline"]
+version_probe = ["cline", "--version"]
+version_pattern = "3.0.61"
+
+[fake_model]
+dialect = "open-ai-chat-completions"
+base_url_env = "OPENAI_BASE_URL"
+credential_env = "OPENAI_API_KEY"
+model = "ahrb-fake-v1"
+allowed_paths = ["/v1/chat/completions", "/v1/models"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_CACHE_HOME = "{{profile}}/cache"
+XDG_RUNTIME_DIR = "{{profile}}/runtime"
+TMPDIR = "{{profile}}/tmp"
+CLINE_DATA_DIR = "{{profile}}/data/cline"
+CLINE_DB_DATA_DIR = "{{profile}}/data/cline/db"
+CLINE_SESSION_DATA_DIR = "{{profile}}/data/cline/sessions"
+CLINE_TEAM_DATA_DIR = "{{profile}}/data/cline/teams"
+
+[isolation.environment]
+CLINE_PROVIDER_SETTINGS_PATH = "{{profile}}/data/cline/settings/providers.json"
+CLINE_NO_AUTO_UPDATE = "1"
+HTTPS_PROXY = "http://127.0.0.1:9"
+HTTP_PROXY = "http://127.0.0.1:9"
+NO_PROXY = "127.0.0.1,localhost"
+
+[isolation]
+forbidden_roots = ["~/.cline"]
+
+[[isolation.generated_files]]
+path = "{{profile}}/data/cline/settings/providers.json"
+mode = "0600"
+content = '''{"version":1,"lastUsedProvider":"openai-compatible","modes":{},"providers":{"openai-compatible":{"settings":{"provider":"openai-compatible","apiKey":"{{credential}}","model":"{{model}}","baseUrl":"{{base_url}}/v1"},"updatedAt":"2026-09-06T00:00:00.000Z","tokenSource":"manual"}}}
+'''
+
+[daemon]
+persistent = false
+
+[transport]
+kind = "exec"
+command = [
+  "cline", "--json", "--auto-approve", "true", "--config", "{{profile}}/config/cline",
+  "--data-dir", "{{profile}}/data/cline", "--cwd", "{{workspace}}", "--timeout", "25",
+  "{{prompt}}"
+]
+timeout_ms = 30000
+
+[sessions]
+store_paths = ["{{profile}}/data/cline/sessions", "{{profile}}/data/cline/db"]
+
+[next_input]
+[agents]
+
+[concurrency]
+topology = "client-process-fanout"
+# Benchmark fanout ceiling, not a native coordinator limit.
+max_agents = 8
+fanout_mode = "client"
+
+[tools.aliases]
+write = "run_commands"
+read = "run_commands"
+fail = "run_commands"
+large_output = "run_commands"
+
+[tools.bindings]
+"run_commands.command_list" = "commands"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+large_output = ["{{ahrb_fixture}}", "emit", "--bytes", "{{bytes}}"]
+
+[events]
+source = "stdout"
+framing = "jsonl"
+type_pointer = "/event/type"
+id_pointer = "/event/toolCallId"
+# Prefer authoritative content_end and run_result carriers. content_update,
+# hook notifications for tools, and done are duplicate/progress surfaces.
+
+[events.metadata]
+timestamp_pointer = "/ts"
+timestamp_format = "rfc3339"
+
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/event/text"
+assistant_text_match_fields = { "/event/contentType" = "text" }
+assistant_text_aggregation = "complete-event"
+turn_pointer = "/actor"
+# No reasoning or compaction-scope declaration without a captured carrier.
+
+[[events.rules]]
+matches = "hook_event"
+match_fields = { "/hookEventName" = "agent_start" }
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "iteration_start"
+event = "model-request"
+payload_pointer = "/event"
+
+[[events.rules]]
+matches = "content_start"
+match_fields = { "/event/contentType" = "tool" }
+event = "tool-call"
+payload_pointer = "/event"
+payload_bindings = { call_id = "/event/toolCallId", name = "/event/toolName", arguments = "/event/input" }
+
+[[events.rules]]
+matches = "content_end"
+match_fields = { "/event/contentType" = "tool" }
+event = "tool-result"
+payload_pointer = "/event"
+# Preserve either a command-result array or a protocol-error object. The generic
+# result normalizer unwraps only a singleton object array, retaining native_result.
+payload_bindings = { call_id = "/event/toolCallId", name = "/event/toolName", result = "/event/output" }
+
+[[events.rules]]
+matches = "content_end"
+match_fields = { "/event/contentType" = "text" }
+event = "model-response"
+payload_pointer = "/event"
+
+[[events.rules]]
+matches = "run_result"
+match_fields = { "/finishReason" = "completed" }
+event = "terminal-success"
+
+[[events.rules]]
+matches = "run_result"
+match_fields = { "/finishReason" = "error" }
+event = "terminal-failure"
+
+[exit]
+success = 0
+success_stdout = ['"finishReason":"completed"']
+failure_stdout = ['"finishReason":"error"']
+# HTTP 401 and CLI validation both exit 1; it is not a provider-exclusive code.
+
+# No invented typed failure categories: observe native terminal records/exit status.
+
+[process]
+executable_names = ["cline", ".cline", "node"]
+
+[resources]
+# These are AHRB observation deadlines/capture caps, not a native budget claim.
+turn_timeout_ms = 30000
+idle_timeout_ms = 2000
+max_output_bytes = 1048576
+log_paths = ["{{profile}}/data/cline/logs"]
+journal_paths = ["{{profile}}/data/cline/sessions", "{{profile}}/data/cline/db/sessions.db"]
+# Retry policy, context injection, budgets and tariffs are absent until proven.
+
+[input]
+prompt_uses_stdin = false
+
+[hooks]
+[cleanup]
+paths = ["{{profile}}"]
+
+[capture]
+redact_env = ["OPENAI_API_KEY"]
+max_bytes = 1048576
+credential_carrier_paths = ["{{profile}}/data/cline/settings/providers.json"]
+
+
+[capabilities.injection_surface.provider]
+method = "generated-config"
+generated_path = "{{profile}}/data/cline/settings/providers.json"
+json_pointer = "/providers/openai-compatible/settings/model"
+
+[capabilities.injection_surface.base_url]
+method = "generated-config"
+generated_path = "{{profile}}/data/cline/settings/providers.json"
+json_pointer = "/providers/openai-compatible/settings/baseUrl"
+
+[capabilities.injection_surface.credential]
+method = "generated-config"
+generated_path = "{{profile}}/data/cline/settings/providers.json"
+json_pointer = "/providers/openai-compatible/settings/apiKey"
+
+[capabilities.required]
+secrets_hygiene_on_disk = "The generated private providers.json is the declared fake-credential carrier"
+tool_result_role_fidelity = "Captured tool results return to the fake endpoint with the native OpenAI tool role"
+headless = "Explicit one-shot prompt with stdin closed and no PTY"
+
+[capabilities.optional]
+# No native delegation, session-ops, permissions, budget or usage claim from flags alone.

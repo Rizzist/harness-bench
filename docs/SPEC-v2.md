@@ -385,6 +385,11 @@ observability/security/correctness extensions and cannot earn a badge when unsup
 
 #### Row-69 real-adapter declarations
 
+This table preserves the historical replay inventory. The current Aider, Goose and
+Cline declarations, including the `cline-cli` to `cline` rename, are documented in
+[`adapters/README.md`](../adapters/README.md); newer live results do not rewrite the
+stored evidence below.
+
 The cited full-matrix reports below predate revision 2.5. Their row-69 fixture has the
 same three success/failure actor pairs but did not emit the new pre-tool text or
 reasoning. Offline replay must therefore report the historical evidence as it exists;

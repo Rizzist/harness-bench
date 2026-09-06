@@ -107,6 +107,34 @@ isolated profiles, fake-model bindings, lifecycle and session operations, transp
 events, process ownership, limits, hooks, cleanup, and capabilities. The complete
 reference is [`adapters/mock/manifest.toml`](adapters/mock/manifest.toml).
 
+The nine named real harnesses are available through `hbench`:
+
+| Harness | `hbench` name | Manifest |
+|---|---|---|
+| Claude Code | `claude-code` | [manifest](adapters/claude-code/manifest.toml) |
+| Codex | `codex` | [manifest](adapters/codex/manifest.toml) |
+| Haider Agent | `haider` | [manifest](adapters/haider-agent/manifest.toml) |
+| OpenCode | `opencode` | [manifest](adapters/opencode/manifest.toml) |
+| Pi | `pi` | [manifest](adapters/pi/manifest.toml) |
+| Rick | `rick` | [manifest](adapters/rick/manifest.toml) |
+| Aider | `aider` | [manifest](adapters/aider/manifest.toml) |
+| Goose | `goose` | [manifest](adapters/goose/manifest.toml) |
+| Cline CLI | `cline` | [manifest](adapters/cline/manifest.toml) |
+
+Adapter availability is not certification. See [adapter notes](adapters/README.md)
+for pinned versions, event and session limitations, and undeclared capabilities.
+`cline-cli` is accepted as a compatibility alias for `cline`.
+Start with a small selection and a fresh absolute output directory:
+
+```sh
+hbench goose --profile quick --tests 1-3,9,10,15 \
+  --output "$PWD/results/goose/$(date -u +%Y%m%dT%H%M%SZ)"
+hbench cline --profile quick --tests 1-3,9,10,15 \
+  --output "$PWD/results/cline/$(date -u +%Y%m%dT%H%M%SZ)"
+hbench aider --profile quick --tests 1-3,9,10,15 \
+  --output "$PWD/results/aider/$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
 Credentials are generated per run, supplied through private environment/config
 bindings, redacted from evidence, and never placed in argv. Commands are direct argv
 arrays, never shell strings.
