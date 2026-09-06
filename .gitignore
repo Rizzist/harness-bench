@@ -6,3 +6,6 @@ Cargo.lock.orig
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# session scratch (never published)
+scratchpad/
