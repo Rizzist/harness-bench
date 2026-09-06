@@ -33,7 +33,7 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 | Lane | Scope | Depends on | Status |
 |---|---|---|---|
 | L0 `l0-setup-runners` | Land the portable instruction files (`AGENTS.md`, `CLAUDE.md`, `docs/DEVELOPMENT.md`, this ledger); fix `scripts/mock-cert.sh` and `scripts/six-harness.sh`: failure/exit-code propagation, fresh timestamped output paths, ownership-scoped temp cleanup, preservation of earlier evidence; regression coverage for those; baseline build/test; honest mock self-certification | — | **complete** (SHIP, landed `1c286b5`) |
-| L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | in verification (iteration 3) |
+| L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | **complete** (SHIP, landed `bec2475`) |
 | L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | pending |
 | L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | pending |
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | pending |
@@ -73,12 +73,14 @@ Record: implementation thread `01a0776d-e1fa-71f1-8ba6-8fdbc99eed34` (gpt-6-astr
 
 ## L1 `l1-storage-spec`
 
-- [ ] Worktree
-- [ ] Clean code pass + implement (GPT6-Astra)
-- [ ] Code verification (GPT6-Astra)
-- [ ] Computer-use verification (GPT6-Astra)
-- [ ] Repair loop until SHIP
-- [ ] Complete
+- [x] Worktree `worktrees/l1-storage-spec`, branch `lane/l1-storage-spec`, base `9d9b5c2`, rebased onto `b7405ff`
+- [x] Clean code pass + implement (GPT6-Astra; threads `01a0776f-7c52-7963-9079-73a1e87b3cd7`, repair `01a07798-379f-7f52-b206-f9baf85da335`, repair `01a077ba-b81b-7b22-bc2c-a44f0b933169`); documentation-only lane, no build/test claimed
+- [x] Code verification (GPT6-Astra; three independent iterations: `01a07789-fcf3-78b3-b646-fa1bf6b7c563` NO-SHIP F1 S6 aggregation/exit contradiction, F2 no feasible storage deadline budget, F3 exec-resume claim; `01a0779f-f8b2-7560-a58b-2b668bb93b37` NO-SHIP F4 S10 timing branches for daemon+exec+control-resume; `01a077bf-8c82-7fb1-8515-ad3d82281280` **SHIP**): full citation audit against runner/driver/manifest code, contract arithmetic recomputed, links and rendering checked
+- [x] Computer-use verification (same verifiers: real `ahrb list-tests`, `ahrb doctor`, the not-yet-implemented `ahrb run --pillar storage` error text, and a real `hbench economy mock --profile quick` bundle inspected for the report/index conventions the spec mirrors)
+- [x] Repair loop until SHIP (three iterations)
+- [x] Complete: commit `bec2475`, fast-forwarded onto `master`, pushed
+
+Record: verified spec sha256 `42066ae544de43f71ec84d4f411abe9b55875b9f06f06164a5eabfd30413816a` (574 lines), README/DEVELOPMENT pointer diffs byte-identical to the verified candidate after rebase. Raw evidence: harness `state/lanes/l1-storage-spec/{impl-1..3,verify-1..3}` and `results/l1-verify/` (outside Git).
 
 ## L2 `l2-storage-core-s1-s3`
 
