@@ -63,6 +63,8 @@ retention, and typed end/workspace evidence. These are serialized-request observ
 not claims about model understanding or task success. The complete contract is in
 [`docs/SPEC-v3-fidelity.md`](docs/SPEC-v3-fidelity.md).
 
+The planned independent storage pillar is defined in [`docs/SPEC-v4-storage.md`](docs/SPEC-v4-storage.md).
+
 ## Deadlines and saved results
 
 Every run has an internal run-level deadline: 15 minutes for `quick` and 30

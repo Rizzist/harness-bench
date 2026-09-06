@@ -27,6 +27,8 @@ The historical handoff's mock-cert script prints failure information without rel
 
 ## Storage scope
 
+The normative storage contract is [SPEC-v4-storage.md](SPEC-v4-storage.md).
+
 Start from `docs/PROPOSAL-v4-storage.md`: write the normative storage spec first, then implement W1 (S1, S3, S5, S7, S8) and W2 (S2, S6, S9, S10), each in reviewable lanes. Include S4 compaction-versus-disk explicitly; the proposal's wave list omits it, but its ten-row scope includes it. Document thresholds, units, accounting and unsupported conditions before implementing claims.
 
 Keep adapters declarative and measurements harness-neutral. Preserve the proposal's honesty rails: separate physical writes from allocated footprint; distinguish measurement from inference; report unsupported OS instrumentation honestly; never infer request-body retention solely from total disk growth; never treat estimated durability cost as measured latency. A new row needs positive and negative mock evidence plus actual CLI/report verification. Six-harness tables are measurements, not expected values.
