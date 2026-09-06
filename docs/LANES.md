@@ -32,15 +32,15 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 
 | Lane | Scope | Depends on | Status |
 |---|---|---|---|
-| L0 `l0-setup-runners` | Land the portable instruction files (`AGENTS.md`, `CLAUDE.md`, `docs/DEVELOPMENT.md`, this ledger); fix `scripts/mock-cert.sh` and `scripts/six-harness.sh`: failure/exit-code propagation, fresh timestamped output paths, ownership-scoped temp cleanup, preservation of earlier evidence; regression coverage for those; baseline build/test; honest mock self-certification | — | in progress |
-| L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | pending |
+| L0 `l0-setup-runners` | Land the portable instruction files (`AGENTS.md`, `CLAUDE.md`, `docs/DEVELOPMENT.md`, this ledger); fix `scripts/mock-cert.sh` and `scripts/six-harness.sh`: failure/exit-code propagation, fresh timestamped output paths, ownership-scoped temp cleanup, preservation of earlier evidence; regression coverage for those; baseline build/test; honest mock self-certification | — | **complete** (SHIP, landed `1c286b5`) |
+| L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | in verification (iteration 3) |
 | L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | pending |
 | L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | pending |
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | pending |
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
 | L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six bundled adapters from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression | L3, L4, L5, L6 | pending |
-| L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses | L7 | pending |
+| L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; runs in parallel with L2, storage blocks added by L7 | L0 | in progress |
 | L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, nine-harness matrix, economy, fidelity and storage per harness; sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7, L9 | pending |
 
 Wave mapping to the proposal: W1 = L2 + L3 + L4 (S1, S3, S5, S7, S8, plus S4 which the
@@ -64,12 +64,12 @@ Acceptance criteria:
 
 - [x] Worktree created: `worktrees/l0-setup-runners`, branch `lane/l0-setup-runners`, base `9d9b5c2`
 - [x] Clean code pass + implement (GPT6-Astra, thread `01a0776d-e1fa-71f1-8ba6-8fdbc99eed34`, exit 0; baseline 454 tests pass, 7 new runner-script tests pass, real `scripts/mock-cert.sh` -> `MOCK_CERT PASS`, exit 0, 1140 s)
-- [ ] Code verification (GPT6-Astra, separate context)
-- [ ] Computer-use verification (GPT6-Astra: real script/CLI runs and artifact inspection)
-- [ ] Repair loop until SHIP
-- [ ] Complete: focused commit, reconcile `origin/master`, push
+- [x] Code verification (GPT6-Astra, separate context; thread `01a07795-e230-7f02-9988-c278a7d15381`: full diff review, `cargo build --locked`, `list-tests` = 73, `cargo test --locked` 454 passed in 977 s, `zsh -n`)
+- [x] Computer-use verification (same verifier: real `scripts/mock-cert.sh` run -> `MOCK_CERT PASS` exit 0 with report inspection, stub-driven failure provocation of both scripts -> nonzero exits with named failures, fresh run directories, unrelated `ahrb-*` directory and earlier run directory preserved)
+- [x] Repair loop until SHIP (iteration 1: NO-SHIP on one P2 ledger inconsistency, fixed; iteration 2 thread `01a077bb-dbcb-7390-868c-eb221e89692a`: hash-bound re-verification plus re-run fast checks -> **SHIP**)
+- [x] Complete: focused commit `1c286b5`, reconciled with `origin/master`, pushed
 
-Record: (filled in at completion)
+Record: implementation thread `01a0776d-e1fa-71f1-8ba6-8fdbc99eed34` (gpt-6-astra); verified source tree = base `9d9b5c2` + diff sha256 `bb041f7e03f4c073977da7a8fe3808312835c4919a5b57077b74efc679602e36` + new files (`tests/runner_scripts.rs` `3975b8ea…`); landing commit `1c286b5`; this ledger update is a docs-only status commit outside the verified candidate per `docs/DEVELOPMENT.md`. Raw evidence: harness `state/lanes/l0-setup-runners/{impl-1,verify-1,verify-2}` and `results/mock-cert/20260906T161422Z-0952` (outside Git).
 
 ## L1 `l1-storage-spec`
 
