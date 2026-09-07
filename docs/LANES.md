@@ -40,7 +40,7 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
 | L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six bundled adapters from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression | L3, L4, L5, L6 | pending |
-| L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; runs in parallel with L2, storage blocks added by L7 | L0 | in progress |
+| L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; storage blocks added by L7 | L0 | **complete** (SHIP, landed `c33237e`) |
 | L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, nine-harness matrix, economy, fidelity and storage per harness; sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7, L9 | pending |
 
 Wave mapping to the proposal: W1 = L2 + L3 + L4 (S1, S3, S5, S7, S8, plus S4 which the
@@ -138,12 +138,14 @@ Record: verified spec sha256 `42066ae544de43f71ec84d4f411abe9b55875b9f06f06164a5
 
 ## L9 `l9-extra-adapters`
 
-- [ ] Worktree
-- [ ] Clean code pass + implement (GPT6-Astra)
-- [ ] Code verification (GPT6-Astra)
-- [ ] Computer-use verification (GPT6-Astra: real doctor/run flows for each new adapter)
-- [ ] Repair loop until SHIP
-- [ ] Complete
+- [x] Worktree `worktrees/l9-extra-adapters`, branch `lane/l9-extra-adapters`, base `9d9b5c2`, rebased onto `692d54b`
+- [x] Clean code pass + implement (GPT6-Astra threads `01a07797-961e-7811-af89-b744dc6c1e25`, continuation `01a0785a-272f-7d33-afc0-2440a4be2832`, doc repair `01a07994-4549-76c3-907a-b1b0a52fe9ed`): schema-2 manifests verified against the installed CLIs, generic runtime bindings, tests; pass 1 stopped honestly at its machine-sharing gate and pass 2 completed the outstanding native runs and full suite (460 passed)
+- [x] Code verification (GPT6-Astra `01a07929-7afa-7ff0-be18-fb0b0c90c28e`: line-range manifest review against pinned CLI help/config schemas, full suite 467 passed, shared-Rust review for regressions; NO-SHIP on one P2 documentation finding about aider `--env-file`)
+- [x] Computer-use verification (same verifier: `ahrb doctor` clean x3; real short and expanded quick matrix runs for aider, goose and cline with per-row outcomes recorded, fake-only routing and empty egress attempts confirmed, real `~/.aider*`, goose and `~/.cline` directories proven untouched by metadata snapshots; `hbench pi` regression check attributed a row-3 FAIL to a pre-existing oracle gap, not to this lane)
+- [x] Repair loop until SHIP (iteration 2 `01a07996-a33a-77d0-b507-392a1cb99d07`: hash-bound re-verification of the wording fix plus a fresh aider doctor and run -> **SHIP**)
+- [x] Complete: commit `c33237e`, fast-forwarded onto `master`, pushed
+
+Record: candidate `e1f1583` + doc diff sha256 `a9aa118f86438eeff010a3aa28c38f3ef665cb88b359854f3e8daf70d7366eca` -> `c33237e`. Incident (contained): the first cline probe's generated config lacked the provider `updatedAt` field, so cline ignored it and sent a disposable fake credential to the real OpenAI endpoint once (authentication failure, zero fake-model requests); no real secret was involved, the template was fixed, and both later passes and the verifier proved fake-only routing. Real-harness FAIL/ERROR rows observed in these runs are benchmark findings kept in the lane evidence. Raw evidence: harness `state/lanes/l9-extra-adapters/{impl-1..3,verify-1,verify-2}` and `results/l9-*` (outside Git).
 
 ## L8 `l8-references-macmini`
 
