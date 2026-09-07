@@ -29,7 +29,11 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 - Per-stage boxes: `[ ]` pending, `[x]` done with evidence, `[!]` blocked (reason recorded).
 
 
-## Status 2026-09-07 16:50 UTC — blocked on GPT6-Astra capacity
+## Status 2026-09-07 22:10 UTC — blocked again on GPT6-Astra capacity
+
+Capacity was restored at 17:16 UTC and all six lanes advanced (L3 repaired and re-verifying, L4 repaired, L5 verifying with one confirmed persistence finding, L6 repaired twice and re-verifying, L7a's codex collector fix proven on real codex/pi/claude-code runs, L8a repaired after three findings) until the usage limit was exhausted again at 22:06 UTC ("try again at Sep 14th, 2026"). The owner's standing rule is to wait for GPT6-Astra rather than substitute any other model. The harness checklist's BLOCKER #2 section lists exact per-lane resume steps.
+
+## Status 2026-09-07 16:50 UTC — blocked on GPT6-Astra capacity (superseded)
 
 OpenAI's Codex usage limit was exhausted mid-run ("try again at Sep 14th, 2026"), ending every active
 GPT6-Astra worker. Per the owner's rules no capacity was purchased, no model was substituted and no
