@@ -34,14 +34,14 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 |---|---|---|---|
 | L0 `l0-setup-runners` | Land the portable instruction files (`AGENTS.md`, `CLAUDE.md`, `docs/DEVELOPMENT.md`, this ledger); fix `scripts/mock-cert.sh` and `scripts/six-harness.sh`: failure/exit-code propagation, fresh timestamped output paths, ownership-scoped temp cleanup, preservation of earlier evidence; regression coverage for those; baseline build/test; honest mock self-certification | — | **complete** (SHIP, landed `1c286b5`) |
 | L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | **complete** (SHIP, landed `bec2475`) |
-| L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | pending |
+| L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | **complete** (SHIP, landed `e24aeba`) |
 | L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | pending |
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | pending |
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
-| L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six bundled adapters from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression | L3, L4, L5, L6 | pending |
+| L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six original adapters (codex, claude-code, opencode, pi, rick, haider-agent) from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression. Owner decision 2026-09-07: aider/goose/cline stay as landed adapters without storage declarations | L3, L4, L5, L6 | pending |
 | L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; storage blocks added by L7 | L0 | **complete** (SHIP, landed `c33237e`) |
-| L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, nine-harness matrix, economy, fidelity and storage per harness; sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7, L9 | pending |
+| L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, then matrix, economy, fidelity and storage for the six original harnesses (owner decision 2026-09-07); sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7 | pending |
 
 Wave mapping to the proposal: W1 = L2 + L3 + L4 (S1, S3, S5, S7, S8, plus S4 which the
 proposal's wave list omitted); W2 = L5 + L6 (S2, S6, S9, S10).
@@ -84,12 +84,14 @@ Record: verified spec sha256 `42066ae544de43f71ec84d4f411abe9b55875b9f06f06164a5
 
 ## L2 `l2-storage-core-s1-s3`
 
-- [ ] Worktree
-- [ ] Clean code pass + implement (GPT6-Astra)
-- [ ] Code verification (GPT6-Astra)
-- [ ] Computer-use verification (GPT6-Astra)
-- [ ] Repair loop until SHIP
-- [ ] Complete
+- [x] Worktree `worktrees/l2-storage-core-s1-s3`, branch `lane/l2-storage-core-s1-s3`, base `692d54b`, rebased onto `c72f2a5`
+- [x] Clean code pass + implement (GPT6-Astra threads `01a077c8-ad90-7d81-a9f5-5e11d6959744`, repair `01a07919-5c04-7631-abbc-376e6f2a8d26`, repair `01a07a15-2e37-7d62-bcb8-61c82dce8add`): pillar plumbing, `[storage]` contract, task fixture, block accounting, S1/S3, mock knobs, 8 mock bundles, tests
+- [x] Code verification (GPT6-Astra, four independent iterations: `01a07891-e7ad-7d20-82c5-6534cdc2e50e` NO-SHIP F1 daemon+exec clients omitted from S1, F2 conflicting no-log declarations accepted; `01a07972-6684-7dc2-b630-94170f5a912f` SHIP; `01a079c9-58d1-7fb3-9055-ee4a43bb2e5f` integration NO-SHIP after the L9 rebase, aider plaintext stdout turned into an infrastructure ERROR; `01a07af8-524a-76a2-ba23-9f10880d0539` **SHIP**): full diff review against the spec, 477→491 tests, `clippy -D warnings`, fmt, `list-tests` = 73
+- [x] Computer-use verification (same verifiers: real `ahrb run --pillar storage` and `hbench storage` bundles on both mock transports for bounded/linear/quadratic growth and append/rewrite modes with artifact audits, quadratic FAIL and nonzero exit, combined daemon+exec fixture with 100 retired clients per repetition, plaintext fixture UNSUPPORTED, conflicting-declaration rejection, parser isolation, `cline-cli` alias; real adapters: pi and rick honest ABSENT, codex spec-conformant capture ERROR from a volatile git temp pack, recorded for L7/L8)
+- [x] Repair loop until SHIP (four iterations)
+- [x] Complete: commit `e24aeba`, fast-forwarded onto `master`, pushed
+
+Record: verified tree = `b201bab` + diff sha256 `f8cb55b3577d9fcd185525edcfcaae57b1268351c4bd4ac8bf9bc6b9f421fd89` + `adapters/mock-exec-plaintext/manifest.toml` `ef507e30…`, squashed into `e24aeba`. Open notes for later lanes: codex's volatile `.tmp/.../.git/objects/pack` files trip the spec's capture-stability rule (L7 may need a declared volatile area or settle policy); pi's manifest declares no sessions so storage is ABSENT until L7 revisits. Raw evidence: harness `state/lanes/l2-storage-core-s1-s3/{impl-1..3,verify-1..4}` and `results/l2-*` (outside Git).
 
 ## L3 `l3-storage-s7-s8`
 
