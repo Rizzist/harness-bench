@@ -28,6 +28,26 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
   machine. Reference measurements run alone on a quiet machine.
 - Per-stage boxes: `[ ]` pending, `[x]` done with evidence, `[!]` blocked (reason recorded).
 
+
+## Status 2026-09-07 16:50 UTC — blocked on GPT6-Astra capacity
+
+OpenAI's Codex usage limit was exhausted mid-run ("try again at Sep 14th, 2026"), ending every active
+GPT6-Astra worker. Per the owner's rules no capacity was purchased, no model was substituted and no
+SHIP was claimed. Landed and pushed: L0, L1, L9, L2. State of the unfinished lanes, each with its
+worktree, candidate and evidence preserved in the harness (outside Git):
+
+| Lane | State when blocked |
+|---|---|
+| L3 `l3-storage-s7-s8` | Implemented (494 tests, 10 mock bundles; thread `01a079c9-5902-71c1-bd84-102595d9d5f4`), rebased onto `6f4f2e5` as `9f198a5`; verify-1 (`01a07b98-08ef-7451-bbd8-9791f84bece0`) NO-SHIP: F1 plaintext feasibility not propagated to S7/S8; F2 whole-crate suite failed on an unrelated one-ULP float assertion in `tests/mock_full_matrix.rs` |
+| L4 `l4-storage-s5-s4` | Implemented (500 tests, 4 mock bundles; `01a079c9-5971-75b3-9f12-cccac6742516`), rebased as `de78fa2`; verify-1 (`01a07c1e-b0c6-7d81-a00b-7af0ce721348`) found the saved-results copy of the daemon bundle missing its S4 context receipts before the session ended |
+| L5 `l5-storage-s2-durability` | Implementation (`01a079c9-59d0-7392-aaa1-d663663fae64`) in its final full-suite run after a focused regression repair; S1/S2/S3 pass in its mock bundles; not yet rebased or verified |
+| L6 `l6-storage-s6-s9-s10` | Implemented (502 tests; `01a079c9-59c9-7320-801c-258cd4f0d489`), rebased as `b22e569`; integration repair applied (`01a07c22-239d-7593-a8f0-0c03b5eaac11`); verify-2 (`01a07c71-9fc6-75f3-8068-6af535b76c8b`) interim NO-SHIP with stages pending |
+| L7a `l7a-storage-collector-results` (split from L7) | Codex terminal-before-reap collector fix implemented with a new immediate-exit mock fixture passing 300 turns (`01a07be6-8d64-79a3-95f4-ae5c8900933d`); real-adapter runs and report pending |
+| L8a `l8a-reference-runner` (split from L8) | `scripts/reference-run.sh`, `scripts/reference-tables.py`, tests and handoff docs written (`01a07be6-8d76-7852-a69b-fa8a318baa4b`); mock reference exercise pending |
+| L7b, L8 | Not started |
+
+Resume procedure: the harness checklist's BLOCKER section lists the per-lane resume steps.
+
 ## Lane list and dependencies
 
 | Lane | Scope | Depends on | Status |
@@ -39,6 +59,8 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | pending |
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
+| L7a `l7a-storage-collector-results` | Split out 2026-09-07: codex terminal-before-reap collector fix, codex volatile-area rule, pi sessions revisit, saved-index/`hbench diff` storage integration | L2 | in progress (blocked) |
+| L8a `l8a-reference-runner` | Split out 2026-09-07: `scripts/reference-run.sh` (six harnesses x four pillars, pre-flight, resumable, honest exit), `scripts/reference-tables.py`, tests, handoff docs; verified on mocks | L2 | in progress (blocked) |
 | L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six original adapters (codex, claude-code, opencode, pi, rick, haider-agent) from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression. Owner decision 2026-09-07: aider/goose/cline stay as landed adapters without storage declarations | L3, L4, L5, L6 | pending |
 | L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; storage blocks added by L7 | L0 | **complete** (SHIP, landed `c33237e`) |
 | L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, then matrix, economy, fidelity and storage for the six original harnesses (owner decision 2026-09-07); sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7 | pending |
