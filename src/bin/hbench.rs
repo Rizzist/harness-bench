@@ -26,43 +26,30 @@ async fn main() {
                 2
             }
         }
-    } else if args.first().is_some_and(|argument| argument == "economy") {
-        match ahrb::hbench::parse_economy(&args[1..]) {
-            Ok(options) => match ahrb::hbench::execute_economy(options).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("hbench: {error}");
-                    2
-                }
-            },
-            Err(error) => {
-                eprintln!("hbench: {error}");
-                2
-            }
-        }
-    } else if args.first().is_some_and(|argument| argument == "fidelity") {
-        match ahrb::hbench::parse_fidelity(&args[1..]) {
-            Ok(options) => match ahrb::hbench::execute_fidelity(options).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("hbench: {error}");
-                    2
-                }
-            },
-            Err(error) => {
-                eprintln!("hbench: {error}");
-                2
-            }
-        }
     } else {
-        match ahrb::hbench::parse(&args) {
-            Ok(options) => match ahrb::hbench::execute(options).await {
-                Ok(code) => code,
-                Err(error) => {
-                    eprintln!("hbench: {error}");
-                    2
-                }
+        type PillarParser = fn(&[String]) -> ahrb::Result<ahrb::hbench::Options>;
+        let (parse, execute): (PillarParser, _) = match args.first().map(String::as_str) {
+            Some("economy") => (ahrb::hbench::parse_economy, "economy"),
+            Some("fidelity") => (ahrb::hbench::parse_fidelity, "fidelity"),
+            Some("storage") => (ahrb::hbench::parse_storage, "storage"),
+            _ => (ahrb::hbench::parse, "matrix"),
+        };
+        let arguments = if execute == "matrix" {
+            &args[..]
+        } else {
+            &args[1..]
+        };
+        let result = match parse(arguments) {
+            Ok(options) => match execute {
+                "economy" => ahrb::hbench::execute_economy(options).await,
+                "fidelity" => ahrb::hbench::execute_fidelity(options).await,
+                "storage" => ahrb::hbench::execute_storage(options).await,
+                _ => ahrb::hbench::execute(options).await,
             },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(code) => code,
             Err(error) => {
                 eprintln!("hbench: {error}");
                 2

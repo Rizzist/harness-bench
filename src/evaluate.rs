@@ -18,6 +18,8 @@ pub enum Pillar {
     Resource,
     /// Automation readiness.
     AutomationReadiness,
+    /// Isolated storage v4 observations (numeric rows are pillar-local).
+    Storage,
 }
 
 /// The five possible matrix-row classifications.
@@ -550,6 +552,14 @@ pub fn suite_exit_code(
 ) -> i32 {
     let has_failure_or_error = results.iter().any(|result| match result.outcome {
         TestOutcome::Error(_) => true,
+        TestOutcome::Fail(_) if result.pillar == Pillar::Storage => {
+            result.id == "footprint-curve"
+                || (result.id == "delete-uninstall-residue"
+                    && _manifest
+                        .storage
+                        .as_ref()
+                        .is_some_and(crate::storage::StorageConfig::delete_declared))
+        }
         TestOutcome::Fail(_) => crate::scenarios::all()
             .iter()
             .find(|definition| definition.row == result.row)

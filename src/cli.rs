@@ -17,6 +17,8 @@ pub enum Command {
     Economy(RunOptions),
     /// Execute the isolated long-horizon context-fidelity task.
     Fidelity(RunOptions),
+    /// Execute the independent storage task.
+    Storage(RunOptions),
     /// Re-render an existing JSON report.
     Report {
         /// Existing `report.json` path.
@@ -103,9 +105,9 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 .transpose()?
                 .unwrap_or_default();
             let pillar = values.get("pillar").map(String::as_str).unwrap_or("matrix");
-            if !matches!(pillar, "matrix" | "economy" | "fidelity") {
+            if !matches!(pillar, "matrix" | "economy" | "fidelity" | "storage") {
                 return Err(AhrbError::Usage(format!(
-                    "--pillar must be matrix, economy, or fidelity, not {pillar:?}"
+                    "--pillar must be matrix, economy, fidelity, or storage, not {pillar:?}"
                 )));
             }
             if pillar != "matrix" && !tests.is_empty() {
@@ -129,6 +131,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
             match pillar {
                 "economy" => Ok(Command::Economy(options)),
                 "fidelity" => Ok(Command::Fidelity(options)),
+                "storage" => Ok(Command::Storage(options)),
                 _ => Ok(Command::Run(options)),
             }
         }
@@ -200,6 +203,7 @@ pub async fn execute(command: Command) -> Result<i32> {
         Command::Run(options) => crate::runner::run(options).await,
         Command::Economy(options) => crate::runner::run_economy(options).await,
         Command::Fidelity(options) => crate::runner::run_fidelity(options).await,
+        Command::Storage(options) => crate::runner::run_storage(options).await,
         Command::Report { input } => {
             let bytes = std::fs::read(input)?;
             let report: crate::report::Report = serde_json::from_slice(&bytes)?;

@@ -112,6 +112,11 @@ pub fn parse_fidelity(args: &[String]) -> Result<Options> {
     parse_isolated_pillar(args, "fidelity")
 }
 
+/// Parse the independent storage shorthand.
+pub fn parse_storage(args: &[String]) -> Result<Options> {
+    parse_isolated_pillar(args, "storage")
+}
+
 fn parse_isolated_pillar(args: &[String], pillar: &str) -> Result<Options> {
     let options = parse(args)?;
     if !options.tests.is_empty() {
@@ -135,6 +140,11 @@ pub async fn execute_economy(options: Options) -> Result<i32> {
 /// Resolve, availability-check, and execute the isolated fidelity pillar.
 pub async fn execute_fidelity(options: Options) -> Result<i32> {
     execute_pillar(options, Some("fidelity")).await
+}
+
+/// Execute storage after the shared availability check.
+pub async fn execute_storage(options: Options) -> Result<i32> {
+    execute_pillar(options, Some("storage")).await
 }
 
 async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
@@ -171,6 +181,7 @@ async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
     match pillar {
         Some("economy") => crate::runner::run_economy(run_options).await,
         Some("fidelity") => crate::runner::run_fidelity(run_options).await,
+        Some("storage") => crate::runner::run_storage(run_options).await,
         Some(other) => Err(AhrbError::Usage(format!(
             "unknown isolated pillar {other:?}"
         ))),
@@ -180,7 +191,7 @@ async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
 
 /// One-line command synopsis.
 pub fn usage() -> &'static str {
-    "hbench <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy|fidelity <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
+    "hbench <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy|fidelity|storage <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
 }
 
 fn unavailable_error(name: &str, detail: &str) -> AhrbError {
@@ -202,6 +213,7 @@ fn adapter_directory(name: &str) -> Result<&'static str> {
         "haider" | "haider-agent" => Ok("haider-agent"),
         "mock" => Ok("mock"),
         "mock-exec" => Ok("mock-exec"),
+        "mock-exec-plaintext" => Ok("mock-exec-plaintext"),
         _ => Err(unavailable_error(name, "no bundled adapter has that name")),
     }
 }

@@ -1,7 +1,7 @@
 //! Human-readable, machine-readable, and raw-evidence reports.
 
 use crate::economy::EconomySummary;
-use crate::evaluate::{Badge, TestOutcome, TestResult, badge_label};
+use crate::evaluate::{Badge, TestOutcome, TestResult};
 use crate::fidelity::FidelitySummary;
 use crate::manifest::Manifest;
 use crate::process::{ProcIdentity, ProcOwnership, ProcessSample, Sample};
@@ -180,6 +180,9 @@ impl<'de> Deserialize<'de> for ReportDetails {
         let values = BTreeMap::<String, Value>::deserialize(deserializer)?;
         for (name, value) in &values {
             let validation = match name.as_str() {
+                name if crate::storage::ROWS.contains(&name) => {
+                    crate::storage::evidence::validate_details(name, value)
+                }
                 "model-request-efficiency" => {
                     serde_json::from_value::<ModelRequestEfficiencyDetails>(value.clone())
                         .map(|_| ())
@@ -1193,6 +1196,9 @@ pub struct Report {
     /// Authoritative benchmark specification version.
     #[serde(default = "default_spec_version")]
     pub spec_version: u32,
+    /// Isolated pillar identity; legacy matrix reports omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pillar: Option<String>,
     /// Deterministic run identifier.
     pub run_id: String,
     /// Canonical short root holding isolated harness state for this run.
@@ -1203,7 +1209,7 @@ pub struct Report {
     /// Matrix results sorted by row.
     pub results: Vec<TestResult>,
     /// Badge when every topology-relative CORE gate passes.
-    pub badge: Option<Badge>,
+    pub badge: Option<ReportBadge>,
     /// Named non-resource automation diagnostics. Resource observations live
     /// exclusively in `resource_metrics` so topology labels cannot be dropped.
     pub metrics: BTreeMap<String, f64>,
@@ -1229,6 +1235,19 @@ pub struct Report {
     /// Long-horizon request-context fidelity summary. Absent from other pillars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fidelity_summary: Option<FidelitySummary>,
+    /// Storage v4 classes and measurements, absent from ordinary runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_summary: Option<crate::storage::evidence::StorageSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_samples: Vec<crate::storage::evidence::StorageSample>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_files: Vec<crate::storage::evidence::StorageFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_responses: Vec<crate::storage::evidence::ResponseReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fsync_events: Vec<crate::storage::evidence::FsyncEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_body_matches: Vec<crate::storage::evidence::BodyMatch>,
     /// Raw resource samples.
     pub samples: Vec<Sample>,
     /// Raw row-46 continuous whole-tree counter samples.
@@ -1257,6 +1276,41 @@ pub struct Report {
     pub egress_attempts: Vec<EgressAttempt>,
 }
 
+/// Independent badge schemas preserve the existing matrix JSON shape.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ReportBadge {
+    Storage(crate::storage::evidence::StorageBadge),
+    Matrix(Badge),
+}
+
+impl ReportBadge {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Storage(b) => b.label.clone(),
+            Self::Matrix(b) => crate::evaluate::badge_label(b),
+        }
+    }
+    pub fn os(&self) -> &str {
+        match self {
+            Self::Storage(b) => &b.os,
+            Self::Matrix(b) => &b.os,
+        }
+    }
+    pub fn topology(&self) -> &str {
+        match self {
+            Self::Storage(b) => &b.topology,
+            Self::Matrix(b) => &b.topology,
+        }
+    }
+    pub fn matrix(&self) -> Option<&Badge> {
+        match self {
+            Self::Storage(_) => None,
+            Self::Matrix(b) => Some(b),
+        }
+    }
+}
+
 /// Persist the manifest declaration state needed to interpret optional-row
 /// transitions without parsing human-readable evidence.
 pub fn record_capability_declarations(results: &mut [TestResult], manifest: &Manifest) {
@@ -1276,6 +1330,25 @@ fn default_spec_version() -> u32 {
 /// Persist the full report bundle using stable names and ordering.
 pub fn write_bundle(report: &Report, directory: &Path, junit: bool) -> Result<()> {
     std::fs::create_dir_all(directory)?;
+    if report.storage_summary.is_some() {
+        write_jsonl(
+            &directory.join("storage-samples.jsonl"),
+            &report.storage_samples,
+        )?;
+        write_jsonl(
+            &directory.join("storage-files.jsonl"),
+            &report.storage_files,
+        )?;
+        write_jsonl(&directory.join("fsync-events.jsonl"), &report.fsync_events)?;
+        write_jsonl(
+            &directory.join("storage-responses.jsonl"),
+            &report.storage_responses,
+        )?;
+        write_jsonl(
+            &directory.join("request-body-matches.jsonl"),
+            &report.request_body_matches,
+        )?;
+    }
     write_atomic(
         &directory.join("report.json"),
         &serde_json::to_vec_pretty(report)?,
@@ -1364,7 +1437,7 @@ pub fn render_markdown(report: &Report) -> String {
         let _ = writeln!(output, "Profile: `{}`\n", report.profile_path);
     }
     if let Some(badge) = &report.badge {
-        let _ = writeln!(output, "**{}**\n", badge_label(badge));
+        let _ = writeln!(output, "**{}**\n", badge.label());
     } else {
         let _ = writeln!(output, "**No badge certified.**\n");
     }
@@ -1608,7 +1681,13 @@ pub fn render_markdown(report: &Report) -> String {
             summary.end_reason_label, summary.workspace_state_label,
         );
     }
-    if report.economy_summary.is_none() && report.fidelity_summary.is_none() {
+    if let Some(summary) = &report.storage_summary {
+        output.push_str(&crate::storage::render_markdown(summary, report));
+    }
+    if report.economy_summary.is_none()
+        && report.fidelity_summary.is_none()
+        && report.storage_summary.is_none()
+    {
         let _ = writeln!(output, "| Row | Pillar | Test | Outcome |");
         let _ = writeln!(output, "|---:|---|---|---|");
         let mut results: Vec<&TestResult> = report.results.iter().collect();

@@ -23,6 +23,7 @@ pub mod results;
 pub mod runner;
 pub mod sampler;
 pub mod scenarios;
+pub mod storage;
 pub mod wave2;
 pub mod wave2_automation;
 pub mod wave3_concurrency;

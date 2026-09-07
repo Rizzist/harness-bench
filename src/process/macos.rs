@@ -614,6 +614,30 @@ impl Sampler for MacOsSampler {
         })
     }
 
+    fn disk_counter_preflight(&mut self) -> Result<()> {
+        match rusage(std::process::id()) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(AhrbError::Unsupported(
+                "macos proc_pid_rusage self probe returned no physical-counter record".into(),
+            )),
+            Err(AhrbError::Io(error))
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL)
+                        | Some(libc::ENOSYS)
+                        | Some(libc::ENOTSUP)
+                        | Some(libc::EACCES)
+                        | Some(libc::EPERM)
+                ) =>
+            {
+                Err(AhrbError::Unsupported(format!(
+                    "macos proc_pid_rusage self probe: {error}"
+                )))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn disk_counters(&mut self, tree: &ProcessTree) -> Result<ProcessDiskObservation> {
         let mut observation = ProcessDiskObservation {
             expected_identities: tree.members.keys().copied().collect(),
@@ -636,7 +660,25 @@ impl Sampler for MacOsSampler {
         if identity_of(&current) != identity {
             return Ok(None);
         }
-        Ok(rusage(identity.pid)?.map(|usage| usage.ri_diskio_byteswritten))
+        let value = rusage(identity.pid)?.map(|usage| usage.ri_diskio_byteswritten);
+        let Some(after) = bsd_info(identity.pid)? else {
+            return Ok(None);
+        };
+        Ok((identity_of(&after) == identity).then_some(value).flatten())
+    }
+
+    fn disk_read_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
+        let Some(current) = bsd_info(identity.pid)? else {
+            return Ok(None);
+        };
+        if identity_of(&current) != identity {
+            return Ok(None);
+        }
+        let value = rusage(identity.pid)?.map(|usage| usage.ri_diskio_bytesread);
+        let Some(after) = bsd_info(identity.pid)? else {
+            return Ok(None);
+        };
+        Ok((identity_of(&after) == identity).then_some(value).flatten())
     }
 }
 

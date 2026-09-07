@@ -59,6 +59,10 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
         "manifest_sha256",
         "workflow_sha256",
         "ahrb_revision",
+        "pillar",
+        "storage_summary",
+        "badge_label",
+        "outcome_counts",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -72,6 +76,25 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
         exact_keys
     );
     assert_eq!(entry.schema, ahrb::results::INDEX_SCHEMA);
+    assert_eq!(entry.schema, 3);
+    assert_eq!(entry.pillar, "matrix");
+    assert!(entry.storage_summary.is_none());
+    assert!(entry.badge_label.is_none());
+    assert_eq!(
+        indexed_value["outcome_counts"],
+        serde_json::json!({"PASS":3,"FAIL":0,"UNSUPPORTED":0,"ERROR":0})
+    );
+    let mut legacy = indexed_value.clone();
+    let object = legacy.as_object_mut().expect("legacy object");
+    object.insert("schema".into(), 2.into());
+    for field in ["pillar", "storage_summary", "badge_label", "outcome_counts"] {
+        object.remove(field);
+    }
+    let legacy: IndexEntry =
+        serde_json::from_value(legacy).expect("schema-2 additive compatibility");
+    assert_eq!(legacy.pillar, "matrix");
+    assert!(legacy.storage_summary.is_none());
+
     assert_eq!(entry.harness, "ahrb-mock");
     assert!(entry.run_key.starts_with("run-"));
     assert_ne!(entry.ahrb_revision, "unknown");

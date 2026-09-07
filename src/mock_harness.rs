@@ -980,6 +980,14 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "serve" => serve(parse_config(&args[1..])?, false).await,
         "rpc" => serve(parse_config(&args[1..])?, true).await,
         "status" => status_command(&args[1..]),
+        // Storage regression controller: stays warm while separate exec clients
+        // own the session work and its observable storage-payload.bin writes.
+        "storage-controller" => {
+            let config = parse_config(&args[1..])?;
+            let _harness = MockHarness::open(config)?;
+            std::future::pending::<()>().await;
+            Ok(0)
+        }
         "exec-turn" => exec_turn(&args[1..]).await,
         "budget-trial" => budget_trial_command(&args[1..]).await,
         "session-create" => session_create_command(&args[1..]),
@@ -1817,6 +1825,7 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     let mut rendered_base_url = None;
     let mut event_journal = None;
     let mut post_output_delay_ms = 0_u64;
+    let mut plaintext_stdout = false;
     let mut config_args = Vec::new();
     let mut index = 0_usize;
     while index < args.len() {
@@ -1831,6 +1840,13 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
             "--key" => key = Some(value.clone()),
             "--base-url" => rendered_base_url = Some(value.clone()),
             "--event-journal" => event_journal = Some(PathBuf::from(value)),
+            "--stdout-format" => {
+                plaintext_stdout = match value.as_str() {
+                    "jsonl" => false,
+                    "plaintext" => true,
+                    _ => return Err(AhrbError::Usage("invalid stdout format".to_owned())),
+                };
+            }
             "--post-output-delay-ms" => {
                 post_output_delay_ms = value
                     .parse()
@@ -1858,6 +1874,10 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         .ok_or_else(|| AhrbError::Usage("--session-id is required".to_owned()))?;
     let prompt = prompt.ok_or_else(|| AhrbError::Usage("--prompt is required".to_owned()))?;
     let key = key.ok_or_else(|| AhrbError::Usage("--key is required".to_owned()))?;
+    if plaintext_stdout {
+        println!("AHRB mock plaintext client");
+        std::io::stdout().flush()?;
+    }
     let use_indexed_terminal_observer = prompt.starts_with("AHRB long horizon turn ");
     let exec_template_evidence = match rendered_base_url {
         Some(base_url) => {
@@ -2019,8 +2039,12 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
         file.sync_all()?;
         sync_parent(&path)?;
     }
-    for event in events {
-        println!("{}", serde_json::to_string(&event)?);
+    if plaintext_stdout {
+        println!("Turn completed: {:?}", terminal.event);
+    } else {
+        for event in events {
+            println!("{}", serde_json::to_string(&event)?);
+        }
     }
     std::io::stdout().flush()?;
     if post_output_delay_ms > 0 {
@@ -3336,6 +3360,7 @@ async fn execute_turn(
             .unwrap_or_default();
         messages.push(message.clone());
         if tool_calls.is_empty() {
+            storage_fixture_write(&config, &turn.prompt)?;
             let content = message.get("content").cloned().unwrap_or(Value::Null);
             let (event, status) = terminal_from_content(&content);
             if let Some(width) = turn
@@ -4721,6 +4746,81 @@ fn chat_response_usage(response: &Value) -> Result<(u64, u64)> {
         }
     }
     Ok((input_tokens, output_tokens))
+}
+
+// These knobs change real file writes only for the storage fixture. Ordinary
+// matrix defaults and evaluator outcomes are untouched.
+fn storage_fixture_write(config: &MockConfig, prompt: &str) -> Result<()> {
+    if !prompt.contains(crate::storage::TASK) {
+        return Ok(());
+    }
+    let mode = std::env::var("AHRB_MOCK_STORAGE_WRITE_MODE").unwrap_or_else(|_| "append".into());
+    let growth = std::env::var("AHRB_MOCK_STORAGE_GROWTH").unwrap_or_else(|_| "linear".into());
+    let turn = prompt
+        .rsplit("checkpoint=t")
+        .next()
+        .and_then(|s| s.get(..4))
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| AhrbError::Protocol("mock storage turn marker missing".into()))?;
+    let size = match growth.as_str() {
+        // A reserved store budget is consumed as journals grow. This models a
+        // finite preallocated store using real truncation and real allocated blocks.
+        "bounded" => 8_388_608_u64.saturating_sub(storage_other_allocated(&config.state_dir)?),
+        "linear" => turn * 65_536,
+        // This coefficient clears the quick shape threshold while keeping
+        // the cert fixture bounded in size (256 MB at turn 1000).
+        "quadratic" => turn * turn * 256,
+        _ => {
+            return Err(AhrbError::Usage(
+                "AHRB_MOCK_STORAGE_GROWTH must be bounded/linear/quadratic".into(),
+            ));
+        }
+    };
+    let path = config.state_dir.join("storage-payload.bin");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    let previous = file.metadata()?.len();
+    let start = match mode.as_str() {
+        "append" => previous.min(size),
+        "rewrite" => 0,
+        _ => {
+            return Err(AhrbError::Usage(
+                "AHRB_MOCK_STORAGE_WRITE_MODE must be append/rewrite".into(),
+            ));
+        }
+    };
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start))?;
+    let block = [b'S'; 65_536];
+    let mut remaining = size.saturating_sub(start);
+    while remaining > 0 {
+        let n = remaining.min(block.len() as u64) as usize;
+        file.write_all(&block[..n])?;
+        remaining -= n as u64;
+    }
+    file.set_len(size)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn storage_other_allocated(root: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let meta = fs::symlink_metadata(entry.path())?;
+        if meta.is_dir() {
+            total += storage_other_allocated(&entry.path())?;
+        } else if meta.is_file() && entry.file_name() != "storage-payload.bin" {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                total += meta.blocks() * 512;
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn terminal_from_content(content: &Value) -> (EventVocab, &'static str) {

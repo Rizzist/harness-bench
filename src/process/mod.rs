@@ -1194,6 +1194,16 @@ pub struct TerminalRusage {
 
 /// Platform-specific whole-tree sampler.
 pub trait Sampler: Send {
+    /// Pre-stimulus facility probe. Platform implementations inspect the
+    /// collector's own process and discard that value; it is never harness I/O.
+    fn disk_counter_preflight(&mut self) -> Result<()> {
+        self.disk_counters(&ProcessTree::default()).map(|_| ())
+    }
+
+    /// OS-accounted physical read bytes, separate from allocated footprint.
+    fn disk_read_counter_for_identity(&mut self, _identity: ProcIdentity) -> Result<Option<u64>> {
+        Ok(None)
+    }
     /// Discover ownership from verified roots.
     fn discover(&mut self, roots: &[u32]) -> Result<ProcessTree>;
     /// Capture one boundary or cadence sample.

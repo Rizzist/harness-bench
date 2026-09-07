@@ -1,7 +1,7 @@
 //! Durable benchmark result bundles and compact history reporting.
 
 use crate::cli::RunOptions;
-use crate::evaluate::{Badge, TestOutcome, badge_label};
+use crate::evaluate::{Badge, TestOutcome};
 use crate::manifest::Manifest;
 use crate::report::Report;
 use crate::{AhrbError, Result};
@@ -105,6 +105,14 @@ pub struct IndexedResourceSummary {
 pub struct IndexEntry {
     /// Version of the JSONL line contract. Legacy lines have no schema.
     pub schema: u32,
+    #[serde(default = "matrix_pillar")]
+    pub pillar: String,
+    #[serde(default)]
+    pub storage_summary: Option<crate::storage::evidence::StorageSummary>,
+    #[serde(default)]
+    pub badge_label: Option<String>,
+    #[serde(default)]
+    pub outcome_counts: OutcomeCounts,
     /// Stable unique occurrence key for this run.
     pub run_key: String,
     /// UTC timestamp captured after report persistence completes.
@@ -163,7 +171,7 @@ struct LegacyIndexEntry {
 }
 
 /// Current index-line schema. Schema 1 is the implicit legacy format.
-pub const INDEX_SCHEMA: u32 = 2;
+pub const INDEX_SCHEMA: u32 = 3;
 
 /// Resolve default output and capture run-start metadata.
 pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersistence> {
@@ -262,6 +270,31 @@ pub fn persist_report(
     };
     if results_dir != &persistence.output {
         crate::report::write_bundle(report, results_dir, junit)?;
+        if report.storage_summary.is_some() {
+            for name in [
+                "storage-fixture.jsonl",
+                "storage-deadline.json",
+                "storage-area-matches.jsonl",
+                "storage-log-audit.jsonl",
+                "storage-request-bodies.jsonl",
+            ] {
+                copy_optional(&persistence.output.join(name), &results_dir.join(name))?;
+            }
+            let bodies = persistence.output.join("request-bodies");
+            if bodies.is_dir() {
+                let destination = results_dir.join("request-bodies");
+                std::fs::create_dir_all(&destination)?;
+                for entry in std::fs::read_dir(bodies)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        return Err(AhrbError::Protocol(
+                            "storage body artifact must be a regular file".into(),
+                        ));
+                    }
+                    std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+                }
+            }
+        }
         if include_run_error {
             copy_optional(
                 &persistence.output.join("run-error.txt"),
@@ -312,6 +345,18 @@ fn index_entry(
     );
     Ok(IndexEntry {
         schema: INDEX_SCHEMA,
+        pillar: report.pillar.clone().unwrap_or_else(|| {
+            if report.economy_summary.is_some() {
+                "economy".into()
+            } else if report.fidelity_summary.is_some() {
+                "fidelity".into()
+            } else {
+                matrix_pillar()
+            }
+        }),
+        storage_summary: report.storage_summary.clone(),
+        badge_label: report.badge.as_ref().map(crate::report::ReportBadge::label),
+        outcome_counts: outcome_counts(&report.results),
         run_key,
         completed_at,
         harness: report.fingerprint.harness.clone(),
@@ -323,7 +368,7 @@ fn index_entry(
         os: report
             .badge
             .as_ref()
-            .map(|badge| badge.os.clone())
+            .map(|badge| badge.os().to_owned())
             .unwrap_or_else(|| std::env::consts::OS.to_owned()),
         topology: report.resource_summary.topology.clone(),
         resource_summary: IndexedResourceSummary {
@@ -457,7 +502,7 @@ pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
         let badge = report
             .as_ref()
             .and_then(|report| report.badge.as_ref())
-            .map(badge_label)
+            .map(crate::report::ReportBadge::label)
             .unwrap_or_else(|| "-".to_owned());
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -506,7 +551,7 @@ pub fn read_index() -> Result<Vec<IndexEntry>> {
                     line_index + 1
                 ))
             })?;
-            if entry.schema != INDEX_SCHEMA {
+            if !matches!(entry.schema, 2 | INDEX_SCHEMA) {
                 return Err(AhrbError::Protocol(format!(
                     "unsupported results/index.jsonl schema {} on line {}",
                     entry.schema,
@@ -610,6 +655,10 @@ fn normalize_legacy_index(
         .unwrap_or_else(|| "unknown".to_owned());
     let mut entry = IndexEntry {
         schema: INDEX_SCHEMA,
+        pillar: matrix_pillar(),
+        storage_summary: None,
+        badge_label: None,
+        outcome_counts: OutcomeCounts::default(),
         run_key: stable_legacy_run_key(raw_line, line_number),
         completed_at: legacy.timestamp,
         harness: legacy.harness_id,
@@ -648,7 +697,7 @@ fn normalize_legacy_index(
             report
                 .badge
                 .as_ref()
-                .map(|badge| badge.topology.clone())
+                .map(|badge| badge.topology().to_owned())
                 .unwrap_or(entry.topology)
         } else {
             report.resource_summary.topology
@@ -663,7 +712,7 @@ fn normalize_legacy_index(
                     .unwrap_or("unknown")
                     .to_owned()
             },
-            |badge| badge.os,
+            |badge| badge.os().to_owned(),
         );
     }
     entry
@@ -900,6 +949,10 @@ fn load_average_1m() -> Option<f64> {
     // SAFETY: `values` has room for all three load averages.
     let count = unsafe { libc::getloadavg(values.as_mut_ptr(), 3) };
     (count >= 1).then_some(values[0])
+}
+
+fn matrix_pillar() -> String {
+    "matrix".into()
 }
 
 #[cfg(test)]

@@ -159,6 +159,17 @@ pub struct RenderedResponse {
     pub body: Vec<u8>,
 }
 
+/// Exact rendered response bytes, separate from request sizes and yielded frames.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StorageResponseReceipt {
+    pub dialect: String,
+    pub checkpoint: String,
+    pub attempt: u64,
+    pub request_sha256: String,
+    pub rendered_bytes: u64,
+    pub rendered_sha256: String,
+}
+
 /// Transport-agnostic protocol adapter for parsing and rendering model traffic.
 pub trait ProtocolFrontend: Send + Sync {
     /// Stable dialect name.
@@ -638,9 +649,17 @@ type SemanticRequestKey = (String, String, String, u64);
 type FrameBoundaryKey = (String, String, String, u64);
 type FrameBoundaryMap = BTreeMap<FrameBoundaryKey, (u64, u64)>;
 
+#[derive(Debug)]
+struct StorageBodyCapture {
+    directory: std::path::PathBuf,
+    receipts: Vec<Value>,
+}
+
 /// State for deterministic transition validation, barriers, and idempotent retries.
 #[derive(Debug)]
 pub struct FakeModelEngine {
+    storage_responses: StdMutex<Vec<StorageResponseReceipt>>,
+    storage_body_capture: StdMutex<Option<StorageBodyCapture>>,
     machine: WorkflowMachine,
     barriers: BarrierCoordinator,
     requests: Mutex<BTreeMap<RequestRecordKey, Vec<ModelRequestRecord>>>,
@@ -709,6 +728,8 @@ impl FakeModelEngine {
             barriers: BarrierCoordinator::new(workflow)?,
             requests: Mutex::new(BTreeMap::new()),
             frame_observations: Arc::new(StdMutex::new(Vec::new())),
+            storage_responses: StdMutex::new(Vec::new()),
+            storage_body_capture: StdMutex::new(None),
             frame_boundaries: Arc::new(StdMutex::new(BTreeMap::new())),
             attempt_sequences: Mutex::new(BTreeMap::new()),
             request_role_rules,
@@ -721,6 +742,93 @@ impl FakeModelEngine {
     /// Advertised row-51 provider context window, when configured.
     pub fn context_window_tokens(&self) -> Option<u64> {
         self.context_window_tokens
+    }
+
+    /// Enable lossless bodies in an explicitly external, private bundle directory.
+    pub fn enable_storage_body_capture(&self, directory: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(directory)?;
+        *self
+            .storage_body_capture
+            .lock()
+            .map_err(|_| AhrbError::Protocol("storage body capture lock poisoned".into()))? =
+            Some(StorageBodyCapture {
+                directory: directory.into(),
+                receipts: Vec::new(),
+            });
+        Ok(())
+    }
+
+    pub fn take_storage_body_receipts(&self) -> Result<Vec<Value>> {
+        let mut capture = self
+            .storage_body_capture
+            .lock()
+            .map_err(|_| AhrbError::Protocol("storage body capture lock poisoned".into()))?;
+        Ok(capture
+            .as_mut()
+            .map_or_else(Vec::new, |c| std::mem::take(&mut c.receipts)))
+    }
+
+    fn capture_storage_body(&self, body: &[u8], received_ns: u64) -> Result<()> {
+        use std::io::Write as _;
+        let mut capture = self
+            .storage_body_capture
+            .lock()
+            .map_err(|_| AhrbError::Protocol("storage body capture lock poisoned".into()))?;
+        let Some(capture) = capture.as_mut() else {
+            return Ok(());
+        };
+        let hash = sha256_hex(body);
+        let path = capture.directory.join(format!("{hash}.bin"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => file.write_all(body)?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&path)? != body {
+                    return Err(AhrbError::Protocol(
+                        "storage raw-body digest collision".into(),
+                    ));
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        capture.receipts.push(json!({"received_ns":received_ns,"raw_sha256":hash,"body_bytes":body.len(),"path":format!("request-bodies/{hash}.bin")}));
+        Ok(())
+    }
+
+    /// Storage-only byte receipts do not change ordinary request records.
+    pub fn storage_response_receipts(&self) -> Result<Vec<StorageResponseReceipt>> {
+        self.storage_responses
+            .lock()
+            .map(|r| r.clone())
+            .map_err(|_| AhrbError::Protocol("storage response receipt lock poisoned".into()))
+    }
+
+    fn record_storage_response(
+        &self,
+        selected: &ModelResponse,
+        rendered: &RenderedResponse,
+    ) -> Result<()> {
+        if selected.scenario != crate::storage::TASK {
+            return Ok(());
+        }
+        self.storage_responses
+            .lock()
+            .map_err(|_| AhrbError::Protocol("storage response receipt lock poisoned".into()))?
+            .push(StorageResponseReceipt {
+                dialect: selected.dialect.clone(),
+                checkpoint: selected.checkpoint.clone(),
+                attempt: selected.attempt,
+                request_sha256: selected.request_hash.clone(),
+                rendered_bytes: rendered.body.len() as u64,
+                rendered_sha256: sha256_hex(&rendered.body),
+            });
+        Ok(())
     }
 
     /// Validate, route, and await any named barrier for a canonical request.
@@ -2041,6 +2149,7 @@ async fn handle_provider_mailbox_request(
         AhrbError::Protocol("provider mailbox body length does not fit u64".to_owned())
     })?;
     let headers = canonicalize_provider_headers(&envelope.headers)?;
+    engine.capture_storage_body(&envelope.body, received_ns)?;
     let parsed = frontend.parse(&envelope.path, &headers, &envelope.body)?;
     let selected = engine
         .handle_observed(parsed, body_bytes, received_ns)
@@ -2069,10 +2178,12 @@ async fn handle_provider_mailbox_request(
         Some(Fault::Delay { delay_ms }) => {
             tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
             let rendered = frontend.render(&selected)?;
+            engine.record_storage_response(&selected, &rendered)?;
             (rendered.status, rendered.body)
         }
         None | Some(Fault::Fragment { .. }) | Some(Fault::RepeatFrame { .. }) => {
             let rendered = frontend.render(&selected)?;
+            engine.record_storage_response(&selected, &rendered)?;
             (rendered.status, rendered.body)
         }
     };
@@ -2335,6 +2446,7 @@ async fn handle_http(
     let body_bytes = u64::try_from(body.len()).map_err(|_| {
         AhrbError::Protocol("fake-model request body length does not fit u64".to_owned())
     })?;
+    engine.capture_storage_body(&body, received_ns)?;
     let parsed = frontend.parse(&path, &headers, &body)?;
     let selected = engine
         .handle_observed(parsed, body_bytes, received_ns)
@@ -2377,6 +2489,7 @@ async fn handle_http(
         tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
     }
     let mut rendered = frontend.render(&selected)?;
+    engine.record_storage_response(&selected, &rendered)?;
     if let Some(Fault::Trickle { count, .. }) = selected.fault.as_ref() {
         rendered.body = trickle_success_body(*count)?;
     }

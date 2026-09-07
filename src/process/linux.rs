@@ -307,6 +307,29 @@ impl Sampler for LinuxSampler {
         })
     }
 
+    fn disk_counter_preflight(&mut self) -> Result<()> {
+        let pid = std::process::id();
+        let path = self.proc_root.join(pid.to_string()).join("io");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => parse_proc_io(pid, &text).map(|_| ()).map_err(|error| {
+                AhrbError::Unsupported(format!("linux physical write_bytes self probe: {error}"))
+            }),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                Err(AhrbError::Unsupported(format!(
+                    "linux physical write_bytes self probe: {error}"
+                )))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn disk_counters(&mut self, tree: &ProcessTree) -> Result<ProcessDiskObservation> {
         let mut observation = ProcessDiskObservation {
             expected_identities: tree.members.keys().copied().collect(),
@@ -330,6 +353,30 @@ impl Sampler for LinuxSampler {
 
     fn disk_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
         read_process_disk_counter(&self.proc_root, identity)
+    }
+
+    fn disk_read_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
+        let root = self.proc_root.join(identity.pid.to_string());
+        let Some(before) = read_transient_text(&root.join("stat"))? else {
+            return Ok(None);
+        };
+        if parse_stat(identity.pid, &before)?.identity() != identity {
+            return Ok(None);
+        }
+        let Some(io) = read_transient_text(&root.join("io"))? else {
+            return Ok(None);
+        };
+        let value = io
+            .lines()
+            .find_map(|line| line.strip_prefix("read_bytes:"))
+            .ok_or_else(|| AhrbError::Protocol("/proc io omitted read_bytes".into()))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| AhrbError::Protocol("invalid /proc read_bytes".into()))?;
+        let Some(after) = read_transient_text(&root.join("stat"))? else {
+            return Ok(None);
+        };
+        Ok((parse_stat(identity.pid, &after)?.identity() == identity).then_some(value))
     }
 }
 
@@ -608,7 +655,11 @@ fn read_process_disk_counter(proc_root: &Path, identity: ProcIdentity) -> Result
     let Some(io_text) = read_transient_text(&process_root.join("io"))? else {
         return Ok(None);
     };
-    parse_proc_io(identity.pid, &io_text).map(Some)
+    let value = parse_proc_io(identity.pid, &io_text)?;
+    let Some(after) = read_transient_text(&process_root.join("stat"))? else {
+        return Ok(None);
+    };
+    Ok((parse_stat(identity.pid, &after)?.identity() == identity).then_some(value))
 }
 
 fn read_cgroup_io_stat(path: &Path) -> Result<Option<u64>> {

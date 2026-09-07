@@ -2119,7 +2119,11 @@ pub struct PerInvocationDriver {
 impl PerInvocationDriver {
     /// Construct a per-invocation CLI driver. Disk state is loaded by `start`.
     pub fn new(config: PerInvocationConfig) -> Self {
-        let state_root = config.profile_root.join("ahrb-exec-sessions");
+        let state_root = config
+            .base_variables
+            .get("ahrb_evidence_root")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.profile_root.join("ahrb-exec-sessions"));
         Self {
             config,
             state_root,
@@ -2136,6 +2140,14 @@ impl PerInvocationDriver {
 
     fn session_directory(&self, id: &str) -> PathBuf {
         self.state_root.join(id)
+    }
+
+    fn workspace_directory(&self, id: &str) -> PathBuf {
+        self.config
+            .base_variables
+            .get("storage_workspace")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.session_directory(id).join("workspace"))
     }
 
     fn metadata_path(&self, id: &str) -> PathBuf {
@@ -2231,8 +2243,16 @@ impl PerInvocationDriver {
         key: &str,
     ) -> BTreeMap<String, String> {
         let directory = self.session_directory(&session.local_id);
-        let workspace = directory.join("workspace");
-        let journal = directory.join("harness-journal.jsonl");
+        let workspace = self.workspace_directory(&session.local_id);
+        let journal = if self
+            .config
+            .base_variables
+            .contains_key("ahrb_evidence_root")
+        {
+            workspace.join("harness-journal.jsonl")
+        } else {
+            directory.join("harness-journal.jsonl")
+        };
         let mut variables = self.config.base_variables.clone();
         variables.extend([
             (
@@ -2776,7 +2796,7 @@ impl PerInvocationDriver {
         command
             .args(arguments)
             .envs(&self.config.environment)
-            .current_dir(self.session_directory(&session.local_id).join("workspace"))
+            .current_dir(self.workspace_directory(&session.local_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2843,7 +2863,7 @@ impl PerInvocationDriver {
         command
             .args(arguments)
             .envs(&self.config.environment)
-            .current_dir(self.session_directory(&session.local_id).join("workspace"))
+            .current_dir(self.workspace_directory(&session.local_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2975,8 +2995,7 @@ impl Driver for PerInvocationDriver {
                 next_cursor: 1,
                 closed: false,
             };
-            let directory = self.session_directory(&id);
-            std::fs::create_dir_all(directory.join("workspace"))?;
+            std::fs::create_dir_all(self.workspace_directory(&id))?;
             Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
             self.sessions.insert(
                 id.clone(),
@@ -2993,7 +3012,7 @@ impl Driver for PerInvocationDriver {
     }
 
     fn session_workspace(&self, session: &SessionId) -> Option<PathBuf> {
-        Some(self.session_directory(&session.0).join("workspace"))
+        Some(self.workspace_directory(&session.0))
     }
 
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()> {
@@ -3078,7 +3097,7 @@ impl Driver for PerInvocationDriver {
             command.process_group(0);
             command
                 .envs(&self.config.environment)
-                .current_dir(directory.join("workspace"))
+                .current_dir(self.workspace_directory(&id))
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
@@ -3241,7 +3260,7 @@ impl Driver for PerInvocationDriver {
             let (program, arguments) = argv.split_first().ok_or_else(|| {
                 AhrbError::Validation("per-invocation replay command is empty".to_owned())
             })?;
-            let working_directory = self.session_directory(&id).join("workspace");
+            let working_directory = self.workspace_directory(&id);
             let state_argv = self
                 .config
                 .events
@@ -3633,7 +3652,7 @@ impl Driver for PerInvocationDriver {
                 }
                 persisted.turns = persisted.turns.saturating_add(1);
                 Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
-                let workspace = self.session_directory(&id).join("workspace");
+                let workspace = self.workspace_directory(&id);
                 if workspace.exists() {
                     std::fs::remove_dir_all(&workspace)?;
                 }
@@ -3925,7 +3944,7 @@ impl Driver for PerInvocationDriver {
             command
                 .args(arguments)
                 .envs(&self.config.environment)
-                .current_dir(self.session_directory(&session.local_id).join("workspace"))
+                .current_dir(self.workspace_directory(&session.local_id))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())

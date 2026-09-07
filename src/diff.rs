@@ -1134,6 +1134,10 @@ mod tests {
     fn index_entry(os: &str, topology: &str, profile: &str) -> IndexEntry {
         IndexEntry {
             schema: crate::results::INDEX_SCHEMA,
+            pillar: "matrix".into(),
+            storage_summary: None,
+            badge_label: None,
+            outcome_counts: Default::default(),
             run_key: "run-test".to_owned(),
             completed_at: "2026-09-01T00:00:00Z".to_owned(),
             harness: "mock".to_owned(),

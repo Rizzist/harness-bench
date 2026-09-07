@@ -1,5 +1,8 @@
 //! End-to-end benchmark orchestration.
 
+mod storage;
+pub use storage::run_storage;
+
 use crate::cli::{Profile, RunOptions};
 use crate::determinism::{
     CrossRunReproducibilityEvaluation, DeterminismRun, NondeterministicFieldEvaluation,
@@ -12,8 +15,8 @@ use crate::driver::{
     SocketJsonRpcTransport, StdinRpcTransport, Transport,
 };
 use crate::evaluate::{
-    Assertion, TestOutcome, TestResult, TestResultMetadata, automation_score, badge_label, certify,
-    classify, suite_exit_code,
+    Assertion, TestOutcome, TestResult, TestResultMetadata, automation_score, certify, classify,
+    suite_exit_code,
 };
 use crate::events::{EventVocab, NormalizedEvent, rule_matches};
 use crate::fake_model::{
@@ -2727,6 +2730,20 @@ async fn start_scripted_pillar_runtime_with_engine(
         ),
         ("endpoint".to_owned(), String::new()),
     ]);
+    if pillar == "storage" {
+        let evidence = profile_root.with_extension("evidence");
+        std::fs::create_dir_all(&evidence)?;
+        variables.insert(
+            "ahrb_evidence_root".into(),
+            evidence.to_string_lossy().into_owned(),
+        );
+        if let Some(workspace) = task_workspace {
+            variables.insert(
+                "storage_workspace".into(),
+                workspace.to_string_lossy().into_owned(),
+            );
+        }
+    }
     let hash_prefix = manifest_hash.get(..16).unwrap_or(manifest_hash);
     let credential = format!("ahrb-{hash_prefix}-{pillar}-{}", std::process::id());
     let mut environment = isolated_environment(manifest, &variables)?;
@@ -2764,14 +2781,14 @@ async fn start_scripted_pillar_runtime_with_engine(
     variables.insert("credential".to_owned(), credential);
     variables.insert("model".to_owned(), manifest.fake_model.model.clone());
     write_generated_files(manifest, &variables, profile_root)?;
-    if !manifest.hooks.acceptance.is_empty() {
+    if pillar != "storage" && !manifest.hooks.acceptance.is_empty() {
         let hook = render_argv(&manifest.hooks.acceptance, &variables)?;
         environment.insert(
             "AHRB_MOCK_ACCEPTANCE_HOOK".to_owned(),
             serde_json::to_string(&hook)?,
         );
     }
-    if !manifest.hooks.completion.is_empty() {
+    if pillar != "storage" && !manifest.hooks.completion.is_empty() {
         let hook = render_argv(&manifest.hooks.completion, &variables)?;
         environment.insert(
             "AHRB_MOCK_COMPLETION_HOOK".to_owned(),
@@ -4008,28 +4025,7 @@ fn economy_workflow(manifest: &Manifest) -> Result<Workflow> {
             json!({"path":path,"route":marker(checkpoint)}),
         )
     };
-    let fixture_contents = [
-        (
-            "a",
-            "alpha architecture notes and stable constraints\n".repeat(16),
-        ),
-        (
-            "b",
-            "bravo interface notes and deterministic inputs\n".repeat(16),
-        ),
-        (
-            "c",
-            "charlie verification notes and expected outputs\n".repeat(16),
-        ),
-        (
-            "d",
-            "delta edge cases and bounded failure behavior\n".repeat(16),
-        ),
-        (
-            "e",
-            "echo integration notes and terminal conditions\n".repeat(16),
-        ),
-    ];
+    let fixture_contents = crate::storage::fixture::contents()?;
     let bootstrap_calls = fixture_contents
         .iter()
         .map(|(suffix, content)| {
@@ -4306,6 +4302,8 @@ fn write_interrupted_report(
     let report = Report {
         schema: 3,
         spec_version: 2,
+        pillar: None,
+        storage_summary: None,
         run_id: deterministic_run_id(&manifest_hash, &selected_rows),
         profile_path: persistence.profile_path.to_string_lossy().into_owned(),
         fingerprint: Fingerprint {
@@ -7295,7 +7293,7 @@ async fn run_inner(
             profile: format!("{:?}", options.profile).to_lowercase(),
         },
         results,
-        badge,
+        badge: badge.map(crate::report::ReportBadge::Matrix),
         metrics,
         details,
         lifecycle_notes: state.lifecycle_notes,
@@ -7304,6 +7302,13 @@ async fn run_inner(
         resource_summary,
         economy_summary: None,
         fidelity_summary: None,
+        pillar: None,
+        storage_summary: None,
+        storage_samples: Vec::new(),
+        storage_files: Vec::new(),
+        storage_responses: Vec::new(),
+        fsync_events: Vec::new(),
+        request_body_matches: Vec::new(),
         samples: state.samples,
         memory_time_samples: row46_trials
             .as_ref()
@@ -7375,7 +7380,7 @@ async fn run_inner(
     crate::results::persist_report(&persistence, &report, options.junit, false)?;
     println!("{}", render_resource_summary(&report.resource_summary));
     match &report.badge {
-        Some(badge) => println!("badge {}", badge_label(badge)),
+        Some(badge) => println!("badge {}", badge.label()),
         None => println!("badge none"),
     }
     if automation_components_missing {
@@ -7383,7 +7388,10 @@ async fn run_inner(
     }
     Ok(suite_exit_code(
         &report.results,
-        report.badge.as_ref(),
+        report
+            .badge
+            .as_ref()
+            .and_then(crate::report::ReportBadge::matrix),
         &manifest,
     ))
 }
@@ -7849,7 +7857,11 @@ fn rendered_managed_daemon_config(
             &manifest.daemon.initialize,
             variables,
         )?)?,
-        initialize_marker: profile_root.join("daemon-initialized"),
+        initialize_marker: variables
+            .get("ahrb_evidence_root")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| profile_root.to_path_buf())
+            .join("daemon-initialized"),
         environment: environment.clone(),
         readiness,
         shutdown_command: resolve_local_program(&render_argv(
@@ -7858,7 +7870,11 @@ fn rendered_managed_daemon_config(
         )?)?,
         shutdown_result: manifest.daemon.shutdown_result.clone(),
         grace: Duration::from_millis(manifest.daemon.grace_ms.max(1)),
-        log_directory: profile_root.join("daemon-logs"),
+        log_directory: variables
+            .get("ahrb_evidence_root")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| profile_root.to_path_buf())
+            .join("daemon-logs"),
     })
 }
 
@@ -16237,6 +16253,15 @@ fn row47_looks_like_log(path: &Path) -> bool {
     })
 }
 
+// Shared no-log semantics: journal locators exempt filename heuristics, but
+// cannot override an explicit declaration that a matched file is a log.
+fn no_log_contradiction(path: &Path, journal: bool, log_family: bool) -> Option<String> {
+    (log_family || (!journal && row47_looks_like_log(path))).then(|| format!(
+        "conflicting-log-declaration: resources.log_paths=[] contradicted by isolated-root log artifact {}",
+        path.display()
+    ))
+}
+
 fn row47_verify_no_log(
     profile_root: &Path,
     repetition: u32,
@@ -16253,11 +16278,8 @@ fn row47_verify_no_log(
             "isolated-root-audit",
             raw,
         )?;
-        if !journal_paths.contains(&path) && row47_looks_like_log(&path) {
-            return Err(AhrbError::Protocol(format!(
-                "resources.log_paths=[] contradicted by isolated-root log artifact {}",
-                path.display()
-            )));
+        if let Some(reason) = no_log_contradiction(&path, journal_paths.contains(&path), false) {
+            return Err(AhrbError::Protocol(reason));
         }
     }
     Ok(())

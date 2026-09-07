@@ -101,6 +101,10 @@ fn diff_latest_reads_mixed_legacy_and_v2_index_lines() {
     });
     let current_line = IndexEntry {
         schema: INDEX_SCHEMA,
+        pillar: "matrix".into(),
+        storage_summary: None,
+        badge_label: None,
+        outcome_counts: Default::default(),
         run_key: "run-current".to_owned(),
         completed_at: "2026-01-02T00:00:00Z".to_owned(),
         harness: "ahrb-mock".to_owned(),

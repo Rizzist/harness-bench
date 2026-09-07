@@ -54,6 +54,9 @@ pub struct Manifest {
     /// Optional declarations used only by the isolated context-fidelity pillar.
     #[serde(default, skip_serializing_if = "FidelityConfig::is_absent")]
     pub fidelity: FidelityConfig,
+    /// Storage declarations are optional; omission still permits whole-root S1/S3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<crate::storage::StorageConfig>,
     /// Lifecycle hooks.
     #[serde(default)]
     pub hooks: Hooks,
@@ -1181,6 +1184,24 @@ fn validate_scripted_workspace_template(path: Option<&str>, field: &str) -> Resu
 
 /// Validate invariants that can be checked without starting a harness.
 pub fn validate(manifest: &Manifest) -> Result<()> {
+    if let Some(storage) = &manifest.storage {
+        storage.validate()?;
+        if manifest
+            .resources
+            .log_paths
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+            && storage
+                .areas
+                .as_ref()
+                .and_then(|a| a.get("logs"))
+                .is_some_and(|p| !p.is_empty())
+        {
+            return Err(AhrbError::Validation(
+                "storage: conflicting-log-declaration: resources.log_paths=[] contradicts nonempty storage.areas.logs".into(),
+            ));
+        }
+    }
     if !matches!(manifest.identity.schema, 1 | 2) {
         return Err(AhrbError::Validation(format!(
             "unsupported manifest schema {} (expected 1 or 2)",
