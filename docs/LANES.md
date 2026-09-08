@@ -69,7 +69,7 @@ Resume procedure: the harness checklist's BLOCKER section lists the per-lane res
 | L0 `l0-setup-runners` | Land the portable instruction files (`AGENTS.md`, `CLAUDE.md`, `docs/DEVELOPMENT.md`, this ledger); fix `scripts/mock-cert.sh` and `scripts/six-harness.sh`: failure/exit-code propagation, fresh timestamped output paths, ownership-scoped temp cleanup, preservation of earlier evidence; regression coverage for those; baseline build/test; honest mock self-certification | — | **complete** (SHIP, landed `1c286b5`) |
 | L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | **complete** (SHIP, landed `bec2475`) |
 | L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | **complete** (SHIP, landed `e24aeba`) |
-| L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | pending |
+| L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | **complete** (SHIP, landed `2241d82`) |
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | pending |
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
@@ -133,12 +133,14 @@ Record: verified tree = `b201bab` + diff sha256 `f8cb55b3577d9fcd185525edcfcaae5
 
 ## L3 `l3-storage-s7-s8`
 
-- [ ] Worktree
-- [ ] Clean code pass + implement (GPT6-Astra)
-- [ ] Code verification (GPT6-Astra)
-- [ ] Computer-use verification (GPT6-Astra)
-- [ ] Repair loop until SHIP
-- [ ] Complete
+- [x] Worktree `worktrees/l3-storage-s7-s8`, branch `lane/l3-storage-s7-s8`, based on the L2 candidate, rebased onto master
+- [x] Clean code pass + implement (GPT6-Astra thread `01a079c9-5902-71c1-bd84-102595d9d5f4`, repair `01a07ce0-c03c-76d0-aed6-d88d42b14705`): S7 per-family growth with rotated siblings, S8 retention classification by digest and byte search with stored/unique ratio, `AHRB_MOCK_STORAGE_AUX_MODE` / `REQUEST_RETENTION` / `UNRELATED_GROWTH` knobs, ten mock bundles, tests
+- [x] Code verification (GPT6-Astra `01a07b98-08ef-7451-bbd8-9791f84bece0` NO-SHIP: plaintext feasibility not propagated to S7/S8, whole-crate float assertion; `01a07d39-6fb3-70a0-9828-9b6849ce6ba8` **SHIP** after the repair: full suite passed, both findings confirmed fixed)
+- [x] Computer-use verification (same verifiers: positive/adverse S7/S8 mock cases on both transports incl. fault injection, plaintext mock UNSUPPORTED across S1/S3/S7/S8, real codex honest collector ERROR, real pi ABSENT)
+- [x] Repair loop until SHIP (two iterations; interrupted by provider outages and resumed on the same threads)
+- [x] Complete: commit `2241d82`, fast-forwarded onto `master`, pushed
+
+Record: verified tree = `9f198a5` + repair diff sha256 `4801dee3f9ad2c33d5bfd6a23a5767e76caf0e5a8b4091985dae7872d952e388`, squashed and rebased onto `5cd41b4` by the interim orchestrator with a clean post-rebase build/focused-test check. Raw evidence: harness `state/lanes/l3-storage-s7-s8/` (outside Git).
 
 ## L4 `l4-storage-s5-s4`
 
