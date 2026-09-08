@@ -4265,6 +4265,7 @@ async fn model_http_post(
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> Result<crate::driver::HttpResponse> {
+    storage_retain_request(config, body)?;
     #[cfg(unix)]
     if let Some(stream) = &config.provider_stream {
         if let Some(guard) = &config.owned_egress_guard {
@@ -4754,6 +4755,7 @@ fn storage_fixture_write(config: &MockConfig, prompt: &str) -> Result<()> {
     if !prompt.contains(crate::storage::TASK) {
         return Ok(());
     }
+    storage_auxiliary_write(config)?;
     let mode = std::env::var("AHRB_MOCK_STORAGE_WRITE_MODE").unwrap_or_else(|_| "append".into());
     let growth = std::env::var("AHRB_MOCK_STORAGE_GROWTH").unwrap_or_else(|_| "linear".into());
     let turn = prompt
@@ -4802,6 +4804,105 @@ fn storage_fixture_write(config: &MockConfig, prompt: &str) -> Result<()> {
     }
     file.set_len(size)?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn storage_auxiliary_write(config: &MockConfig) -> Result<()> {
+    if let Ok(mode) = std::env::var("AHRB_MOCK_STORAGE_AUX_MODE") {
+        let dir = config.state_dir.join("storage-aux");
+        fs::create_dir_all(&dir)?;
+        for family in ["logs", "store", "history"] {
+            let active = dir.join(format!("{family}.log"));
+            match mode.as_str() {
+                "capped" => {
+                    let old = dir.join(format!("{family}.log.1"));
+                    let older = dir.join(format!("{family}.log.2"));
+                    if old.exists() {
+                        fs::rename(&old, &older)?;
+                    }
+                    if active.exists() {
+                        fs::rename(&active, &old)?;
+                    }
+                    fs::write(&active, vec![b'A'; 4096])?;
+                }
+                "grow" => {
+                    let mut f = OpenOptions::new().create(true).append(true).open(active)?;
+                    f.write_all(&[b'A'; 8192])?;
+                }
+                _ => {
+                    return Err(AhrbError::Usage(
+                        "AHRB_MOCK_STORAGE_AUX_MODE must be capped/grow".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if std::env::var("AHRB_MOCK_STORAGE_UNRELATED_GROWTH").as_deref() == Ok("1") {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(config.state_dir.join("unrelated-growth.bin"))?;
+        f.write_all(&[b'X'; 16384])?;
+    }
+    Ok(())
+}
+
+fn storage_retain_request(config: &MockConfig, body: &[u8]) -> Result<()> {
+    let mode =
+        std::env::var("AHRB_MOCK_STORAGE_REQUEST_RETENTION").unwrap_or_else(|_| "none".into());
+    if mode == "none" {
+        return Ok(());
+    }
+    if !body
+        .windows(crate::storage::TASK.len())
+        .any(|w| w == crate::storage::TASK.as_bytes())
+    {
+        return Ok(());
+    }
+    let directory = config.state_dir.join("storage-requests");
+    fs::create_dir_all(&directory)?;
+    let request: Value = serde_json::from_slice(body)?;
+    match mode.as_str() {
+        "full" => {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("bodies.jsonl"))?;
+            file.write_all(body)?;
+            file.write_all(b"\n")?;
+        }
+        "deduplicated" | "partial" => {
+            let blocks =
+                crate::economy::canonical_message_blocks(&request, "openai-chat-completions");
+            for block in blocks
+                .into_iter()
+                .take(if mode == "partial" { 1 } else { usize::MAX })
+            {
+                let bytes = serde_json::to_vec(&block)?;
+                // Partial retains only the first observed block across the session.
+                let name = if mode == "partial" {
+                    "first.block".into()
+                } else {
+                    format!("{}.block", crate::storage::retention::digest(&bytes))
+                };
+                let path = directory.join(name);
+                if !path.exists() {
+                    fs::write(path, bytes)?;
+                }
+            }
+        }
+        "opaque" => {
+            let mut bytes = vec![0, 255];
+            bytes.extend(body.iter().map(|b| b ^ 0x80));
+            fs::write(directory.join("opaque.bin"), bytes)?;
+        }
+        _ => {
+            return Err(AhrbError::Usage(
+                "AHRB_MOCK_STORAGE_REQUEST_RETENTION must be none/deduplicated/full/partial/opaque"
+                    .into(),
+            ));
+        }
+    }
     Ok(())
 }
 

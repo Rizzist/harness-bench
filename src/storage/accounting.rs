@@ -433,3 +433,63 @@ pub async fn settle(
         "storage failed to settle within 10000 ms".into(),
     ))
 }
+
+/// Read bytes from the exact audited regular-file identity using held no-follow
+/// parent descriptors. Recheck metadata and content digest before accepting them.
+#[cfg(unix)]
+pub fn read_verified(root: &Path, entry: &FileEntry) -> Result<Vec<u8>> {
+    if entry.kind != "regular" {
+        return Err(AhrbError::Protocol("S8 nonregular content read".into()));
+    }
+    let mut parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    let parts = entry.path.split('/').collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() || *part == "." || *part == ".." {
+            return Err(AhrbError::Protocol("S8 invalid relative path".into()));
+        }
+        let name = std::ffi::CString::new(*part).map_err(|e| AhrbError::Protocol(e.to_string()))?;
+        let mut file = open_child(&parent, &name, index + 1 < parts.len())?;
+        if index + 1 < parts.len() {
+            parent = file;
+            continue;
+        }
+        let before = file.metadata()?;
+        if !before.is_file()
+            || (
+                before.dev(),
+                before.ino(),
+                before.size(),
+                before.blocks() * 512,
+            ) != (
+                entry.device_id,
+                entry.inode_or_file_id,
+                entry.apparent_bytes,
+                entry.allocated_bytes,
+            )
+        {
+            return Err(AhrbError::Protocol(
+                "S8 changed file identity/size/blocks".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let reopened = open_child(&parent, &name, false)?;
+        if signature(&before) != signature(&file.metadata()?)
+            || signature(&before) != signature(&reopened.metadata()?)
+            || entry.sha256.as_deref() != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+        {
+            return Err(AhrbError::Protocol("S8 changed content during scan".into()));
+        }
+        return Ok(bytes);
+    }
+    Err(AhrbError::Protocol("S8 empty path".into()))
+}
+#[cfg(not(unix))]
+pub fn read_verified(_root: &Path, _entry: &FileEntry) -> Result<Vec<u8>> {
+    Err(AhrbError::Unsupported(
+        "S8 no-follow content audit unavailable".into(),
+    ))
+}

@@ -294,7 +294,12 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         .max()
         .unwrap_or(0) as f64
         / (1024.0 * 1024.0);
-    assert!((report.resource_summary.peak_rss_mib - sampled_peak).abs() < f64::EPSILON);
+    // JSON f64 parsing can round the serialized peak by one ULP; use a
+    // magnitude-scaled bound when comparing it with the integer-derived value.
+    assert!(
+        (report.resource_summary.peak_rss_mib - sampled_peak).abs()
+            <= f64::EPSILON * sampled_peak.abs().max(1.0)
+    );
     let sampled_cpu_s = report
         .samples
         .first()

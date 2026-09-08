@@ -803,8 +803,11 @@ fn cache_eligibility_note(topology: &str) -> String {
 }
 
 fn primary_message_array(record: &ModelRequestRecord) -> Value {
-    let canonical = &record.request.canonical;
-    let value = if record.request.dialect == "openai-responses" {
+    primary_message_value(&record.request.canonical, &record.request.dialect)
+}
+
+fn primary_message_value(canonical: &Value, dialect: &str) -> Value {
+    let value = if dialect == "openai-responses" {
         canonical.get("input")
     } else {
         canonical.get("messages")
@@ -958,8 +961,12 @@ fn count_named_fields(value: &Value, field: &str) -> u64 {
     visit(value, field, false)
 }
 
-fn message_blocks(record: &ModelRequestRecord) -> Vec<Value> {
-    let Value::Array(items) = primary_message_array(record) else {
+pub(crate) fn message_blocks(record: &ModelRequestRecord) -> Vec<Value> {
+    canonical_message_blocks(&record.request.canonical, &record.request.dialect)
+}
+
+pub(crate) fn canonical_message_blocks(canonical: &Value, dialect: &str) -> Vec<Value> {
+    let Value::Array(items) = primary_message_value(canonical, dialect) else {
         return Vec::new();
     };
     let mut blocks = Vec::new();

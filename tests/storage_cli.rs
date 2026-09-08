@@ -250,7 +250,7 @@ fn plaintext_exit_terminals_are_unsupported_before_stimulus_in_both_cli_forms() 
         let report: ahrb::report::Report =
             serde_json::from_slice(&std::fs::read(output.join("report.json")).expect("report"))
                 .expect("typed report");
-        for i in [0, 2] {
+        for i in [0, 2, 6, 7] {
             let row = &report.results[i];
             assert!(
                 matches!(&row.outcome, ahrb::evaluate::TestOutcome::Unsupported(reason)
@@ -269,7 +269,7 @@ fn plaintext_exit_terminals_are_unsupported_before_stimulus_in_both_cli_forms() 
                 .results
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| ![0, 2].contains(i))
+                .filter(|(i, _)| ![0, 2, 6, 7].contains(i))
                 .all(
                     |(_, r)| matches!(&r.outcome, ahrb::evaluate::TestOutcome::Error(_))
                         && !r.metadata.measurement_complete
@@ -277,15 +277,30 @@ fn plaintext_exit_terminals_are_unsupported_before_stimulus_in_both_cli_forms() 
         );
         assert!(report.turns.is_empty() && report.model_requests.is_empty());
         assert!(report.storage_samples.is_empty() && report.storage_files.is_empty());
+        assert!(report.request_body_matches.is_empty());
+        assert!(
+            report.details["request-body-retention"]["matches"]
+                .as_array()
+                .expect("matches")
+                .is_empty()
+        );
         assert!(report.badge.is_none());
         let summary = report.storage_summary.expect("summary");
         assert_eq!(summary.completed_turns, 0);
+        assert_eq!(summary.physical_requests, 0);
         assert!(summary.disk_class.is_none() && summary.growth_class.is_none());
         assert!(summary.write_bytes_per_turn_p95.is_none() && summary.footprint_curve.is_empty());
+        assert!(summary.auxiliaries.is_empty());
+        assert!(summary.request_retention_class.is_none());
+        assert!(summary.stored_request_bytes.is_none());
+        assert!(summary.unique_request_content_bytes.is_none());
+        assert!(summary.stored_unique_ratio.is_none());
         let markdown = std::fs::read_to_string(output.join("report.md")).expect("markdown");
         assert!(markdown.contains("| S1 `write-volume` | UNSUPPORTED |"));
         assert!(markdown.contains("| S3 `footprint-curve` | UNSUPPORTED |"));
-        assert!(markdown.contains("shared S1/S3 task not started"));
+        assert!(markdown.contains("| S7 `bounded-auxiliaries` | UNSUPPORTED |"));
+        assert!(markdown.contains("| S8 `request-body-retention` | UNSUPPORTED |"));
+        assert!(markdown.contains("shared S1/S3/S7/S8 task not started"));
         std::fs::remove_dir_all(output).expect("remove owned output");
     }
 }

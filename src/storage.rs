@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod accounting;
+pub mod auxiliaries;
 pub mod evidence;
 pub mod fixture;
+pub mod retention;
 
 /// Versioned fixture identity, independent of the matrix.
 pub const TASK: &str = "ahrb-storage-tiny-turns-v1";
@@ -591,7 +593,7 @@ pub fn render_markdown(
             .unwrap_or_else(|| "unavailable".into())
     );
     out.push_str("| Trial scalar | Median | MAD |\n|---|---:|---:|\n");
-    for slug in [ROWS[0], ROWS[2]] {
+    for slug in [ROWS[0], ROWS[2], ROWS[7]] {
         if let Some(trials) = details.get(slug).and_then(|d| d["trials"].as_array()) {
             let keys = trials
                 .iter()
@@ -640,24 +642,46 @@ pub fn render_markdown(
             );
         }
     }
-    out.push_str("\n| Family | Cap bytes | Peak allocated bytes | Final allocated bytes |\n|---|---:|---:|---:|\n");
+    out.push_str("\n| Family | Cap bytes | Peak allocated bytes | Final allocated bytes | Slope bytes/turn | Rotation | Class |\n|---|---:|---:|---:|---:|---|---|\n");
     if summary.auxiliaries.is_empty() {
         out.push_str(
-            "| unavailable (S7 collector pending) | unavailable | unavailable | unavailable |\n",
+            "| unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |\n",
         );
     }
     for a in &summary.auxiliaries {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             a.name,
             a.cap_bytes
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "unavailable".into()),
             a.peak_allocated_bytes,
-            a.final_allocated_bytes
+            a.final_allocated_bytes,
+            a.slope_bytes_per_turn,
+            a.rotation_observed,
+            a.class
+                .map(|c| format!("{c:?}").to_lowercase())
+                .unwrap_or_else(|| "unsupported cap assessment".into())
         );
     }
+    let _ = writeln!(
+        out,
+        "\nRequest retention: **{}** · matched stored bytes: {} · unique content bytes: {} · stored/unique ratio: {}.\n\nPrivacy limitation: these are observational byte-retention classes, not storage architecture or privacy-safety claims. `none` means no matching request bytes found in supported representations; transformed storage may retain prompts. Captured request bodies and matches are private benchmark evidence.\n",
+        summary
+            .request_retention_class
+            .map(|c| format!("{c:?}").to_lowercase())
+            .unwrap_or_else(|| "unavailable".into()),
+        summary
+            .stored_request_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into()),
+        summary
+            .unique_request_content_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into()),
+        show(summary.stored_unique_ratio)
+    );
     out.push_str("\n| Residue operation | Allocated bytes | Files |\n|---|---:|---:|\n");
     for (name, bytes, files) in [
         (
