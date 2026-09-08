@@ -161,3 +161,8 @@ The normative behavior and 41-row matrix live in [`docs/SPEC.md`](docs/SPEC.md).
 Licensed under the Kingdom of Abraham Permissive License (KOA-P-1.0), an MIT-equivalent
 license for the AI Agents Era — see [`LICENSE.md`](LICENSE.md). The license must be
 included in full (notice, preamble, and terms) in all copies or substantial portions.
+
+For the quiet Mac mini six-harness reference across matrix, economy, fidelity and storage,
+use [`scripts/reference-run.sh`](scripts/reference-run.sh) and
+[`scripts/reference-tables.py`](scripts/reference-tables.py); see the
+[one-command procedure and resume rules](docs/HANDOFF-macmini.md#2--one-command-reference-serial-quiet).
