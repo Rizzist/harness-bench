@@ -29,6 +29,16 @@ summaries: candidate commits/digests, commands, exit codes, verdicts and worker 
 - Per-stage boxes: `[ ]` pending, `[x]` done with evidence, `[!]` blocked (reason recorded).
 
 
+## Status 2026-09-08 11:55 UTC — paused for orchestrator move
+
+The owner paused the run to move orchestration to the Haider harness. Landed: L0, L1, L9, L2, L8a.
+In verification when paused: L3 (`verify-2`, both findings fixed, 4 mock fault cases left), L4
+(`verify-2`, real-adapter forms left), L5 (`verify-2`, suite passed, last CLI cases left), L6
+(`verify-5`, Part A green, Part B left), L7a (`verify-1`, real runs left). L10 (measurement fixes from
+the Haider analysis) implementing. Queued: L7b, L11 (ERROR rows), L8. Every worker thread, candidate
+digest and resume command is recorded in the harness `HANDOFF-RESUME-2026-09-08.md` and
+`state/checklist.md` (outside Git).
+
 ## Status 2026-09-07 22:10 UTC — blocked again on GPT6-Astra capacity
 
 Capacity was restored at 17:16 UTC and all six lanes advanced (L3 repaired and re-verifying, L4 repaired, L5 verifying with one confirmed persistence finding, L6 repaired twice and re-verifying, L7a's codex collector fix proven on real codex/pi/claude-code runs, L8a repaired after three findings) until the usage limit was exhausted again at 22:06 UTC ("try again at Sep 14th, 2026"). The owner's standing rule is to wait for GPT6-Astra rather than substitute any other model. The harness checklist's BLOCKER #2 section lists exact per-lane resume steps.
@@ -65,6 +75,8 @@ Resume procedure: the harness checklist's BLOCKER section lists the per-lane res
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
 | L7a `l7a-storage-collector-results` | Split out 2026-09-07: codex terminal-before-reap collector fix, codex volatile-area rule, pi sessions revisit, saved-index/`hbench diff` storage integration | L2 | in progress (blocked) |
 | L8a `l8a-reference-runner` | Split out 2026-09-07: `scripts/reference-run.sh` (six harnesses x four pillars, pre-flight, resumable, honest exit), `scripts/reference-tables.py`, tests, handoff docs; verified on mocks | L2 | **complete** (SHIP, landed `8cc1e8d`) |
+| L10 `l10-measurement-fixes` | From the GPT6-Astra analysis of the Haider/rick ad-hoc run: cross-collector CPU aggregation defect, missing thin-client roots in daemon+exec trials, tool-argument normalization (false `terminal-without-effect`, rows 29/61), collector reread overhead (rows 43/49), stream frame identity (48/59), haider-agent declarations, per-row wall timing | L2 | in progress (paused) |
+| L11 `l11-error-rows` | Make the eight ERROR rows (47, 48, 52, 53, 59, 60, 61, 62) measurable for the six harnesses | after the storage pass | pending |
 | L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six original adapters (codex, claude-code, opencode, pi, rick, haider-agent) from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression. Owner decision 2026-09-07: aider/goose/cline stay as landed adapters without storage declarations | L3, L4, L5, L6 | pending |
 | L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; storage blocks added by L7 | L0 | **complete** (SHIP, landed `c33237e`) |
 | L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, then matrix, economy, fidelity and storage for the six original harnesses (owner decision 2026-09-07); sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7 | pending |
