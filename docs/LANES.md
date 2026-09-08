@@ -64,7 +64,7 @@ Resume procedure: the harness checklist's BLOCKER section lists the per-lane res
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
 | L7a `l7a-storage-collector-results` | Split out 2026-09-07: codex terminal-before-reap collector fix, codex volatile-area rule, pi sessions revisit, saved-index/`hbench diff` storage integration | L2 | in progress (blocked) |
-| L8a `l8a-reference-runner` | Split out 2026-09-07: `scripts/reference-run.sh` (six harnesses x four pillars, pre-flight, resumable, honest exit), `scripts/reference-tables.py`, tests, handoff docs; verified on mocks | L2 | in progress (blocked) |
+| L8a `l8a-reference-runner` | Split out 2026-09-07: `scripts/reference-run.sh` (six harnesses x four pillars, pre-flight, resumable, honest exit), `scripts/reference-tables.py`, tests, handoff docs; verified on mocks | L2 | **complete** (SHIP, landed `8cc1e8d`) |
 | L7 `l7-storage-adapters-docs` | `[storage]` declarations for the six original adapters (codex, claude-code, opencode, pi, rick, haider-agent) from journal/disk evidence, README/adapters docs, `hbench diff`/`results` index integration for storage fields, mock full-matrix and CLI regression. Owner decision 2026-09-07: aider/goose/cline stay as landed adapters without storage declarations | L3, L4, L5, L6 | pending |
 | L9 `l9-extra-adapters` | Owner-added 2026-09-06: adapter manifests, doctor and mock-free CLI verification for aider 0.86.2, goose 1.49.0 and cline 3.0.61 (installed pinned in the harness tools directory) so the v4 reference covers nine harnesses; storage blocks added by L7 | L0 | **complete** (SHIP, landed `c33237e`) |
 | L8 `l8-references-macmini` | Quiet-machine references on the mini: mock self-certification, then matrix, economy, fidelity and storage for the six original harnesses (owner decision 2026-09-07); sanitized `docs/REFERENCE-macmini-2026-09.md`; raw evidence archived outside Git | L7 | pending |
@@ -174,6 +174,17 @@ Record: verified tree = `b201bab` + diff sha256 `f8cb55b3577d9fcd185525edcfcaae5
 - [x] Complete: commit `c33237e`, fast-forwarded onto `master`, pushed
 
 Record: candidate `e1f1583` + doc diff sha256 `a9aa118f86438eeff010a3aa28c38f3ef665cb88b359854f3e8daf70d7366eca` -> `c33237e`. Incident (contained): the first cline probe's generated config lacked the provider `updatedAt` field, so cline ignored it and sent a disposable fake credential to the real OpenAI endpoint once (authentication failure, zero fake-model requests); no real secret was involved, the template was fixed, and both later passes and the verifier proved fake-only routing. Real-harness FAIL/ERROR rows observed in these runs are benchmark findings kept in the lane evidence. Raw evidence: harness `state/lanes/l9-extra-adapters/{impl-1..3,verify-1,verify-2}` and `results/l9-*` (outside Git).
+
+## L8a `l8a-reference-runner`
+
+- [x] Worktree `worktrees/l8a-reference-runner`, branch `lane/l8a-reference-runner`, base `6f4f2e5`, rebased onto `bc4f467`
+- [x] Clean code pass + implement (GPT6-Astra thread `01a07be6-8d76-7852-a69b-fa8a318baa4b`, repair `01a07d9b-6593-7a01-846d-55936190c9f5`; both resumed once across provider outages): `scripts/reference-run.sh`, `scripts/reference-support.py`, `scripts/reference-tables.py`, 20 runner-script tests, handoff/README docs
+- [x] Code verification (GPT6-Astra `01a07d22-3906-75e0-83d5-b91f1e5d5cbc` NO-SHIP on three findings: incomplete typed summaries could yield PASS, matrix badge lost in tables, resume adopted reports without provenance; `01a07eef-7d41-7e21-9738-25dc1683136a` **SHIP**: line review, `zsh -n`, `py_compile`, all 20 tests, build)
+- [x] Computer-use verification (same verifiers: real `scripts/reference-run.sh` on the two built-in mocks producing all eight reports and an honest `REFERENCE PARTIAL`, stub-driven pre-flight failure / step failure / resume runs, `scripts/reference-tables.py` output inspected for sanitization and labelling)
+- [x] Repair loop until SHIP (two iterations)
+- [x] Complete: commit `8cc1e8d`, fast-forwarded onto `master`, pushed
+
+Record: verified tree = `6f4f2e5` + diff sha256 `64fe9c137d0e4f0f7785c6565cbc11ac0af0188d6f66f286427e8140c895b403` + new scripts (`2613fc98…`, `e5bf2ae8…`, `a6cf719f…`), rebased onto `bc4f467` without conflict. Raw evidence: harness `state/lanes/l8a-reference-runner/{impl-1,impl-2,verify-1,verify-2}` and `results/l8a-*` (outside Git).
 
 ## L8 `l8-references-macmini`
 
