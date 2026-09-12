@@ -39,7 +39,7 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
-  "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check",
+  "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check", "--disable", "plugins",
   "--ignore-user-config", "--ignore-rules",
   "-c", 'model_provider="ahrb"',
   "-c", "model_context_window=128000",
@@ -56,7 +56,7 @@ timeout_ms = 30000
 
 [sessions]
 resume = [
-  "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check",
+  "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check", "--disable", "plugins",
   "--ignore-user-config", "--ignore-rules",
   "-c", 'model_provider="ahrb"',
   "-c", "model_context_window=128000",
