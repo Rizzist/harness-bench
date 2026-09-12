@@ -250,3 +250,9 @@ budget_enforcement = "public headless token/cost/time controls terminate with ty
 usage_reporting = "terminal-success events carry exact per-turn token/cost/turn usage"
 session_ops_cli = "public direct argv create/list/resume/fork/delete lifecycle with idempotent delete"
 headless_permission_model = "public allow-list and sandbox trials deny filesystem/network scope without prompting"
+
+# Public close retains journals and metadata; the mock expires its close cache after 1 s.
+[storage]
+session_close = ["{{harness}}", "session-close", "--state-dir", "{{profile}}/state", "--session-id", "{{session_id}}"]
+sweep_interval_s = 1
+retention_cap_bytes = 4194304

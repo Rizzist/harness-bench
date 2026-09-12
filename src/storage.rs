@@ -11,6 +11,7 @@ pub mod accounting;
 pub mod auxiliaries;
 pub mod evidence;
 pub mod fixture;
+pub mod lifecycle;
 pub mod retention;
 
 /// Versioned fixture identity, independent of the matrix.
@@ -592,8 +593,53 @@ pub fn render_markdown(
             .map(|c| format!("{c:?}").to_lowercase())
             .unwrap_or_else(|| "unavailable".into())
     );
+    let statement = if let Some(pct) = summary.compaction_freed_pct {
+        format!("compaction frees {pct:+.3}% of allocated disk")
+    } else if summary.compaction_before_allocated_bytes == Some(0.0)
+        || (summary.compaction_before_allocated_bytes.is_some()
+            && summary.compaction_after_allocated_bytes.is_some()
+            && details
+                .get(ROWS[3])
+                .and_then(|d| d["trials"].as_array())
+                .is_some_and(|trials| {
+                    trials.iter().any(|trial| {
+                        trial["measurement_complete"] == true
+                            && trial["summary"]["compaction_before_allocated_bytes"].as_f64()
+                                == Some(0.0)
+                    })
+                }))
+    {
+        "compaction frees unavailable% of allocated disk (zero baseline)".into()
+    } else {
+        "compaction frees unavailable% of allocated disk (missing compacted pair)".into()
+    };
+    let _ = writeln!(
+        out,
+        "{statement}.\n\nAllocated before: {} bytes; after: {} bytes. This is an interval association: context shrinking need not reclaim journals. Negative percent means growth.\n",
+        show(summary.compaction_before_allocated_bytes),
+        show(summary.compaction_after_allocated_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "| Closed sessions (sum) | Retained bytes/session | After sweep bytes/session | Declared total cap bytes | Class |\n|---:|---:|---:|---:|---|\n| {} | {} | {} | {} | {} |\n",
+        summary
+            .closed_sessions
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into()),
+        show(summary.close_retained_bytes_per_session),
+        show(summary.close_retained_after_sweep_bytes_per_session),
+        summary
+            .retention_cap_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into()),
+        summary
+            .close_retention_class
+            .map(|v| format!("{v:?}").to_lowercase())
+            .unwrap_or_else(|| "unavailable".into())
+    );
+    out.push_str("S5 classes mean within/exceeds the declared total bound over this sampled horizon. Cap breaches are informational; client exit or AHRB metadata-only close is never deletion evidence.\n\n");
     out.push_str("| Trial scalar | Median | MAD |\n|---|---:|---:|\n");
-    for slug in [ROWS[0], ROWS[2], ROWS[7]] {
+    for slug in [ROWS[0], ROWS[2], ROWS[3], ROWS[4], ROWS[6], ROWS[7]] {
         if let Some(trials) = details.get(slug).and_then(|d| d["trials"].as_array()) {
             let keys = trials
                 .iter()

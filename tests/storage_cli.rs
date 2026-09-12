@@ -91,7 +91,8 @@ fn storage_deadlines_follow_serialized_budget_and_precedence() {
 #[test]
 fn storage_manifests_are_additive_and_strict() {
     let text = std::fs::read_to_string("adapters/mock/manifest.toml").expect("mock");
-    let omitted: manifest::Manifest = toml::from_str(&text).expect("old manifest");
+    let text = text.split("\n[storage]").next().expect("base manifest");
+    let omitted: manifest::Manifest = toml::from_str(text).expect("old manifest");
     assert!(omitted.storage.is_none());
     let good = format!(
         "{text}\n[storage]\nsession_close=[]\nsweep_interval_s=1\nretention_cap_bytes=0\nworkspace_path='{{{{profile}}}}/work/{{{{session_id}}}}'\n[storage.areas]\nstore=['state/**']\nlogs=[]\nother=[]\n[storage.auxiliary_cap_bytes]\nother=0\nstore=1024\n"
@@ -208,7 +209,7 @@ fn both_real_cli_forms_preserve_zero_deadline_reports() {
 }
 
 #[test]
-fn plaintext_exit_terminals_are_unsupported_before_stimulus_in_both_cli_forms() {
+fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
     let _guard = common::serialize_ahrb_subprocesses();
     for short in [false, true] {
         let output = fresh("plaintext-preflight");
@@ -269,20 +270,52 @@ fn plaintext_exit_terminals_are_unsupported_before_stimulus_in_both_cli_forms() 
                 .results
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| ![0, 2, 6, 7].contains(i))
+                .filter(|(i, _)| ![0, 2, 3, 4, 6, 7].contains(i))
                 .all(
                     |(_, r)| matches!(&r.outcome, ahrb::evaluate::TestOutcome::Error(_))
                         && !r.metadata.measurement_complete
                 )
         );
-        assert!(report.turns.is_empty() && report.model_requests.is_empty());
-        assert!(report.storage_samples.is_empty() && report.storage_files.is_empty());
+        assert!(report.turns.is_empty());
+        assert!(
+            report
+                .storage_samples
+                .iter()
+                .all(|r| r.row_id == "compaction-vs-disk")
+        );
+        assert!(
+            report
+                .storage_files
+                .iter()
+                .all(|r| r.row_id == "compaction-vs-disk")
+        );
         assert!(report.request_body_matches.is_empty());
         assert!(
             report.details["request-body-retention"]["matches"]
                 .as_array()
                 .expect("matches")
                 .is_empty()
+        );
+        // Lifecycle feasibility is independent of S1/S3's pre-reap counter gate.
+        // S4 attempts its declared recovery but cannot prove tool correlations
+        // from plaintext events; S5 has no declared close-only command.
+        assert!(matches!(&report.results[3].outcome,
+            ahrb::evaluate::TestOutcome::Error(reason)
+            if reason.contains("row-51 growing session committed 0/0 tool calls/results")));
+        assert!(!report.results[3].metadata.measurement_complete);
+        assert!(matches!(&report.results[4].outcome,
+            ahrb::evaluate::TestOutcome::Unsupported(reason)
+            if reason == "no-close-without-delete"));
+        assert!(report.results[4].metadata.measurement_complete);
+        assert!(
+            !report.model_requests.is_empty(),
+            "S4 attempted recovery evidence survives"
+        );
+        assert!(
+            report
+                .model_requests
+                .iter()
+                .all(|r| r["row_id"] == "compaction-vs-disk")
         );
         assert!(report.badge.is_none());
         let summary = report.storage_summary.expect("summary");
@@ -295,6 +328,7 @@ fn plaintext_exit_terminals_are_unsupported_before_stimulus_in_both_cli_forms() 
         assert!(summary.stored_request_bytes.is_none());
         assert!(summary.unique_request_content_bytes.is_none());
         assert!(summary.stored_unique_ratio.is_none());
+        assert!(summary.compaction_freed_pct.is_none() && summary.closed_sessions.is_none());
         let markdown = std::fs::read_to_string(output.join("report.md")).expect("markdown");
         assert!(markdown.contains("| S1 `write-volume` | UNSUPPORTED |"));
         assert!(markdown.contains("| S3 `footprint-curve` | UNSUPPORTED |"));

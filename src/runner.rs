@@ -14613,6 +14613,7 @@ mod row51_context_evidence_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_context_recovery_repetition(
     manifest: &Manifest,
     run_profile_root: &Path,
@@ -14621,6 +14622,7 @@ async fn collect_context_recovery_repetition(
     ordinary_turns: u32,
     tool_pairs: u32,
     window_tokens: u64,
+    mut storage_capture: Option<&mut storage::lifecycle::CompactionCapture>,
 ) -> Result<ContextRecoveryTrials> {
     let profile_root = run_profile_root.join(format!("dr51-r{repetition}"));
     prepare_profile(manifest, &profile_root).map_err(|error| {
@@ -14639,6 +14641,13 @@ async fn collect_context_recovery_repetition(
         &manifest.request_role_rules,
         Some(window_tokens),
     )?);
+    let storage_gate = if let Some(capture) = storage_capture.as_mut() {
+        engine.enable_storage_body_capture(&capture.output.join("request-bodies"))?;
+        capture.engine = Some(Arc::clone(&engine));
+        Some(engine.enable_storage_context_gate()?)
+    } else {
+        None
+    };
     let (server, model_environment) = start_model(
         Arc::clone(&engine),
         &workflow,
@@ -14655,6 +14664,20 @@ async fn collect_context_recovery_repetition(
         ),
         ("endpoint".to_owned(), String::new()),
     ]);
+    if storage_capture.is_some() {
+        let evidence = profile_root.with_extension("evidence");
+        std::fs::create_dir_all(&evidence)?;
+        variables.insert(
+            "ahrb_evidence_root".into(),
+            evidence.to_string_lossy().into_owned(),
+        );
+        let workspace = profile_root.join("storage-workspace");
+        std::fs::create_dir_all(&workspace)?;
+        variables.insert(
+            "storage_workspace".into(),
+            workspace.to_string_lossy().into_owned(),
+        );
+    }
     let credential = format!(
         "ahrb-{}-row51-r{repetition}-{}",
         &manifest_hash[..16],
@@ -14722,6 +14745,11 @@ async fn collect_context_recovery_repetition(
             .map(|event| Cursor(event.cursor))
             .max()
             .or(after);
+        if let Some(capture) = storage_capture.as_mut() {
+            for event in &suffix {
+                capture.events.push(serde_json::to_value(event)?);
+            }
+        }
         events.extend(suffix);
     }
     let durable_tool_calls = events
@@ -14750,7 +14778,25 @@ async fn collect_context_recovery_repetition(
             &format!("row-51-recover-r{repetition}"),
         )
         .await?;
-    let recovery_events = collect_session_terminal(&mut driver, &session, after, timeout).await?;
+    let recovery_events = if let (Some(gate), Some(capture)) =
+        (&storage_gate, storage_capture.as_mut())
+    {
+        let terminal = collect_session_terminal(&mut driver, &session, after, timeout);
+        tokio::pin!(terminal);
+        tokio::select! {
+            result = &mut terminal => result?,
+            _ = gate.arrived.notified() => {
+                let snapshot = crate::storage::accounting::settle(&profile_root, &capture.config, monotonic_timestamp_ns()).await;
+                let captured_ns = monotonic_timestamp_ns();
+                gate.release.notify_one();
+                capture.before = Some(snapshot?);
+                capture.before_ns = Some(captured_ns);
+                terminal.await?
+            }
+        }
+    } else {
+        collect_session_terminal(&mut driver, &session, after, timeout).await?
+    };
     let terminal_received_ns = monotonic_timestamp_ns();
     let structural_terminal_count = recovery_events
         .iter()
@@ -14763,8 +14809,26 @@ async fn collect_context_recovery_repetition(
     let same_session_identity = recovery_events
         .iter()
         .all(|event| stable_evidence_hash(&event.session_id) == expected_session_hash);
+    if let Some(capture) = storage_capture.as_mut() {
+        for event in &recovery_events {
+            capture.events.push(serde_json::to_value(event)?);
+        }
+    }
     events.extend(recovery_events);
-    if manifest.transport.kind == TransportKind::Exec || !manifest.sessions.close_delete.is_empty()
+    if let Some(capture) = storage_capture.as_mut() {
+        capture.after = Some(
+            crate::storage::accounting::settle(
+                &profile_root,
+                &capture.config,
+                terminal_received_ns,
+            )
+            .await?,
+        );
+        capture.after_ns = Some(monotonic_timestamp_ns());
+    }
+    if storage_capture.is_none()
+        && (manifest.transport.kind == TransportKind::Exec
+            || !manifest.sessions.close_delete.is_empty())
     {
         driver.close(&session).await?;
     }
@@ -14784,6 +14848,11 @@ async fn collect_context_recovery_repetition(
         .min_by_key(|record| record.received_ns)
         .copied()
     else {
+        if storage_capture.is_some() {
+            return Err(AhrbError::Protocol(
+                "missing provider context-error record for storage recovery stimulus".into(),
+            ));
+        }
         return Ok(ContextRecoveryTrials {
             events,
             requests,
@@ -15003,6 +15072,7 @@ async fn collect_context_recovery_trials(
             ordinary_turns,
             tool_pairs,
             window_tokens,
+            None,
         )
         .await?;
         combined.events.extend(trial.events);

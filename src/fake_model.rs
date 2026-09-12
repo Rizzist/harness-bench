@@ -655,6 +655,14 @@ struct StorageBodyCapture {
     receipts: Vec<Value>,
 }
 
+/// Storage-only gate before the validated row-51 error is yielded by any transport.
+/// Notify permits survive arrival before the collector starts waiting.
+#[derive(Debug, Default)]
+pub struct StorageContextGate {
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 /// State for deterministic transition validation, barriers, and idempotent retries.
 #[derive(Debug)]
 pub struct FakeModelEngine {
@@ -669,6 +677,7 @@ pub struct FakeModelEngine {
     request_role_rules: Vec<RequestRoleRule>,
     semantic_ordinals: BTreeMap<(String, String, String), u64>,
     context_window_tokens: Option<u64>,
+    storage_context_gate: StdMutex<Option<Arc<StorageContextGate>>>,
     context_faulted_routes: Mutex<BTreeSet<(String, String, String)>>,
 }
 
@@ -735,8 +744,19 @@ impl FakeModelEngine {
             request_role_rules,
             semantic_ordinals,
             context_window_tokens,
+            storage_context_gate: StdMutex::new(None),
             context_faulted_routes: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    pub fn enable_storage_context_gate(&self) -> Result<Arc<StorageContextGate>> {
+        let gate = Arc::new(StorageContextGate::default());
+        *self
+            .storage_context_gate
+            .lock()
+            .map_err(|_| AhrbError::Protocol("context gate lock poisoned".into()))? =
+            Some(Arc::clone(&gate));
+        Ok(gate)
     }
 
     /// Advertised row-51 provider context window, when configured.
@@ -992,6 +1012,15 @@ impl FakeModelEngine {
                     return Err(AhrbError::Protocol(format!(
                         "context-length pre-error request measured {observed_tokens} tokens/{body_bytes} bytes; expected {expected_tokens}/{expected_body}"
                     )));
+                }
+                let gate = self
+                    .storage_context_gate
+                    .lock()
+                    .map_err(|_| AhrbError::Protocol("context gate lock poisoned".into()))?
+                    .clone();
+                if let Some(gate) = gate {
+                    gate.arrived.notify_one();
+                    gate.release.notified().await;
                 }
                 self.context_faulted_routes.lock().await.insert(route);
                 return Ok(ModelResponse {
@@ -4053,6 +4082,76 @@ mod tests {
     use crate::workflow::{Actor, Barrier};
     use std::cell::Cell;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn storage_context_gate_precedes_error_and_requires_explicit_release() -> Result<()> {
+        let window = 4096;
+        let workflow = Workflow {
+            version: crate::workflow::WORKFLOW_SCHEMA_VERSION,
+            scenario: "gate-test".into(),
+            actors: BTreeMap::from([(
+                "actor".into(),
+                Actor {
+                    id: "actor".into(),
+                    parent: None,
+                    prompt: "test".into(),
+                    workspace: "work".into(),
+                },
+            )]),
+            barriers: BTreeMap::new(),
+            responses: vec![crate::workflow::ScriptedResponse {
+                scenario: "gate-test".into(),
+                actor: "actor".into(),
+                checkpoint: "recover".into(),
+                request_hash: String::new(),
+                response: json!({"text":"success"}),
+                fault: Some(Fault::ContextLength {
+                    window_tokens: window,
+                }),
+                barrier: None,
+            }],
+        };
+        let engine = Arc::new(FakeModelEngine::with_request_roles_and_context_window(
+            &workflow,
+            &BTreeMap::new(),
+            &[],
+            Some(window),
+        )?);
+        let gate = engine.enable_storage_context_gate()?;
+        let request = ModelRequest {
+            dialect: "openai-chat-completions".into(),
+            endpoint: "/v1/chat/completions".into(),
+            model: "fixture".into(),
+            scenario: "gate-test".into(),
+            actor: "actor".into(),
+            checkpoint: "recover".into(),
+            canonical: json!({"messages":[{"content":"x ".repeat((window+256) as usize)}]}),
+            credential_fingerprint: "fake".into(),
+            stream: false,
+        };
+        let worker = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.handle_observed(request, window * 8 + 1024, 1).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.arrived.notified())
+            .await
+            .expect("gate arrival");
+        assert!(
+            !worker.is_finished(),
+            "context error escaped the storage gate"
+        );
+        assert!(
+            engine
+                .request_records()
+                .await
+                .iter()
+                .all(|r| r.response_status.is_none())
+        );
+        gate.release.notify_one();
+        let response = worker.await.expect("provider worker")?;
+        assert!(matches!(response.fault, Some(Fault::ContextLength { .. })));
+        Ok(())
+    }
 
     #[test]
     fn semantic_usage_overrides_dialect_token_estimates() -> Result<()> {

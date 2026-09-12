@@ -1,5 +1,7 @@
 //! Serialized storage workload. This child module reuses the matrix's public
 //! session driver and terminal collector, but not its close/delete oracle.
+pub(crate) mod lifecycle;
+
 use super::*;
 use crate::process::{DiskIdentityStatus, ProcessDiskObservation, TreeDiskTracker};
 use crate::storage::{self as contract, accounting, evidence::*, *};
@@ -99,6 +101,7 @@ fn pending_details(id: usize, reason: &str) -> Value {
 
 struct Progress {
     output: PathBuf,
+    finalized: BTreeSet<usize>,
     active_engine: Option<(u32, Arc<FakeModelEngine>, usize, usize)>,
     report: Report,
     write_trials: Vec<Trial<WriteSummary, WriteDiagnostics>>,
@@ -182,6 +185,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
     std::fs::File::create(options.output.join("storage-log-audit.jsonl"))?;
     let mut progress = Progress {
         output: options.output.clone(),
+        finalized: BTreeSet::new(),
         active_engine: None,
         report: Report {
             schema: 4,
@@ -316,14 +320,65 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         if !interrupted && !collection_failed && progress.curve_trials.len() == repetitions as usize
         {
             finalize(&mut progress, &config)?;
+            progress.finalized.extend([0, 2]);
         }
     }
     capture_provider(&mut progress).await?;
+    if !interrupted
+        && common_prerequisite(&manifest).is_none()
+        && !progress
+            .report
+            .results
+            .iter()
+            .all(|r| matches!(r.outcome, TestOutcome::Absent(_)))
+    {
+        preserve_partial_trial(&mut progress, &config)?;
+        progress.active_engine = None;
+        let lifecycle_result = lifecycle::collect(
+            &manifest,
+            &config,
+            &manifest_hash,
+            &persistence.profile_path,
+            options.profile,
+            repetitions,
+            deadline_at,
+            &mut progress,
+        )
+        .await;
+        match lifecycle_result {
+            Ok(expired) => interrupted = expired,
+            Err(error) => {
+                let reason = format!("lifecycle collection aborted: {error}");
+                for id in [3, 4] {
+                    if !progress.finalized.contains(&id) {
+                        progress.report.results[id] =
+                            row(id, TestOutcome::Error(reason.clone()), &config);
+                        progress
+                            .details
+                            .get_mut(ROWS[id])
+                            .expect("storage detail exists")["reason"] = json!(reason);
+                    }
+                }
+                progress.report.lifecycle_notes.push(reason);
+            }
+        }
+    }
     if interrupted {
         for (i, _slug) in ROWS.iter().enumerate() {
-            let reason = if [0, 2, 6, 7].contains(&i)
-                && progress.curve_trials.len() == repetitions as usize
-            {
+            if progress.finalized.contains(&i) {
+                continue;
+            }
+            let reason = if ([0, 2, 6, 7].contains(&i)
+                && progress.curve_trials.len() == repetitions as usize)
+                || ([3, 4].contains(&i)
+                    && progress
+                        .details
+                        .get(ROWS[i])
+                        .and_then(|d| d["trials"].as_array())
+                        .is_some_and(|trials| {
+                            trials.len() == repetitions as usize
+                                && trials.iter().all(|t| t["measurement_complete"] == true)
+                        })) {
                 "deadline interrupted final evaluation"
             } else {
                 "deadline"
@@ -1485,6 +1540,8 @@ fn bind_evidence(
         receipt("storage-files.jsonl", &report.storage_files)?,
         receipt("processes.jsonl", &report.processes)?,
         receipt("turns.jsonl", &report.turns)?,
+        receipt("model-requests.jsonl", &report.model_requests)?,
+        receipt("events.jsonl", &report.events)?,
     ];
     refs.push(receipt(
         "request-body-matches.jsonl",
@@ -1497,7 +1554,7 @@ fn bind_evidence(
         first_record: None,
         last_record: None,
     });
-    for id in [ROWS[0], ROWS[2], ROWS[6], ROWS[7]] {
+    for id in [ROWS[0], ROWS[2], ROWS[3], ROWS[4], ROWS[6], ROWS[7]] {
         if let Some(trials) = details
             .get_mut(id)
             .and_then(|d| d.get_mut("trials"))

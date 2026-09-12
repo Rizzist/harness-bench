@@ -5,6 +5,8 @@
 //! can observe it.  Replay reads that journal again, making it the recoverable source of
 //! truth rather than an in-memory event buffer.
 
+mod storage_lifecycle;
+
 use crate::driver::{http_post, http_post_with_connector};
 #[cfg(unix)]
 use crate::driver::{preconnected_unix_http_post, unix_http_post};
@@ -709,7 +711,7 @@ impl MockHarness {
                     injected: Vec::new(),
                     active: false,
                     cancelled: false,
-                    closed: false,
+                    closed: entry.path().join("closed.json").is_file(),
                     resource_reservation: None,
                 },
             );
@@ -990,6 +992,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
         }
         "exec-turn" => exec_turn(&args[1..]).await,
         "budget-trial" => budget_trial_command(&args[1..]).await,
+        "session-close" => storage_lifecycle::close(&args[1..]),
+        "storage-auto-sweep" => storage_lifecycle::sweep(&args[1..]).await,
         "session-create" => session_create_command(&args[1..]),
         "session-list" => session_list_command(&args[1..]),
         "session-resume" => session_resume_command(&args[1..]),
@@ -1020,6 +1024,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  ahrb-mock-harness budget-trial --state-dir PATH \
                  (--max-tokens N|--max-cost USD|--max-time-ms N)\n\
                  ahrb-mock-harness session-create --state-dir PATH --marker MARKER\n\
+                 ahrb-mock-harness session-close --state-dir PATH --session-id ID\n\
                  ahrb-mock-harness session-list --state-dir PATH\n\
                  ahrb-mock-harness session-resume|session-fork|session-delete \
                  --state-dir PATH --session-id ID\n\
@@ -2977,8 +2982,15 @@ async fn accept_turn(
             Some(width) => guard.config.session_memory_bytes / width,
             None => guard.config.session_memory_bytes,
         };
+        let closed_on_disk = guard
+            .config
+            .state_dir
+            .join("sessions")
+            .join(id)
+            .join("closed.json")
+            .is_file();
         let session = guard.session_mut(id)?;
-        if session.closed {
+        if session.closed || closed_on_disk {
             return Err(AhrbError::Protocol("session is closed".to_owned()));
         }
         if session.keys.contains(&turn.key) {
@@ -3149,6 +3161,9 @@ async fn execute_turn(
         )?,
         None => vec![json!({ "role": "user", "content": turn.prompt })],
     };
+    if context_fixture.is_some() {
+        storage_lifecycle::compaction(&config, id, false)?;
+    }
     let mut turn_input_tokens = 0_u64;
     let mut turn_output_tokens = 0_u64;
     for checkpoint in 0..config.model_request_ceiling {
@@ -3277,6 +3292,7 @@ async fn execute_turn(
                         body.len()
                     )));
                 }
+                storage_lifecycle::compaction(&config, id, true)?;
                 compacted_after_context_error = true;
                 continue;
             }
@@ -4861,7 +4877,10 @@ fn storage_retain_request(config: &MockConfig, body: &[u8]) -> Result<()> {
     }
     let directory = config.state_dir.join("storage-requests");
     fs::create_dir_all(&directory)?;
-    let request: Value = serde_json::from_slice(body)?;
+    let request: Value = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(_) => return Ok(()),
+    };
     match mode.as_str() {
         "full" => {
             let mut file = OpenOptions::new()

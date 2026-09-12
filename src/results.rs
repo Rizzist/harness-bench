@@ -269,37 +269,27 @@ pub fn persist_report(
         return Ok(());
     };
     if results_dir != &persistence.output {
-        crate::report::write_bundle(report, results_dir, junit)?;
         if report.storage_summary.is_some() {
-            for name in [
-                "storage-fixture.jsonl",
-                "storage-deadline.json",
-                "storage-area-matches.jsonl",
-                "storage-log-audit.jsonl",
-                "storage-request-bodies.jsonl",
-            ] {
-                copy_optional(&persistence.output.join(name), &results_dir.join(name))?;
+            // Collectors write supplemental receipts directly into the bundle.
+            // Copy the completed bundle itself so new evidence cannot be omitted
+            // by a second, independently maintained filename inventory.
+            std::fs::create_dir_all(results_dir)?;
+            let source = std::fs::canonicalize(&persistence.output)?;
+            let destination = std::fs::canonicalize(results_dir)?;
+            if destination.starts_with(&source) || source.starts_with(&destination) {
+                return Err(AhrbError::Protocol(
+                    "storage bundle and saved destination must not overlap".into(),
+                ));
             }
-            let bodies = persistence.output.join("request-bodies");
-            if bodies.is_dir() {
-                let destination = results_dir.join("request-bodies");
-                std::fs::create_dir_all(&destination)?;
-                for entry in std::fs::read_dir(bodies)? {
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file() {
-                        return Err(AhrbError::Protocol(
-                            "storage body artifact must be a regular file".into(),
-                        ));
-                    }
-                    std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
-                }
+            mirror_storage_bundle(&source, &destination)?;
+        } else {
+            crate::report::write_bundle(report, results_dir, junit)?;
+            if include_run_error {
+                copy_optional(
+                    &persistence.output.join("run-error.txt"),
+                    &results_dir.join("run-error.txt"),
+                )?;
             }
-        }
-        if include_run_error {
-            copy_optional(
-                &persistence.output.join("run-error.txt"),
-                &results_dir.join("run-error.txt"),
-            )?;
         }
     }
     let completed_at = utc_timestamp(SystemTime::now())?;
@@ -309,6 +299,38 @@ pub fn persist_report(
     let report_body = std::fs::read(results_dir.join("report.json"))?;
     let report_sha256: [u8; 32] = Sha256::digest(report_body).into();
     append_index(persistence, report, completed_at, &report_sha256)
+}
+
+fn mirror_storage_bundle(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(AhrbError::Protocol(format!(
+                "storage bundle artifact must be a regular file or directory: {}",
+                entry.path().display()
+            )));
+        }
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type() != kind => {
+                return Err(AhrbError::Protocol(format!(
+                    "storage bundle destination has incompatible file type: {}",
+                    target.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            mirror_storage_bundle(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_optional(source: &Path, destination: &Path) -> Result<()> {
@@ -958,6 +980,37 @@ fn matrix_pillar() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_mirror_copies_nested_artifacts_and_rejects_links() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-mirror-links-{}-{}",
+            std::process::id(),
+            crate::fake_model::monotonic_timestamp_ns()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir(&destination)?;
+        // Future collectors must not need a new persistence filename whitelist.
+        let nested = Path::new("future-evidence/nested/receipt.bin");
+        std::fs::create_dir_all(source.join(nested.parent().unwrap()))?;
+        std::fs::write(source.join(nested), [0, 255, 1, 128])?;
+        mirror_storage_bundle(&source, &destination)?;
+        assert_eq!(std::fs::read(destination.join(nested))?, [0, 255, 1, 128]);
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"untouched")?;
+        std::os::unix::fs::symlink(&outside, source.join("receipt"))?;
+        assert!(mirror_storage_bundle(&source, &destination).is_err());
+        std::fs::remove_file(source.join("receipt"))?;
+        std::fs::write(source.join("receipt"), b"evidence")?;
+        std::os::unix::fs::symlink(&outside, destination.join("receipt"))?;
+        assert!(mirror_storage_bundle(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&outside)?, b"untouched");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     fn mock_options(output: PathBuf) -> RunOptions {
         RunOptions {
