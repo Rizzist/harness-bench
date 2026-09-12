@@ -201,6 +201,16 @@ Record: candidate `e1f1583` + doc diff sha256 `a9aa118f86438eeff010a3aa28c38f3ef
 
 Record: verified tree = `6f4f2e5` + diff sha256 `64fe9c137d0e4f0f7785c6565cbc11ac0af0188d6f66f286427e8140c895b403` + new scripts (`2613fc98…`, `e5bf2ae8…`, `a6cf719f…`), rebased onto `bc4f467` without conflict. Raw evidence: harness `state/lanes/l8a-reference-runner/{impl-1,impl-2,verify-1,verify-2}` and `results/l8a-*` (outside Git).
 
+## L12 `l12-codex-plugins-capture` (unplanned environment fix, 2026-09-13)
+
+- [x] Worktree `worktrees/l12-codex-plugins-capture`, branch `lane/l12-codex-plugins-capture`, base `c46a5bd`
+- [x] Implement (GPT6-Astra `01a09748-573e-7d62-88d3-6abd225386b1`): codex-cli silently updated 0.153.4 → 0.154.0 and began cloning plugins into fresh disposable profiles mid-run (`.tmp/plugins-clone-*`), tripping storage capture change detection in every real codex run (4 failures across L4/L6 verifications). Fix: `--disable plugins` (documented 0.154.0 switch) added to both codex transport commands in `adapters/codex/manifest.toml`; change detection untouched; owner binary untouched
+- [x] Code verification (GPT6-Astra `01a0974c-58ed-7510-a960-3b83b7d6f78a` **SHIP**: manifest-only diff confirmed, switch documented, build/fmt/clippy/focused adapter tests pass)
+- [x] Computer-use verification (same verifier: three fresh real `hbench storage codex` runs, zero contamination, honest declarations unchanged; matrix probe NOT EXECUTED — hung without output, recorded honestly)
+- [x] Complete: commit `49d98eb`, fast-forwarded onto `master`, pushed (branch tip = master tip, so the landed tree is byte-identical to the verified tree)
+
+Record: verified tree = `c46a5bd` + diff sha256 `f6cc507e9984266eaa6833ccbeec33482a6720aae2fc50fdd1587e81d9f52aca`. Raw evidence: harness `state/lanes/l12-codex-plugins-capture/` (outside Git). Pending lanes must rebase to pick up the fix for their codex rows.
+
 ## L8 `l8-references-macmini`
 
 - [ ] Worktree
