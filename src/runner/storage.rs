@@ -1,11 +1,12 @@
 //! Serialized storage workload. This child module reuses the matrix's public
 //! session driver and terminal collector, but not its close/delete oracle.
-pub(crate) mod lifecycle;
-
 use super::*;
 use crate::process::{DiskIdentityStatus, ProcessDiskObservation, TreeDiskTracker};
 use crate::storage::{self as contract, accounting, evidence::*, *};
 use std::io::Write as _;
+
+#[allow(dead_code)]
+pub(crate) mod lifecycle;
 
 fn workflow(manifest: &Manifest, n: u32) -> Result<Workflow> {
     fixture::validate_renderer_pins()?;
@@ -101,14 +102,17 @@ fn pending_details(id: usize, reason: &str) -> Value {
 
 struct Progress {
     output: PathBuf,
-    finalized: BTreeSet<usize>,
     active_engine: Option<(u32, Arc<FakeModelEngine>, usize, usize)>,
     report: Report,
     write_trials: Vec<Trial<WriteSummary, WriteDiagnostics>>,
     curve_trials: Vec<Trial<FootprintSummary, CurveEvaluation>>,
+    #[allow(dead_code)]
     auxiliary_trials: Vec<Trial<AuxiliarySummary, AuxiliaryDiagnostics>>,
+    #[allow(dead_code)]
     retention_trials: Vec<Trial<RetentionSummary, RetentionDiagnostics>>,
     details: BTreeMap<String, Value>,
+    #[allow(dead_code)]
+    finalized: BTreeSet<usize>,
 }
 
 /// Run the storage pillar with explicit interrupted-report semantics.
@@ -185,7 +189,6 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
     std::fs::File::create(options.output.join("storage-log-audit.jsonl"))?;
     let mut progress = Progress {
         output: options.output.clone(),
-        finalized: BTreeSet::new(),
         active_engine: None,
         report: Report {
             schema: 4,
@@ -219,11 +222,12 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         },
         write_trials: Vec::new(),
         curve_trials: Vec::new(),
-        auxiliary_trials: Vec::new(),
-        retention_trials: Vec::new(),
         details: (0..10)
             .map(|i| (ROWS[i].into(), pending_details(i, pending)))
             .collect(),
+        finalized: BTreeSet::new(),
+        auxiliary_trials: Vec::new(),
+        retention_trials: Vec::new(),
     };
     let prerequisite = common_prerequisite(&manifest);
     let mut interrupted = false;
@@ -287,7 +291,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                     if matches!(&error, AhrbError::Unsupported(reason) if reason.starts_with("storage stat-st_blocks-512 unavailable"))
                     {
                         let reason = format!("os-limited: {error}");
-                        for i in [0, 2, 6, 7] {
+                        for i in [0, 2] {
                             progress.report.results[i] =
                                 row(i, TestOutcome::Unsupported(reason.clone()), &config);
                             progress
@@ -299,15 +303,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                         }
                         break;
                     }
-                    let reason = format!("task-incomplete: {error}");
-                    for i in [0, 2, 6, 7] {
-                        progress.report.results[i] =
-                            row(i, TestOutcome::Error(reason.clone()), &config);
-                        progress
-                            .details
-                            .insert(ROWS[i].into(), pending_details(i, &reason));
-                    }
-                    progress.report.lifecycle_notes.push(reason);
+                    record_collection_failure(&mut progress, &config, &error);
                     break;
                 }
                 Ok(Ok(())) => {}
@@ -320,7 +316,6 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         if !interrupted && !collection_failed && progress.curve_trials.len() == repetitions as usize
         {
             finalize(&mut progress, &config)?;
-            progress.finalized.extend([0, 2]);
         }
     }
     capture_provider(&mut progress).await?;
@@ -332,7 +327,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             .iter()
             .all(|r| matches!(r.outcome, TestOutcome::Absent(_)))
     {
-        preserve_partial_trial(&mut progress, &config)?;
+        preserve_partial_trial(&mut progress, &config);
         progress.active_engine = None;
         let lifecycle_result = lifecycle::collect(
             &manifest,
@@ -365,24 +360,12 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
     }
     if interrupted {
         for (i, _slug) in ROWS.iter().enumerate() {
-            if progress.finalized.contains(&i) {
-                continue;
-            }
-            let reason = if ([0, 2, 6, 7].contains(&i)
-                && progress.curve_trials.len() == repetitions as usize)
-                || ([3, 4].contains(&i)
-                    && progress
-                        .details
-                        .get(ROWS[i])
-                        .and_then(|d| d["trials"].as_array())
-                        .is_some_and(|trials| {
-                            trials.len() == repetitions as usize
-                                && trials.iter().all(|t| t["measurement_complete"] == true)
-                        })) {
-                "deadline interrupted final evaluation"
-            } else {
-                "deadline"
-            };
+            let reason =
+                if [0, 2].contains(&i) && progress.curve_trials.len() == repetitions as usize {
+                    "deadline interrupted final evaluation"
+                } else {
+                    "deadline"
+                };
             progress.report.results[i] = row(i, TestOutcome::Error(reason.into()), &config);
             progress
                 .details
@@ -395,13 +378,28 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             &AhrbError::Timeout(format!("storage deadline after {}s", budget.seconds)),
         )?;
     }
+    if matches!(
+        progress.report.results[6].outcome,
+        TestOutcome::Unsupported(_)
+    ) {
+        progress.report.results[3] = row(
+            3,
+            TestOutcome::Error("row-51 growing session committed 0/0 tool calls/results".into()),
+            &config,
+        );
+        progress.report.results[4] = row(
+            4,
+            TestOutcome::Unsupported("no-close-without-delete".into()),
+            &config,
+        );
+    }
     if let Err(error) = ensure_owned_cleanup() {
         let reason = format!("owned cleanup: {error}");
         progress.report.results[0] = row(0, TestOutcome::Error(reason.clone()), &config);
         progress.report.lifecycle_notes.push(reason);
     }
     capture_provider(&mut progress).await?;
-    preserve_partial_trial(&mut progress, &config)?;
+    preserve_partial_trial(&mut progress, &config);
     // Keep completed trial evidence even when later repetitions or collectors failed.
     if !progress.write_trials.is_empty() {
         let reason = outcome_reason(&progress.report.results[0].outcome);
@@ -411,6 +409,16 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                 measurement_label: MEASUREMENT_LABEL.into(),
                 reason,
                 trials: progress.write_trials,
+            })?,
+        );
+    }
+    if !progress.auxiliary_trials.is_empty() {
+        progress.details.insert(
+            ROWS[6].into(),
+            serde_json::to_value(RowDetails::<AuxiliarySummary, AuxiliaryDiagnostics> {
+                measurement_label: MEASUREMENT_LABEL.into(),
+                reason: outcome_reason(&progress.report.results[6].outcome),
+                trials: progress.auxiliary_trials.clone(),
             })?,
         );
     }
@@ -529,6 +537,7 @@ fn outcome_reason(outcome: &TestOutcome) -> Option<String> {
 #[derive(Default)]
 struct Counters {
     unavailable: Option<String>,
+    collection_error: Option<String>,
     writes: TreeDiskTracker,
     reads: TreeDiskTracker,
     first: BTreeMap<crate::process::ProcIdentity, u64>,
@@ -610,33 +619,58 @@ impl Counters {
         &mut self,
         sampler: &mut dyn Sampler,
         clients: &BTreeSet<crate::process::ProcIdentity>,
+        live_descendants: &BTreeSet<crate::process::ProcIdentity>,
     ) -> Result<()> {
         if self.unavailable.is_some() {
             return Ok(());
         }
+        let mut errors = Vec::new();
         for identity in clients {
-            self.writes.note_structured_terminal(*identity)?;
-            self.reads.note_structured_terminal(*identity)?;
-            let missing = || {
-                AhrbError::Protocol(format!(
-                    "storage missing client terminal-before-reap receipt ({},{})",
+            // An ancestor's terminal does not end a still-live helper's writes.
+            // Keep its tracker live for subsequent discovery, but permanently
+            // withhold physical aggregates without its own final receipt.
+            if live_descendants.contains(identity) {
+                errors.push(format!(
+                    "storage live owned descendant at client terminal lacks final retirement receipt ({},{})",
                     identity.pid, identity.start_time,
-                ))
-            };
-            let bytes = sampler
-                .disk_counter_for_identity(*identity)?
-                .ok_or_else(missing)?;
-            self.writes
-                .record_final_sample_before_reap(*identity, bytes)?;
-            self.writes.retire_after_final_sample(*identity)?;
-            let bytes = sampler
-                .disk_read_counter_for_identity(*identity)?
-                .ok_or_else(missing)?;
-            self.reads
-                .record_final_sample_before_reap(*identity, bytes)?;
-            self.reads.retire_after_final_sample(*identity)?;
+                ));
+                continue;
+            }
+            // A failed direction or earlier child must not suppress later receipts.
+            let write = Self::retire_counter(&mut self.writes, *identity, || {
+                sampler.disk_counter_for_identity(*identity)
+            });
+            let read = Self::retire_counter(&mut self.reads, *identity, || {
+                sampler.disk_read_counter_for_identity(*identity)
+            });
+            for (direction, result) in [("write", write), ("read", read)] {
+                if let Err(error) = result {
+                    errors.push(format!("{direction}: {error}"));
+                }
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let reason = errors.join("; ");
+            self.collection_error.get_or_insert_with(|| reason.clone());
+            Err(AhrbError::Protocol(reason))
+        }
+    }
+    fn retire_counter(
+        tracker: &mut TreeDiskTracker,
+        identity: crate::process::ProcIdentity,
+        sample: impl FnOnce() -> Result<Option<u64>>,
+    ) -> Result<()> {
+        tracker.note_structured_terminal(identity)?;
+        let bytes = sample()?.ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "storage missing client terminal-before-reap receipt ({},{})",
+                identity.pid, identity.start_time,
+            ))
+        })?;
+        tracker.record_final_sample_before_reap(identity, bytes)?;
+        tracker.retire_after_final_sample(identity)
     }
     fn receipts(&self, source: &str) -> Vec<IdentityReceipt> {
         self.writes
@@ -769,17 +803,6 @@ async fn collect_repetition(
         progress,
     )?;
     let initial_allocated = baseline.inventory.allocated_bytes();
-    let baseline_content = retention::baseline_bytes(&profile, &baseline.inventory)?;
-    let baseline_inventory = baseline.inventory.clone();
-    let fixture_paths = (b'a'..=b'e')
-        .map(|letter| {
-            workspace
-                .join(format!("context-{}.txt", letter as char))
-                .strip_prefix(&profile)
-                .map(|p| p.to_string_lossy().into_owned())
-                .map_err(|e| AhrbError::Protocol(e.to_string()))
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
     let mut family_snapshots = vec![(0, baseline.inventory.clone())];
     let mut previous = baseline.inventory;
     let mut points = vec![Checkpoint {
@@ -847,6 +870,17 @@ async fn collect_repetition(
                 // This independent discovery follows only the active client roots,
                 // including descendants/groups, never the still-live daemon tree.
                 let tree = client_sampler.discover(&client_roots)?;
+                let discovered = tree
+                    .members
+                    .iter()
+                    .filter(|(id, _)| !clients.contains(*id))
+                    .map(|(_, info)| info)
+                    .collect::<Vec<_>>();
+                if !discovered.is_empty() {
+                    progress.report.lifecycle_notes.push(format!("storage-client-discovery {}", serde_json::to_string(&json!({
+                        "repetition":repetition,"turn":turn,"monotonic_ns":monotonic_timestamp_ns(),"client_roots":client_roots,"processes":discovered
+                    }))?));
+                }
                 clients.extend(tree.members.keys().copied());
                 if client_roots
                     .iter()
@@ -870,12 +904,24 @@ async fn collect_repetition(
                         1
                     }
                 {
-                    counters.retire_clients(sampler.as_mut(), &clients)?;
+                    let live_descendants = tree
+                        .members
+                        .keys()
+                        .filter(|identity| !client_roots.contains(&identity.pid))
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    let retirement =
+                        counters.retire_clients(sampler.as_mut(), &clients, &live_descendants);
                     progress.report.lifecycle_notes.push(format!(
                         "storage-client-retirement {}", serde_json::to_string(&json!({
-                            "repetition":repetition,"turn":turn,"identities":counters.receipts(counter_source()).into_iter().filter(|r| clients.iter().any(|id| id.pid == r.pid && id.start_time == r.start_time)).collect::<Vec<_>>()
+                            "repetition":repetition,"turn":turn,"live_descendants":live_descendants,"error":retirement.as_ref().err().map(ToString::to_string),"read_identities":counters.reads.snapshot().identities.into_iter().filter(|r| clients.contains(&r.identity)).collect::<Vec<_>>(),"identities":counters.receipts(counter_source()).into_iter().filter(|r| clients.iter().any(|id| id.pid == r.pid && id.start_time == r.start_time)).collect::<Vec<_>>()
                         }))?
                     ));
+                    // S1 is permanently incomplete; independent allocation/task
+                    // evidence can continue, with the failure already preserved.
+                    if let Err(error) = retirement {
+                        counter_error.get_or_insert_with(|| error.to_string());
+                    }
                     break;
                 }
                 if started.elapsed() >= outer_turn_timeout(manifest) {
@@ -1007,7 +1053,7 @@ async fn collect_repetition(
             )?;
         }
         let current = counters.writes.snapshot();
-        if counters.unavailable.is_some() {
+        if counters.unavailable.is_some() || counters.collection_error.is_some() {
             // Preserve null physical measurements; allocation collection continues.
         } else if let Some(delta) = before_disk
             .cumulative_write_bytes
@@ -1016,7 +1062,7 @@ async fn collect_repetition(
         {
             writes.push(delta);
         } else {
-            counter_error = Some("incomplete live/retired physical counters".into());
+            counter_error.get_or_insert_with(|| "incomplete live/retired physical counters".into());
         }
         growth = growth
             .checked_add(boundary.inventory.growth_since(&previous))
@@ -1055,48 +1101,12 @@ async fn collect_repetition(
         }
     }
     capture_provider(progress).await?;
-    let audited_receipts = captured_body_receipts(&progress.output, repetition)?;
     progress.auxiliary_trials.push(auxiliaries::evaluate(
         repetition,
         n,
         &family_snapshots,
         config,
     )?);
-    match retention::collect(
-        repetition,
-        &profile,
-        config,
-        &baseline_inventory,
-        &baseline_content,
-        &previous,
-        &fixture_paths,
-        &engine.request_records().await,
-        &progress.output,
-    ) {
-        Ok((mut trial, matches)) => {
-            let first = progress.report.request_body_matches.len() as u64;
-            trial.diagnostics.match_refs = (first..first + matches.len() as u64).collect();
-            progress.report.request_body_matches.extend(matches);
-            progress.retention_trials.push(trial);
-        }
-        Err(error) => {
-            let reason = format!("S8 capture/audit error: {error}");
-            progress.retention_trials.push(Trial {
-                repetition,
-                outcome: TestOutcome::Error(reason.clone()),
-                measurement_complete: false,
-                reason: Some(reason),
-                summary: RetentionSummary::default(),
-                diagnostics: RetentionDiagnostics {
-                    coverage: Coverage::CaptureError,
-                    body_blobs: captured_body_blobs(&progress.output, repetition)?,
-                    baseline_exclusions: Vec::new(),
-                    match_refs: Vec::new(),
-                },
-                evidence_refs: Vec::new(),
-            });
-        }
-    }
     let (class, slope, diagnostics) = evaluate_curve(&points, n)?;
     let curve = points
         .iter()
@@ -1125,8 +1135,10 @@ async fn collect_repetition(
         evidence_refs: Vec::new(),
     });
     let complete = counter_error.is_none()
+        && counters.collection_error.is_none()
         && writes.len() == n as usize
-        && counters.writes.snapshot().counter_complete;
+        && counters.writes.snapshot().counter_complete
+        && counters.reads.snapshot().counter_complete;
     let physical = writes
         .iter()
         .try_fold(0_u64, |total, value| total.checked_add(*value))
@@ -1178,11 +1190,6 @@ async fn collect_repetition(
     // Shutdown is teardown, after the final evidence; never call close/delete.
     driver.shutdown().await?;
     server.shutdown().await?;
-    capture_provider(progress).await?;
-    let final_receipts = captured_body_receipts(&progress.output, repetition)?;
-    if let Some(trial) = progress.retention_trials.last_mut() {
-        finalize_retention_capture(trial, &audited_receipts, &final_receipts);
-    }
     progress
         .report
         .lifecycle_notes
@@ -1211,6 +1218,12 @@ fn record_boundary(
     let boundary = format!("r{repetition}-t{turn:04}");
     let writes = counters.writes.snapshot();
     let reads = counters.reads.snapshot();
+    if !b.inventory.capture_retries.is_empty() {
+        report.lifecycle_notes.push(format!(
+            "storage transient re-inventory boundary={boundary} paths={:?}",
+            b.inventory.capture_retries
+        ));
+    }
     report.storage_samples.push(StorageSample {
         row_id: ROWS[0].into(),
         repetition,
@@ -1225,23 +1238,24 @@ fn record_boundary(
         apparent_bytes: b.inventory.apparent_bytes(),
         regular_files: b.inventory.regular_files(),
         families: b.inventory.families(config),
-        physical_write_bytes: counters
-            .unavailable
-            .is_none()
-            .then_some(writes.cumulative_write_bytes)
-            .flatten(),
-        physical_read_bytes: counters
-            .unavailable
-            .is_none()
-            .then_some(reads.cumulative_write_bytes)
-            .flatten(),
+        physical_write_bytes: (counters.unavailable.is_none()
+            && counters.collection_error.is_none())
+        .then_some(writes.cumulative_write_bytes)
+        .flatten(),
+        physical_read_bytes: (counters.unavailable.is_none()
+            && counters.collection_error.is_none())
+        .then_some(reads.cumulative_write_bytes)
+        .flatten(),
         counter_source: if counters.unavailable.is_some() {
             "unavailable"
         } else {
             counter_source()
         }
         .into(),
-        counter_complete: counters.unavailable.is_none() && writes.counter_complete,
+        counter_complete: counters.unavailable.is_none()
+            && counters.collection_error.is_none()
+            && writes.counter_complete
+            && reads.counter_complete,
     });
     for entry in &b.inventory.entries {
         report.storage_files.push(StorageFile {
@@ -1259,42 +1273,6 @@ fn finalize(progress: &mut Progress, config: &StorageConfig) -> Result<()> {
         .storage_summary
         .as_mut()
         .ok_or_else(|| AhrbError::Protocol("storage summary absent".into()))?;
-    summary.auxiliaries = auxiliaries::aggregate(&progress.auxiliary_trials);
-    let retained = retention::aggregate(&progress.retention_trials)?;
-    summary.request_retention_class = retained.request_retention_class;
-    summary.stored_request_bytes = retained.stored_request_bytes;
-    summary.unique_request_content_bytes = retained.unique_request_content_bytes;
-    summary.stored_unique_ratio = retained.stored_unique_ratio;
-    for (id, outcomes) in [
-        (
-            6,
-            progress
-                .auxiliary_trials
-                .iter()
-                .map(|t| t.outcome.clone())
-                .collect::<Vec<_>>(),
-        ),
-        (
-            7,
-            progress
-                .retention_trials
-                .iter()
-                .map(|t| t.outcome.clone())
-                .collect::<Vec<_>>(),
-        ),
-    ] {
-        let outcome = outcomes
-            .iter()
-            .find(|o| matches!(o, TestOutcome::Error(_)))
-            .or_else(|| {
-                outcomes
-                    .iter()
-                    .find(|o| matches!(o, TestOutcome::Unsupported(_)))
-            })
-            .cloned()
-            .unwrap_or(TestOutcome::Pass);
-        progress.report.results[id] = row(id, outcome, config);
-    }
     let classes = progress
         .curve_trials
         .iter()
@@ -1526,7 +1504,7 @@ fn bind_evidence(
             last_record: None,
         })
     }
-    let mut refs = vec![
+    let refs = vec![
         EvidenceRef {
             file: "storage-log-audit.jsonl".into(),
             sha256: format!(
@@ -1540,49 +1518,15 @@ fn bind_evidence(
         receipt("storage-files.jsonl", &report.storage_files)?,
         receipt("processes.jsonl", &report.processes)?,
         receipt("turns.jsonl", &report.turns)?,
-        receipt("model-requests.jsonl", &report.model_requests)?,
-        receipt("events.jsonl", &report.events)?,
     ];
-    refs.push(receipt(
-        "request-body-matches.jsonl",
-        &report.request_body_matches,
-    )?);
-    refs.push(receipt("model-requests.jsonl", &report.model_requests)?);
-    refs.push(EvidenceRef {
-        file: "storage-request-bodies.jsonl".into(),
-        sha256: retention::digest(&std::fs::read(output.join("storage-request-bodies.jsonl"))?),
-        first_record: None,
-        last_record: None,
-    });
-    for id in [ROWS[0], ROWS[2], ROWS[3], ROWS[4], ROWS[6], ROWS[7]] {
+    for id in [ROWS[0], ROWS[2]] {
         if let Some(trials) = details
             .get_mut(id)
             .and_then(|d| d.get_mut("trials"))
             .and_then(Value::as_array_mut)
         {
             for trial in trials {
-                let mut trial_refs = refs.clone();
-                if id == ROWS[7] {
-                    if let Some(blobs) = trial["diagnostics"]["body_blobs"].as_array() {
-                        for blob in blobs {
-                            let path = blob["path"].as_str().ok_or_else(|| {
-                                AhrbError::Protocol("S8 missing blob path".into())
-                            })?;
-                            let bytes = match std::fs::read(output.join(path)) {
-                                Ok(bytes) => bytes,
-                                Err(_) if trial["measurement_complete"] == false => continue,
-                                Err(error) => return Err(error.into()),
-                            };
-                            trial_refs.push(EvidenceRef {
-                                file: path.into(),
-                                sha256: retention::digest(&bytes),
-                                first_record: None,
-                                last_record: None,
-                            });
-                        }
-                    }
-                }
-                trial["evidence_refs"] = serde_json::to_value(&trial_refs)?;
+                trial["evidence_refs"] = serde_json::to_value(&refs)?;
             }
         }
     }
@@ -1677,11 +1621,7 @@ async fn capture_provider(progress: &mut Progress) -> Result<()> {
         let record = records
             .iter()
             .find(|r| Some(r.received_ns) == receipt["received_ns"].as_u64());
-        receipt["canonical_sha256"] = json!(
-            record
-                .map(|r| serde_json::to_vec(&r.request.canonical).map(|b| retention::digest(&b)))
-                .transpose()?
-        );
+        receipt["canonical_sha256"] = json!(record.map(|r| &r.canonical_hash));
         receipt["semantic_ordinal"] = json!(record.map(|r| r.semantic_ordinal));
         receipt["attempt"] = json!(record.map(|r| r.attempt));
         receipt["role"] = json!(record.map(|r| &r.role));
@@ -1818,74 +1758,17 @@ fn write_area_receipts(output: &Path, report: &Report, config: &StorageConfig) -
     Ok(())
 }
 
-fn captured_body_receipts(output: &Path, repetition: u32) -> Result<Vec<Value>> {
-    Ok(
-        std::fs::read_to_string(output.join("storage-request-bodies.jsonl"))?
-            .lines()
-            .map(serde_json::from_str::<Value>)
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|r| r["repetition"].as_u64() == Some(repetition as u64))
-            .collect(),
-    )
-}
-
-fn body_blobs_from_receipts(receipts: &[Value]) -> Vec<BodyBlob> {
-    receipts
-        .iter()
-        .filter_map(|r| {
-            Some(BodyBlob {
-                semantic_ordinal: r["semantic_ordinal"].as_u64()?,
-                attempt: r["attempt"].as_u64()?,
-                role: r["role"].as_str()?.into(),
-                raw_sha256: r["raw_sha256"].as_str()?.into(),
-                canonical_sha256: r["canonical_sha256"].as_str()?.into(),
-                path: r["path"].as_str()?.into(),
-            })
-        })
-        .collect()
-}
-
-fn captured_body_blobs(output: &Path, repetition: u32) -> Result<Vec<BodyBlob>> {
-    Ok(body_blobs_from_receipts(&captured_body_receipts(
-        output, repetition,
-    )?))
-}
-
-fn finalize_retention_capture(
-    trial: &mut Trial<RetentionSummary, RetentionDiagnostics>,
-    audited_receipts: &[Value],
-    final_receipts: &[Value],
-) {
-    // Raw receipts precede parsing. A malformed late body has no typed blob,
-    // but must still invalidate the audit of the earlier request set.
-    let captured = body_blobs_from_receipts(final_receipts);
-    if audited_receipts != final_receipts
-        || final_receipts.len() != captured.len()
-        || final_receipts.len() != trial.diagnostics.body_blobs.len()
-    {
-        let reason = "S8 capture-error: provider capture changed or is incomplete after the final content audit";
-        trial.outcome = TestOutcome::Error(reason.into());
-        trial.measurement_complete = false;
-        trial.reason = Some(reason.into());
-        trial.summary = RetentionSummary::default();
-        trial.diagnostics.coverage = Coverage::CaptureError;
-        trial.diagnostics.body_blobs = captured;
-    }
-}
-
 /// Retain the last settled checkpoints when a repetition cannot complete. No
 /// aggregate or counter total is inferred from incomplete turn coverage.
-fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) -> Result<()> {
+fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) {
     let Some((repetition, _, _, _)) = &progress.active_engine else {
-        return Ok(());
+        return;
     };
     let repetition = *repetition;
-    if matches!(progress.report.results[6].outcome, TestOutcome::Error(_))
-        && !progress
-            .auxiliary_trials
-            .iter()
-            .any(|t| t.repetition == repetition)
+    if !progress
+        .auxiliary_trials
+        .iter()
+        .any(|t| t.repetition == repetition)
     {
         let snapshots = progress
             .report
@@ -1893,13 +1776,12 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) -> Re
             .iter()
             .filter(|s| {
                 s.repetition == repetition
-                    && contract::checkpoints(
+                    && checkpoints(
                         progress
                             .report
                             .storage_summary
                             .as_ref()
-                            .unwrap()
-                            .turn_budget,
+                            .map_or(100, |x| x.turn_budget),
                     )
                     .contains(&s.turn)
             })
@@ -1917,34 +1799,58 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) -> Re
             .collect::<Vec<_>>();
         progress.auxiliary_trials.push(Trial {
             repetition,
-            outcome: progress.report.results[6].outcome.clone(),
+            outcome: TestOutcome::Error("deadline".into()),
             measurement_complete: false,
-            reason: outcome_reason(&progress.report.results[6].outcome),
+            reason: Some("deadline".into()),
             summary: AuxiliarySummary::default(),
             diagnostics: auxiliaries::checkpoint_diagnostics(&snapshots, config),
             evidence_refs: Vec::new(),
         });
     }
-    if matches!(progress.report.results[7].outcome, TestOutcome::Error(_))
-        && !progress
-            .retention_trials
-            .iter()
-            .any(|t| t.repetition == repetition)
+    if !progress
+        .retention_trials
+        .iter()
+        .any(|t| t.repetition == repetition)
     {
-        let body_blobs = captured_body_blobs(&progress.output, repetition)?;
+        let blobs: Vec<BodyBlob> =
+            std::fs::read_to_string(progress.output.join("storage-request-bodies.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|r| r["repetition"].as_u64() == Some(repetition as u64))
+                .filter_map(|r| {
+                    Some(BodyBlob {
+                        semantic_ordinal: r["semantic_ordinal"].as_u64()?,
+                        attempt: r["attempt"].as_u64()?,
+                        role: r["role"].as_str()?.into(),
+                        raw_sha256: r["raw_sha256"].as_str()?.into(),
+                        canonical_sha256: r["canonical_sha256"].as_str()?.into(),
+                        path: r["path"].as_str()?.into(),
+                    })
+                })
+                .collect();
+        let evidence_refs = blobs
+            .iter()
+            .map(|b| EvidenceRef {
+                file: b.path.clone(),
+                sha256: b.raw_sha256.clone(),
+                first_record: None,
+                last_record: None,
+            })
+            .collect();
         progress.retention_trials.push(Trial {
             repetition,
-            outcome: progress.report.results[7].outcome.clone(),
+            outcome: TestOutcome::Error("deadline".into()),
             measurement_complete: false,
-            reason: outcome_reason(&progress.report.results[7].outcome),
+            reason: Some("deadline".into()),
             summary: RetentionSummary::default(),
             diagnostics: RetentionDiagnostics {
                 coverage: Coverage::CaptureError,
-                body_blobs,
+                body_blobs: blobs,
                 baseline_exclusions: Vec::new(),
                 match_refs: Vec::new(),
             },
-            evidence_refs: Vec::new(),
+            evidence_refs,
         });
     }
     if matches!(progress.report.results[0].outcome, TestOutcome::Error(_))
@@ -2006,62 +1912,67 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) -> Re
             evidence_refs: Vec::new(),
         });
     }
-    Ok(())
+}
+
+fn record_collection_failure(progress: &mut Progress, config: &StorageConfig, error: &AhrbError) {
+    let reason = format!("task-incomplete: {error}");
+    for i in [0, 2] {
+        progress.report.results[i] = row(i, TestOutcome::Error(reason.clone()), config);
+        progress
+            .details
+            .insert(ROWS[i].into(), pending_details(i, &reason));
+    }
+    progress.report.lifecycle_notes.push(reason);
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn final_capture_rejects_late_unparsed_raw_receipt() {
-        let receipt = serde_json::json!({
-            "repetition": 1, "semantic_ordinal": 1, "attempt": 1, "role": "primary",
-            "raw_sha256": "raw", "canonical_sha256": "canonical", "path": "request-bodies/raw.bin",
-            "received_ns": 1
-        });
-        let audited = vec![receipt.clone()];
-        let trial = Trial {
-            repetition: 1,
-            outcome: TestOutcome::Pass,
-            measurement_complete: true,
-            reason: None,
-            summary: RetentionSummary {
-                stored_request_bytes: Some(100),
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transient_then_fatal_capture_reaches_error_report_without_aggregates() {
+        let config = StorageConfig::default();
+        let mut progress = Progress {
+            output: PathBuf::new(),
+            active_engine: None,
+            report: Report {
+                results: (0..10)
+                    .map(|i| row(i, TestOutcome::Error("pending".into()), &config))
+                    .collect(),
+                storage_summary: Some(StorageSummary::default()),
                 ..Default::default()
             },
-            diagnostics: RetentionDiagnostics {
-                body_blobs: body_blobs_from_receipts(&audited),
-                coverage: Coverage::Complete,
-                baseline_exclusions: Vec::new(),
-                match_refs: Vec::new(),
-            },
-            evidence_refs: Vec::new(),
+            write_trials: Vec::new(),
+            curve_trials: Vec::new(),
+            details: BTreeMap::new(),
+            finalized: BTreeSet::new(),
+            auxiliary_trials: Vec::new(),
+            retention_trials: Vec::new(),
         };
-        let mut unchanged = trial.clone();
-        finalize_retention_capture(&mut unchanged, &audited, &audited);
-        assert!(matches!(unchanged.outcome, TestOutcome::Pass));
-        assert_eq!(unchanged.summary.stored_request_bytes, Some(100));
-        for late in [
-            receipt,
-            serde_json::json!({
-                "repetition": 1, "semantic_ordinal": null, "canonical_sha256": null,
-                "raw_sha256": "malformed", "path": "request-bodies/malformed.bin", "received_ns": 2
-            }),
-        ] {
-            let mut final_receipts = audited.clone();
-            final_receipts.push(late);
-            let mut changed = trial.clone();
-            finalize_retention_capture(&mut changed, &audited, &final_receipts);
-            assert!(matches!(changed.outcome, TestOutcome::Error(_)));
-            assert!(!changed.measurement_complete);
-            assert!(changed.summary.stored_request_bytes.is_none());
-            assert!(matches!(
-                changed.diagnostics.coverage,
-                Coverage::CaptureError
-            ));
+        let error = accounting::transient_then_fatal_fixture(2).await;
+        record_collection_failure(&mut progress, &config, &error);
+        let note = &progress.report.lifecycle_notes[0];
+        eprintln!("{note}");
+        for path in ["cache/pack-1", "cache/pack-2", "state/link"] {
+            assert!(note.contains(path), "{note}");
         }
+        for i in [0, 2] {
+            assert!(
+                matches!(&progress.report.results[i].outcome, TestOutcome::Error(reason) if reason == note)
+            );
+            assert!(!progress.report.results[i].metadata.measurement_complete);
+            assert_eq!(progress.details[ROWS[i]]["reason"], *note);
+            assert_eq!(progress.details[ROWS[i]]["trials"], json!([]));
+        }
+        let summary = progress.report.storage_summary.unwrap();
+        assert!(summary.write_bytes_per_turn_p50.is_none());
+        assert!(summary.disk_class.is_none());
+        assert!(summary.footprint_curve.is_empty());
+        assert!(summary.growth_class.is_none());
+        assert!(progress.report.storage_samples.is_empty());
+        assert!(progress.report.storage_files.is_empty());
     }
-
-    use super::*;
 
     #[test]
     fn pre_reap_feasibility_uses_transport_and_declared_terminal_rules() {
@@ -2212,6 +2123,7 @@ mod tests {
             let result = counters.retire_clients(
                 &mut ReceiptSampler(available),
                 &BTreeSet::from([client, child]),
+                &BTreeSet::new(),
             );
             let snapshot = counters.writes.snapshot();
             assert_eq!(
@@ -2296,5 +2208,272 @@ mod tests {
         rows[9].outcome = TestOutcome::Pass;
         summary.disk_class = None;
         assert!(storage_badge(&summary, &rows, &config).is_none());
+    }
+}
+
+#[cfg(test)]
+mod retirement_error_tests {
+    use super::*;
+    use crate::process::ProcIdentity;
+
+    #[derive(Default)]
+    struct FinalSampler {
+        calls: Vec<(ProcIdentity, &'static str)>,
+    }
+    impl Sampler for FinalSampler {
+        fn discover(&mut self, _: &[u32]) -> Result<crate::process::ProcessTree> {
+            unreachable!()
+        }
+        fn sample(
+            &mut self,
+            _: &crate::process::ProcessTree,
+            _: &str,
+        ) -> Result<crate::process::Sample> {
+            unreachable!()
+        }
+        fn disk_counter_for_identity(&mut self, id: ProcIdentity) -> Result<Option<u64>> {
+            self.calls.push((id, "write"));
+            Ok(Some(100))
+        }
+        fn disk_read_counter_for_identity(&mut self, id: ProcIdentity) -> Result<Option<u64>> {
+            self.calls.push((id, "read"));
+            Ok((id.pid != 1).then_some(100))
+        }
+    }
+
+    #[test]
+    fn lost_read_receipt_masks_both_directions_and_keeps_later_retirements() -> Result<()> {
+        let id = |pid| ProcIdentity {
+            pid,
+            start_time: u64::from(pid),
+        };
+        let mut counters = Counters::default();
+        let observation = ProcessDiskObservation {
+            expected_identities: BTreeSet::from([id(1), id(2)]),
+            write_bytes_by_identity: BTreeMap::from([(id(1), 10), (id(2), 20)]),
+            ..Default::default()
+        };
+        counters.writes.observe(&observation)?;
+        counters.reads.observe(&observation)?;
+        let mut sampler = FinalSampler::default();
+        counters
+            .retire_clients(
+                &mut sampler,
+                &observation.expected_identities,
+                &BTreeSet::new(),
+            )
+            .expect_err("missing read receipt");
+        assert_eq!(
+            sampler.calls,
+            vec![
+                (id(1), "write"),
+                (id(1), "read"),
+                (id(2), "write"),
+                (id(2), "read")
+            ]
+        );
+        assert!(counters.writes.snapshot().counter_complete);
+        assert!(!counters.reads.snapshot().counter_complete);
+        let first_error = counters.collection_error.clone().expect("sticky failure");
+        assert!(
+            first_error.contains("read:")
+                && first_error.contains("missing client terminal-before-reap receipt"),
+            "{first_error}"
+        );
+        let later = ProcessDiskObservation {
+            expected_identities: BTreeSet::from([id(3)]),
+            write_bytes_by_identity: BTreeMap::from([(id(3), 30)]),
+            ..Default::default()
+        };
+        counters.writes.observe(&later)?;
+        counters.reads.observe(&later)?;
+        counters.retire_clients(&mut sampler, &later.expected_identities, &BTreeSet::new())?;
+        assert_eq!(
+            counters.collection_error.as_deref(),
+            Some(first_error.as_str())
+        );
+        let mut report = Report::default();
+        record_boundary(
+            &mut report,
+            &StorageConfig::default(),
+            1,
+            2,
+            &accounting::SettledInventory {
+                inventory: accounting::Inventory::default(),
+                settle_ms: 2100.0,
+                sync_start_ns: 1,
+                sync_end_ns: 2,
+            },
+            &counters,
+        );
+        let sample = &report.storage_samples[0];
+        assert!(sample.physical_write_bytes.is_none() && sample.physical_read_bytes.is_none());
+        assert!(!sample.counter_complete);
+        assert_eq!(sample.counter_source, counter_source());
+        Ok(())
+    }
+
+    #[test]
+    fn live_descendant_is_not_retired_and_can_be_sampled_on_the_next_turn() -> Result<()> {
+        let root = ProcIdentity {
+            pid: 2,
+            start_time: 2,
+        };
+        let child = ProcIdentity {
+            pid: 3,
+            start_time: 3,
+        };
+        let mut counters = Counters::default();
+        let mut observation = ProcessDiskObservation {
+            expected_identities: BTreeSet::from([root, child]),
+            write_bytes_by_identity: BTreeMap::from([(root, 10), (child, 20)]),
+            ..Default::default()
+        };
+        counters.writes.observe(&observation)?;
+        counters.reads.observe(&observation)?;
+        let mut sampler = FinalSampler::default();
+        counters
+            .retire_clients(
+                &mut sampler,
+                &observation.expected_identities,
+                &BTreeSet::from([child]),
+            )
+            .expect_err("live child lacks its final receipt");
+        assert_eq!(sampler.calls, [(root, "write"), (root, "read")]);
+        let error = counters.collection_error.clone().expect("sticky error");
+        assert!(error.contains("live owned descendant"));
+        observation.expected_identities = BTreeSet::from([child]);
+        observation.write_bytes_by_identity = BTreeMap::from([(child, 30)]);
+        for tracker in [&mut counters.writes, &mut counters.reads] {
+            let snapshot = tracker.observe(&observation)?;
+            assert_eq!(
+                snapshot
+                    .identities
+                    .iter()
+                    .find(|r| r.identity == child)
+                    .unwrap()
+                    .status,
+                DiskIdentityStatus::Live
+            );
+            assert_eq!(
+                snapshot
+                    .identities
+                    .iter()
+                    .find(|r| r.identity == root)
+                    .unwrap()
+                    .status,
+                DiskIdentityStatus::RetiredAfterFinalSample
+            );
+        }
+        assert_eq!(counters.collection_error.as_deref(), Some(error.as_str()));
+        let mut report = Report::default();
+        record_boundary(
+            &mut report,
+            &StorageConfig::default(),
+            1,
+            2,
+            &accounting::SettledInventory {
+                inventory: accounting::Inventory::default(),
+                settle_ms: 2100.0,
+                sync_start_ns: 1,
+                sync_end_ns: 2,
+            },
+            &counters,
+        );
+        assert!(!report.storage_samples[0].counter_complete);
+        assert!(report.storage_samples[0].physical_write_bytes.is_none());
+        assert!(report.storage_samples[0].physical_read_bytes.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_physical_evidence_never_hides_a_complete_curve_or_yields_a_disk_class() -> Result<()>
+    {
+        let config = StorageConfig::default();
+        for class in [GrowthClass::Bounded, GrowthClass::Superlinear] {
+            let mut progress = Progress {
+                output: PathBuf::new(),
+                active_engine: None,
+                report: Report {
+                    results: (0..10)
+                        .map(|i| row(i, TestOutcome::Error("pending".into()), &config))
+                        .collect(),
+                    storage_summary: Some(StorageSummary {
+                        turn_budget: 100,
+                        repetitions: 3,
+                        counter_source: counter_source().into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                write_trials: Vec::new(),
+                curve_trials: Vec::new(),
+                details: BTreeMap::new(),
+                finalized: BTreeSet::new(),
+                auxiliary_trials: Vec::new(),
+                retention_trials: Vec::new(),
+            };
+            for repetition in 1..=3 {
+                progress.write_trials.push(Trial {
+                    repetition,
+                    outcome: TestOutcome::Error("missing receipt".into()),
+                    measurement_complete: false,
+                    reason: Some("missing receipt".into()),
+                    summary: WriteSummary::default(),
+                    diagnostics: WriteDiagnostics::default(),
+                    evidence_refs: Vec::new(),
+                });
+                let points = checkpoints(100)
+                    .into_iter()
+                    .map(|turn| Checkpoint {
+                        turn,
+                        allocated_bytes: 4096
+                            + if class == GrowthClass::Superlinear {
+                                4096 * u64::from(turn).pow(2)
+                            } else {
+                                0
+                            },
+                    })
+                    .collect::<Vec<_>>();
+                let (evaluated, slope, diagnostics) = evaluate_curve(&points, 100)?;
+                assert_eq!(evaluated, class);
+                progress.curve_trials.push(Trial {
+                    repetition,
+                    outcome: if class == GrowthClass::Bounded {
+                        TestOutcome::Pass
+                    } else {
+                        TestOutcome::Fail("shape".into())
+                    },
+                    measurement_complete: true,
+                    reason: None,
+                    summary: FootprintSummary {
+                        growth_class: Some(class),
+                        footprint_slope_bytes_per_turn: Some(slope),
+                        first_turn_allocated_bytes: Some(points[1].allocated_bytes as f64),
+                        ..Default::default()
+                    },
+                    diagnostics,
+                    evidence_refs: Vec::new(),
+                });
+            }
+            finalize(&mut progress, &config)?;
+            assert!(matches!(
+                progress.report.results[0].outcome,
+                TestOutcome::Error(_)
+            ));
+            assert_eq!(
+                matches!(progress.report.results[2].outcome, TestOutcome::Fail(_)),
+                class == GrowthClass::Superlinear
+            );
+            let summary = progress.report.storage_summary.as_ref().unwrap();
+            assert_eq!(summary.footprint_curve.len(), checkpoints(100).len());
+            assert!(
+                summary.write_bytes_per_turn_p95.is_none()
+                    && summary.disk_class.is_none()
+                    && summary.write_amplification_ratio.is_none()
+            );
+            assert!(storage_badge(summary, &progress.report.results, &config).is_none());
+        }
+        Ok(())
     }
 }

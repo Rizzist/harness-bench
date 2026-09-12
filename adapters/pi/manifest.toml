@@ -2,7 +2,7 @@
 schema = 1
 id = "pi"
 name = "Pi Coding Agent"
-revision = "print-json-native-tools-v2"
+revision = "print-json-persisted-sessions-v3"
 
 [availability]
 exec_paths = ["pi"]
@@ -77,13 +77,23 @@ persistent = false
 kind = "exec"
 command = [
   "pi", "-p", "{{prompt}}", "--provider", "ahrb", "--model", "{{model}}",
-  "--mode", "json", "--no-session",
+  "--mode", "json", "--session-dir", "{{profile}}/home/.pi/agent/sessions",
   "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
   "--no-themes", "--no-approve", "--offline", "--tools", "bash"
 ]
 timeout_ms = 30000
 
 [sessions]
+# Pi 0.84.4 docs/json.md: first record is the persisted session header.
+# dist/main.js createSessionManager opens --session inside --session-dir.
+id_pointer = "/id"
+store_paths = ["{{profile}}/home/.pi/agent/sessions"]
+resume = [
+  "pi", "-p", "{{prompt}}", "--provider", "ahrb", "--model", "{{model}}",
+  "--mode", "json", "--session", "{{session_id}}", "--session-dir", "{{profile}}/home/.pi/agent/sessions",
+  "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
+  "--no-themes", "--no-approve", "--offline", "--tools", "bash"
+]
 
 [next_input]
 [agents]
@@ -227,6 +237,8 @@ json_pointer = "/ahrb/key"
 
 [capabilities.required]
 headless = "pi --print --mode json terminates without the TUI"
+sessions = "Pi JSON mode persists a JSONL session under the isolated --session-dir"
+resume = "pi --session reopens the exact persisted session ID in a fresh process"
 secrets_hygiene_on_disk = "generated private models/auth files are the only permitted credential carriers"
 tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native tool-result role"
 

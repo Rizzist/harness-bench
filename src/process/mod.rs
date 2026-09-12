@@ -516,12 +516,19 @@ fn register_process_identity(identity: ProcIdentity, process_group: u32) -> Resu
 
 /// Register a newly spawned process and the isolated process group it leads or joins.
 pub fn register_process(pid: u32) -> Result<()> {
-    let Some((identity, process_group)) = process_identity_and_group(pid)? else {
-        return Err(AhrbError::Protocol(format!(
-            "spawned process PID {pid} disappeared before ownership registration"
-        )));
-    };
-    register_process_identity(identity, process_group)
+    // A very short-lived child may finish between `spawn()` and this lookup.
+    // It no longer has an owned tree to track, so treat that race as a
+    // successful registration; externally launched roots use the strict
+    // `register_external_process` path below and still report disappearance.
+    for _ in 0..5 {
+        if let Some((identity, process_group)) = process_identity_and_group(pid)? {
+            return register_process_identity(identity, process_group);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // A very short-lived child may have been reaped before any lookup could
+    // observe it. There is then no safe identity or group to retain.
+    Ok(())
 }
 
 /// Resolve and register an externally launched root, returning its stable

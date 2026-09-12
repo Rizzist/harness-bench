@@ -179,7 +179,7 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
         assert!(!manifest.events.rules.is_empty());
     }
 
-    for adapter in ["codex", "claude-code", "opencode"] {
+    for adapter in ["codex", "claude-code", "opencode", "pi"] {
         let path = format!("adapters/{adapter}/manifest.toml");
         let manifest = ahrb::manifest::load(Path::new(&path))?;
         assert!(
@@ -191,13 +191,10 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             "{adapter} must reopen disk-backed session state"
         );
     }
-    for adapter in ["pi", "rick"] {
-        let path = format!("adapters/{adapter}/manifest.toml");
-        let manifest = ahrb::manifest::load(Path::new(&path))?;
-        assert!(manifest.sessions.resume.is_empty(), "{adapter}");
-        assert!(!manifest.capabilities.required.contains_key("sessions"));
-        assert!(!manifest.capabilities.required.contains_key("resume"));
-    }
+    let rick = ahrb::manifest::load(Path::new("adapters/rick/manifest.toml"))?;
+    assert!(rick.sessions.resume.is_empty());
+    assert!(!rick.capabilities.required.contains_key("sessions"));
+    assert!(!rick.capabilities.required.contains_key("resume"));
 
     let haider = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml"))?;
     assert!(haider.daemon.persistent);
@@ -522,12 +519,25 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
 
     let pi = ahrb::manifest::load(Path::new("adapters/pi/manifest.toml"))?;
     assert_eq!(pi.fake_model.allowed_paths, ["/v1/chat/completions"]);
-    assert!(
-        pi.transport
-            .command
-            .iter()
-            .any(|argument| argument == "--no-session")
+    assert_eq!(pi.sessions.id_pointer, "/id");
+    assert_eq!(
+        pi.sessions.store_paths,
+        ["{{profile}}/home/.pi/agent/sessions"]
     );
+    for command in [&pi.transport.command, &pi.sessions.resume] {
+        assert!(!command.iter().any(|argument| argument == "--no-session"));
+        assert!(command.windows(2).any(|arguments| {
+            arguments == ["--session-dir", "{{profile}}/home/.pi/agent/sessions"]
+        }));
+    }
+    assert!(
+        pi.sessions
+            .resume
+            .windows(2)
+            .any(|arguments| arguments == ["--session", "{{session_id}}"])
+    );
+    assert!(pi.capabilities.required.contains_key("sessions"));
+    assert!(pi.capabilities.required.contains_key("resume"));
     assert_eq!(pi.isolation.generated_files.len(), 2);
     assert!(pi.isolation.generated_files.iter().any(|file| {
         file.path.ends_with("/.pi/agent/models.json")

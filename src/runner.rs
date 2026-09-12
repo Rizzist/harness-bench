@@ -14622,7 +14622,7 @@ async fn collect_context_recovery_repetition(
     ordinary_turns: u32,
     tool_pairs: u32,
     window_tokens: u64,
-    mut storage_capture: Option<&mut storage::lifecycle::CompactionCapture>,
+    mut storage_capture: Option<&mut crate::runner::storage::lifecycle::CompactionCapture>,
 ) -> Result<ContextRecoveryTrials> {
     let profile_root = run_profile_root.join(format!("dr51-r{repetition}"));
     prepare_profile(manifest, &profile_root).map_err(|error| {

@@ -1830,6 +1830,8 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     let mut rendered_base_url = None;
     let mut event_journal = None;
     let mut post_output_delay_ms = 0_u64;
+    let mut pre_terminal_child_ms = 0_u64;
+    let mut lingering_child_ms = 0_u64;
     let mut plaintext_stdout = false;
     let mut config_args = Vec::new();
     let mut index = 0_usize;
@@ -1851,6 +1853,26 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
                     "plaintext" => true,
                     _ => return Err(AhrbError::Usage("invalid stdout format".to_owned())),
                 };
+            }
+            "--pre-terminal-child-ms" => {
+                pre_terminal_child_ms = value
+                    .parse()
+                    .map_err(|_| AhrbError::Usage("invalid pre-terminal child delay".into()))?;
+                if pre_terminal_child_ms > 1000 {
+                    return Err(AhrbError::Usage(
+                        "pre-terminal child delay exceeds 1000 ms".into(),
+                    ));
+                }
+            }
+            "--lingering-child-ms" => {
+                lingering_child_ms = value
+                    .parse()
+                    .map_err(|_| AhrbError::Usage("invalid lingering child delay".into()))?;
+                if lingering_child_ms > 10000 {
+                    return Err(AhrbError::Usage(
+                        "lingering child delay exceeds 10000 ms".into(),
+                    ));
+                }
             }
             "--post-output-delay-ms" => {
                 post_output_delay_ms = value
@@ -2032,6 +2054,45 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     } else {
         vec![terminal.clone()]
     };
+    if pre_terminal_child_ms > 0 {
+        // Adverse lifecycle fixture: the owned child is discoverable, but its
+        // parent reaps it before publishing the invocation's terminal.
+        #[cfg(unix)]
+        {
+            let status = tokio::process::Command::new("/bin/sleep")
+                .arg(format!("{:.3}", pre_terminal_child_ms as f64 / 1000.0))
+                .env_clear()
+                .status()
+                .await?;
+            if !status.success() {
+                return Err(AhrbError::Protocol("pre-terminal child failed".into()));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(AhrbError::Unsupported(
+            "pre-terminal child fixture requires Unix".into(),
+        ));
+    }
+    if lingering_child_ms > 0 {
+        // Deliberately outlive the terminal/client while retaining its owned
+        // process group. Give live discovery a bounded pre-terminal window.
+        #[cfg(unix)]
+        {
+            let child = tokio::process::Command::new("/bin/sleep")
+                .arg(format!("{:.3}", lingering_child_ms as f64 / 1000.0))
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(child);
+        }
+        #[cfg(not(unix))]
+        return Err(AhrbError::Unsupported(
+            "lingering child fixture requires Unix".into(),
+        ));
+    }
     if let Some(path) = event_journal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;

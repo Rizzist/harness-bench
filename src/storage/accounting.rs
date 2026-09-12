@@ -27,6 +27,8 @@ pub struct FileEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Inventory {
     pub entries: Vec<FileEntry>,
+    /// Failed transient capture attempts, retained on the accepted boundary.
+    pub capture_retries: Vec<Vec<String>>,
     // Stability metadata is deliberately not added to the exact JSONL schema.
     stamps: BTreeMap<String, (i64, i64, i64, i64)>,
 }
@@ -85,6 +87,70 @@ pub fn file_growth(before: Option<&FileEntry>, after: Option<&FileEntry>) -> u64
             a.allocated_bytes.saturating_sub(b.allocated_bytes)
         }
         _ => 0,
+    }
+}
+
+fn changed_paths(a: &Inventory, b: &Inventory) -> BTreeSet<String> {
+    let entries = |i: &Inventory| {
+        i.entries
+            .iter()
+            .map(|e| (e.path.clone(), e.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let a_entries = entries(a);
+    let b_entries = entries(b);
+    a_entries
+        .keys()
+        .chain(b_entries.keys())
+        .chain(a.stamps.keys())
+        .chain(b.stamps.keys())
+        .filter(|path| {
+            a_entries.get(*path) != b_entries.get(*path)
+                || a.stamps.get(*path) != b.stamps.get(*path)
+        })
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug)]
+struct TransientCaptureChange(Vec<String>);
+impl std::fmt::Display for TransientCaptureChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "storage transient changed during capture at {:?}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for TransientCaptureChange {}
+
+fn capture_changed(path: &str, config: &StorageConfig) -> AhrbError {
+    if config
+        .family(path)
+        .is_ok_and(|family| family == "transient")
+    {
+        std::io::Error::other(TransientCaptureChange(vec![path.into()])).into()
+    } else {
+        AhrbError::Protocol(format!("storage changed during capture at {path}"))
+    }
+}
+
+fn capture_io(error: std::io::Error, path: &str, config: &StorageConfig) -> AhrbError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        capture_changed(path, config)
+    } else {
+        error.into()
+    }
+}
+
+fn transient_retry(error: &AhrbError) -> Option<Vec<String>> {
+    match error {
+        AhrbError::Io(error) => error
+            .get_ref()?
+            .downcast_ref::<TransientCaptureChange>()
+            .map(|e| e.0.clone()),
+        _ => None,
     }
 }
 
@@ -212,7 +278,7 @@ fn walk(
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(capture_io(std::io::Error::last_os_error(), &path, config));
         }
         let stat = unsafe { stat.assume_init() };
         let kind = stat.st_mode & libc::S_IFMT;
@@ -240,7 +306,11 @@ fn walk(
             });
             continue;
         }
-        let mut file = open_child(directory, &name, kind == libc::S_IFDIR)?;
+        let mut file =
+            open_child(directory, &name, kind == libc::S_IFDIR).map_err(|error| match error {
+                AhrbError::Io(error) => capture_io(error, &path, config),
+                other => other,
+            })?;
         let initial = file.metadata()?;
         inventory.stamps.insert(
             path.clone(),
@@ -251,13 +321,21 @@ fn walk(
                 initial.ctime_nsec(),
             ),
         );
+        let initial_identity = (initial.dev(), initial.ino());
+        if initial.dev() != device
+            || (kind == libc::S_IFREG && !initial.is_file())
+            || (kind == libc::S_IFDIR && !initial.is_dir())
+            || (initial_identity != identity && seen.contains(&initial_identity))
+        {
+            return Err(AhrbError::Protocol(format!(
+                "storage kind/device escape during capture at {path}"
+            )));
+        }
         if (initial.dev(), initial.ino()) != identity
             || initial.size() != stat.st_size as u64
             || initial.blocks() != stat.st_blocks as u64
         {
-            return Err(AhrbError::Protocol(format!(
-                "storage identity/size/blocks changed at {path}"
-            )));
+            return Err(capture_changed(&path, config));
         }
         let sha256 = if kind == libc::S_IFREG && digest {
             let mut hash = Sha256::new();
@@ -306,23 +384,28 @@ fn walk(
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(capture_io(std::io::Error::last_os_error(), &path, config));
         }
         let final_stat = unsafe { final_stat.assume_init() };
+        let final_identity = (final_stat.st_dev as u64, final_stat.st_ino);
+        if final_stat.st_mode & libc::S_IFMT != kind
+            || final_identity.0 != device
+            || (final_identity != identity && seen.contains(&final_identity))
+        {
+            return Err(AhrbError::Protocol(format!(
+                "storage kind/device escape or repeated identity during capture at {path}"
+            )));
+        }
         if signature(&initial) != signature(&final_metadata)
             || (final_stat.st_dev as u64, final_stat.st_ino) != identity
             || final_stat.st_size as u64 != initial.size()
             || final_stat.st_blocks as u64 != initial.blocks()
         {
-            return Err(AhrbError::Protocol(format!(
-                "storage changed during capture at {path}"
-            )));
+            return Err(capture_changed(&path, config));
         }
     }
     if signature(&before) != signature(&directory.metadata()?) {
-        return Err(AhrbError::Protocol(
-            "storage directory changed during capture".into(),
-        ));
+        return Err(capture_changed(prefix, config));
     }
     Ok(())
 }
@@ -398,40 +481,255 @@ pub async fn settle(
     if !status.success() {
         return Err(AhrbError::Protocol("storage sync failed".into()));
     }
-    loop {
-        let before = inventory(root, config, false)?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let after = inventory(root, config, false)?;
-        if before == after {
-            let captured = inventory(root, config, true)?;
-            let mut metadata = captured.clone();
-            for entry in &mut metadata.entries {
-                entry.sha256 = None;
-            }
-            if metadata != after {
-                return Err(AhrbError::Protocol(
-                    "storage changed between stability probe and digest".into(),
-                ));
-            }
-            if tokio::time::Instant::now() > limit {
-                break;
-            }
-            return Ok(SettledInventory {
-                inventory: captured,
-                settle_ms: crate::fake_model::monotonic_timestamp_ns().saturating_sub(boundary_ns)
-                    as f64
-                    / 1e6,
-                sync_start_ns,
-                sync_end_ns,
-            });
+    let inventory = settle_capture(limit, || capture_attempt(root, config)).await?;
+    Ok(SettledInventory {
+        inventory,
+        settle_ms: crate::fake_model::monotonic_timestamp_ns().saturating_sub(boundary_ns) as f64
+            / 1e6,
+        sync_start_ns,
+        sync_end_ns,
+    })
+}
+
+async fn capture_attempt(root: &Path, config: &StorageConfig) -> Result<Option<Inventory>> {
+    let before = inventory(root, config, false)?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = inventory(root, config, false)?;
+    if before != after {
+        return Ok(None);
+    }
+    let captured = inventory(root, config, true)?;
+    let mut metadata = captured.clone();
+    for entry in &mut metadata.entries {
+        entry.sha256 = None;
+    }
+    if metadata != after {
+        let changed = changed_paths(&metadata, &after);
+        if changed.iter().any(|path| {
+            config
+                .family(path)
+                .ok()
+                .is_none_or(|family| family != "transient")
+        }) {
+            return Err(AhrbError::Protocol(format!(
+                "storage undeclared paths changed between stability probe and digest: {changed:?}"
+            )));
         }
-        if tokio::time::Instant::now() >= limit {
-            break;
+        return Err(
+            std::io::Error::other(TransientCaptureChange(changed.into_iter().collect())).into(),
+        );
+    }
+    Ok(Some(captured))
+}
+
+async fn settle_capture<F, Fut>(limit: tokio::time::Instant, mut attempt: F) -> Result<Inventory>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Inventory>>>,
+{
+    let mut retries = Vec::new();
+    while tokio::time::Instant::now() < limit {
+        match attempt().await {
+            Ok(Some(mut captured)) if tokio::time::Instant::now() <= limit => {
+                captured.capture_retries = retries;
+                return Ok(captured);
+            }
+            Err(error) => {
+                let Some(paths) = transient_retry(&error) else {
+                    return Err(if retries.is_empty() {
+                        error
+                    } else {
+                        AhrbError::Protocol(format!(
+                            "storage capture failed: {error}; transient capture attempts={retries:?}"
+                        ))
+                    });
+                };
+                retries.push(paths);
+                if retries.len() >= 3 {
+                    return Err(AhrbError::Protocol(format!(
+                        "storage transient re-inventory exhausted after 3 capture attempts: {retries:?}"
+                    )));
+                }
+            }
+            _ => {}
         }
     }
-    Err(AhrbError::Protocol(
-        "storage failed to settle within 10000 ms".into(),
-    ))
+    Err(AhrbError::Protocol(format!(
+        "storage failed to settle within 10000 ms; transient capture attempts={retries:?}"
+    )))
+}
+
+/// Deterministic retry injection followed by an actual fatal filesystem capture.
+#[cfg(all(test, unix))]
+pub(crate) async fn transient_then_fatal_fixture(transient_attempts: usize) -> AhrbError {
+    static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-transient-fatal-{}-{}",
+        std::process::id(),
+        NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::os::unix::fs::symlink("missing", root.join("state/link")).unwrap();
+    let config = StorageConfig {
+        areas: Some(BTreeMap::from([(
+            "transient".into(),
+            vec!["cache/**".into()],
+        )])),
+        ..Default::default()
+    };
+    let mut attempts = 0;
+    let result = settle_capture(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        || {
+            attempts += 1;
+            std::future::ready(if attempts <= transient_attempts {
+                Err(capture_changed(&format!("cache/pack-{attempts}"), &config))
+            } else {
+                inventory(&root, &config, true).map(Some)
+            })
+        },
+    )
+    .await;
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(attempts, transient_attempts + 1);
+    result.unwrap_err()
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+    #[test]
+    fn retry_policy_requires_declared_transient_and_a_capture_change() {
+        let config = StorageConfig {
+            areas: Some(BTreeMap::from([(
+                "transient".into(),
+                vec!["cache/**".into()],
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            transient_retry(&capture_changed("cache/pack", &config)),
+            Some(vec!["cache/pack".into()])
+        );
+        for path in ["", "state/journal", "cache-sibling/pack"] {
+            assert!(transient_retry(&capture_changed(path, &config)).is_none());
+        }
+        assert!(
+            transient_retry(&capture_changed("cache/pack", &StorageConfig::default())).is_none()
+        );
+        assert!(
+            transient_retry(&capture_io(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                "cache/pack",
+                &config
+            ))
+            .is_none()
+        );
+        assert!(
+            transient_retry(&AhrbError::Protocol(
+                "storage symlink/escape at cache/pack".into()
+            ))
+            .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_change_tests {
+    use super::*;
+    #[test]
+    fn comparison_includes_every_path_and_timestamp_only_changes() {
+        let mut before = Inventory::default();
+        before.stamps.insert("cache/pack".into(), (1, 0, 1, 0));
+        before.stamps.insert("state/journal".into(), (1, 0, 1, 0));
+        let mut after = before.clone();
+        after.stamps.insert("cache/pack".into(), (2, 0, 2, 0));
+        assert_eq!(
+            changed_paths(&before, &after),
+            BTreeSet::from(["cache/pack".into()])
+        );
+        after.stamps.insert("state/journal".into(), (2, 0, 2, 0));
+        assert_eq!(
+            changed_paths(&before, &after),
+            BTreeSet::from(["cache/pack".into(), "state/journal".into()])
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_boundary_tests {
+    use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transient_then_fatal_capture_preserves_every_failed_path() {
+        for transient_attempts in 1..=2 {
+            let error = transient_then_fatal_fixture(transient_attempts).await;
+            let reason = error.to_string();
+            for attempt in 1..=transient_attempts {
+                assert!(
+                    reason.contains(&format!("cache/pack-{attempt}")),
+                    "{reason}"
+                );
+            }
+            assert!(reason.contains("state/link"), "{reason}");
+            assert!(reason.contains("symlink/escape"), "{reason}");
+            assert!(transient_retry(&error).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reinventory_preserves_receipts_and_requires_complete_final_capture() {
+        let config = StorageConfig {
+            areas: Some(BTreeMap::from([(
+                "transient".into(),
+                vec!["cache/**".into()],
+            )])),
+            ..Default::default()
+        };
+        let mut attempts = 0;
+        let captured = settle_capture(tokio::time::Instant::now() + Duration::from_secs(1), || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(capture_changed("cache/pack", &config))
+            } else {
+                Ok(Some(Inventory::default()))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            captured.capture_retries,
+            vec![vec!["cache/pack".to_string()]; 2]
+        );
+        attempts = 0;
+        let error = settle_capture(tokio::time::Instant::now() + Duration::from_secs(1), || {
+            attempts += 1;
+            std::future::ready(Err(capture_changed("cache/pack", &config)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert!(error.to_string().contains("exhausted"));
+        attempts = 0;
+        let error = settle_capture(tokio::time::Instant::now() - Duration::from_secs(1), || {
+            attempts += 1;
+            std::future::ready(Ok(Some(Inventory::default())))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 0);
+        assert!(error.to_string().contains("10000 ms"));
+        attempts = 0;
+        let error = settle_capture(tokio::time::Instant::now() + Duration::from_secs(1), || {
+            attempts += 1;
+            std::future::ready(Err(capture_changed("state/journal", &config)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("state/journal"));
+    }
 }
 
 /// Read bytes from the exact audited regular-file identity using held no-follow

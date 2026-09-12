@@ -367,15 +367,7 @@ fn index_entry(
     );
     Ok(IndexEntry {
         schema: INDEX_SCHEMA,
-        pillar: report.pillar.clone().unwrap_or_else(|| {
-            if report.economy_summary.is_some() {
-                "economy".into()
-            } else if report.fidelity_summary.is_some() {
-                "fidelity".into()
-            } else {
-                matrix_pillar()
-            }
-        }),
+        pillar: report_pillar(report),
         storage_summary: report.storage_summary.clone(),
         badge_label: report.badge.as_ref().map(crate::report::ReportBadge::label),
         outcome_counts: outcome_counts(&report.results),
@@ -478,17 +470,17 @@ fn append_index(
 }
 
 /// Print compact saved-run history. By default only the latest entry for each
-/// harness is shown; `all` retains every matching line.
+/// harness/pillar pair is shown; `all` retains every matching line.
 pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
     let mut entries = read_index()?
         .into_iter()
         .filter(|entry| harness.is_none_or(|wanted| wanted == entry.harness))
         .collect::<Vec<_>>();
     if !all {
-        let mut latest: BTreeMap<String, IndexEntry> = BTreeMap::new();
+        let mut latest: BTreeMap<(String, String), IndexEntry> = BTreeMap::new();
         for entry in entries {
             let entry_completed_at = utc_timestamp_seconds(&entry.completed_at)?;
-            let should_replace = match latest.get(&entry.harness) {
+            let should_replace = match latest.get(&(entry.harness.clone(), entry.pillar.clone())) {
                 Some(existing) => {
                     let existing_completed_at = utc_timestamp_seconds(&existing.completed_at)?;
                     (entry_completed_at, &entry.run_key)
@@ -497,20 +489,24 @@ pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
                 None => true,
             };
             if should_replace {
-                latest.insert(entry.harness.clone(), entry);
+                latest.insert((entry.harness.clone(), entry.pillar.clone()), entry);
             }
         }
         entries = latest.into_values().collect();
     }
     println!(
-        "HARNESS\tVERSION\tPROFILE\tROWS\tPASS\tFAIL\tUNSUP\tERROR\tBADGE\tCOMPLETED\tRESULTS"
+        "HARNESS\tVERSION\tPILLAR\tD/G\tPROFILE\tROWS\tPASS\tFAIL\tUNSUP\tERROR\tBADGE\tCOMPLETED\tRESULTS"
     );
     for entry in entries {
         let report = load_indexed_report(&entry).ok();
-        let counts = report
-            .as_ref()
-            .map(|report| outcome_counts(&report.results))
-            .unwrap_or_default();
+        let counts = if entry.schema >= 3 {
+            entry.outcome_counts.clone()
+        } else {
+            report
+                .as_ref()
+                .map(|report| outcome_counts(&report.results))
+                .unwrap_or_default()
+        };
         let rows = report
             .as_ref()
             .map(|report| {
@@ -521,15 +517,34 @@ pub fn print_history(harness: Option<&str>, all: bool) -> Result<()> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let badge = report
+        let badge = if entry.schema >= 3 {
+            entry.badge_label.clone()
+        } else {
+            report
+                .as_ref()
+                .and_then(|report| report.badge.as_ref())
+                .map(crate::report::ReportBadge::label)
+        }
+        .unwrap_or_else(|| "-".to_owned());
+        let classes = entry
+            .storage_summary
             .as_ref()
-            .and_then(|report| report.badge.as_ref())
-            .map(crate::report::ReportBadge::label)
-            .unwrap_or_else(|| "-".to_owned());
+            .map(|s| {
+                format!(
+                    "D{}/G{}",
+                    s.disk_class.as_deref().unwrap_or("unavailable"),
+                    s.growth_class
+                        .map(|g| format!("{g:?}").to_lowercase())
+                        .unwrap_or_else(|| "unavailable".into())
+                )
+            })
+            .unwrap_or_else(|| "-".into());
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean_field(&entry.harness),
             clean_field(&entry.harness_version),
+            clean_field(&entry.pillar),
+            clean_field(&classes),
             entry.profile,
             compact_rows(&rows),
             counts.pass,
@@ -567,7 +582,7 @@ pub fn read_index() -> Result<Vec<IndexEntry>> {
             ))
         })?;
         let entry = if value.get("schema").is_some() {
-            let entry: IndexEntry = serde_json::from_value(value).map_err(|error| {
+            let mut entry: IndexEntry = serde_json::from_value(value).map_err(|error| {
                 AhrbError::Protocol(format!(
                     "invalid versioned results/index.jsonl line {}: {error}",
                     line_index + 1
@@ -579,6 +594,12 @@ pub fn read_index() -> Result<Vec<IndexEntry>> {
                     entry.schema,
                     line_index + 1
                 )));
+            }
+            if entry.schema == 2 {
+                entry.storage_summary = None;
+                if let Ok(report) = load_indexed_report(&entry) {
+                    entry.pillar = report_pillar(&report);
+                }
             }
             entry
         } else {
@@ -698,6 +719,9 @@ fn normalize_legacy_index(
         ahrb_revision: legacy.ahrb_revision,
     };
     if let Ok(report) = load_report_without_schema_check(&entry) {
+        entry.pillar = report_pillar(&report);
+        entry.outcome_counts = outcome_counts(&report.results);
+        entry.badge_label = report.badge.as_ref().map(crate::report::ReportBadge::label);
         entry.report_schema = report.schema;
         entry.spec_version = report.spec_version;
         entry.harness.clone_from(&report.fingerprint.harness);
@@ -751,7 +775,7 @@ fn load_report_without_schema_check(entry: &IndexEntry) -> Result<Report> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn outcome_counts(results: &[crate::evaluate::TestResult]) -> OutcomeCounts {
+pub(crate) fn outcome_counts(results: &[crate::evaluate::TestResult]) -> OutcomeCounts {
     let mut counts = OutcomeCounts::default();
     for result in results {
         match result.outcome {
@@ -971,6 +995,21 @@ fn load_average_1m() -> Option<f64> {
     // SAFETY: `values` has room for all three load averages.
     let count = unsafe { libc::getloadavg(values.as_mut_ptr(), 3) };
     (count >= 1).then_some(values[0])
+}
+
+pub(crate) fn report_pillar(report: &Report) -> String {
+    report.pillar.clone().unwrap_or_else(|| {
+        if report.storage_summary.is_some() {
+            "storage"
+        } else if report.economy_summary.is_some() {
+            "economy"
+        } else if report.fidelity_summary.is_some() {
+            "fidelity"
+        } else {
+            "matrix"
+        }
+        .into()
+    })
 }
 
 fn matrix_pillar() -> String {

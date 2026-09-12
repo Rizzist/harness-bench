@@ -294,11 +294,12 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         .max()
         .unwrap_or(0) as f64
         / (1024.0 * 1024.0);
-    // JSON f64 parsing can round the serialized peak by one ULP; use a
-    // magnitude-scaled bound when comparing it with the integer-derived value.
+    // JSON decoding can move a float by one ULP; EPSILON alone is scaled to 1.0.
     assert!(
         (report.resource_summary.peak_rss_mib - sampled_peak).abs()
-            <= f64::EPSILON * sampled_peak.abs().max(1.0)
+            <= f64::EPSILON * sampled_peak.abs().max(1.0),
+        "reported peak {} differs from sampled peak {sampled_peak}",
+        report.resource_summary.peak_rss_mib
     );
     let sampled_cpu_s = report
         .samples
@@ -307,7 +308,12 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns))
         as f64
         / 1_000_000_000.0;
-    assert!((report.resource_summary.cpu_total_s - sampled_cpu_s).abs() < f64::EPSILON);
+    assert!(
+        (report.resource_summary.cpu_total_s - sampled_cpu_s).abs()
+            <= f64::EPSILON * sampled_cpu_s.abs().max(1.0),
+        "reported CPU {} differs from sampled CPU {sampled_cpu_s}",
+        report.resource_summary.cpu_total_s
+    );
     assert!(report.resource_metrics.values().all(|metric| {
         metric.topology == "shared-daemon-sessions"
             && metric.profile == "quick"

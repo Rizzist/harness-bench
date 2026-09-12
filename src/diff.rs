@@ -5,6 +5,8 @@ use crate::results::{IndexEntry, load_indexed_report_value, read_index};
 use crate::scenarios::RequirementKind;
 use crate::{AhrbError, Result};
 use serde::Serialize;
+
+mod storage;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Parse selectors, print the canonical diff document, and return its status.
@@ -21,7 +23,7 @@ pub fn execute(args: &[String]) -> Result<i32> {
     } else {
         if args.len() != 2 {
             return Err(AhrbError::Usage(
-                "hbench diff requires exactly two harness selectors".to_owned(),
+                "hbench diff requires exactly two harness selectors or report paths".to_owned(),
             ));
         }
         (
@@ -50,6 +52,9 @@ fn ensure_unique_run_keys(entries: &[IndexEntry]) -> Result<()> {
 }
 
 fn resolve_operand(entries: &[IndexEntry], operand: &str) -> Result<IndexEntry> {
+    if std::path::Path::new(operand).exists() {
+        return storage::path_entry(std::path::Path::new(operand));
+    }
     let (harness, selector) = match operand.rsplit_once('@') {
         Some((harness, selector)) if !harness.is_empty() && !selector.is_empty() => {
             (harness, Some(selector))
@@ -132,10 +137,28 @@ fn resolve_latest_pair(entries: &[IndexEntry], harness: &str) -> Result<(IndexEn
         .collect::<Vec<_>>();
     let right = newest(matching.clone())?;
     let right_completed_at = crate::results::utc_timestamp_seconds(&right.completed_at)?;
+    let previous = newest(
+        matching
+            .iter()
+            .copied()
+            .filter(|e| e.run_key != right.run_key)
+            .collect(),
+    )?;
+    if previous.pillar != right.pillar {
+        return Err(AhrbError::Usage(
+            "latest occurrences span pillars; use explicit run paths".into(),
+        ));
+    }
     let mut earlier = Vec::new();
     for entry in matching {
         let entry_completed_at = crate::results::utc_timestamp_seconds(&entry.completed_at)?;
         if entry.run_key != right.run_key
+            && entry.pillar == right.pillar
+            && (right.pillar != "storage"
+                || storage::same_scope(
+                    entry.storage_summary.as_ref(),
+                    right.storage_summary.as_ref(),
+                ))
             && entry.os == right.os
             && entry.topology == right.topology
             && entry.profile == right.profile
@@ -159,7 +182,7 @@ struct LoadedReport {
 }
 
 fn load_supported_report(entry: &IndexEntry) -> Result<LoadedReport> {
-    if !matches!(entry.report_schema, 2 | 3) {
+    if !matches!(entry.report_schema, 2..=4) {
         return Err(AhrbError::Protocol(format!(
             "unsupported report schema {} for run {}",
             entry.report_schema, entry.run_key
@@ -187,6 +210,8 @@ struct DiffDocument {
     economy_summary_deltas: Option<EconomySummaryDiff>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fidelity_summary_deltas: Option<FidelitySummaryDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_summary_deltas: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,6 +272,7 @@ struct FractionCurveDiff {
 
 #[derive(Debug, Serialize)]
 struct RowDiff {
+    pillar: crate::evaluate::Pillar,
     row: u8,
     id: String,
     badge_impact: String,
@@ -273,29 +299,112 @@ fn build_document(
     left_report: &LoadedReport,
     right_report: &LoadedReport,
 ) -> Result<(DiffDocument, bool)> {
-    let (rows, gating_regression) =
+    let explicit_cross_pillar = left_report
+        .parsed
+        .pillar
+        .as_deref()
+        .zip(right_report.parsed.pillar.as_deref())
+        .is_some_and(|(a, b)| a != b);
+    let storage_vs_non_storage = (left_report.parsed.storage_summary.is_some()
+        && right_report.parsed.storage_summary.is_none()
+        && right_report
+            .parsed
+            .results
+            .iter()
+            .any(|result| result.pillar != crate::evaluate::Pillar::Storage))
+        || (right_report.parsed.storage_summary.is_some()
+            && left_report.parsed.storage_summary.is_none()
+            && left_report
+                .parsed
+                .results
+                .iter()
+                .any(|result| result.pillar != crate::evaluate::Pillar::Storage));
+    if explicit_cross_pillar || storage_vs_non_storage {
+        return Err(AhrbError::Usage(format!(
+            "cannot diff reports from different pillars: {} vs {}",
+            left.pillar, right.pillar
+        )));
+    }
+    let (rows, mut gating_regression) =
         compare_rows(&left_report.parsed.results, &right_report.parsed.results)?;
+    if left.pillar != right.pillar && (left.pillar == "storage" || right.pillar == "storage") {
+        gating_regression = false;
+    }
     let comparable = comparable_scope(&left, &right);
     let resource_summary_deltas =
         compare_resources(&left_report.raw, &right_report.raw, comparable);
     let economy_summary_deltas = compare_economy(
-        left_report.parsed.economy_summary.as_ref(),
-        right_report.parsed.economy_summary.as_ref(),
+        left_report
+            .parsed
+            .economy_summary
+            .as_ref()
+            .filter(|_| left.pillar == "economy"),
+        right_report
+            .parsed
+            .economy_summary
+            .as_ref()
+            .filter(|_| right.pillar == "economy"),
     );
     let fidelity_summary_deltas = compare_fidelity(
-        left_report.parsed.fidelity_summary.as_ref(),
-        right_report.parsed.fidelity_summary.as_ref(),
+        left_report
+            .parsed
+            .fidelity_summary
+            .as_ref()
+            .filter(|_| left.pillar == "fidelity"),
+        right_report
+            .parsed
+            .fidelity_summary
+            .as_ref()
+            .filter(|_| right.pillar == "fidelity"),
     );
+    let storage_summary_deltas = storage::compare(
+        left_report
+            .parsed
+            .storage_summary
+            .as_ref()
+            .filter(|_| left.pillar == "storage"),
+        right_report
+            .parsed
+            .storage_summary
+            .as_ref()
+            .filter(|_| right.pillar == "storage"),
+    )?
+    .or_else(|| {
+        (left.pillar == "storage" || right.pillar == "storage")
+            .then(|| serde_json::json!({"comparison_scope":"unavailable","values":{}}))
+    });
+    let comparison_scope = if let Some(storage) = &storage_summary_deltas {
+        match storage["comparison_scope"].as_str() {
+            Some("comparable") if comparable => "within-topology-only",
+            Some("comparable") => "not-comparable",
+            Some(status) => status,
+            None => "unavailable",
+        }
+    } else if comparable
+        && resource_summary_deltas
+            .values()
+            .all(|value| value.delta.is_none())
+        && economy_summary_deltas.is_none()
+        && fidelity_summary_deltas.is_none()
+    {
+        "unavailable"
+    } else if comparable {
+        "within-topology-only"
+    } else {
+        "not-comparable"
+    }
+    .to_owned();
     Ok((
         DiffDocument {
             schema: 1,
             left,
             right,
-            comparison_scope: "within-topology-only".to_owned(),
+            comparison_scope,
             rows,
             resource_summary_deltas,
             economy_summary_deltas,
             fidelity_summary_deltas,
+            storage_summary_deltas,
         },
         gating_regression,
     ))
@@ -749,16 +858,22 @@ fn compare_rows(left: &[TestResult], right: &[TestResult]) -> Result<(Vec<RowDif
         .collect::<BTreeSet<_>>();
     let mut rows = Vec::with_capacity(ids.len());
     let mut gating_regression = false;
-    for id in ids {
-        let before = left.get(&id).copied();
-        let after = right.get(&id).copied();
+    for key in ids {
+        let before = left.get(&key).copied();
+        let after = right.get(&key).copied();
+        let (pillar, id) = key;
         let current = after.or(before).ok_or_else(|| {
             AhrbError::Protocol(format!("row {id:?} disappeared while joining diff"))
         })?;
         let requirement = requirement_for(current);
-        let (change, row_regression) = row_change(requirement, before, after);
+        let (change, row_regression) = if current.pillar == crate::evaluate::Pillar::Storage {
+            storage::row_change(&id, before, after)
+        } else {
+            row_change(requirement, before, after)
+        };
         gating_regression |= row_regression;
         rows.push(RowDiff {
+            pillar,
             row: current.row,
             id,
             badge_impact: requirement_label(requirement).to_owned(),
@@ -771,10 +886,15 @@ fn compare_rows(left: &[TestResult], right: &[TestResult]) -> Result<(Vec<RowDif
     Ok((rows, gating_regression))
 }
 
-fn results_by_id(results: &[TestResult]) -> Result<BTreeMap<String, &TestResult>> {
+fn results_by_id(
+    results: &[TestResult],
+) -> Result<BTreeMap<(crate::evaluate::Pillar, String), &TestResult>> {
     let mut by_id = BTreeMap::new();
     for result in results {
-        if by_id.insert(result.id.clone(), result).is_some() {
+        if by_id
+            .insert((result.pillar, result.id.clone()), result)
+            .is_some()
+        {
             return Err(AhrbError::Protocol(format!(
                 "report contains duplicate stable row ID {:?}",
                 result.id
@@ -785,6 +905,16 @@ fn results_by_id(results: &[TestResult]) -> Result<BTreeMap<String, &TestResult>
 }
 
 fn requirement_for(result: &TestResult) -> RequirementKind {
+    if result.pillar == crate::evaluate::Pillar::Storage {
+        return if result.id == "footprint-curve"
+            || (result.id == "delete-uninstall-residue"
+                && result.metadata.requirement != "informational")
+        {
+            RequirementKind::Core
+        } else {
+            RequirementKind::Informational
+        };
+    }
     crate::scenarios::all()
         .iter()
         .find(|definition| definition.id == result.id)
@@ -891,7 +1021,9 @@ fn optional_capability_declared(result: &TestResult) -> Option<bool> {
 }
 
 fn comparable_scope(left: &IndexEntry, right: &IndexEntry) -> bool {
-    known_scope_value(&left.os)
+    known_scope_value(&left.pillar)
+        && left.pillar == right.pillar
+        && known_scope_value(&left.os)
         && known_scope_value(&left.topology)
         && known_scope_value(&left.profile)
         && known_scope_value(&right.os)
@@ -903,7 +1035,7 @@ fn comparable_scope(left: &IndexEntry, right: &IndexEntry) -> bool {
 }
 
 fn known_scope_value(value: &str) -> bool {
-    !value.is_empty() && value != "unknown"
+    !value.is_empty() && value != "unknown" && value != "unavailable"
 }
 
 fn informational_change(before: &str, after: &str) -> (&'static str, bool) {
@@ -995,33 +1127,15 @@ fn compare_resources(
     for field in RESOURCE_FIELDS {
         let before = numeric_field(left, field);
         let after = numeric_field(right, field);
-        let value = if !comparable {
-            ResourceDelta {
-                before,
-                after,
-                delta: None,
-                delta_pct: None,
-                change: Some("not-comparable".to_owned()),
-            }
-        } else if let (Some(before_value), Some(after_value)) = (before, after) {
-            ResourceDelta {
-                before,
-                after,
-                delta: Some(after_value - before_value),
-                delta_pct: Some(if before_value == 0.0 {
-                    None
-                } else {
-                    Some(100.0 * (after_value - before_value) / before_value)
-                }),
-                change: None,
-            }
+        let value = if comparable || before.is_none() || after.is_none() {
+            numeric_delta(before, after)
         } else {
             ResourceDelta {
                 before,
                 after,
                 delta: None,
                 delta_pct: None,
-                change: Some("unavailable".to_owned()),
+                change: Some("not-comparable".to_owned()),
             }
         };
         deltas.insert((*field).to_owned(), value);
@@ -1030,8 +1144,25 @@ fn compare_resources(
 }
 
 fn numeric_field(value: &serde_json::Value, field: &str) -> Option<f64> {
+    // Storage carries the legacy summary's default numbers for schema compatibility,
+    // but does not run the general resource collector.
+    if value.get("pillar").and_then(serde_json::Value::as_str) == Some("storage")
+        || value
+            .get("storage_summary")
+            .is_some_and(|summary| !summary.is_null())
+    {
+        return None;
+    }
     if let Some(required_id) = resource_field_id(field)
         && !row_measurement_complete(value, required_id)
+    {
+        return None;
+    }
+    if resource_field_id(field).is_none()
+        && value
+            .pointer("/details/resource-summary/measurement_complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
     {
         return None;
     }
@@ -1245,6 +1376,63 @@ mod tests {
             workspace_receipt_before_sha256: "a".repeat(64),
             workspace_receipt_after_sha256: "b".repeat(64),
         }
+    }
+
+    #[test]
+    fn legacy_pillar_inference_uses_summary_blocks() {
+        let mut report = crate::report::Report {
+            economy_summary: Some(economy(100)),
+            ..Default::default()
+        };
+        assert_eq!(crate::results::report_pillar(&report), "economy");
+        report.economy_summary = None;
+        report.fidelity_summary = Some(fidelity("quick", 1.0));
+        assert_eq!(crate::results::report_pillar(&report), "fidelity");
+    }
+
+    #[test]
+    fn storage_latest_refuses_cross_pillar_and_skips_incompatible_scope() -> Result<()> {
+        let mut a = index_entry("macos", "per-invocation", "quick");
+        a.run_key = "a".into();
+        a.harness = "h".into();
+        a.completed_at = "2026-01-01T00:00:00Z".into();
+        let mut b = a.clone();
+        b.run_key = "b".into();
+        b.completed_at = "2026-01-02T00:00:00Z".into();
+        b.pillar = "storage".into();
+        assert!(
+            resolve_latest_pair(&[a.clone(), b.clone()], "h")
+                .unwrap_err()
+                .to_string()
+                .contains("span pillars")
+        );
+        a.pillar = "storage".into();
+        let scope = crate::storage::evidence::StorageSummary {
+            schema: 1,
+            task: crate::storage::TASK.into(),
+            profile: "quick".into(),
+            os: "macos".into(),
+            topology: "per-invocation".into(),
+            comparison_scope: "within-topology-only".into(),
+            allocation_source: "stat-st_blocks-512".into(),
+            counter_source: "macos-ri_diskio_byteswritten".into(),
+            declarations_sha256: "a".repeat(64),
+            ..Default::default()
+        };
+        a.storage_summary = Some(scope.clone());
+        b.storage_summary = Some(scope);
+        let mut incompatible = a.clone();
+        incompatible.run_key = "between".into();
+        incompatible.completed_at = "2026-01-01T12:00:00Z".into();
+        incompatible
+            .storage_summary
+            .as_mut()
+            .unwrap()
+            .declarations_sha256 = "b".repeat(64);
+        let (left, right) = resolve_latest_pair(&[a, incompatible, b], "h")?;
+        assert_eq!(left.run_key, "a");
+        assert_eq!(right.run_key, "b");
+        Ok(())
     }
 
     #[test]
@@ -1571,11 +1759,13 @@ mod tests {
                 {"id": "memory-time-integral", "measurement_complete": false}
             ],
             "resource_summary": {
+                "cpu_total_s": 0.0,
                 "wall_per_turn_p95_ms": 125.0,
                 "memory_time_integral_mib_s_per_turn": 9.0
             }
         });
         assert_eq!(numeric_field(&report, "wall_per_turn_p95_ms"), Some(125.0));
+        assert_eq!(numeric_field(&report, "cpu_total_s"), None);
         assert_eq!(
             numeric_field(&report, "memory_time_integral_mib_s_per_turn"),
             None

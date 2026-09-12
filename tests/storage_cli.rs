@@ -698,3 +698,269 @@ fn exhaustive_storage_audit_reports_an_undeclared_log_contradiction() {
     std::fs::remove_dir_all(report.profile_path).expect("cleanup profile");
     std::fs::remove_file(path).expect("cleanup manifest");
 }
+
+#[test]
+fn saved_storage_history_survives_missing_bundle_and_no_save_adds_no_line() {
+    let _guard = common::serialize_ahrb_subprocesses();
+    let root = fresh("saved-storage");
+    for (name, no_save) in [("saved", false), ("unsaved", true)] {
+        let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_hbench"));
+        cmd.args([
+            "storage",
+            "mock-exec",
+            "--profile",
+            "quick",
+            "--deadline",
+            "0",
+            "--output",
+        ])
+        .arg(root.join(name))
+        .env("AHRB_RESULTS_ROOT", &root);
+        if no_save {
+            cmd.arg("--no-save");
+        }
+        let output = cmd.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let index = std::fs::read_to_string(root.join("results/index.jsonl")).unwrap();
+    assert_eq!(index.lines().count(), 1);
+    let entry: ahrb::results::IndexEntry =
+        serde_json::from_str(index.lines().next().unwrap()).unwrap();
+    assert_eq!(entry.schema, 3);
+    assert_eq!(entry.spec_version, 4);
+    assert_eq!(entry.pillar, "storage");
+    assert!(entry.storage_summary.is_some());
+    assert_eq!(entry.outcome_counts.error, 10);
+    assert!(entry.badge_label.is_none());
+    std::fs::remove_file(root.join(&entry.report_path)).unwrap();
+    let history = ProcessCommand::new(env!("CARGO_BIN_EXE_hbench"))
+        .args(["results", "--all"])
+        .env("AHRB_RESULTS_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let history = String::from_utf8(history.stdout).unwrap();
+    assert!(
+        history.contains("\tstorage\tDunavailable/Gunavailable\t"),
+        "{history}"
+    );
+    assert!(history.contains("\t0\t0\t0\t10\t-\t"), "{history}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn counter_loss_survives_later_deadline_without_partial_physical_or_curve_headlines() {
+    let _guard = common::serialize_ahrb_subprocesses();
+    let root = fresh("reaped-child");
+    std::fs::create_dir(&root).unwrap();
+    let declaration = std::fs::read_to_string("adapters/mock-exec-immediate-exit/manifest.toml")
+        .unwrap()
+        .replace(
+            "\"exec-turn\",",
+            "\"exec-turn\", \"--pre-terminal-child-ms\", \"100\",",
+        );
+    let manifest = root.join("manifest.toml");
+    std::fs::write(&manifest, declaration).unwrap();
+    let output = root.join("output");
+    let result = ProcessCommand::new(env!("CARGO_BIN_EXE_ahrb"))
+        .args(["run", "--pillar", "storage", "--manifest"])
+        .arg(&manifest)
+        .args([
+            "--profile",
+            "quick",
+            "--deadline",
+            "9",
+            "--no-save",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: ahrb::report::Report =
+        serde_json::from_slice(&std::fs::read(output.join("report.json")).unwrap()).unwrap();
+    let children = report
+        .lifecycle_notes
+        .iter()
+        .filter_map(|n| n.strip_prefix("storage-client-discovery "))
+        .map(|n| serde_json::from_str::<serde_json::Value>(n).unwrap())
+        .flat_map(|n| n["processes"].as_array().unwrap().clone())
+        .filter(|p| p["command"] == "sleep")
+        .collect::<Vec<_>>();
+    assert!(!children.is_empty(), "adverse child was not discovered");
+    let retirements = report
+        .lifecycle_notes
+        .iter()
+        .filter_map(|n| n.strip_prefix("storage-client-retirement "))
+        .map(|n| serde_json::from_str::<serde_json::Value>(n).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!retirements.is_empty(), "{:?}", report.results);
+    assert!(retirements.iter().any(|r| {
+        r["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("missing client terminal-before-reap receipt"))
+    }));
+    assert!(
+        retirements
+            .iter()
+            .flat_map(|r| r["identities"].as_array().unwrap())
+            .any(|r| r["complete"] == false
+                && children.iter().any(|p| p["identity"]["pid"] == r["pid"]
+                    && p["identity"]["start_time"] == r["start_time"]))
+    );
+    let boundaries = report
+        .storage_samples
+        .iter()
+        .filter(|s| s.turn > 0)
+        .collect::<Vec<_>>();
+    assert!(!boundaries.is_empty());
+    assert!(boundaries.iter().all(|s| !s.counter_complete
+        && s.physical_write_bytes.is_none()
+        && s.physical_read_bytes.is_none()));
+    let summary = report.storage_summary.unwrap();
+    assert!(summary.completed_turns > 0 && summary.completed_turns < 100);
+    assert!(
+        summary.disk_class.is_none()
+            && summary.write_bytes_per_turn_p95.is_none()
+            && summary.growth_class.is_none()
+            && summary.footprint_curve.is_empty()
+    );
+    for slug in ["write-volume", "footprint-curve"] {
+        assert_eq!(
+            report.details[slug]["trials"][0]["measurement_complete"],
+            false
+        );
+        assert_eq!(report.details[slug]["trials"][0]["reason"], "deadline");
+    }
+    assert!(report.badge.is_none());
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(report.profile_path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn live_descendant_across_turns_keeps_physical_error_without_aborting_task() {
+    let _guard = common::serialize_ahrb_subprocesses();
+    let root = fresh("live-child");
+    std::fs::create_dir(&root).unwrap();
+    let declaration = std::fs::read_to_string("adapters/mock-exec-immediate-exit/manifest.toml")
+        .unwrap()
+        .replace(
+            "\"exec-turn\",",
+            "\"exec-turn\", \"--lingering-child-ms\", \"6000\",",
+        );
+    let manifest = root.join("manifest.toml");
+    std::fs::write(&manifest, declaration).unwrap();
+    let output = root.join("output");
+    let result = ProcessCommand::new(env!("CARGO_BIN_EXE_ahrb"))
+        .args(["run", "--pillar", "storage", "--manifest"])
+        .arg(&manifest)
+        .args([
+            "--profile",
+            "quick",
+            "--deadline",
+            "9",
+            "--no-save",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: ahrb::report::Report =
+        serde_json::from_slice(&std::fs::read(output.join("report.json")).unwrap()).unwrap();
+    let summary = report.storage_summary.as_ref().unwrap();
+    assert!(summary.completed_turns >= 2, "{:?}", report.results);
+    assert!(summary.disk_class.is_none() && summary.write_bytes_per_turn_p95.is_none());
+    let retirements = report
+        .lifecycle_notes
+        .iter()
+        .filter_map(|n| n.strip_prefix("storage-client-retirement "))
+        .map(|n| serde_json::from_str::<serde_json::Value>(n).unwrap())
+        .collect::<Vec<_>>();
+    assert!(retirements.len() >= 2);
+    let first = &retirements[0];
+    assert!(
+        first["error"]
+            .as_str()
+            .unwrap()
+            .contains("live owned descendant")
+    );
+    let child = first["live_descendants"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("live child");
+    let write = first["identities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["pid"] == child["pid"] && r["start_time"] == child["start_time"])
+        .unwrap();
+    assert_eq!(write["retirement_method"], "Live");
+    let read = first["read_identities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["identity"] == *child)
+        .unwrap();
+    assert_eq!(read["status"], "live");
+    assert!(
+        !report
+            .lifecycle_notes
+            .iter()
+            .any(|n| n.contains("was observed again"))
+    );
+    #[cfg(target_os = "macos")]
+    {
+        use ahrb::process::Sampler;
+        let mut sampler = ahrb::process::macos::MacOsSampler::default();
+        for identity in retirements
+            .iter()
+            .flat_map(|r| r["live_descendants"].as_array().unwrap())
+        {
+            let identity: ahrb::process::ProcIdentity =
+                serde_json::from_value(identity.clone()).unwrap();
+            assert!(
+                !sampler
+                    .discover(&[identity.pid])
+                    .unwrap()
+                    .members
+                    .contains_key(&identity),
+                "owned lingering child survived deadline cleanup: {identity:?}"
+            );
+        }
+    }
+    let boundaries = report
+        .storage_samples
+        .iter()
+        .filter(|s| s.turn > 0)
+        .collect::<Vec<_>>();
+    assert!(!boundaries.is_empty());
+    assert!(boundaries.iter().all(|s| !s.counter_complete
+        && s.physical_write_bytes.is_none()
+        && s.physical_read_bytes.is_none()));
+    assert!(report.badge.is_none());
+    assert!(summary.footprint_curve.is_empty() && summary.growth_class.is_none());
+    for slug in ["write-volume", "footprint-curve"] {
+        assert_eq!(report.details[slug]["trials"][0]["reason"], "deadline");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(report.profile_path).unwrap();
+}

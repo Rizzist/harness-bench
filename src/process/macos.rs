@@ -654,28 +654,28 @@ impl Sampler for MacOsSampler {
     }
 
     fn disk_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
-        let Some(current) = bsd_info(identity.pid)? else {
+        let Some(current) = bsd_info_including_zombies(identity.pid)? else {
             return Ok(None);
         };
         if identity_of(&current) != identity {
             return Ok(None);
         }
         let value = rusage(identity.pid)?.map(|usage| usage.ri_diskio_byteswritten);
-        let Some(after) = bsd_info(identity.pid)? else {
+        let Some(after) = bsd_info_including_zombies(identity.pid)? else {
             return Ok(None);
         };
         Ok((identity_of(&after) == identity).then_some(value).flatten())
     }
 
     fn disk_read_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
-        let Some(current) = bsd_info(identity.pid)? else {
+        let Some(current) = bsd_info_including_zombies(identity.pid)? else {
             return Ok(None);
         };
         if identity_of(&current) != identity {
             return Ok(None);
         }
         let value = rusage(identity.pid)?.map(|usage| usage.ri_diskio_bytesread);
-        let Some(after) = bsd_info(identity.pid)? else {
+        let Some(after) = bsd_info_including_zombies(identity.pid)? else {
             return Ok(None);
         };
         Ok((identity_of(&after) == identity).then_some(value).flatten())
@@ -807,6 +807,16 @@ fn skip_nuls(buffer: &[u8], offset: &mut usize) {
 }
 
 fn bsd_info(pid: u32) -> Result<Option<ProcBsdInfo>> {
+    bsd_info_with_zombies(pid, false)
+}
+
+// Darwin exposes final rusage for an unreaped zombie. The identity guards must
+// use the matching lookup policy; ordinary discovery still excludes zombies.
+fn bsd_info_including_zombies(pid: u32) -> Result<Option<ProcBsdInfo>> {
+    bsd_info_with_zombies(pid, true)
+}
+
+fn bsd_info_with_zombies(pid: u32, include_zombies: bool) -> Result<Option<ProcBsdInfo>> {
     let pid = c_int::try_from(pid)
         .map_err(|_| AhrbError::Validation("PID exceeds Darwin pid_t range".to_owned()))?;
     // SAFETY: the all-zero representation is valid for this C output struct.
@@ -818,7 +828,7 @@ fn bsd_info(pid: u32) -> Result<Option<ProcBsdInfo>> {
         proc_pidinfo(
             pid,
             PROC_PIDTBSDINFO,
-            0,
+            u64::from(include_zombies),
             (&mut info as *mut ProcBsdInfo).cast::<c_void>(),
             size,
         )
@@ -1262,6 +1272,81 @@ mod tests {
                 parent_cpu.saturating_add(12)
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod zombie_counter_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn immediate_terminal_exit_retains_counters_until_reap_only() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-zombie-receipt-{}-{}",
+            std::process::id(),
+            crate::fake_model::monotonic_timestamp_ns()
+        ));
+        std::fs::create_dir(&root)?;
+        let output = root.join("terminal.jsonl");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "read release; printf '%s\\n' '{\"type\":\"turn.completed\"}'",
+            ])
+            .env_clear()
+            .current_dir(&root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::fs::File::create(&output)?)
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let identity = identity_of(&bsd_info(child.id())?.expect("gated child is live"));
+        child
+            .stdin
+            .take()
+            .expect("release pipe")
+            .write_all(b"go\n")?;
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: only our unreaped child is observed; WNOWAIT retains its
+        // kernel exit record and never reaps an unrelated process.
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                status.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(observed, 0, "{}", std::io::Error::last_os_error());
+        let terminal = std::fs::read_to_string(&output)?;
+        let live_lookup = bsd_info(child.id())?;
+        let mut sampler = MacOsSampler::default();
+        let writes = sampler.disk_counter_for_identity(identity)?;
+        let reads = sampler.disk_read_counter_for_identity(identity)?;
+        let wrong = ProcIdentity {
+            start_time: identity.start_time + 1,
+            ..identity
+        };
+        let wrong_writes = sampler.disk_counter_for_identity(wrong)?;
+        let wrong_reads = sampler.disk_read_counter_for_identity(wrong)?;
+        let exit = child.wait()?;
+        let reaped_writes = sampler.disk_counter_for_identity(identity)?;
+        let reaped_reads = sampler.disk_read_counter_for_identity(identity)?;
+        std::fs::remove_dir_all(root)?;
+        // Assert after cleanup so the expected pre-fix failure does not leak a child.
+        assert_eq!(terminal, "{\"type\":\"turn.completed\"}\n");
+        assert!(
+            live_lookup.is_none(),
+            "live-only lookup must exclude zombie"
+        );
+        println!(
+            "unreaped structured-terminal identity={identity:?} physical_write_bytes={writes:?} physical_read_bytes={reads:?}; live-only BSD lookup unavailable"
+        );
+        assert!(writes.is_some());
+        assert!(reads.is_some());
+        assert!(wrong_writes.is_none() && wrong_reads.is_none());
+        assert!(exit.success());
+        assert!(reaped_writes.is_none() && reaped_reads.is_none());
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 # AHRB v4 — storage pillar
 
-Status: normative implementation specification, revision 4.0. This document defines requirements for implementing storage; it does not claim that the current binary supports them.
+Status: normative implementation specification, revision 4.1 (2026-09-07: declared transient capture retries). This document defines requirements for implementing storage; it does not claim that the current binary supports them.
 MUST, MUST NOT, and REQUIRED are normative. [SPEC-v2](SPEC-v2.md) §§3–7 supply the outcome, identity, evidence, and comparison conventions except for explicit overrides below.
 The [proposal](PROPOSAL-v4-storage.md) supplies motivation, not additional oracles.
 
@@ -117,6 +117,18 @@ record directories and special entries separately. APFS clones are distinct iden
 by their reported blocks, even when extents are shared. Sparse files count allocated blocks.
 This is per-file allocated footprint, not unique-volume consumption or recoverable free space.
 
+Revision 4.1 exception: a manifest may label a `transient` family in `storage.areas`.
+Identity/size/block/content changes or disappearance during capture of a path explicitly
+matching that family permit a fresh exhaustive re-inventory, with at most three failed
+capture attempts and the original 10,000 ms boundary limit. Changes to undeclared paths,
+root or ancestor directories outside that family, symlinks, hard links, device escapes,
+and unreadable paths remain ERROR. The final inventory MUST still satisfy both matching
+metadata probes and the complete digest/identity audit. Exhaustion is ERROR with no
+incomplete aggregates. Record every failed path in boundary lifecycle notes. Transient
+bytes MUST remain in whole-root totals, growth and body scans, and MUST appear separately
+as `families.transient` and file family labels; this declaration never excludes bytes.
+
+
 `allocated_bytes = st_blocks * 512 bytes`; 512 bytes is the stat block unit, independent
 of filesystem allocation size. Record `apparent_bytes = st_size` only as a diagnostic. Never use apparent size, `du -h`, or compressed-size guesses as the footprint metric.
 “Logical growth” below means growth of allocated footprint; it is not logical write syscall bytes.
@@ -164,7 +176,7 @@ Add a typed optional `[storage]` table, accepted additively by existing manifest
 
 | Exact key / type | Meaning and validation |
 |---|---|
-| `areas.<name>: string[]` | Run-root-relative globs. Reserved families are `store`, `cas`, `views`, `pipes`, `logs`, `other`; additional names match `[a-z][a-z0-9_]*`. `other` is computed remainder and may only be omitted or `[]`. |
+| `areas.<name>: string[]` | Run-root-relative globs. Reserved families are `store`, `cas`, `views`, `pipes`, `logs`, `transient`, `other`; additional names match `[a-z][a-z0-9_]*`. `other` is computed remainder and may only be omitted or `[]`. |
 | `session_delete: string[]`, `uninstall_cleanup: string[]` | Optional public harness argv; empty/omitted means no declared verb. Delete requires `{{session_id}}` exactly once. Scope must be proven by `{{profile}}`/`{{workspace}}` arguments or the isolated environment actually honored by the public command. |
 | `sweep_interval_s: u64?` | Positive seconds until a documented automatic retention sweep; measure elapsed time, never invoke an invented sweep. Missing means no expiry claim. |
 | `session_close: string[]` | NEW extension required for S5: public close-without-delete argv with `{{session_id}}` exactly once, or `[]` for unavailable. Never alias a deleting operation. |

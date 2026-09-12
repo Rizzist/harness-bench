@@ -279,3 +279,8 @@ tool_result_role_fidelity = "Responses function_call_output items preserve the n
 # declaring secrets_hygiene_on_disk.
 # TODO(orchestrator): pin exact budget, tariff, usage carrier/scope/pointers, and
 # network-denial behavior before declaring rows 66, 67, or the complete row 70.
+
+# Plugin clone staging remains part of exhaustive allocated-byte accounting.
+# SPEC-v4 revision 4.1 permits bounded re-inventory, never exclusion.
+[storage.areas]
+transient = ["codex/.tmp/**"]

@@ -280,3 +280,36 @@ fn missing_retirement_never_becomes_a_low_write_class() {
     assert!(after.cumulative_write_bytes.is_none());
     assert!(tracker.retire_after_final_sample(identity).is_err());
 }
+
+#[test]
+#[cfg(unix)]
+fn transient_family_is_reported_and_never_excluded() {
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-transient-{}-{}",
+        std::process::id(),
+        ahrb::fake_model::monotonic_timestamp_ns()
+    ));
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::write(root.join("cache/pack"), vec![42; 8192]).unwrap();
+    std::fs::write(root.join("journal"), vec![7; 4096]).unwrap();
+    let config = StorageConfig {
+        areas: Some(BTreeMap::from([(
+            "transient".into(),
+            vec!["cache/**".into()],
+        )])),
+        ..Default::default()
+    };
+    let captured = inventory(&root, &config, true).unwrap();
+    let families = captured.families(&config);
+    assert!(families["transient"] > 0);
+    assert_eq!(captured.allocated_bytes(), families.values().sum::<u64>());
+    assert!(
+        captured
+            .entries
+            .iter()
+            .any(|e| e.path == "cache/pack" && e.sha256.is_some())
+    );
+    std::os::unix::fs::symlink(root.join("journal"), root.join("cache/link")).unwrap();
+    assert!(inventory(&root, &config, true).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
