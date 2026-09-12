@@ -139,8 +139,9 @@ Record: verified tree = `b201bab` + diff sha256 `f8cb55b3577d9fcd185525edcfcaae5
 - [x] Computer-use verification (same verifiers: positive/adverse S7/S8 mock cases on both transports incl. fault injection, plaintext mock UNSUPPORTED across S1/S3/S7/S8, real codex honest collector ERROR, real pi ABSENT)
 - [x] Repair loop until SHIP (two iterations; interrupted by provider outages and resumed on the same threads)
 - [x] Complete: commit `2241d82`, fast-forwarded onto `master`, pushed
+- [x] Post-integration verification (GPT6-Astra `01a0816f-e2d6-7860-b668-74b8c2d647a2`, 2026-09-12): first pass NO-SHIP on one finding — `cargo fmt --check` failed in `tests/runner_scripts.rs` (upstream L8a test formatting, not L3 code); rustfmt-only repair by GPT6-Astra (`01a095a2-71f8-79f1-9d78-f854f2196150`) landed as `894b9df`; second pass **SHIP** bound to `894b9df`: full suite 510 passed / 0 failed, mock fault cases ERROR as specified, real codex honest ERROR receipt, real pi ABSENT, no NOT EXECUTED rows. Known docs-only defect: the `2241d82` commit title says "volatile-area retention and cleanup"; the implementation is S7 bounded auxiliaries + S8 request-body retention (history not rewritten).
 
-Record: verified tree = `9f198a5` + repair diff sha256 `4801dee3f9ad2c33d5bfd6a23a5767e76caf0e5a8b4091985dae7872d952e388`, squashed and rebased onto `5cd41b4` by the interim orchestrator with a clean post-rebase build/focused-test check. Raw evidence: harness `state/lanes/l3-storage-s7-s8/` (outside Git).
+Record: verified tree = `9f198a5` + repair diff sha256 `4801dee3f9ad2c33d5bfd6a23a5767e76caf0e5a8b4091985dae7872d952e388`, squashed and rebased onto `5cd41b4` by the interim orchestrator; integrated tree `894b9df` re-verified post-landing as above. Raw evidence: harness `state/lanes/l3-storage-s7-s8/` (outside Git).
 
 ## L4 `l4-storage-s5-s4`
 
