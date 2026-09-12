@@ -70,7 +70,7 @@ Resume procedure: the harness checklist's BLOCKER section lists the per-lane res
 | L1 `l1-storage-spec` | Normative `docs/SPEC-v4-storage.md` for S1–S10 (S4 included): operational definitions, units, accounting rules, manifest `[storage]` contract, unsupported/ABSENT/ERROR cases, report/CLI behavior, evidence bundle, badge classes, six-adapter declaration requirements | L0 | **complete** (SHIP, landed `bec2475`) |
 | L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | **complete** (SHIP, landed `e24aeba`) |
 | L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | **complete** (SHIP, landed `2241d82`) |
-| L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | pending |
+| L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | **complete** (SHIP, landed `18e3e60`) |
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
 | L7a `l7a-storage-collector-results` | Split out 2026-09-07: codex terminal-before-reap collector fix, codex volatile-area rule, pi sessions revisit, saved-index/`hbench diff` storage integration | L2 | in progress (blocked) |
@@ -200,6 +200,15 @@ Record: candidate `e1f1583` + doc diff sha256 `a9aa118f86438eeff010a3aa28c38f3ef
 - [x] Complete: commit `8cc1e8d`, fast-forwarded onto `master`, pushed
 
 Record: verified tree = `6f4f2e5` + diff sha256 `64fe9c137d0e4f0f7785c6565cbc11ac0af0188d6f66f286427e8140c895b403` + new scripts (`2613fc98…`, `e5bf2ae8…`, `a6cf719f…`), rebased onto `bc4f467` without conflict. Raw evidence: harness `state/lanes/l8a-reference-runner/{impl-1,impl-2,verify-1,verify-2}` and `results/l8a-*` (outside Git).
+
+## L4 `l4-storage-s5-s4` — completion record (2026-09-13)
+
+- [x] Verification history: verify-1 and verify-2 NO-SHIP with repaired findings (F2: missing context-error boundary must classify ERROR, never UNSUPPORTED/PASS with a zero figure); verify-3 across passes 2026-09-12 (GPT6-Astra `01a081ce-89c2-7bb1-9def-e9c0b51f4e0e`) **SHIP**: full serial suite exit 0, F2 repro correct, fresh daemon/exec S4/S5 mock runs PASS both transports, auto-save parity (217 identical files, 147 evidence references), real codex honest ABSENT/UNSUPPORTED, real pi ABSENT, cleanup audits clean
+- [x] Integration: squashed verified tree (`0549a7b`), rebase onto `c46a5bd` conflicted in 4 files vs L3's S7/S8 work → GPT6-Astra integrate (`01a096bf-bc41-7361-8257-e56298333d44`) resolved; its row-65 injection-surface regression (malformed request bodies carrying the storage marker leaked JSON parse errors) was caught by post-integration verification and repaired; final rebase onto `12f2ca2` picked up the L12 codex fix
+- [x] Post-integration verification (GPT6-Astra `01a0971a-c309-7673-a2fe-71c0ca9dbec6` **SHIP** bound to `18e3e60`): full serial suite exit 0 (incl. mock_exec_full_matrix 657s, mock_full_matrix 246s), daemon+exec mock S4/S5 PASS / S7 UNSUPPORTED / S8 PASS, real pi honest ABSENT, real codex honest S4 ABSENT / S5 UNSUPPORTED with pre-existing S7/S8 protocol receipts matching the master baseline, no plugins contamination
+- [x] Complete: commit `18e3e60`, fast-forwarded onto `master`, pushed
+
+Record: pre-integration verified tree = `de78fa2` + diff sha256 `3206ba87…` (squashed as `0549a7b`, tree `6c91b06a…`); integrated tree `4889e8ab…` at `18e3e60`. Raw evidence: harness `state/lanes/l4-storage-s5-s4/` (outside Git).
 
 ## L12 `l12-codex-plugins-capture` (unplanned environment fix, 2026-09-13)
 
