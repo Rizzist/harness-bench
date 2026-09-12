@@ -847,9 +847,10 @@ fn reference_resume_skips_reports_preserves_receipts_and_keeps_failures() {
         &["--resume", run.to_str().unwrap()],
     );
     assert_eq!(failed.status.code(), Some(2));
-    assert!(f
-        .log("reference-run", &failed)
-        .ends_with("REFERENCE FAIL\n"));
+    assert!(
+        f.log("reference-run", &failed)
+            .ends_with("REFERENCE FAIL\n")
+    );
     fs::write(run.join("mock/matrix/exit-code.txt"), "0\n").unwrap();
     fs::write(run.join("mock/matrix/report.json"), "[]").unwrap();
     let malformed = f.run_args(
@@ -859,9 +860,10 @@ fn reference_resume_skips_reports_preserves_receipts_and_keeps_failures() {
         &["--resume", run.to_str().unwrap()],
     );
     assert_eq!(malformed.status.code(), Some(1));
-    assert!(f
-        .log("reference-run", &malformed)
-        .contains("RE-RUN reason=step receipt differs"));
+    assert!(
+        f.log("reference-run", &malformed)
+            .contains("RE-RUN reason=step receipt differs")
+    );
     f.assert_preserved();
 }
 
@@ -911,10 +913,11 @@ fn reference_propagates_failures_runs_later_pillars_and_scopes_cleanup() {
         assert!(profile.exists());
         f.assert_preserved();
         if mode == "keep" {
-            assert!(f
-                .run_dir(&output)
-                .join("mock/storage/profile-local")
-                .is_dir());
+            assert!(
+                f.run_dir(&output)
+                    .join("mock/storage/profile-local")
+                    .is_dir()
+            );
         }
     }
 }
@@ -1013,9 +1016,10 @@ fn reference_refuses_locked_runs_and_changed_provenance() {
         &["--resume", run.to_str().unwrap()],
     );
     assert_eq!(changed.status.code(), Some(2));
-    assert!(f
-        .log("reference-run", &changed)
-        .contains("resume provenance differs"));
+    assert!(
+        f.log("reference-run", &changed)
+            .contains("resume provenance differs")
+    );
 }
 
 #[test]
