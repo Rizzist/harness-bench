@@ -210,6 +210,16 @@ Record: verified tree = `6f4f2e5` + diff sha256 `64fe9c137d0e4f0f7785c6565cbc11a
 
 Record: pre-integration verified tree = `de78fa2` + diff sha256 `3206ba87…` (squashed as `0549a7b`, tree `6c91b06a…`); integrated tree `4889e8ab…` at `18e3e60`. Raw evidence: harness `state/lanes/l4-storage-s5-s4/` (outside Git).
 
+## L7a `l7a-storage-collector-results` — completion record (2026-09-13)
+
+- [x] Implement (GPT6-Astra, passes 1-5 incl. repairs): storage collector result handling with fatal-capture retention of transient receipts; `hbench diff` refuses numeric cross-pillar comparisons (exit 2, both operand orders; same-pillar unchanged); process registration tolerates a child exiting between spawn and registration (bounded identity-checked retry; external roots strict); mock-exec immediate-exit and reaped-child fixtures
+- [x] Code + computer-use verification (GPT6-Astra, six passes; final verify-6 `01a096c4-ce0d-7fc0-a9c1-020c3e4dc558` **SHIP**: full serial suite pass, F1 refusal both orders on real report files, mock fixtures both command forms, real codex/pi vs pass-1 evidence, probes, save/no-save parity)
+- [x] Integration onto `e4c868a`: conflict resolution across the storage core and codex manifest required four repair rounds (two storage_cli regressions; S7 trial chain dropped by the merge — checkpoint family snapshots, auxiliaries::evaluate, row 6/7 serialization — restored and adapted to this lane's typed RowDetails; interrupted-path S8 reconstruction with evidence_refs; interrupted-run ordering reconciled so both parents' semantics hold). Fresh-context battery: all seven focused checks exit 0
+- [x] Post-integration verification (GPT6-Astra `01a097b2-8a44-7921-a438-02c9b9a55405` **SHIP** bound to `ab014c5`, zero NOT EXECUTED rows: repair audit, full serial suite, fresh daemon/exec mocks, cross-pillar refusal + same-pillar sanity, real codex (no plugins contamination, baseline receipts), real pi honest)
+- [x] Complete: commit `ab014c5`, fast-forwarded onto `master`, pushed
+
+Record: pre-integration verified tree = `6f4f2e5` + diff sha256 `846494ec…` (committed `a1d77b0`); integrated tree at `ab014c5`. Raw evidence: harness `state/lanes/l7a-storage-collector-results/` (outside Git).
+
 ## L12 `l12-codex-plugins-capture` (unplanned environment fix, 2026-09-13)
 
 - [x] Worktree `worktrees/l12-codex-plugins-capture`, branch `lane/l12-codex-plugins-capture`, base `c46a5bd`
