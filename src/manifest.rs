@@ -2914,7 +2914,7 @@ fn concise_version(output: &str, version_pattern: &str) -> String {
     }
 }
 
-fn resolve_executable(candidate: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_executable(candidate: &str) -> Option<PathBuf> {
     let path = PathBuf::from(candidate);
     if path.components().count() > 1 {
         return path.is_file().then_some(path);

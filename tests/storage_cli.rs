@@ -203,6 +203,9 @@ fn both_real_cli_forms_preserve_zero_deadline_reports() {
         let markdown = std::fs::read_to_string(output.join("report.md")).expect("markdown");
         assert!(markdown.contains("Storage v4"));
         assert!(markdown.contains("unavailable"));
+        assert!(markdown.contains("S9 crash residue bytes"));
+        assert!(markdown.contains("S10 read bytes p50"));
+        assert!(markdown.contains("S10 timing origin:"));
         assert!(!markdown.contains("Automation Ready"));
         std::fs::remove_dir_all(output).expect("remove owned fixture");
     }
@@ -251,7 +254,7 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
         let report: ahrb::report::Report =
             serde_json::from_slice(&std::fs::read(output.join("report.json")).expect("report"))
                 .expect("typed report");
-        for i in [0, 2, 6, 7] {
+        for i in [0, 2, 5, 6, 7, 8, 9] {
             let row = &report.results[i];
             assert!(
                 matches!(&row.outcome, ahrb::evaluate::TestOutcome::Unsupported(reason)
@@ -270,7 +273,7 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
                 .results
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| ![0, 2, 3, 4, 6, 7].contains(i))
+                .filter(|(i, _)| ![0, 2, 3, 4, 5, 6, 7, 8, 9].contains(i))
                 .all(
                     |(_, r)| matches!(&r.outcome, ahrb::evaluate::TestOutcome::Error(_))
                         && !r.metadata.measurement_complete
@@ -317,6 +320,15 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
                 .iter()
                 .all(|r| r["row_id"] == "compaction-vs-disk")
         );
+        let operations = report.details["delete-uninstall-residue"]["operations"]
+            .as_array()
+            .expect("missing-operation receipts");
+        assert_eq!(operations.len(), 2);
+        for operation in operations {
+            assert_eq!(operation["declared"], false);
+            assert_eq!(operation["outcome"]["class"], "UNSUPPORTED");
+            assert!(operation["repetition"].is_null());
+        }
         assert!(report.badge.is_none());
         let summary = report.storage_summary.expect("summary");
         assert_eq!(summary.completed_turns, 0);
@@ -335,6 +347,25 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
         assert!(markdown.contains("| S7 `bounded-auxiliaries` | UNSUPPORTED |"));
         assert!(markdown.contains("| S8 `request-body-retention` | UNSUPPORTED |"));
         assert!(markdown.contains("shared S1/S3/S7/S8 task not started"));
+        assert!(summary.delete_residue_allocated_bytes.is_none());
+        assert!(summary.delete_residue_files.is_none());
+        assert!(summary.uninstall_residue_allocated_bytes.is_none());
+        assert!(summary.uninstall_residue_files.is_none());
+        assert!(summary.crash_residue_allocated_bytes.is_none());
+        assert!(summary.crash_residue_files.is_none());
+        assert!(summary.crash_resume_outcome.is_none());
+        assert!(summary.resume_read_bytes_p50.is_none());
+        assert!(summary.resume_read_bytes_p95.is_none());
+        assert!(summary.resume_latency_p50_ms.is_none());
+        assert!(summary.resume_latency_p95_ms.is_none());
+        assert!(summary.resume_outcome.is_none());
+        for (row, slug) in [
+            (6, "delete-uninstall-residue"),
+            (9, "crash-residue"),
+            (10, "resume-read-cost"),
+        ] {
+            assert!(markdown.contains(&format!("| S{row} `{slug}` | UNSUPPORTED |")));
+        }
         std::fs::remove_dir_all(output).expect("remove owned output");
     }
 }

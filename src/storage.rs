@@ -147,6 +147,18 @@ fn valid_family(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Only option arguments use flag=value syntax; an equals sign in a positional
+/// path is part of that path and must not hide its root or parent components.
+fn verb_argument_value(argument: &str) -> &str {
+    if argument.starts_with('-') {
+        argument
+            .split_once('=')
+            .map_or(argument, |(_, value)| value)
+    } else {
+        argument
+    }
+}
+
 fn validate_verb(name: &str, argv: &[String], session: bool) -> Result<()> {
     if argv.is_empty() {
         return Ok(());
@@ -240,9 +252,7 @@ fn validate_verb(name: &str, argv: &[String], session: bool) -> Result<()> {
         if rendered.contains(['{', '}']) || rendered.split('/').any(|p| p == "." || p == "..") {
             return Err(error());
         }
-        let value = rendered
-            .split_once('=')
-            .map_or(rendered.as_str(), |(_, v)| v);
+        let value = verb_argument_value(&rendered);
         if index > 0
             && (value.starts_with(['/', '~'])
                 || (value.contains('/') && !value.starts_with("ROOT/")))
@@ -752,6 +762,43 @@ pub fn render_markdown(
                 .unwrap_or_else(|| "unavailable".into())
         );
     }
+    out.push_str("\n| S9 crash residue bytes | S9 crash residue files | S9 recovery | S10 read bytes p50 | S10 read bytes p95 | S10 latency p50 ms | S10 latency p95 ms | S10 resume |\n|---:|---:|---|---:|---:|---:|---:|---|\n");
+    let _ = writeln!(
+        out,
+        "| {} | {} | {} | {} | {} | {} | {} | {} |",
+        summary
+            .crash_residue_allocated_bytes
+            .map_or_else(|| "unavailable".into(), |v| v.to_string()),
+        summary
+            .crash_residue_files
+            .map_or_else(|| "unavailable".into(), |v| v.to_string()),
+        summary
+            .crash_resume_outcome
+            .map(|x| format!("{x:?}").to_lowercase())
+            .unwrap_or_else(|| "unavailable".into()),
+        show(summary.resume_read_bytes_p50),
+        show(summary.resume_read_bytes_p95),
+        show(summary.resume_latency_p50_ms),
+        show(summary.resume_latency_p95_ms),
+        summary
+            .resume_outcome
+            .map(|x| format!("{x:?}").to_lowercase())
+            .unwrap_or_else(|| "unavailable".into())
+    );
+    let timing_origin = report
+        .details
+        .get(ROWS[9])
+        .and_then(|d| d["trials"].as_array())
+        .and_then(|trials| {
+            trials
+                .iter()
+                .find_map(|t| t["diagnostics"]["resume_path"].as_str())
+        });
+    let _ = writeln!(
+        out,
+        "S10 timing origin: `{}` (per the validated lifecycle/topology path; headline starts at the selected resume boundary).\n",
+        timing_origin.unwrap_or("unavailable")
+    );
     out.push_str("\nDurability wall cost is an estimate using 4 ms/call, never measured latency. Request-byte retention requires exact matches and verified representation coverage; disk growth alone cannot establish retention. Context shrinking need not reclaim journals. Sync is an AHRB boundary operation, not evidence of harness fsync or hardware durability.\n\nEvidence: [samples](storage-samples.jsonl), [files](storage-files.jsonl), [processes](processes.jsonl), [turns](turns.jsonl), [requests](model-requests.jsonl), [fsync](fsync-events.jsonl), [body matches](request-body-matches.jsonl). Empty collectors have no coverage claim.\n");
     out
 }

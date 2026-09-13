@@ -1,4 +1,9 @@
 //! Lifecycle storage collectors. Public verbs act only on fresh benchmark profiles.
+mod delete_crash_resume;
+pub(super) use delete_crash_resume::{
+    collect_crash, collect_delete, collect_resume, missing_operations,
+};
+
 use super::*;
 use crate::storage::lifecycle::{aggregate_outcome, compaction_summary, evaluate_close};
 
@@ -198,7 +203,7 @@ pub(super) async fn collect(
             progress.report.results[id] = row(id, outcome.clone(), config);
             progress.details.insert(
                 ROWS[id].into(),
-                pending_details(id, &outcome_reason(&outcome).unwrap_or_default()),
+                pending_details(id, &outcome_reason(&outcome).unwrap_or_default(), config),
             );
             progress.finalized.insert(id);
             continue;
@@ -546,6 +551,7 @@ async fn close(
         engine,
         server,
         mut driver,
+        ..
     } = start_scripted_pillar_runtime(
         manifest,
         hash,

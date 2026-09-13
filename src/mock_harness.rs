@@ -631,6 +631,7 @@ impl MockHarness {
         publish_daemon_pid: bool,
         session_filter: Option<&str>,
     ) -> Result<Self> {
+        storage_crash_recover(&config)?;
         fs::create_dir_all(config.state_dir.join("sessions"))?;
         fs::create_dir_all(config.state_dir.join("workspaces"))?;
         let mut sessions = BTreeMap::new();
@@ -799,7 +800,7 @@ impl MockHarness {
         let normalized = NormalizedEvent {
             id: format!("{session_id}:{cursor}"),
             cursor,
-            session_id: session_id.to_owned(),
+            session_id: session.meta.id.clone(),
             actor: session.meta.marker.clone(),
             event,
             payload,
@@ -997,6 +998,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
         "session-create" => session_create_command(&args[1..]),
         "session-list" => session_list_command(&args[1..]),
         "session-resume" => session_resume_command(&args[1..]),
+        "storage-cleanup" => storage_cleanup_command(&args[1..]),
         "session-fork" => session_fork_command(&args[1..]),
         "session-delete" => session_delete_command(&args[1..]),
         "permission-trial" => permission_trial_command(&args[1..]),
@@ -1026,6 +1028,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  ahrb-mock-harness session-create --state-dir PATH --marker MARKER\n\
                  ahrb-mock-harness session-close --state-dir PATH --session-id ID\n\
                  ahrb-mock-harness session-list --state-dir PATH\n\
+                 ahrb-mock-harness storage-cleanup --profile DISPOSABLE --operation delete|uninstall [--session-id ID]\n\
                  ahrb-mock-harness session-resume|session-fork|session-delete \
                  --state-dir PATH --session-id ID\n\
                  ahrb-mock-harness permission-trial --state-dir PATH \
@@ -1543,6 +1546,7 @@ fn session_resume_command(args: &[String]) -> Result<i32> {
         );
         return Ok(4);
     };
+    storage_resume_reads(&harness.config, "checkpoint=resume")?;
     let history_hashes = event_history_hashes(&session.events)?;
     println!(
         "{}",
@@ -1553,6 +1557,15 @@ fn session_resume_command(args: &[String]) -> Result<i32> {
             "history_hashes":history_hashes,"events":session.events
         })
     );
+    if harness
+        .config
+        .state_dir
+        .join("storage-benchmark-owned")
+        .is_file()
+    {
+        std::io::stdout().flush()?;
+        std::thread::sleep(Duration::from_millis(350));
+    }
     Ok(0)
 }
 
@@ -3147,6 +3160,29 @@ async fn execute_turn(
     turn: &PendingTurn,
 ) -> Result<()> {
     let config = harness.lock().await.config.clone();
+    storage_resume_reads(&config, &turn.prompt)?;
+    if turn.prompt.contains(crate::storage::TASK)
+        && turn.prompt.contains("checkpoint=crash")
+        && !config.state_dir.join("storage-crash-recovered").exists()
+    {
+        fs::write(config.state_dir.join("storage-crash-armed"), id)?;
+        if std::env::var("AHRB_MOCK_STORAGE_CRASH_TEMP").as_deref() == Ok("leave") {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(config.state_dir.join("storage-orphan.tmp"))?;
+            file.sync_all()?;
+        }
+    }
+    if turn.prompt.contains(crate::storage::TASK)
+        && turn.prompt.contains("checkpoint=resume")
+        && std::env::var("AHRB_MOCK_STORAGE_RESUME_ID").as_deref() == Ok("wrong")
+    {
+        // Real durable identity corruption, not an evaluator override.
+        let mut guard = harness.lock().await;
+        guard.session_mut(id)?.meta.id = "wrong-storage-session".into();
+    }
     if turn.prompt.contains("AHRB-ROW53-LARGE-JOURNAL") {
         {
             let mut guard = harness.lock().await;
@@ -4829,10 +4865,14 @@ fn chat_response_usage(response: &Value) -> Result<(u64, u64)> {
 // These knobs change real file writes only for the storage fixture. Ordinary
 // matrix defaults and evaluator outcomes are untouched.
 fn storage_fixture_write(config: &MockConfig, prompt: &str) -> Result<()> {
-    if !prompt.contains(crate::storage::TASK) {
+    if !prompt.contains(crate::storage::TASK) || !prompt.contains("checkpoint=t") {
         return Ok(());
     }
     storage_auxiliary_write(config)?;
+    fs::write(
+        config.state_dir.join("storage-benchmark-owned"),
+        "ahrb-disposable-storage-v1",
+    )?;
     let mode = std::env::var("AHRB_MOCK_STORAGE_WRITE_MODE").unwrap_or_else(|_| "append".into());
     let growth = std::env::var("AHRB_MOCK_STORAGE_GROWTH").unwrap_or_else(|_| "linear".into());
     let turn = prompt
@@ -5342,6 +5382,160 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+fn storage_resume_reads(config: &MockConfig, prompt: &str) -> Result<()> {
+    if !prompt.contains("checkpoint=resume")
+        || !config.state_dir.join("storage-benchmark-owned").is_file()
+    {
+        return Ok(());
+    }
+    let path = config.state_dir.join("storage-payload.bin");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let repeats = if std::env::var("AHRB_MOCK_STORAGE_RESUME_READ").as_deref() == Ok("extra") {
+        16
+    } else {
+        1
+    };
+    for _ in 0..repeats {
+        std::hint::black_box(fs::read(&path)?);
+    }
+    Ok(())
+}
+
+fn storage_crash_recover(config: &MockConfig) -> Result<()> {
+    let marker = config.state_dir.join("storage-crash-armed");
+    if !marker.is_file() {
+        return Ok(());
+    }
+    let id = fs::read_to_string(&marker)?;
+    validate_session_id(&id)?;
+    if std::env::var("AHRB_MOCK_STORAGE_CRASH_RECOVERY").as_deref() == Ok("corrupt") {
+        let path = config
+            .state_dir
+            .join("sessions")
+            .join(&id)
+            .join("journal.jsonl");
+        let text = fs::read_to_string(&path)?;
+        let mut events = text
+            .lines()
+            .map(serde_json::from_str::<NormalizedEvent>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if let Some(first) = events.first_mut() {
+            first.payload["storage_corrupt_committed_prefix"] = json!(true);
+        }
+        let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
+        for event in events {
+            writeln!(file, "{}", serde_json::to_string(&event)?)?;
+        }
+        file.sync_all()?;
+    }
+    if std::env::var("AHRB_MOCK_STORAGE_CRASH_TEMP").as_deref() != Ok("leave") {
+        let path = config.state_dir.join("storage-orphan.tmp");
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    fs::remove_file(marker)?;
+    fs::write(
+        config.state_dir.join("storage-crash-recovered"),
+        "recovered",
+    )?;
+    Ok(())
+}
+
+fn remove_storage_directory(profile: &Path, path: &Path) -> Result<()> {
+    crate::storage::lifecycle::contained_path(profile, path)?;
+    let canonical = fs::canonicalize(path)?;
+    crate::storage::lifecycle::contained_path(profile, &canonical)?;
+    fs::remove_dir_all(canonical)?;
+    Ok(())
+}
+
+fn storage_cleanup_command(args: &[String]) -> Result<i32> {
+    use crate::storage::{StorageConfig, accounting, lifecycle::contained_path};
+
+    let options = parse_cli_options(args, &["--profile", "--operation", "--session-id"])?;
+    let profile = PathBuf::from(required_cli_option(&options, "--profile")?);
+    contained_path(&profile, &profile)?;
+    let profile = fs::canonicalize(profile)?;
+    let state = profile.join("state");
+    contained_path(&profile, &state.join("storage-benchmark-owned"))?;
+    if fs::read_to_string(state.join("storage-benchmark-owned"))? != "ahrb-disposable-storage-v1" {
+        return Err(AhrbError::Validation(
+            "mock cleanup has no benchmark ownership marker".into(),
+        ));
+    }
+    // Refuse the whole operation before changing any entry if any profile path
+    // is a link or crosses the root/device boundary. Inventory uses openat with
+    // O_NOFOLLOW, including directory traversal and final identity checks.
+    accounting::inventory(&profile, &StorageConfig::default(), false)?;
+    let controller_live = fs::read_to_string(state.join("daemon.pid"))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+        .map(|pid| {
+            #[cfg(unix)]
+            {
+                unsafe { libc::kill(pid, 0) == 0 }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+                false
+            }
+        });
+    let operation = required_cli_option(&options, "--operation")?;
+    match operation {
+        "delete" => {
+            let id = required_cli_option(&options, "--session-id")?;
+            validate_session_id(id)?;
+            let mode =
+                std::env::var("AHRB_MOCK_STORAGE_DELETE_MODE").unwrap_or_else(|_| "clean".into());
+            if mode == "error" {
+                return Ok(7);
+            }
+            if !matches!(mode.as_str(), "clean" | "residue") {
+                return Err(AhrbError::Validation("unknown storage delete mode".into()));
+            }
+            let path = state.join("sessions").join(id);
+            contained_path(&profile, &path)?;
+            if path.exists() {
+                remove_storage_directory(&profile, &path)?;
+            }
+            if mode == "residue" {
+                let path = state.join("sessions/delete-residue-empty");
+                contained_path(&profile, &path)?;
+                fs::write(path, b"")?;
+            }
+        }
+        "uninstall" => {
+            let mode = std::env::var("AHRB_MOCK_STORAGE_UNINSTALL_MODE")
+                .unwrap_or_else(|_| "clean".into());
+            if mode == "error" {
+                return Ok(7);
+            }
+            if !matches!(mode.as_str(), "clean" | "residue") {
+                return Err(AhrbError::Validation(
+                    "unknown storage uninstall mode".into(),
+                ));
+            }
+            remove_storage_directory(&profile, &state)?;
+            if mode == "residue" {
+                let path = profile.join("uninstall-residue-empty");
+                contained_path(&profile, &path)?;
+                fs::write(path, b"")?;
+            }
+        }
+        _ => return Err(AhrbError::Usage("unknown storage cleanup operation".into())),
+    }
+    println!(
+        "{}",
+        json!({"operation":operation,"terminal_type":"success","disposable":true,"controller_live":controller_live})
+    );
+    Ok(0)
 }
 
 #[cfg(test)]

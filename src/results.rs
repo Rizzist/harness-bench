@@ -290,6 +290,41 @@ pub fn persist_report(
                     &results_dir.join("run-error.txt"),
                 )?;
             }
+            // Lifecycle receipts are referenced from the per-row trial details. Copy
+            // every referenced artifact into the indexed mirror so selecting the
+            // saved result remains self-contained.
+            let mut referenced = std::collections::BTreeSet::new();
+            for detail in report.details.values() {
+                if let Some(trials) = detail.get("trials").and_then(serde_json::Value::as_array) {
+                    for trial in trials {
+                        if let Some(refs) = trial
+                            .get("evidence_refs")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            for item in refs {
+                                if let Some(file) =
+                                    item.get("file").and_then(serde_json::Value::as_str)
+                                {
+                                    referenced.insert(file.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for file in referenced {
+                let path = std::path::Path::new(&file);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(AhrbError::Protocol(
+                        "storage evidence reference escapes bundle".into(),
+                    ));
+                }
+                copy_optional(&persistence.output.join(path), &results_dir.join(path))?;
+            }
         }
     }
     let completed_at = utc_timestamp(SystemTime::now())?;

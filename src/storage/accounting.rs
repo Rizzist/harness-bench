@@ -446,6 +446,7 @@ pub fn inventory(_root: &Path, _config: &StorageConfig, _digest: bool) -> Result
     ))
 }
 
+#[derive(Clone)]
 pub struct SettledInventory {
     pub inventory: Inventory,
     pub settle_ms: f64,

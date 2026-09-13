@@ -4,6 +4,8 @@
 //! semantic driver independent from process and wire framing, while the monotonically
 //! increasing request ID makes recordings deterministic.
 
+pub mod storage_control;
+
 use crate::events::{
     EventNormalizer, EventVocab, NATIVE_FIXTURE_METADATA_PREFIX, NormalizedEvent, rule_matches,
 };
@@ -1297,6 +1299,15 @@ pub trait Driver: Send {
     fn completed_turn_boundaries(&self) -> Vec<CompletedTurnBoundary> {
         Vec::new()
     }
+    /// Arm complete control-command read receipts for a storage resume trial.
+    fn enable_storage_resume_receipts(&mut self) {}
+    fn storage_control_receipts(&self) -> Vec<storage_control::StorageControlReceipt> {
+        Vec::new()
+    }
+    /// Actual spawn boundary while a continuation is still held at the provider.
+    fn active_launch_ns(&self, _session: &SessionId) -> Option<u64> {
+        None
+    }
     /// Last observed thin-client process state for a logical session.
     fn client_exit(&self, _session: &SessionId) -> ClientExit {
         ClientExit::NotApplicable
@@ -2112,6 +2123,8 @@ pub struct PerInvocationDriver {
     daemon_launch_pid: Option<u32>,
     completed_turn_wall_ns: Vec<u64>,
     completed_turn_boundaries: Vec<CompletedTurnBoundary>,
+    storage_resume_receipts: bool,
+    storage_controls: std::sync::Mutex<Vec<storage_control::StorageControlReceipt>>,
     lifecycle_notes: Vec<String>,
     unmapped_payload_kinds: BTreeSet<String>,
 }
@@ -2133,6 +2146,8 @@ impl PerInvocationDriver {
             daemon_launch_pid: None,
             completed_turn_wall_ns: Vec::new(),
             completed_turn_boundaries: Vec::new(),
+            storage_resume_receipts: false,
+            storage_controls: std::sync::Mutex::new(Vec::new()),
             lifecycle_notes: Vec::new(),
             unmapped_payload_kinds: BTreeSet::new(),
         }
@@ -2801,12 +2816,22 @@ impl PerInvocationDriver {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = run_owned_output(
-            &mut command,
-            self.config.timeout,
-            "per-invocation control command",
-        )
-        .await?;
+        let output = if self.storage_resume_receipts {
+            let (output, receipt) =
+                storage_control::collect(&mut command, self.config.timeout).await?;
+            self.storage_controls
+                .lock()
+                .map_err(|_| AhrbError::Protocol("storage control receipts poisoned".into()))?
+                .push(receipt);
+            output
+        } else {
+            run_owned_output(
+                &mut command,
+                self.config.timeout,
+                "per-invocation control command",
+            )
+            .await?
+        };
         // Control commands may print a human-readable preamble line before the
         // JSON document on the same stream (e.g. haider's recover --probe emits
         // "no crash window to reconcile" ahead of its haider.session_recovery.v1
@@ -3870,6 +3895,21 @@ impl Driver for PerInvocationDriver {
         self.completed_turn_wall_ns.clone()
     }
 
+    fn enable_storage_resume_receipts(&mut self) {
+        self.storage_resume_receipts = true;
+    }
+    fn storage_control_receipts(&self) -> Vec<storage_control::StorageControlReceipt> {
+        self.storage_controls
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+    fn active_launch_ns(&self, session: &SessionId) -> Option<u64> {
+        self.sessions
+            .get(&session.0)
+            .and_then(|s| s.active.as_ref())
+            .map(|a| a.launch_ns)
+    }
     fn completed_turn_boundaries(&self) -> Vec<CompletedTurnBoundary> {
         self.completed_turn_boundaries.clone()
     }

@@ -4,8 +4,6 @@ use super::*;
 use crate::process::{DiskIdentityStatus, ProcessDiskObservation, TreeDiskTracker};
 use crate::storage::{self as contract, accounting, evidence::*, *};
 use std::io::Write as _;
-
-#[allow(dead_code)]
 pub(crate) mod lifecycle;
 
 fn workflow(manifest: &Manifest, n: u32) -> Result<Workflow> {
@@ -87,7 +85,7 @@ fn row(id: usize, outcome: TestOutcome, config: &StorageConfig) -> TestResult {
     }
 }
 
-fn pending_details(id: usize, reason: &str) -> Value {
+fn pending_details(id: usize, reason: &str, config: &StorageConfig) -> Value {
     let mut value = json!({"measurement_label":MEASUREMENT_LABEL,"reason":reason,"trials":[]});
     if let Some(key) = match id {
         1 => Some("instrumentation"),
@@ -96,6 +94,9 @@ fn pending_details(id: usize, reason: &str) -> Value {
         _ => None,
     } {
         value[key] = json!([]);
+    }
+    if id == 5 {
+        value["operations"] = json!(lifecycle::missing_operations(config));
     }
     value
 }
@@ -221,7 +222,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         write_trials: Vec::new(),
         curve_trials: Vec::new(),
         details: (0..10)
-            .map(|i| (ROWS[i].into(), pending_details(i, pending)))
+            .map(|i| (ROWS[i].into(), pending_details(i, pending, &config)))
             .collect(),
         finalized: BTreeSet::new(),
         auxiliary_trials: Vec::new(),
@@ -237,16 +238,16 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             progress.report.results[i] = row(i, TestOutcome::Absent(reason.clone()), &config);
             progress
                 .details
-                .insert((*_slug).into(), pending_details(i, &reason));
+                .insert((*_slug).into(), pending_details(i, &reason, &config));
         }
     } else if let Some(reason) = pre_reap_unavailability(&manifest) {
         // This is declared transport feasibility, established before launching
         // the workload. Never route a failed collection through this branch.
-        for i in [0, 2, 6, 7] {
+        for i in [0, 2, 5, 6, 7, 8, 9] {
             progress.report.results[i] = row(i, TestOutcome::Unsupported(reason.clone()), &config);
             progress
                 .details
-                .insert(ROWS[i].into(), pending_details(i, &reason));
+                .insert(ROWS[i].into(), pending_details(i, &reason, &config));
         }
         progress.report.lifecycle_notes.push(reason);
     } else {
@@ -282,7 +283,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                                 row(i, TestOutcome::Absent(reason.into()), &config);
                             progress
                                 .details
-                                .insert(ROWS[i].into(), pending_details(i, reason));
+                                .insert(ROWS[i].into(), pending_details(i, reason, &config));
                         }
                         break;
                     }
@@ -294,7 +295,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                                 row(i, TestOutcome::Unsupported(reason.clone()), &config);
                             progress
                                 .details
-                                .insert(ROWS[i].into(), pending_details(i, &reason));
+                                .insert(ROWS[i].into(), pending_details(i, &reason, &config));
                         }
                         if let Some(summary) = &mut progress.report.storage_summary {
                             summary.allocation_source = "unavailable".into();
@@ -314,6 +315,23 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         if !interrupted && !collection_failed && progress.curve_trials.len() == repetitions as usize
         {
             finalize(&mut progress, &config)?;
+            progress.finalized.extend([0, 2]);
+        }
+        if !interrupted && collection_failed {
+            for id in [5, 8, 9] {
+                if !matches!(progress.report.results[id].outcome, TestOutcome::Absent(_)) {
+                    let reason = format!(
+                        "task-incomplete: shared storage task prerequisite: {}",
+                        outcome_reason(&progress.report.results[0].outcome).unwrap_or_default()
+                    );
+                    progress.report.results[id] =
+                        row(id, TestOutcome::Error(reason.clone()), &config);
+                    progress
+                        .details
+                        .entry(ROWS[id].into())
+                        .and_modify(|d| d["reason"] = json!(reason));
+                }
+            }
         }
     }
     capture_provider(&mut progress).await?;
@@ -356,8 +374,79 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             }
         }
     }
+    if !interrupted && !collection_failed && progress.curve_trials.len() == repetitions as usize {
+        capture_provider(&mut progress).await?;
+        progress.active_engine = None;
+        for id in [5, 8, 9] {
+            let collection = async {
+                match id {
+                    5 => {
+                        lifecycle::collect_delete(
+                            &manifest,
+                            &config,
+                            &manifest_hash,
+                            &workflow,
+                            &persistence.profile_path,
+                            repetitions,
+                            n,
+                            &mut progress,
+                        )
+                        .await
+                    }
+                    8 => {
+                        lifecycle::collect_crash(
+                            &manifest,
+                            &config,
+                            &manifest_hash,
+                            &persistence.profile_path,
+                            if options.profile == Profile::Quick {
+                                1
+                            } else {
+                                3
+                            },
+                            n,
+                            &mut progress,
+                        )
+                        .await
+                    }
+                    _ => {
+                        lifecycle::collect_resume(
+                            &manifest,
+                            &config,
+                            &manifest_hash,
+                            &persistence.profile_path,
+                            repetitions,
+                            n,
+                            &mut progress,
+                        )
+                        .await
+                    }
+                }
+            };
+            match tokio::time::timeout_at(deadline_at, collection).await {
+                Err(_) => {
+                    interrupted = true;
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let reason = format!("task-incomplete: {e}");
+                    progress.report.results[id] =
+                        row(id, TestOutcome::Error(reason.clone()), &config);
+                    progress
+                        .details
+                        .entry(ROWS[id].into())
+                        .and_modify(|d| d["reason"] = json!(reason));
+                }
+                Ok(Ok(())) => {}
+            }
+            progress.finalized.insert(id);
+        }
+    }
     if interrupted {
         for (i, _slug) in ROWS.iter().enumerate() {
+            if progress.finalized.contains(&i) {
+                continue;
+            }
             let reason =
                 if [0, 2].contains(&i) && progress.curve_trials.len() == repetitions as usize {
                     "deadline interrupted final evaluation"
@@ -697,6 +786,7 @@ async fn collect_repetition(
         engine,
         server,
         mut driver,
+        ..
     } = start_scripted_pillar_runtime(
         manifest,
         manifest_hash,
@@ -1590,13 +1680,25 @@ fn bind_evidence(
             last_record: None,
         },
     ];
-    for id in [ROWS[0], ROWS[2], ROWS[6], ROWS[7]] {
+    for id in [
+        ROWS[0], ROWS[2], ROWS[5], ROWS[6], ROWS[7], ROWS[8], ROWS[9],
+    ] {
         if let Some(trials) = details
             .get_mut(id)
             .and_then(|d| d.get_mut("trials"))
             .and_then(Value::as_array_mut)
         {
             for trial in trials {
+                // L13 rebuilds shared-task references, including its handling of
+                // missing S8 blobs. Only L6 carries additional command receipts.
+                let existing = if [ROWS[5], ROWS[8], ROWS[9]].contains(&id) {
+                    trial["evidence_refs"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let mut trial_refs = refs.clone();
                 if id == ROWS[7] {
                     if let Some(blobs) = trial["diagnostics"]["body_blobs"].as_array() {
@@ -1619,6 +1721,12 @@ fn bind_evidence(
                     }
                 }
                 trial["evidence_refs"] = serde_json::to_value(&trial_refs)?;
+                let bound_refs = trial["evidence_refs"].as_array_mut().unwrap();
+                for reference in existing {
+                    if !bound_refs.contains(&reference) {
+                        bound_refs.push(reference);
+                    }
+                }
             }
         }
     }
@@ -2072,7 +2180,7 @@ fn record_collection_failure(progress: &mut Progress, config: &StorageConfig, er
         progress.report.results[i] = row(i, TestOutcome::Error(reason.clone()), config);
         progress
             .details
-            .insert(ROWS[i].into(), pending_details(i, &reason));
+            .insert(ROWS[i].into(), pending_details(i, &reason, config));
     }
     progress.report.lifecycle_notes.push(reason);
 }
@@ -2080,6 +2188,78 @@ fn record_collection_failure(progress: &mut Progress, config: &StorageConfig, er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_preserves_lifecycle_receipts_without_restoring_missing_retention_blobs() -> Result<()>
+    {
+        let output =
+            std::env::temp_dir().join(format!("ahrb-binding-{}", monotonic_timestamp_ns()));
+        std::fs::create_dir(&output)?;
+        for file in [
+            "storage-log-audit.jsonl",
+            "storage-request-bodies.jsonl",
+            "kill.json",
+        ] {
+            std::fs::write(output.join(file), b"")?;
+        }
+        let reference = |file: &str| EvidenceRef {
+            file: file.into(),
+            sha256: retention::digest(b""),
+            first_record: None,
+            last_record: None,
+        };
+        let mut retention = serde_json::to_value(RowDetails {
+            measurement_label: MEASUREMENT_LABEL.into(),
+            reason: Some("deadline".into()),
+            trials: vec![Trial {
+                repetition: 1,
+                outcome: TestOutcome::Error("deadline".into()),
+                measurement_complete: false,
+                reason: Some("deadline".into()),
+                summary: RetentionSummary::default(),
+                diagnostics: RetentionDiagnostics {
+                    coverage: Coverage::CaptureError,
+                    body_blobs: vec![BodyBlob {
+                        path: "missing.bin".into(),
+                        ..Default::default()
+                    }],
+                    baseline_exclusions: Vec::new(),
+                    match_refs: Vec::new(),
+                },
+                evidence_refs: vec![reference("missing.bin")],
+            }],
+        })?;
+        retention["matches"] = json!([]);
+        let crash = serde_json::to_value(RowDetails {
+            measurement_label: MEASUREMENT_LABEL.into(),
+            reason: None,
+            trials: vec![Trial {
+                repetition: 1,
+                outcome: TestOutcome::Pass,
+                measurement_complete: true,
+                reason: None,
+                summary: CrashSummary::default(),
+                diagnostics: CrashDiagnostics::default(),
+                evidence_refs: vec![reference("kill.json")],
+            }],
+        })?;
+        let mut details = BTreeMap::from([(ROWS[7].into(), retention), (ROWS[8].into(), crash)]);
+        let mut report = Report::default();
+        bind_evidence(&mut report, &mut details, &output)?;
+        bind_evidence(&mut report, &mut details, &output)?;
+        let refs = |id: usize| {
+            details[ROWS[id]]["trials"][0]["evidence_refs"]
+                .as_array()
+                .unwrap()
+        };
+        assert!(!refs(7).iter().any(|r| r["file"] == "missing.bin"));
+        assert_eq!(
+            refs(8).iter().filter(|r| r["file"] == "kill.json").count(),
+            1
+        );
+        std::fs::remove_dir_all(output)?;
+        Ok(())
+    }
 
     #[test]
     fn final_capture_rejects_late_unparsed_raw_receipt() {

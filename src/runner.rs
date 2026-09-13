@@ -2678,6 +2678,7 @@ struct ScriptedPillarRuntime {
     engine: Arc<FakeModelEngine>,
     server: ModelServer,
     driver: HarnessDriver,
+    storage_pre_start: Option<crate::storage::accounting::SettledInventory>,
 }
 
 async fn start_scripted_pillar_runtime(
@@ -2701,10 +2702,12 @@ async fn start_scripted_pillar_runtime(
         pillar,
         task_workspace,
         engine,
+        false,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_scripted_pillar_runtime_with_engine(
     manifest: &Manifest,
     manifest_hash: &str,
@@ -2713,6 +2716,7 @@ async fn start_scripted_pillar_runtime_with_engine(
     pillar: &str,
     task_workspace: Option<&Path>,
     engine: Arc<FakeModelEngine>,
+    capture_pre_start: bool,
 ) -> Result<ScriptedPillarRuntime> {
     let (server, model_environment) = start_model(
         Arc::clone(&engine),
@@ -2809,6 +2813,18 @@ async fn start_scripted_pillar_runtime_with_engine(
         false,
         outer_turn_timeout(manifest),
     )?;
+    let storage_pre_start = if capture_pre_start {
+        Some(
+            crate::storage::accounting::settle(
+                profile_root,
+                &manifest.storage.clone().unwrap_or_default(),
+                monotonic_timestamp_ns(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     driver
         .start()
         .await
@@ -2820,6 +2836,7 @@ async fn start_scripted_pillar_runtime_with_engine(
         engine,
         server,
         driver,
+        storage_pre_start,
     })
 }
 
@@ -2838,6 +2855,7 @@ async fn run_economy_inner(
         engine,
         server,
         mut driver,
+        ..
     } = start_scripted_pillar_runtime(
         &manifest,
         &manifest_hash,
@@ -3313,6 +3331,7 @@ async fn execute_fidelity_run(
             "fidelity",
             (manifest.transport.kind != TransportKind::Exec).then_some(task_workspace),
             engine,
+            false,
         ),
     )
     .await
@@ -9590,6 +9609,8 @@ async fn collect_child_failure_trials(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SignalMatrixCase {
+    /// Storage S9 uses the uncatchable fault with an exit-only receipt.
+    Sigkill,
     Sigterm,
     Sigint2,
     Sighup,
@@ -9599,6 +9620,7 @@ enum SignalMatrixCase {
 impl SignalMatrixCase {
     fn label(self) -> &'static str {
         match self {
+            Self::Sigkill => "sigkill",
             Self::Sigterm => "sigterm",
             Self::Sigint2 => "sigint2",
             Self::Sighup => "sighup",
@@ -9609,6 +9631,7 @@ impl SignalMatrixCase {
     #[cfg(unix)]
     fn unix_signal(self) -> Option<i32> {
         match self {
+            Self::Sigkill => Some(libc::SIGKILL),
             Self::Sigterm => Some(libc::SIGTERM),
             Self::Sigint2 => Some(libc::SIGINT),
             Self::Sighup => Some(libc::SIGHUP),
