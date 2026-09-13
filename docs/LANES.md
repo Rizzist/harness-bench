@@ -230,6 +230,17 @@ Record: pre-integration verified tree = `6f4f2e5` + diff sha256 `846494ec…` (c
 
 Record: verified tree = `c46a5bd` + diff sha256 `f6cc507e9984266eaa6833ccbeec33482a6720aae2fc50fdd1587e81d9f52aca`. Raw evidence: harness `state/lanes/l12-codex-plugins-capture/` (outside Git). Pending lanes must rebase to pick up the fix for their codex rows.
 
+## L13 `l13-master-s7s8-finalization` (unplanned regression fix, 2026-09-14)
+
+- [x] Trigger: L6's integration worker cross-checked its merged tree and found completed-run S7/S8 reporting ERROR `collector-not-implemented` on master `857f457`, contradicting L4's recorded S8 PASS at `18e3e60` — a regression from the L7a landing (interrupted-path repair had displaced completed-run finalization)
+- [x] Implement (GPT6-Astra `01a0985b-1278-7900-8c81-59d3476ffed9`): reproduction CONFIRMED at 857f457; minimal repair restores completed-run S7 auxiliary trials (declared UNSUPPORTED with measured auxiliaries) and S8 retention PASS; `preserve_partial_trial` byte-identical to base
+- [x] Code + computer-use verification (GPT6-Astra `01a098c9-3aad-77f0-88e1-a90822c478b5` **SHIP** bound to 857f457 + diff a716e804…): build/fmt/clippy/focused tests, fresh daemon+exec transport audits confirming S7/S8/S4/S5 outcomes
+- [x] Complete: commit `33ad06a`, fast-forwarded onto `master`, pushed (branch tip = master tip; landed tree byte-identical to verified tree)
+
+Separate pre-existing finding (NOT this lane, explicitly non-blocking): `mock_full_matrix` row 29 long-horizon final-plateau `trustworthy=false` under machine load, demonstrated on clean 857f457 (3 reproductions incl. clean-base); follow-up routed to lane L10 measurement verification.
+
+Record: verified tree = `857f457` + diff sha256 `a716e804e50e2adc172722a141a3857d6bcecc2dddbc8cdaf9b791859caaec82`. Raw evidence: harness `state/lanes/l13-master-s7s8-finalization/` (outside Git).
+
 ## L8 `l8-references-macmini`
 
 - [ ] Worktree
