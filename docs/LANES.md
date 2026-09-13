@@ -263,6 +263,17 @@ Record: candidate verified tree = `b22e569` + diff sha256 `462527a2…`; integra
 
 Record: candidate verified tree = `205b8de` + diff sha256 `b56ff3ab…`; integrated tree `e27330cf…` at `7c333a4`. Raw evidence: harness `state/lanes/l5-storage-s2-durability/` (outside Git).
 
+## L14 `l14-sweep-baseline-tolerance` (unplanned measurement-validity fix, 2026-09-14)
+
+- [x] Trigger: an owner-requested haider 0.0.970-vs-0.0.971 benchmark showed 971 losing matrix rows 26/27/28 to `ERROR: resource sweep N=1 steady memory ... is below baseline ...` and failing row 25 on the same inversion — 16,384 bytes, one 16 KiB page. Investigation found the defect was AHRB's: `sampler.rs:552` rejected any `steady < baseline` with zero tolerance while `sampler.rs:600` computed `steady.saturating_sub(baseline)` against `SCALING_NOISE_FLOOR_BYTES` (4 MiB) and treated the identical condition as noise — the analysis path anticipated what the validation path refused to admit
+- [x] Implement (GPT6-Astra `01a09be2-067b-7043-9516-d660868e2ac8`): admit inversions within `min(4 MiB, baseline/20)` (669 KiB at the observed baseline, 6.1x tighter than inheriting the noise floor), clamp the active delta at zero, and publish `baseline_inversion_bytes` / `baseline_inversion_tolerance_bytes` as typed diagnostics; larger inversions still error; no PASS oracle weakened
+- [x] Code + computer-use verification (GPT6-Astra `01a09bf3-d824-7e12-835d-ef10ddc9c983` **SHIP**): 365 library tests, real matrix runs against haider 0.0.971 (rows 25-27 PASS, row 28 FAILs on merit) and rick v0.1.18 (rows 25-28 still PASS, no regression), the one modified existing test judged legitimate contract adaptation, and — since no live inversion occurred in either run — explicit confirmation that the executed tests, not the CLI runs, prove the exact 16 KiB admission, the clamping, and beyond-tolerance rejection
+- [x] Complete: commit `5698ea8`, fast-forwarded onto `master`, pushed (verified tree = landed tree; master had not moved)
+
+Consequence: haider 0.0.971 now has scaling characterisation it could not previously produce — parallel beta 0.130 MiB/agent (970: 0.161), flat curve with alpha legitimately unfitted below the noise floor — and row 28's thread-reclaim failure, previously masked by the sweep ERROR, became visible on merit.
+
+Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
+
 ## L8 `l8-references-macmini`
 
 - [ ] Worktree
