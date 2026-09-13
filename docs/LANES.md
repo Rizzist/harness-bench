@@ -71,7 +71,7 @@ Resume procedure: the harness checklist's BLOCKER section lists the per-lane res
 | L2 `l2-storage-core-s1-s3` | Storage pillar plumbing: `ahrb run --pillar storage`, `hbench storage <harness>`, manifest `[storage]` parsing/validation, run-root allocated-block accounting with settle/sync, standardized 100-turn storage driver, S1 write volume + amplification, S3 footprint curve/shape; `storage_summary` in `report.json`/`report.md`; mock positive/negative evidence and tests | L1 | **complete** (SHIP, landed `e24aeba`) |
 | L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | **complete** (SHIP, landed `2241d82`) |
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | **complete** (SHIP, landed `18e3e60`) |
-| L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
+| L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | **complete** (SHIP, landed `7c333a4`) |
 | L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | **complete** (SHIP, landed `9d2243e`) |
 | L7a `l7a-storage-collector-results` | Split out 2026-09-07: codex terminal-before-reap collector fix, codex volatile-area rule, pi sessions revisit, saved-index/`hbench diff` storage integration | L2 | in progress (blocked) |
 | L8a `l8a-reference-runner` | Split out 2026-09-07: `scripts/reference-run.sh` (six harnesses x four pillars, pre-flight, resumable, honest exit), `scripts/reference-tables.py`, tests, handoff docs; verified on mocks | L2 | **complete** (SHIP, landed `8cc1e8d`) |
@@ -250,6 +250,18 @@ Record: verified tree = `857f457` + diff sha256 `a716e804e50e2adc172722a141a3857
 - [x] Complete: commits `9a1c9fa` + `9d2243e`, fast-forwarded onto `master`, pushed
 
 Record: candidate verified tree = `b22e569` + diff sha256 `462527a2…`; integrated tree `88ebbee6…` at `9d2243e`. Raw evidence: harness `state/lanes/l6-storage-s6-s9-s10/` (outside Git).
+
+## L5 `l5-storage-s2-durability` — completion record (2026-09-14)
+
+- [x] Implement (GPT6-Astra, three passes): S2 write durability and fsync cost across daemon and exec transports. verify-2 found two defects (auto-save rejected disposable preflight helper links leaving no index; newline-only record file panicked the parser) — both repaired in pass 3
+- [x] Candidate verification (GPT6-Astra `01a09776-8e71-7723-a30d-81260a78c79c` **SHIP**: 502 tests, both repairs re-verified, the three CLI cases verify-2 had left unexecuted (exec-extra, loss-daemon, loss-exec) all executed, 154/154 saved-bundle files hash-matched; codex row accepted BLOCKED pre-L12-manifest)
+- [x] Integration onto `316c4e1` (single pass, GPT6-Astra `01a09a57-6d31-7993-bccd-5bc027ec8cf6`): rebased across L3/L4/L12/L7a/L13/L6, 399-test battery green, daemon acceptance run exited **0 with no ERROR/FAIL rows** — S2 measured 5.4 fsync calls/turn
+- [x] Post-integration verification (GPT6-Astra `01a09aa6-2ccf-7382-9ea3-7a1aa13bf3c1` **SHIP** bound to `7c333a4`, tree `e27330cf…`): 573 tests, **both mock transports report all ten rows with no placeholders**, later-deadline preservation and interrupted reconstruction both confirmed, real codex and pi executed and audited
+- [x] Complete: commit `7c333a4`, fast-forwarded onto `master`, pushed
+
+**With S2 landed the ten-row storage pillar (S1-S10) is implemented, verified and on master.**
+
+Record: candidate verified tree = `205b8de` + diff sha256 `b56ff3ab…`; integrated tree `e27330cf…` at `7c333a4`. Raw evidence: harness `state/lanes/l5-storage-s2-durability/` (outside Git).
 
 ## L8 `l8-references-macmini`
 
