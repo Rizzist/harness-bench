@@ -315,7 +315,6 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         if !interrupted && !collection_failed && progress.curve_trials.len() == repetitions as usize
         {
             finalize(&mut progress, &config)?;
-            progress.finalized.extend([0, 2]);
         }
         if !interrupted && collection_failed {
             for id in [5, 8, 9] {
@@ -443,22 +442,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         }
     }
     if interrupted {
-        for (i, _slug) in ROWS.iter().enumerate() {
-            if progress.finalized.contains(&i) {
-                continue;
-            }
-            let reason =
-                if [0, 2].contains(&i) && progress.curve_trials.len() == repetitions as usize {
-                    "deadline interrupted final evaluation"
-                } else {
-                    "deadline"
-                };
-            progress.report.results[i] = row(i, TestOutcome::Error(reason.into()), &config);
-            progress
-                .details
-                .entry(ROWS[i].into())
-                .and_modify(|v| v["reason"] = json!(reason));
-        }
+        mark_interrupted_rows(&mut progress, &config, repetitions);
         crate::report::write_failure_diagnostic(
             &options.output,
             &options.manifest,
@@ -1392,6 +1376,24 @@ fn record_boundary(
     }
 }
 
+fn mark_interrupted_rows(progress: &mut Progress, config: &StorageConfig, repetitions: u32) {
+    for (i, _slug) in ROWS.iter().enumerate() {
+        if progress.finalized.contains(&i) {
+            continue;
+        }
+        let reason = if [0, 2].contains(&i) && progress.curve_trials.len() == repetitions as usize {
+            "deadline interrupted final evaluation"
+        } else {
+            "deadline"
+        };
+        progress.report.results[i] = row(i, TestOutcome::Error(reason.into()), config);
+        progress
+            .details
+            .entry(ROWS[i].into())
+            .and_modify(|v| v["reason"] = json!(reason));
+    }
+}
+
 fn finalize(progress: &mut Progress, config: &StorageConfig) -> Result<()> {
     let summary = progress
         .report
@@ -1539,6 +1541,8 @@ fn finalize(progress: &mut Progress, config: &StorageConfig) -> Result<()> {
             .write_bytes_per_turn_p95
             .map(|b| disk_class(b).into());
     }
+    // All shared rows have been evaluated, even when an outcome is unavailable.
+    progress.finalized.extend([0, 2, 6, 7]);
     Ok(())
 }
 
@@ -2768,102 +2772,139 @@ mod retirement_error_tests {
         Ok(())
     }
 
+    fn complete_shared_progress(class: GrowthClass, config: &StorageConfig) -> Result<Progress> {
+        let mut progress = Progress {
+            output: PathBuf::new(),
+            active_engine: None,
+            report: Report {
+                results: (0..10)
+                    .map(|i| row(i, TestOutcome::Error("pending".into()), config))
+                    .collect(),
+                storage_summary: Some(StorageSummary {
+                    turn_budget: 100,
+                    repetitions: 3,
+                    counter_source: counter_source().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            write_trials: Vec::new(),
+            curve_trials: Vec::new(),
+            details: BTreeMap::new(),
+            finalized: BTreeSet::new(),
+            auxiliary_trials: Vec::new(),
+            retention_trials: Vec::new(),
+        };
+        for repetition in 1..=3 {
+            progress.write_trials.push(Trial {
+                repetition,
+                outcome: TestOutcome::Error("missing receipt".into()),
+                measurement_complete: false,
+                reason: Some("missing receipt".into()),
+                summary: WriteSummary::default(),
+                diagnostics: WriteDiagnostics::default(),
+                evidence_refs: Vec::new(),
+            });
+            let points = checkpoints(100)
+                .into_iter()
+                .map(|turn| Checkpoint {
+                    turn,
+                    allocated_bytes: 4096
+                        + if class == GrowthClass::Superlinear {
+                            4096 * u64::from(turn).pow(2)
+                        } else {
+                            0
+                        },
+                })
+                .collect::<Vec<_>>();
+            let (evaluated, slope, diagnostics) = evaluate_curve(&points, 100)?;
+            assert_eq!(evaluated, class);
+            progress.curve_trials.push(Trial {
+                repetition,
+                outcome: if class == GrowthClass::Bounded {
+                    TestOutcome::Pass
+                } else {
+                    TestOutcome::Fail("shape".into())
+                },
+                measurement_complete: true,
+                reason: None,
+                summary: FootprintSummary {
+                    growth_class: Some(class),
+                    footprint_slope_bytes_per_turn: Some(slope),
+                    first_turn_allocated_bytes: Some(points[1].allocated_bytes as f64),
+                    ..Default::default()
+                },
+                diagnostics,
+                evidence_refs: Vec::new(),
+            });
+            let snapshots = checkpoints(100)
+                .into_iter()
+                .map(|turn| (turn, accounting::Inventory::default()))
+                .collect::<Vec<_>>();
+            progress
+                .auxiliary_trials
+                .push(auxiliaries::evaluate(repetition, 100, &snapshots, config)?);
+            progress.retention_trials.push(Trial {
+                repetition,
+                outcome: TestOutcome::Pass,
+                measurement_complete: true,
+                reason: None,
+                summary: RetentionSummary {
+                    request_retention_class: Some(RetentionClass::Full),
+                    stored_request_bytes: Some(100),
+                    unique_request_content_bytes: Some(50),
+                    stored_unique_ratio: Some(2.0),
+                },
+                diagnostics: RetentionDiagnostics {
+                    coverage: Coverage::Complete,
+                    body_blobs: Vec::new(),
+                    baseline_exclusions: Vec::new(),
+                    match_refs: Vec::new(),
+                },
+                evidence_refs: Vec::new(),
+            });
+        }
+        Ok(progress)
+    }
+
+    #[test]
+    fn later_lifecycle_deadline_preserves_finalized_shared_rows() -> Result<()> {
+        let config = StorageConfig::default();
+        let mut progress = complete_shared_progress(GrowthClass::Bounded, &config)?;
+        finalize(&mut progress, &config)?;
+        let before = serde_json::to_value(&progress.report)?;
+        mark_interrupted_rows(&mut progress, &config, 3);
+        preserve_partial_trial(&mut progress, &config);
+        let after = serde_json::to_value(&progress.report)?;
+        for id in [0, 2, 6, 7] {
+            assert_eq!(before["results"][id], after["results"][id]);
+        }
+        assert!(matches!(
+            progress.report.results[6].outcome,
+            TestOutcome::Unsupported(_)
+        ));
+        assert_eq!(progress.report.results[7].outcome, TestOutcome::Pass);
+        assert!(progress.report.results[6].metadata.measurement_complete);
+        assert!(progress.report.results[7].metadata.measurement_complete);
+        assert_eq!(before["storage_summary"], after["storage_summary"]);
+        assert_eq!(progress.auxiliary_trials.len(), 3);
+        assert_eq!(progress.retention_trials.len(), 3);
+        for id in [1, 3, 4, 5, 8, 9] {
+            assert_eq!(
+                progress.report.results[id].outcome,
+                TestOutcome::Error("deadline".into())
+            );
+            assert!(!progress.report.results[id].metadata.measurement_complete);
+        }
+        Ok(())
+    }
+
     #[test]
     fn missing_physical_evidence_preserves_complete_shared_rows_without_a_disk_class() -> Result<()>
     {
         let config = StorageConfig::default();
         for class in [GrowthClass::Bounded, GrowthClass::Superlinear] {
-            let mut progress = Progress {
-                output: PathBuf::new(),
-                active_engine: None,
-                report: Report {
-                    results: (0..10)
-                        .map(|i| row(i, TestOutcome::Error("pending".into()), &config))
-                        .collect(),
-                    storage_summary: Some(StorageSummary {
-                        turn_budget: 100,
-                        repetitions: 3,
-                        counter_source: counter_source().into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                write_trials: Vec::new(),
-                curve_trials: Vec::new(),
-                details: BTreeMap::new(),
-                finalized: BTreeSet::new(),
-                auxiliary_trials: Vec::new(),
-                retention_trials: Vec::new(),
-            };
-            for repetition in 1..=3 {
-                progress.write_trials.push(Trial {
-                    repetition,
-                    outcome: TestOutcome::Error("missing receipt".into()),
-                    measurement_complete: false,
-                    reason: Some("missing receipt".into()),
-                    summary: WriteSummary::default(),
-                    diagnostics: WriteDiagnostics::default(),
-                    evidence_refs: Vec::new(),
-                });
-                let points = checkpoints(100)
-                    .into_iter()
-                    .map(|turn| Checkpoint {
-                        turn,
-                        allocated_bytes: 4096
-                            + if class == GrowthClass::Superlinear {
-                                4096 * u64::from(turn).pow(2)
-                            } else {
-                                0
-                            },
-                    })
-                    .collect::<Vec<_>>();
-                let (evaluated, slope, diagnostics) = evaluate_curve(&points, 100)?;
-                assert_eq!(evaluated, class);
-                progress.curve_trials.push(Trial {
-                    repetition,
-                    outcome: if class == GrowthClass::Bounded {
-                        TestOutcome::Pass
-                    } else {
-                        TestOutcome::Fail("shape".into())
-                    },
-                    measurement_complete: true,
-                    reason: None,
-                    summary: FootprintSummary {
-                        growth_class: Some(class),
-                        footprint_slope_bytes_per_turn: Some(slope),
-                        first_turn_allocated_bytes: Some(points[1].allocated_bytes as f64),
-                        ..Default::default()
-                    },
-                    diagnostics,
-                    evidence_refs: Vec::new(),
-                });
-                let snapshots = checkpoints(100)
-                    .into_iter()
-                    .map(|turn| (turn, accounting::Inventory::default()))
-                    .collect::<Vec<_>>();
-                progress
-                    .auxiliary_trials
-                    .push(auxiliaries::evaluate(repetition, 100, &snapshots, &config)?);
-                progress.retention_trials.push(Trial {
-                    repetition,
-                    outcome: TestOutcome::Pass,
-                    measurement_complete: true,
-                    reason: None,
-                    summary: RetentionSummary {
-                        request_retention_class: Some(RetentionClass::Full),
-                        stored_request_bytes: Some(100),
-                        unique_request_content_bytes: Some(50),
-                        stored_unique_ratio: Some(2.0),
-                    },
-                    diagnostics: RetentionDiagnostics {
-                        coverage: Coverage::Complete,
-                        body_blobs: Vec::new(),
-                        baseline_exclusions: Vec::new(),
-                        match_refs: Vec::new(),
-                    },
-                    evidence_refs: Vec::new(),
-                });
-            }
+            let mut progress = complete_shared_progress(class, &config)?;
             finalize(&mut progress, &config)?;
             assert!(matches!(
                 &progress.report.results[6].outcome,

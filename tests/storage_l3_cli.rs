@@ -60,6 +60,14 @@ fn interrupted_both_transport_bundles_preserve_rotations_and_body_mappings() {
         let s7: RowDetails<AuxiliarySummary, AuxiliaryDiagnostics> =
             serde_json::from_value(report.details[ROWS[6]].clone()).unwrap();
         assert!(!s7.trials.is_empty());
+        assert!(!report.results[6].metadata.measurement_complete);
+        assert!(!report.results[7].metadata.measurement_complete);
+        assert!(s7.trials.iter().all(|trial| !trial.measurement_complete));
+        assert!(
+            s7.trials
+                .iter()
+                .all(|trial| matches!(trial.outcome, TestOutcome::Error(_)))
+        );
         assert!(
             s7.trials[0]
                 .diagnostics
