@@ -113,6 +113,21 @@ post-turn retained Iₙ−B; post-close residual max(0,Rₙ−B); residual/agent
 `(Sₙ−Rₙ)/(Sₙ−B)` clamped 0–1; tree CPU/scripted-turn; barrier idle CPU. Keep raw series +
 PID membership.
 
+Sweep admission tolerates a steady median below its separate warm-baseline median only
+when `B-S_n <= min(4 MiB, floor(B/20))` (inclusive). The relative bound matches the 5%
+plateau stability envelope; the absolute cap is the existing scaling noise floor.
+This is an admission bound, not a confidence interval or a PASS allowance. Preserve raw
+B and S_n and report `baseline_inversion_bytes=max(0,B-S_n)`, the applied
+`baseline_inversion_tolerance_bytes`, and `active_delta_bytes=max(0,S_n-B)` in typed
+sweep point metrics and numeric resource metrics (including repetition distributions).
+Average added memory uses that nonnegative active delta. Missing diagnostics in older
+reports are unavailable. Larger inversions remain validation errors. A workload lifecycle
+peak below its included steady plateau remains invalid. An admitted zero active delta
+has no logarithm: an entirely sub-noise sweep retains the existing flat-curve treatment;
+a mixed above-noise sweep keeps alpha unavailable and cannot pass row 27. Such a
+repetition must not be hidden by aggregating other repetitions. Zero active delta cannot
+satisfy the reclaim-ratio oracle. All existing resource PASS thresholds remain unchanged.
+
 v1 reference envelope (small-host): N=8 completes; cold whole-tree peak ≤4 GiB; β ≤256
 MiB/agent; α ≤1.20; reclaim ≥80%; residual ≤max(64 MiB, 20% of active delta); barrier idle
 CPU <5% of one core; CPU ≤250 ms/scripted turn.

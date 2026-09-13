@@ -1512,7 +1512,7 @@ impl<'a> Analysis<'a> {
         let points: Vec<SweepPoint> = self.sweep_points.values().copied().collect();
         if !points.is_empty() {
             match SweepMetrics::calculate(&points) {
-                Ok(metrics) => {
+                Ok(mut metrics) => {
                     if let Some(beta) = metrics.headline_beta_bytes_per_agent {
                         self.metrics
                             .insert("parallel_beta_bytes_per_agent".to_owned(), beta);
@@ -1536,9 +1536,20 @@ impl<'a> Analysis<'a> {
                     for (point, derived) in &metrics.points {
                         self.record_sweep_point_metrics(*point, *derived);
                     }
-                    if let Err(error) = self.record_sweep_repetition_distributions() {
-                        self.sweep_error = Some(error.to_string());
-                        return;
+                    match self.record_sweep_repetition_distributions() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // A clamped repetition with other widths above the noise
+                            // floor cannot support log(0). Retain the sweep, but do not
+                            // let aggregation hide its unavailable alpha from row 27.
+                            metrics.scaling_exponent_alpha = None;
+                            metrics.scaling_curve_within_noise_floor = false;
+                            self.metrics.remove("parallel_scaling_exponent");
+                        }
+                        Err(error) => {
+                            self.sweep_error = Some(error.to_string());
+                            return;
+                        }
                     }
                     self.sweep_metrics = Some(metrics);
                 }
@@ -2408,6 +2419,19 @@ impl<'a> Analysis<'a> {
         ] {
             self.metrics.insert(format!("{prefix}_{suffix}"), value);
         }
+        for (suffix, value) in [
+            ("active_delta_bytes", derived.active_delta_bytes),
+            ("baseline_inversion_bytes", derived.baseline_inversion_bytes),
+            (
+                "baseline_inversion_tolerance_bytes",
+                derived.baseline_inversion_tolerance_bytes,
+            ),
+        ] {
+            if let Some(value) = value {
+                self.metrics
+                    .insert(format!("{prefix}_{suffix}"), value as f64);
+            }
+        }
         if let Some(value) = derived.adjacent_marginal_bytes_per_agent {
             self.metrics
                 .insert(format!("{prefix}_adjacent_marginal_bytes_per_agent"), value);
@@ -2418,7 +2442,7 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    fn record_sweep_repetition_distributions(&mut self) -> Result<()> {
+    fn record_sweep_repetition_distributions(&mut self) -> Result<bool> {
         let mut repetitions = Vec::new();
         for repetition in 0..self.timing.repetitions {
             let points: Vec<SweepPoint> = self
@@ -2457,7 +2481,15 @@ impl<'a> Analysis<'a> {
             .iter()
             .filter_map(|metrics| metrics.scaling_exponent_alpha)
             .collect();
-        if alpha.len() != fitted.len() {
+        let alpha_complete = alpha.len() == fitted.len();
+        if fitted.iter().any(|metrics| {
+            metrics.scaling_exponent_alpha.is_none()
+                && !metrics.points.iter().any(|(_, derived)| {
+                    derived
+                        .baseline_inversion_bytes
+                        .is_some_and(|bytes| bytes > 0)
+                })
+        }) {
             return Err(AhrbError::Validation(
                 "scaling alpha requires a strictly positive active delta at every width and repetition"
                     .to_owned(),
@@ -2473,7 +2505,7 @@ impl<'a> Analysis<'a> {
             .collect();
         record_distribution(&mut self.metrics, "parallel_beta_bytes_per_agent", &beta);
         record_distribution(&mut self.metrics, "parallel_beta_mib_per_agent", &beta_mib);
-        if !alpha.is_empty() {
+        if alpha_complete && !alpha.is_empty() {
             record_distribution(&mut self.metrics, "parallel_scaling_exponent", &alpha);
         }
         record_distribution(&mut self.metrics, "maximum_cold_peak_bytes", &cold_peaks);
@@ -2521,6 +2553,18 @@ impl<'a> Analysis<'a> {
                 ] {
                     values.entry(name).or_default().push(value);
                 }
+                for (name, value) in [
+                    ("active_delta_bytes", derived.active_delta_bytes),
+                    ("baseline_inversion_bytes", derived.baseline_inversion_bytes),
+                    (
+                        "baseline_inversion_tolerance_bytes",
+                        derived.baseline_inversion_tolerance_bytes,
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        values.entry(name).or_default().push(value as f64);
+                    }
+                }
                 if let Some(value) = derived.adjacent_marginal_bytes_per_agent {
                     values
                         .entry("adjacent_marginal_bytes_per_agent")
@@ -2536,7 +2580,7 @@ impl<'a> Analysis<'a> {
                 );
             }
         }
-        Ok(())
+        Ok(alpha_complete)
     }
 
     fn insert_checks(&mut self, row: u8, assertions: Vec<Assertion>) {
@@ -3916,6 +3960,176 @@ mod tests {
             matches!(&row.outcome, TestOutcome::Fail(message) if message.contains(expected)),
             "unexpected row-29 outcome: {:?}",
             row.outcome
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_inversion_preserves_measurements_without_hiding_unfittable_repetition() -> Result<()>
+    {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let observation = evidence
+            .sweep
+            .iter()
+            .find(|observation| observation.agents == 1 && observation.identity.repetition == 0)
+            .expect("N1 repetition 0");
+        let steady = evidence
+            .series
+            .samples
+            .iter()
+            .find(|sample| sample.phase == observation.steady_phase)
+            .expect("steady sample")
+            .rss_bytes;
+        let baseline_phase = observation.baseline_phase.clone();
+        for sample in &mut evidence.series.samples {
+            if sample.phase == baseline_phase {
+                sample.rss_bytes = steady + 16_384;
+                sample.pss_bytes = Some(sample.rss_bytes);
+                sample.private_bytes = Some(sample.rss_bytes);
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let metrics = certification
+            .sweep_metrics
+            .as_ref()
+            .expect("admitted sweep");
+        assert!(metrics.headline_beta_bytes_per_agent.is_some());
+        assert_eq!(metrics.scaling_exponent_alpha, None);
+        assert!(!metrics.scaling_curve_within_noise_floor);
+        assert_eq!(
+            certification.metrics["parallel_n1_baseline_inversion_bytes_p95"],
+            16_384.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_baseline_inversion_bytes_median"],
+            0.0
+        );
+        assert!(
+            !certification
+                .metrics
+                .contains_key("parallel_scaling_exponent")
+        );
+        assert!(
+            !certification
+                .metrics
+                .contains_key("parallel_scaling_exponent_median")
+        );
+        for number in [26, 28] {
+            let row = certification
+                .rows
+                .iter()
+                .find(|row| row.row == number)
+                .expect("row");
+            assert!(
+                matches!(row.outcome, TestOutcome::Pass),
+                "{number}: {:?}",
+                row.outcome
+            );
+        }
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 27)
+            .expect("row 27");
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("scaling-alpha"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flat_inverted_sweep_is_measured_but_zero_active_cannot_pass_reclaim() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        for observation in &evidence.sweep {
+            for sample in &mut evidence.series.samples {
+                if sample.phase == observation.steady_phase {
+                    sample.rss_bytes = 100 * MIB - 16_384;
+                    sample.pss_bytes = Some(sample.rss_bytes);
+                    sample.private_bytes = Some(sample.rss_bytes);
+                }
+            }
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let metrics = certification
+            .sweep_metrics
+            .as_ref()
+            .expect("admitted flat sweep");
+        assert!(metrics.scaling_curve_within_noise_floor);
+        assert_eq!(metrics.scaling_exponent_alpha, None);
+        for number in [26, 27] {
+            assert!(
+                certification
+                    .rows
+                    .iter()
+                    .any(|row| row.row == number && matches!(row.outcome, TestOutcome::Pass))
+            );
+        }
+        for agents in [1, 2, 4] {
+            assert_eq!(
+                certification.metrics[&format!("parallel_n{agents}_baseline_inversion_bytes")],
+                16_384.0
+            );
+            assert_eq!(
+                certification.metrics[&format!("parallel_n{agents}_active_delta_bytes")],
+                0.0
+            );
+        }
+        assert_row_28_fails(&evidence, "reclaim-ratio")
+    }
+
+    #[test]
+    fn resource_sweep_still_rejects_over_budget_beta_alpha_and_missing_n8() -> Result<()> {
+        let evidence = passing_evidence(ResourceProfile::Cert)?;
+        for (number, check) in [(26, "headline-beta"), (27, "scaling-alpha")] {
+            let mut excessive = evidence.clone();
+            for observation in &excessive.sweep {
+                let agents = u64::from(observation.agents);
+                let added = if number == 26 {
+                    300 * agents * MIB
+                } else {
+                    20 * agents * agents * MIB
+                };
+                for sample in &mut excessive.series.samples {
+                    if sample.phase == observation.steady_phase {
+                        sample.rss_bytes = 100 * MIB + added;
+                        sample.pss_bytes = Some(sample.rss_bytes);
+                        sample.private_bytes = Some(sample.rss_bytes);
+                    }
+                }
+            }
+            let certification = evaluate_resources(
+                ResourceProfile::Cert,
+                &excessive,
+                &ResourceEnvelope::default(),
+            );
+            let row = certification
+                .rows
+                .iter()
+                .find(|row| row.row == number)
+                .expect("row");
+            assert!(matches!(&row.outcome, TestOutcome::Fail(message) if message.contains(check)));
+        }
+        let mut missing = evidence;
+        missing.sweep.retain(|observation| observation.agents != 8);
+        let certification = evaluate_resources(
+            ResourceProfile::Cert,
+            &missing,
+            &ResourceEnvelope::default(),
+        );
+        assert!(
+            certification
+                .rows
+                .iter()
+                .filter(|row| (26..=28).contains(&row.row))
+                .all(|row| matches!(row.outcome, TestOutcome::Error(_)))
         );
         Ok(())
     }

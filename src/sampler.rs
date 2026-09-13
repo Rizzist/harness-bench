@@ -477,7 +477,17 @@ pub struct SweepPoint {
 /// Derived measurements for one sweep point.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct PointMetrics {
-    /// `(S_n-B)/N`.
+    /// `max(0,S_n-B)`; zero is clamped when `baseline_inversion_bytes` is positive.
+    /// Absent in reports predating baseline-inversion diagnostics.
+    #[serde(default)]
+    pub active_delta_bytes: Option<u64>,
+    /// Observed `max(0,B-S_n)`; raw baseline and steady values remain unchanged.
+    #[serde(default)]
+    pub baseline_inversion_bytes: Option<u64>,
+    /// Inclusive admission bound: `min(4 MiB, floor(B/20))`.
+    #[serde(default)]
+    pub baseline_inversion_tolerance_bytes: Option<u64>,
+    /// `max(0,S_n-B)/N`.
     pub average_added_bytes_per_agent: f64,
     /// Marginal bytes per additional agent from the preceding N point.
     pub adjacent_marginal_bytes_per_agent: Option<f64>,
@@ -549,10 +559,20 @@ impl SweepMetrics {
                     point.agents
                 )));
             }
-            if point.steady_bytes < point.baseline_bytes {
+            let baseline_inversion_bytes = point.baseline_bytes.saturating_sub(point.steady_bytes);
+            // Separate phase medians can decrease within the existing 5% plateau
+            // stability envelope. Cap that relative allowance at the scaling noise
+            // floor; cadence alone supplies no defensible byte-rate error bound.
+            let baseline_inversion_tolerance_bytes =
+                (point.baseline_bytes / 20).min(SCALING_NOISE_FLOOR_BYTES);
+            if baseline_inversion_bytes > baseline_inversion_tolerance_bytes {
                 return Err(AhrbError::Validation(format!(
-                    "resource sweep N={} steady memory {} is below baseline {}",
-                    point.agents, point.steady_bytes, point.baseline_bytes
+                    "resource sweep N={} steady memory {} is below baseline {} by {} bytes (tolerance {} bytes)",
+                    point.agents,
+                    point.steady_bytes,
+                    point.baseline_bytes,
+                    baseline_inversion_bytes,
+                    baseline_inversion_tolerance_bytes
                 )));
             }
             if point.workload_peak_bytes < point.steady_bytes {
@@ -579,6 +599,9 @@ impl SweepMetrics {
             derived.push((
                 *point,
                 PointMetrics {
+                    active_delta_bytes: Some(active_delta),
+                    baseline_inversion_bytes: Some(baseline_inversion_bytes),
+                    baseline_inversion_tolerance_bytes: Some(baseline_inversion_tolerance_bytes),
                     average_added_bytes_per_agent,
                     adjacent_marginal_bytes_per_agent,
                     peak_amplification,
@@ -858,16 +881,23 @@ mod tests {
                 .iter()
                 .all(|(_, point)| point.reclaim_ratio == 1.0)
         );
+        for (raw, derived) in &metrics.points {
+            assert_eq!(derived.baseline_inversion_bytes, Some(0));
+            assert_eq!(
+                derived.active_delta_bytes,
+                Some(u64::from(raw.agents) * 20 * mib)
+            );
+        }
         assert_eq!(metrics.maximum_workload_peak_bytes, 171 * 1_048_576_u64);
         Ok(())
     }
 
     #[test]
-    fn sweep_rejects_impossible_steady_and_peak_relationships() {
+    fn sweep_rejects_large_inversions_and_impossible_peak_relationships() {
         let below_baseline = SweepPoint {
             agents: 1,
             baseline_bytes: 100,
-            steady_bytes: 99,
+            steady_bytes: 94,
             workload_peak_bytes: 100,
             cold_peak_bytes: 100,
             post_turn_bytes: 100,
@@ -885,6 +915,80 @@ mod tests {
             post_close_bytes: 100,
         };
         assert!(SweepMetrics::calculate(&[peak_below_steady]).is_err());
+    }
+
+    #[test]
+    fn sweep_admits_page_inversion_and_serializes_clamped_diagnostics() -> Result<()> {
+        let point = SweepPoint {
+            agents: 1,
+            baseline_bytes: 13_697_600,
+            steady_bytes: 13_681_216,
+            workload_peak_bytes: 14_000_000,
+            cold_peak_bytes: 15_000_000,
+            post_turn_bytes: 13_681_216,
+            post_close_bytes: 13_681_216,
+        };
+        let metrics = SweepMetrics::calculate(&[point])?;
+        let (raw, derived) = metrics.points[0];
+        assert_eq!(raw.steady_bytes, point.steady_bytes);
+        assert_eq!(raw.baseline_bytes, point.baseline_bytes);
+        assert_eq!(derived.active_delta_bytes, Some(0));
+        assert_eq!(derived.baseline_inversion_bytes, Some(16_384));
+        assert_eq!(derived.baseline_inversion_tolerance_bytes, Some(684_880));
+        assert_eq!(derived.average_added_bytes_per_agent, 0.0);
+        assert_eq!(derived.reclaim_ratio, 0.0);
+        assert!(metrics.scaling_curve_within_noise_floor);
+        assert_eq!(metrics.scaling_exponent_alpha, None);
+        let mut json = serde_json::to_value(derived)?;
+        assert_eq!(json["baseline_inversion_bytes"], 16_384);
+        assert_eq!(json["active_delta_bytes"], 0);
+        let object = json.as_object_mut().expect("point metrics object");
+        for name in [
+            "active_delta_bytes",
+            "baseline_inversion_bytes",
+            "baseline_inversion_tolerance_bytes",
+        ] {
+            object.remove(name);
+        }
+        let legacy: PointMetrics = serde_json::from_value(json)?;
+        assert_eq!(legacy.active_delta_bytes, None);
+        assert_eq!(legacy.baseline_inversion_bytes, None);
+        assert_eq!(legacy.baseline_inversion_tolerance_bytes, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_inversion_tolerance_has_inclusive_relative_and_absolute_bounds() -> Result<()> {
+        for baseline in [0, 19, 100, 13_697_600, 100 * 1_048_576, u64::MAX] {
+            let tolerance = (baseline / 20).min(SCALING_NOISE_FLOOR_BYTES);
+            let point = SweepPoint {
+                agents: 1,
+                baseline_bytes: baseline,
+                steady_bytes: baseline - tolerance,
+                workload_peak_bytes: baseline,
+                cold_peak_bytes: baseline,
+                post_turn_bytes: baseline,
+                post_close_bytes: baseline,
+            };
+            let metrics = SweepMetrics::calculate(&[point])?;
+            assert_eq!(
+                metrics.points[0].1.baseline_inversion_bytes,
+                Some(tolerance)
+            );
+            if point.steady_bytes > 0 {
+                let beyond = SweepPoint {
+                    steady_bytes: point.steady_bytes - 1,
+                    ..point
+                };
+                let error = SweepMetrics::calculate(&[beyond]).expect_err("beyond tolerance");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("tolerance {tolerance} bytes"))
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
