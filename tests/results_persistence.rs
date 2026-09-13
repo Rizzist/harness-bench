@@ -285,8 +285,16 @@ fn storage_auto_save_preserves_all_files_hashes_and_lifecycle_receipts() {
         );
         assert!(report.results[i].metadata.measurement_complete);
     }
-    // Pending later-lane rows remain visible as ERROR, hence completed-run exit 1.
-    assert_eq!(run.status.code(), Some(1));
+    // All ten collectors are implemented; unsupported declarations remain non-failing.
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| !matches!(r.outcome, TestOutcome::Error(_) | TestOutcome::Fail(_))),
+        "{:?}",
+        report.results
+    );
+    assert_eq!(run.status.code(), Some(0));
     let summary = report.storage_summary.as_ref().unwrap();
     assert_eq!(summary.closed_sessions, Some(60));
     assert_eq!(
@@ -357,4 +365,131 @@ fn storage_auto_save_preserves_all_files_hashes_and_lifecycle_receipts() {
     )
     .unwrap();
     // Preserve this substantial real CLI run outside Git for failure diagnosis and audits.
+}
+
+// The protected version-probe executable produces real S2 loader-refusal
+// receipts. A short deadline bounds the unrelated shared storage workload.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn storage_auto_save_preserves_native_s2_evidence_and_all_bundle_hashes() {
+    storage_auto_save_preserves_bundle(false);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn storage_auto_save_accepts_version_probe_home_helper_links() {
+    storage_auto_save_preserves_bundle(true);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn storage_auto_save_preserves_bundle(home_helper: bool) {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+
+    fn file_hashes(root: &Path, directory: &Path) -> BTreeMap<std::path::PathBuf, String> {
+        let mut hashes = BTreeMap::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                hashes.extend(file_hashes(root, &entry.path()));
+            } else {
+                assert!(kind.is_file());
+                hashes.insert(
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    format!("{:x}", Sha256::digest(std::fs::read(entry.path()).unwrap())),
+                );
+            }
+        }
+        hashes
+    }
+
+    let _guard = common::serialize_ahrb_subprocesses();
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-results-s2-{}-{}",
+        std::process::id(),
+        ahrb::fake_model::monotonic_timestamp_ns()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut manifest =
+        ahrb::manifest::load(&repository.join("adapters/mock/manifest.toml")).unwrap();
+    manifest.availability.exec_paths = vec!["/usr/bin/true".into()];
+    manifest.availability.version_probe = vec!["/usr/bin/true".into()];
+    if home_helper {
+        manifest.availability.exec_paths = vec!["/bin/sh".into()];
+        manifest.availability.version_probe = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "if [ \"$AHRB_DURABILITY_CONTROL_ONLY\" = 1 ]; then ln -s missing-helper \"$HOME/helper\" || exit 1; fi; printf 'version-probe-ok'".into(),
+        ];
+    }
+    let manifest_path = root.join("manifest.toml");
+    std::fs::write(&manifest_path, toml::to_string(&manifest).unwrap()).unwrap();
+    let primary = root.join("primary");
+    let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(repository)
+        .env("AHRB_RESULTS_ROOT", &root)
+        .env("AHRB_NO_SAVE", "0")
+        .args(["run", "--pillar", "storage", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--profile", "quick", "--deadline", "10", "--output"])
+        .arg(&primary)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    let index = std::fs::read_to_string(root.join("results/index.jsonl")).unwrap();
+    assert_eq!(index.lines().count(), 1);
+    let entry: IndexEntry = serde_json::from_str(index.lines().next().unwrap()).unwrap();
+    let saved_report = root.join(entry.report_path);
+    let saved = saved_report.parent().unwrap();
+    let primary_hashes = file_hashes(&primary, &primary);
+    assert_eq!(primary_hashes, file_hashes(saved, saved));
+    let launch: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(saved.join("durability-support/preflight/launch.json")).unwrap(),
+    )
+    .unwrap();
+    let home = Path::new(launch["isolated_home"].as_str().unwrap());
+    assert!(home.is_dir() && !home.starts_with(&primary) && !home.starts_with(saved));
+    assert!(!primary.join("durability-preflight-home").exists());
+    assert!(!saved.join("durability-preflight-home").exists());
+    if home_helper {
+        assert_eq!(launch["exit_code"], 0);
+        assert_eq!(launch["stdout"], "version-probe-ok");
+        assert!(home.join("helper").is_symlink());
+    }
+    for name in [
+        "durability-support/libahrb-durability.dylib",
+        "durability-support/libahrb-durability-control.dylib",
+        "durability-support/preflight/launch.json",
+    ] {
+        assert!(
+            primary_hashes.contains_key(Path::new(name)),
+            "missing {name}"
+        );
+    }
+    let report: Report = serde_json::from_slice(&std::fs::read(&saved_report).unwrap()).unwrap();
+    assert!(
+        matches!(&report.results[1].outcome, TestOutcome::Unsupported(reason)
+        if reason.starts_with("os-limited:"))
+    );
+    let details: ahrb::storage::evidence::DurabilityDetails =
+        serde_json::from_value(report.details["durability-cost"].clone()).unwrap();
+    assert!(!details.trials.is_empty());
+    for trial in details.trials {
+        assert!(!trial.evidence_refs.is_empty());
+        for reference in trial.evidence_refs {
+            assert_eq!(primary_hashes[Path::new(&reference.file)], reference.sha256);
+            match (reference.first_record, reference.last_record) {
+                (None, None) => {}
+                (Some(first), Some(last)) => {
+                    let text = std::fs::read_to_string(saved.join(reference.file)).unwrap();
+                    assert!(first >= 1 && last >= first && last <= text.lines().count() as u64);
+                }
+                _ => panic!("incomplete record bounds"),
+            }
+        }
+    }
+    std::fs::remove_dir_all(home).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

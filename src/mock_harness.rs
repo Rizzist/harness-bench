@@ -4920,7 +4920,18 @@ fn storage_fixture_write(config: &MockConfig, prompt: &str) -> Result<()> {
         remaining -= n as u64;
     }
     file.set_len(size)?;
-    file.sync_all()?;
+    let calls = match std::env::var("AHRB_MOCK_STORAGE_FSYNC_MODE").as_deref() {
+        Ok("extra") => 12,
+        Ok("per-turn") | Err(_) => 1,
+        Ok(_) => {
+            return Err(AhrbError::Usage(
+                "AHRB_MOCK_STORAGE_FSYNC_MODE must be per-turn/extra".into(),
+            ));
+        }
+    };
+    for _ in 0..calls {
+        file.sync_all()?;
+    }
     Ok(())
 }
 

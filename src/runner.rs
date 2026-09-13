@@ -2718,6 +2718,32 @@ async fn start_scripted_pillar_runtime_with_engine(
     engine: Arc<FakeModelEngine>,
     capture_pre_start: bool,
 ) -> Result<ScriptedPillarRuntime> {
+    start_scripted_pillar_runtime_with_environment(
+        manifest,
+        manifest_hash,
+        workflow,
+        profile_root,
+        pillar,
+        task_workspace,
+        engine,
+        capture_pre_start,
+        &BTreeMap::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_scripted_pillar_runtime_with_environment(
+    manifest: &Manifest,
+    manifest_hash: &str,
+    workflow: &Workflow,
+    profile_root: &Path,
+    pillar: &str,
+    task_workspace: Option<&Path>,
+    engine: Arc<FakeModelEngine>,
+    capture_pre_start: bool,
+    collector_environment: &BTreeMap<String, String>,
+) -> Result<ScriptedPillarRuntime> {
     let (server, model_environment) = start_model(
         Arc::clone(&engine),
         workflow,
@@ -2752,6 +2778,7 @@ async fn start_scripted_pillar_runtime_with_engine(
     let credential = format!("ahrb-{hash_prefix}-{pillar}-{}", std::process::id());
     let mut environment = isolated_environment(manifest, &variables)?;
     environment.extend(model_environment);
+    environment.extend(collector_environment.clone());
     environment.insert(
         manifest.fake_model.credential_env.clone(),
         credential.clone(),

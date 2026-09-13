@@ -268,17 +268,6 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
                     .is_empty()
             );
         }
-        assert!(
-            report
-                .results
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| ![0, 2, 3, 4, 5, 6, 7, 8, 9].contains(i))
-                .all(
-                    |(_, r)| matches!(&r.outcome, ahrb::evaluate::TestOutcome::Error(_))
-                        && !r.metadata.measurement_complete
-                )
-        );
         assert!(report.turns.is_empty());
         assert!(
             report
@@ -329,8 +318,26 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
             assert_eq!(operation["outcome"]["class"], "UNSUPPORTED");
             assert!(operation["repetition"].is_null());
         }
+        let s2 = &report.results[1];
+        assert!(
+            matches!(&s2.outcome, ahrb::evaluate::TestOutcome::Unsupported(reason)
+            if reason.contains("task-observation-unavailable")
+                && reason.contains("instrumentation feasibility not probed"))
+        );
+        assert!(s2.metadata.measurement_complete);
+        let details: evidence::DurabilityDetails =
+            serde_json::from_value(report.details[&s2.id].clone()).expect("typed S2 feasibility");
+        assert!(details.trials.is_empty() && details.instrumentation.is_empty());
+        assert!(report.fsync_events.is_empty());
         assert!(report.badge.is_none());
         let summary = report.storage_summary.expect("summary");
+        assert!(summary.fsync_calls_per_turn.is_none());
+        assert!(summary.fdatasync_calls_per_turn.is_none());
+        assert!(summary.fullfsync_calls_per_turn.is_none());
+        assert!(summary.durability_calls_per_turn.is_none());
+        assert!(summary.estimated_durability_wall_ms_per_turn.is_none());
+        assert!(summary.durability_class.is_none());
+        assert_eq!(summary.assumed_fsync_cost_ms, Some(4.0));
         assert_eq!(summary.completed_turns, 0);
         assert_eq!(summary.physical_requests, 0);
         assert!(summary.disk_class.is_none() && summary.growth_class.is_none());
@@ -366,6 +373,7 @@ fn plaintext_shared_task_is_unsupported_before_stimulus_in_both_cli_forms() {
         ] {
             assert!(markdown.contains(&format!("| S{row} `{slug}` | UNSUPPORTED |")));
         }
+        assert!(markdown.contains("| S2 `durability-cost` | UNSUPPORTED |"));
         std::fs::remove_dir_all(output).expect("remove owned output");
     }
 }

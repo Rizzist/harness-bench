@@ -1,5 +1,6 @@
 //! Serialized storage workload. This child module reuses the matrix's public
 //! session driver and terminal collector, but not its close/delete oracle.
+mod durability;
 use super::*;
 use crate::process::{DiskIdentityStatus, ProcessDiskObservation, TreeDiskTracker};
 use crate::storage::{self as contract, accounting, evidence::*, *};
@@ -103,6 +104,7 @@ fn pending_details(id: usize, reason: &str, config: &StorageConfig) -> Value {
 
 struct Progress {
     output: PathBuf,
+    finalized: BTreeSet<usize>,
     active_engine: Option<(u32, Arc<FakeModelEngine>, usize, usize)>,
     report: Report,
     write_trials: Vec<Trial<WriteSummary, WriteDiagnostics>>,
@@ -110,8 +112,6 @@ struct Progress {
     auxiliary_trials: Vec<Trial<AuxiliarySummary, AuxiliaryDiagnostics>>,
     retention_trials: Vec<Trial<RetentionSummary, RetentionDiagnostics>>,
     details: BTreeMap<String, Value>,
-    #[allow(dead_code)]
-    finalized: BTreeSet<usize>,
 }
 
 /// Run the storage pillar with explicit interrupted-report semantics.
@@ -183,11 +183,13 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         assumed_fsync_cost_ms: Some(4.0),
         ..StorageSummary::default()
     };
-    let pending = "collector-not-implemented: scheduled for a later storage lane; no feasibility or zero measurement claimed";
+    let pending =
+        "collector-pending: collection has not started; no feasibility or zero measurement claimed";
     std::fs::File::create(options.output.join("storage-request-bodies.jsonl"))?;
     std::fs::File::create(options.output.join("storage-log-audit.jsonl"))?;
     let mut progress = Progress {
         output: options.output.clone(),
+        finalized: BTreeSet::new(),
         active_engine: None,
         report: Report {
             schema: 4,
@@ -224,7 +226,6 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         details: (0..10)
             .map(|i| (ROWS[i].into(), pending_details(i, pending, &config)))
             .collect(),
-        finalized: BTreeSet::new(),
         auxiliary_trials: Vec::new(),
         retention_trials: Vec::new(),
     };
@@ -250,8 +251,45 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                 .insert(ROWS[i].into(), pending_details(i, &reason, &config));
         }
         progress.report.lifecycle_notes.push(reason);
+        // S2 does not depend on S1 disk counters, but its ordinary task also
+        // requires structured success and correlated tool observations. An
+        // exit-synthesized terminal cannot certify that instrumented task.
+        let reason = format!(
+            "task-observation-unavailable: transport=exec source={} framing={}; no compatible declared structured success terminal for the S2 task; exit-terminal synthesis cannot certify successful turns and correlated reads; instrumentation feasibility not probed",
+            manifest.events.source, manifest.events.framing
+        );
+        progress.report.results[1] = row(1, TestOutcome::Unsupported(reason.clone()), &config);
+        progress.details.insert(
+            ROWS[1].into(),
+            serde_json::to_value(DurabilityDetails {
+                measurement_label:
+                    "instrumented durability calls; wall cost is an estimate at 4 ms/call".into(),
+                reason: Some(reason),
+                instrumentation: Vec::new(),
+                trials: Vec::new(),
+            })?,
+        );
+        progress.finalized.insert(1);
     } else {
+        match tokio::time::timeout_at(
+            deadline_at,
+            durability::preflight(&manifest, &config, &mut progress),
+        )
+        .await
+        {
+            Err(_) => interrupted = true,
+            Ok(Err(error)) => {
+                progress.finalized.insert(1);
+                let reason = format!("S2 preflight: {error}");
+                progress.report.results[1] = row(1, TestOutcome::Error(reason.clone()), &config);
+                progress.details.get_mut(ROWS[1]).expect("S2 details")["reason"] = json!(reason);
+            }
+            Ok(Ok(())) => {}
+        }
         for repetition in 1..=repetitions {
+            if interrupted {
+                break;
+            }
             let outcome = tokio::time::timeout_at(
                 deadline_at,
                 collect_repetition(
@@ -330,6 +368,42 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
                         .entry(ROWS[id].into())
                         .and_modify(|d| d["reason"] = json!(reason));
                 }
+            }
+        }
+        if collection_failed && progress.details[ROWS[1]]["reason"].is_null() {
+            let reason = "task-incomplete: shared storage preparation failed; S2 was not started";
+            progress.report.results[1] = row(1, TestOutcome::Error(reason.into()), &config);
+            progress.details.get_mut(ROWS[1]).expect("S2 details")["reason"] = json!(reason);
+            progress.finalized.insert(1);
+        }
+        if !interrupted && !collection_failed && progress.details[ROWS[1]]["reason"].is_null() {
+            let s2 = tokio::time::timeout_at(
+                deadline_at,
+                durability::run(
+                    &manifest,
+                    &config,
+                    &manifest_hash,
+                    &workflow,
+                    &persistence.profile_path,
+                    repetitions,
+                    n,
+                    &mut progress,
+                ),
+            )
+            .await;
+            match s2 {
+                Err(_) => interrupted = true,
+                Ok(Err(error)) => {
+                    progress.finalized.insert(1);
+                    let reason = format!("S2: {error}");
+                    progress.report.results[1] =
+                        row(1, TestOutcome::Error(reason.clone()), &config);
+                    progress.details.get_mut(ROWS[1]).expect("S2 details")["reason"] =
+                        json!(reason);
+                    progress.report.lifecycle_notes.push(reason);
+                    ensure_owned_cleanup()?;
+                }
+                Ok(Ok(())) => {}
             }
         }
     }
@@ -455,6 +529,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         progress.report.lifecycle_notes.push(reason);
     }
     capture_provider(&mut progress).await?;
+    durability::preserve_partial(&mut progress)?;
     preserve_partial_trial(&mut progress, &config);
     // Keep completed trial evidence even when later repetitions or collectors failed.
     if !progress.write_trials.is_empty() {
@@ -1734,6 +1809,54 @@ fn bind_evidence(
             }
         }
     }
+    if let Some(trials) = details
+        .get_mut(ROWS[1])
+        .and_then(|v| v.get_mut("trials"))
+        .and_then(Value::as_array_mut)
+    {
+        let mut refs = vec![
+            receipt("fsync-events.jsonl", &report.fsync_events)?,
+            receipt("storage-samples.jsonl", &report.storage_samples)?,
+            receipt("turns.jsonl", &report.turns)?,
+        ];
+        let support = output.join("durability-support");
+        if support.is_dir() {
+            fn raw_refs(root: &Path, output: &Path, refs: &mut Vec<EvidenceRef>) -> Result<()> {
+                let mut paths = std::fs::read_dir(root)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                paths.sort();
+                for path in paths {
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    if metadata.is_dir() {
+                        raw_refs(&path, output, refs)?;
+                    } else if metadata.is_file() {
+                        refs.push(EvidenceRef {
+                            file: path
+                                .strip_prefix(output)
+                                .map_err(|_| {
+                                    AhrbError::Protocol("collector evidence escaped bundle".into())
+                                })?
+                                .to_string_lossy()
+                                .into_owned(),
+                            sha256: crate::storage::durability::digest(&path)?,
+                            first_record: None,
+                            last_record: None,
+                        });
+                    } else {
+                        return Err(AhrbError::Protocol(
+                            "collector evidence is not a regular file".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            raw_refs(&support, output, &mut refs)?;
+        }
+        for trial in trials {
+            trial["evidence_refs"] = serde_json::to_value(&refs)?;
+        }
+    }
     for (id, value) in details {
         validate_details(id, value)?;
     }
@@ -1803,8 +1926,10 @@ async fn capture_provider(progress: &mut Progress) -> Result<()> {
         return Ok(());
     };
     let records = engine.request_records().await;
-    if let Some(summary) = &mut progress.report.storage_summary {
-        summary.physical_requests += (records.len() - *request_count) as u64;
+    if *repetition < 1_000_000 {
+        if let Some(summary) = &mut progress.report.storage_summary {
+            summary.physical_requests += (records.len() - *request_count) as u64;
+        }
     }
     // The engine sorts by semantic route; late auxiliary traffic may insert
     // before prior records, and acceptance/attempt totals can change in place.
@@ -2029,6 +2154,9 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) {
         return;
     };
     let repetition = *repetition;
+    if repetition >= 1_000_000 {
+        return;
+    }
     if !progress
         .auxiliary_trials
         .iter()
@@ -2145,7 +2273,8 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) {
             .storage_samples
             .iter()
             .filter(|s| {
-                s.repetition == repetition
+                s.row_id == ROWS[0]
+                    && s.repetition == repetition
                     && checkpoints(
                         progress
                             .report
@@ -2423,6 +2552,81 @@ mod tests {
                 "explicit test backend unavailability".into(),
             ))
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn durability_preflight_home_links_do_not_enter_collector_evidence() {
+        let output = std::env::temp_dir().join(format!(
+            "ahrb-durability-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&output).unwrap();
+        let probe = crate::storage::durability::probe(
+            &output,
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "ln -s missing-optional-helper \"$HOME/helper\" && printf '%s' \"$HOME\"".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        let reason = probe.instrumentation.reason.clone().unwrap();
+        assert!(reason.starts_with("os-limited:"));
+        let trace = output.join("durability-support/preflight");
+        let launch: Value =
+            serde_json::from_slice(&std::fs::read(trace.join("launch.json")).unwrap()).unwrap();
+        let home = PathBuf::from(launch["stdout"].as_str().unwrap());
+        assert!(!home.starts_with(&output) && home.is_dir());
+        assert!(home.join("helper").is_symlink());
+        std::fs::write(output.join("storage-log-audit.jsonl"), "").unwrap();
+        std::fs::write(output.join("storage-request-bodies.jsonl"), "").unwrap();
+        let detail = DurabilityDetails {
+            measurement_label: "durability wall estimate at 4 ms/call".into(),
+            reason: Some(reason.clone()),
+            instrumentation: vec![probe.instrumentation],
+            trials: vec![Trial {
+                repetition: 0,
+                outcome: TestOutcome::Unsupported(reason.clone()),
+                measurement_complete: true,
+                reason: Some(reason),
+                summary: DurabilitySummary {
+                    assumed_fsync_cost_ms: Some(4.0),
+                    ..Default::default()
+                },
+                diagnostics: DurabilityDiagnostics {
+                    instrumentation_ref: Some(0),
+                    ..Default::default()
+                },
+                evidence_refs: Vec::new(),
+            }],
+        };
+        let mut details = BTreeMap::from([(ROWS[1].into(), serde_json::to_value(detail).unwrap())]);
+        let mut report = Report::default();
+        bind_evidence(&mut report, &mut details, &output)
+            .expect("disposable home helpers must not abort collector evidence finalization");
+        let refs = details[ROWS[1]]["trials"][0]["evidence_refs"]
+            .as_array()
+            .unwrap();
+        assert!(
+            refs.iter()
+                .any(|r| r["file"] == "durability-support/preflight/launch.json")
+        );
+        // Collector artifacts themselves retain the strict no-symlink contract.
+        std::os::unix::fs::symlink("missing-trace", trace.join("unexpected-link")).unwrap();
+        assert!(
+            bind_evidence(&mut report, &mut details, &output)
+                .unwrap_err()
+                .to_string()
+                .contains("collector evidence is not a regular file")
+        );
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(output).unwrap();
     }
 
     #[test]

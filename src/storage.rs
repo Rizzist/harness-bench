@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod accounting;
 pub mod auxiliaries;
+pub mod durability;
 pub mod evidence;
 pub mod fixture;
 pub mod lifecycle;
@@ -681,10 +682,12 @@ pub fn render_markdown(
     }
     out.push_str("\nAllocated families at each repetition's last settled boundary (S1 audit):\n\n| Repetition | Turn | Family | Allocated bytes |\n|---:|---:|---|---:|\n");
     let mut last = BTreeMap::new();
-    for sample in &report.storage_samples {
-        if sample.row_id == ROWS[0] {
-            last.insert(sample.repetition, sample);
-        }
+    for sample in report
+        .storage_samples
+        .iter()
+        .filter(|s| s.row_id == ROWS[0])
+    {
+        last.insert(sample.repetition, sample);
     }
     if last.is_empty() {
         out.push_str("| unavailable | unavailable | unavailable | unavailable |\n");
@@ -798,6 +801,73 @@ pub fn render_markdown(
         out,
         "S10 timing origin: `{}` (per the validated lifecycle/topology path; headline starts at the selected resume boundary).\n",
         timing_origin.unwrap_or("unavailable")
+    );
+    let durability_mad = |field: &str| -> Option<f64> {
+        let trials = report.details.get(ROWS[1])?.get("trials")?.as_array()?;
+        if trials.len() != summary.repetitions as usize {
+            return None;
+        }
+        let values = trials
+            .iter()
+            .map(|t| {
+                if t["outcome"]["class"] != "PASS" {
+                    return None;
+                }
+                t.get("summary")?
+                    .get(field)?
+                    .as_f64()
+                    .filter(|v| v.is_finite())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let center = median(values.clone())?;
+        median(values.into_iter().map(|v| (v - center).abs()).collect())
+    };
+    out.push_str(
+        "\n| Durability primitive | Median successful calls/turn | MAD |\n|---|---:|---:|\n",
+    );
+    for (name, field, value) in [
+        (
+            "fsync",
+            "fsync_calls_per_turn",
+            summary.fsync_calls_per_turn,
+        ),
+        (
+            "fdatasync",
+            "fdatasync_calls_per_turn",
+            summary.fdatasync_calls_per_turn,
+        ),
+        (
+            "F_FULLFSYNC",
+            "fullfsync_calls_per_turn",
+            summary.fullfsync_calls_per_turn,
+        ),
+        (
+            "Total",
+            "durability_calls_per_turn",
+            summary.durability_calls_per_turn,
+        ),
+    ] {
+        let _ = writeln!(
+            out,
+            "| {name} | {} | {} |",
+            value
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "unavailable".into()),
+            durability_mad(field)
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "unavailable".into())
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nEstimated durability wall ms/turn (fixed 4 ms/call assumption): **{}** (MAD **{}**).",
+        summary
+            .estimated_durability_wall_ms_per_turn
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "unavailable".into()),
+        durability_mad("estimated_durability_wall_ms_per_turn")
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "unavailable".into())
     );
     out.push_str("\nDurability wall cost is an estimate using 4 ms/call, never measured latency. Request-byte retention requires exact matches and verified representation coverage; disk growth alone cannot establish retention. Context shrinking need not reclaim journals. Sync is an AHRB boundary operation, not evidence of harness fsync or hardware durability.\n\nEvidence: [samples](storage-samples.jsonl), [files](storage-files.jsonl), [processes](processes.jsonl), [turns](turns.jsonl), [requests](model-requests.jsonl), [fsync](fsync-events.jsonl), [body matches](request-body-matches.jsonl). Empty collectors have no coverage claim.\n");
     out
