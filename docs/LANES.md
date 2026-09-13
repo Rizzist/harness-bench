@@ -72,7 +72,7 @@ Resume procedure: the harness checklist's BLOCKER section lists the per-lane res
 | L3 `l3-storage-s7-s8` | S7 bounded auxiliaries per declared file family; S8 request-body retention classification and ratio from fake-model request bytes versus run-root growth; mock evidence for none/deduplicated/full | L2 | **complete** (SHIP, landed `2241d82`) |
 | L4 `l4-storage-s5-s4` | S5 close retention after N create/close cycles and after the declared sweep interval; S4 compaction-versus-disk around the row-51 context-limit trigger; mock evidence | L2 | **complete** (SHIP, landed `18e3e60`) |
 | L5 `l5-storage-s2-durability` | S2 fsync/fdatasync/F_FULLFSYNC counting per turn with honest OS limits (macOS interpose shim where the binary permits, Linux tracing where available, otherwise `UNSUPPORTED: os-limited` with evidence); estimated durability wall labelled as an estimate | L2 | pending |
-| L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | pending |
+| L6 `l6-storage-s6-s9-s10` | S6 declared `session_delete`/`uninstall_cleanup` residue on disposable benchmark profiles only; S9 crash residue after the row-57 kill; S10 resume read cost around the row-52 resume; mock evidence | L2, L4 | **complete** (SHIP, landed `9d2243e`) |
 | L7a `l7a-storage-collector-results` | Split out 2026-09-07: codex terminal-before-reap collector fix, codex volatile-area rule, pi sessions revisit, saved-index/`hbench diff` storage integration | L2 | in progress (blocked) |
 | L8a `l8a-reference-runner` | Split out 2026-09-07: `scripts/reference-run.sh` (six harnesses x four pillars, pre-flight, resumable, honest exit), `scripts/reference-tables.py`, tests, handoff docs; verified on mocks | L2 | **complete** (SHIP, landed `8cc1e8d`) |
 | L10 `l10-measurement-fixes` | From the GPT6-Astra analysis of the Haider/rick ad-hoc run: cross-collector CPU aggregation defect, missing thin-client roots in daemon+exec trials, tool-argument normalization (false `terminal-without-effect`, rows 29/61), collector reread overhead (rows 43/49), stream frame identity (48/59), haider-agent declarations, per-row wall timing | L2 | in progress (paused) |
@@ -240,6 +240,16 @@ Record: verified tree = `c46a5bd` + diff sha256 `f6cc507e9984266eaa6833ccbeec334
 Separate pre-existing finding (NOT this lane, explicitly non-blocking): `mock_full_matrix` row 29 long-horizon final-plateau `trustworthy=false` under machine load, demonstrated on clean 857f457 (3 reproductions incl. clean-base); follow-up routed to lane L10 measurement verification.
 
 Record: verified tree = `857f457` + diff sha256 `a716e804e50e2adc172722a141a3857d6bcecc2dddbc8cdaf9b791859caaec82`. Raw evidence: harness `state/lanes/l13-master-s7s8-finalization/` (outside Git).
+
+## L6 `l6-storage-s6-s9-s10` — completion record (2026-09-14)
+
+- [x] Implement (GPT6-Astra, passes 1-4): S6 delete/uninstall residue accounting (clean/residue/missing/command-error modes), S9 committed-journal crash evidence, S10 resume read/latency with timing-origin labels; verify-5 found two defects (saved bundle omitted referenced S6/S9 receipts, results.rs; Markdown omitted S9/S10 values + S10 timing origin, storage.rs), repaired in impl-4 with end-to-end proof
+- [x] Candidate verification (GPT6-Astra verify-6 `01a096fc-5ca9-7832-b48d-aafcfa254bdf`, eight continuations, **SHIP**: serial suite exit 0 foreground, full Part B case matrix, both repaired-defect regression checks; codex row accepted BLOCKED pre-L12-manifest)
+- [x] Integration: two rebase rounds (onto post-L7a `857f457`, then post-L13 `2f4bc3d`; `src/runner/storage.rs` resolved against both shapes), 396-test battery green, daemon acceptance S6/S9/S10 PASS with S7/S8 correct; L6's round-1 report also SURFACED the master completed-run S7/S8 regression that became lane L13
+- [x] Post-integration verification (GPT6-Astra `01a0992e-39f3-7030-83cc-3e08a6919b99`, zero NOT EXECUTED rows: 562-test suite, both mock transports with full artifact audits, real pi, and the previously BLOCKED codex row executed clean of contamination). Its one finding — a later lifecycle deadline overwriting completed S7/S8 (inherited L13 completion gap at runner/storage.rs:318) — was repaired as separate commit `9d2243e` with a bidirectional regression test; re-verdict **SHIP** bound to `9d2243e` (tree `88ebbee6…`)
+- [x] Complete: commits `9a1c9fa` + `9d2243e`, fast-forwarded onto `master`, pushed
+
+Record: candidate verified tree = `b22e569` + diff sha256 `462527a2…`; integrated tree `88ebbee6…` at `9d2243e`. Raw evidence: harness `state/lanes/l6-storage-s6-s9-s10/` (outside Git).
 
 ## L8 `l8-references-macmini`
 
