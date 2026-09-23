@@ -500,7 +500,23 @@ pub struct PointMetrics {
     /// Residual divided by N.
     pub residual_bytes_per_agent: f64,
     /// `(S_n-R_n)/(S_n-B)`, clamped to zero through one.
-    pub reclaim_ratio: f64,
+    ///
+    /// Unavailable when `S_n <= B`, because there is no active-delta denominator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_ratio: Option<f64>,
+    /// Why `reclaim_ratio` is unavailable, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_ratio_unavailable_reason: Option<ReclaimRatioUnavailableReason>,
+}
+
+/// Typed reason that a sweep point cannot produce a reclaim ratio.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReclaimRatioUnavailableReason {
+    /// `max(0,S_n-B)` is zero, so the ratio has no denominator.
+    NoActiveDelta,
+    /// At least one repetition had no active-delta denominator.
+    IncompleteDenominatorCoverage,
 }
 
 /// Active delta below which a sweep width carries no fittable scaling signal.
@@ -596,6 +612,9 @@ impl SweepMetrics {
                 point.post_close_bytes.saturating_sub(point.baseline_bytes);
             let residual_bytes_per_agent = post_close_residual_bytes as f64 / point.agents as f64;
             let reclaim_ratio = reclaim_ratio(*point);
+            let reclaim_ratio_unavailable_reason = reclaim_ratio
+                .is_none()
+                .then_some(ReclaimRatioUnavailableReason::NoActiveDelta);
             derived.push((
                 *point,
                 PointMetrics {
@@ -609,6 +628,7 @@ impl SweepMetrics {
                     post_close_residual_bytes,
                     residual_bytes_per_agent,
                     reclaim_ratio,
+                    reclaim_ratio_unavailable_reason,
                 },
             ));
             maximum_cold_peak_bytes = maximum_cold_peak_bytes.max(point.cold_peak_bytes);
@@ -736,13 +756,13 @@ fn scaling_exponent(points: &[SweepPoint]) -> Option<f64> {
     linear_slope(&log_points)
 }
 
-fn reclaim_ratio(point: SweepPoint) -> f64 {
+pub(crate) fn reclaim_ratio(point: SweepPoint) -> Option<f64> {
     let active = point.steady_bytes.saturating_sub(point.baseline_bytes);
     if active == 0 {
-        return 0.0;
+        return None;
     }
     let reclaimed = point.steady_bytes as f64 - point.post_close_bytes as f64;
-    (reclaimed / active as f64).clamp(0.0, 1.0)
+    Some((reclaimed / active as f64).clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -879,7 +899,7 @@ mod tests {
             metrics
                 .points
                 .iter()
-                .all(|(_, point)| point.reclaim_ratio == 1.0)
+                .all(|(_, point)| point.reclaim_ratio == Some(1.0))
         );
         for (raw, derived) in &metrics.points {
             assert_eq!(derived.baseline_inversion_bytes, Some(0));
@@ -936,7 +956,11 @@ mod tests {
         assert_eq!(derived.baseline_inversion_bytes, Some(16_384));
         assert_eq!(derived.baseline_inversion_tolerance_bytes, Some(684_880));
         assert_eq!(derived.average_added_bytes_per_agent, 0.0);
-        assert_eq!(derived.reclaim_ratio, 0.0);
+        assert_eq!(derived.reclaim_ratio, None);
+        assert_eq!(
+            derived.reclaim_ratio_unavailable_reason,
+            Some(ReclaimRatioUnavailableReason::NoActiveDelta)
+        );
         assert!(metrics.scaling_curve_within_noise_floor);
         assert_eq!(metrics.scaling_exponent_alpha, None);
         let mut json = serde_json::to_value(derived)?;
@@ -947,6 +971,7 @@ mod tests {
             "active_delta_bytes",
             "baseline_inversion_bytes",
             "baseline_inversion_tolerance_bytes",
+            "reclaim_ratio_unavailable_reason",
         ] {
             object.remove(name);
         }
@@ -954,6 +979,43 @@ mod tests {
         assert_eq!(legacy.active_delta_bytes, None);
         assert_eq!(legacy.baseline_inversion_bytes, None);
         assert_eq!(legacy.baseline_inversion_tolerance_bytes, None);
+        assert_eq!(legacy.reclaim_ratio, None);
+        assert_eq!(legacy.reclaim_ratio_unavailable_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_ratio_distinguishes_zero_unavailable_and_partial() -> Result<()> {
+        let point = |steady_bytes, post_close_bytes| SweepPoint {
+            agents: 1,
+            baseline_bytes: 100,
+            steady_bytes,
+            workload_peak_bytes: steady_bytes,
+            cold_peak_bytes: steady_bytes,
+            post_turn_bytes: steady_bytes,
+            post_close_bytes,
+        };
+
+        let zero = SweepMetrics::calculate(&[point(200, 200)])?;
+        assert_eq!(zero.points[0].1.reclaim_ratio, Some(0.0));
+        assert_eq!(zero.points[0].1.reclaim_ratio_unavailable_reason, None);
+
+        let unavailable = SweepMetrics::calculate(&[point(100, 100)])?;
+        assert_eq!(unavailable.points[0].1.reclaim_ratio, None);
+        assert_eq!(
+            unavailable.points[0].1.reclaim_ratio_unavailable_reason,
+            Some(ReclaimRatioUnavailableReason::NoActiveDelta)
+        );
+        let unavailable_json = serde_json::to_value(unavailable.points[0].1)?;
+        assert!(unavailable_json.get("reclaim_ratio").is_none());
+        assert_eq!(
+            unavailable_json["reclaim_ratio_unavailable_reason"],
+            "no-active-delta"
+        );
+
+        let partial = SweepMetrics::calculate(&[point(200, 150)])?;
+        assert_eq!(partial.points[0].1.reclaim_ratio, Some(0.5));
+        assert_eq!(partial.points[0].1.reclaim_ratio_unavailable_reason, None);
         Ok(())
     }
 

@@ -10,7 +10,7 @@ use crate::evaluate::{Assertion, Pillar, TestResult, classify};
 use crate::process::ProcIdentity;
 use crate::sampler::{
     MemoryMetric, PhaseCoverage, Plateau, SampleSeries, SamplingHealth, SweepMetrics, SweepPoint,
-    cadence_quality,
+    cadence_quality, reclaim_ratio,
 };
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
@@ -1513,6 +1513,7 @@ impl<'a> Analysis<'a> {
         if !points.is_empty() {
             match SweepMetrics::calculate(&points) {
                 Ok(mut metrics) => {
+                    self.enforce_reclaim_ratio_denominator_completeness(&mut metrics);
                     if let Some(beta) = metrics.headline_beta_bytes_per_agent {
                         self.metrics
                             .insert("parallel_beta_bytes_per_agent".to_owned(), beta);
@@ -2061,8 +2062,19 @@ impl<'a> Analysis<'a> {
                     .iter()
                     .filter(|((agents, _), _)| *agents == target_agents)
                     .all(|(_, point)| {
-                        point_reclaim_ratio(*point) >= self.envelope.minimum_reclaim_ratio
+                        reclaim_ratio(*point)
+                            .is_some_and(|ratio| ratio >= self.envelope.minimum_reclaim_ratio)
                     });
+                let unavailable_repetitions = self
+                    .sweep_repetition_points
+                    .iter()
+                    .filter_map(|((agents, repetition), point)| {
+                        (*agents == target_agents && reclaim_ratio(*point).is_none())
+                            .then_some(*repetition)
+                    })
+                    .collect::<Vec<_>>();
+                let reclaim_ratio_available =
+                    derived.reclaim_ratio.is_some() && unavailable_repetitions.is_empty();
                 let measured_reclaim_after_ms =
                     self.sweep_reclaim_after_ms.get(&target_agents).copied();
                 let (mut cleanup_assertions, cleanup_deadlines) = match cleanup_result {
@@ -2084,10 +2096,31 @@ impl<'a> Analysis<'a> {
                         format!("{} <= {residual_limit}", derived.post_close_residual_bytes),
                     ),
                     check(
+                        "reclaim-ratio-denominator",
+                        reclaim_ratio_available,
+                        if active == 0 {
+                            format!(
+                                "unavailable: N={target_agents} active delta is zero (steady={} baseline={}); repetitions without a denominator={unavailable_repetitions:?}",
+                                point.steady_bytes, point.baseline_bytes
+                            )
+                        } else if unavailable_repetitions.is_empty() {
+                            format!("active delta={active} bytes")
+                        } else {
+                            format!(
+                                "unavailable in repetitions {unavailable_repetitions:?}; aggregate active delta={active} bytes"
+                            )
+                        },
+                    ),
+                    check(
                         "reclaim-ratio",
-                        derived.reclaim_ratio >= self.envelope.minimum_reclaim_ratio
+                        derived
+                            .reclaim_ratio
+                            .is_some_and(|ratio| ratio >= self.envelope.minimum_reclaim_ratio)
                             && repetition_reclaim_ok,
-                        format!("{:.3}", derived.reclaim_ratio),
+                        derived.reclaim_ratio.map_or_else(
+                            || "unavailable: active-delta denominator is absent".to_owned(),
+                            |ratio| format!("{ratio:.3}"),
+                        ),
                     ),
                     check(
                         "measured-reclaim-deadline",
@@ -2415,9 +2448,12 @@ impl<'a> Analysis<'a> {
                 derived.post_close_residual_bytes as f64,
             ),
             ("residual_bytes_per_agent", derived.residual_bytes_per_agent),
-            ("reclaim_ratio", derived.reclaim_ratio),
         ] {
             self.metrics.insert(format!("{prefix}_{suffix}"), value);
+        }
+        if let Some(value) = derived.reclaim_ratio {
+            self.metrics
+                .insert(format!("{prefix}_reclaim_ratio"), value);
         }
         for (suffix, value) in [
             ("active_delta_bytes", derived.active_delta_bytes),
@@ -2439,6 +2475,24 @@ impl<'a> Analysis<'a> {
         if let Some(value) = derived.peak_amplification {
             self.metrics
                 .insert(format!("{prefix}_peak_amplification"), value);
+        }
+    }
+
+    fn enforce_reclaim_ratio_denominator_completeness(&self, metrics: &mut SweepMetrics) {
+        for (point, derived) in &mut metrics.points {
+            let denominator_complete = (0..self.timing.repetitions).all(|repetition| {
+                self.sweep_repetition_points
+                    .get(&(point.agents, repetition))
+                    .copied()
+                    .and_then(reclaim_ratio)
+                    .is_some()
+            });
+            if !denominator_complete {
+                derived.reclaim_ratio = None;
+                derived.reclaim_ratio_unavailable_reason = Some(
+                    crate::sampler::ReclaimRatioUnavailableReason::IncompleteDenominatorCoverage,
+                );
+            }
         }
     }
 
@@ -2549,9 +2603,11 @@ impl<'a> Analysis<'a> {
                         derived.post_close_residual_bytes as f64,
                     ),
                     ("residual_bytes_per_agent", derived.residual_bytes_per_agent),
-                    ("reclaim_ratio", derived.reclaim_ratio),
                 ] {
                     values.entry(name).or_default().push(value);
+                }
+                if let Some(value) = derived.reclaim_ratio {
+                    values.entry("reclaim_ratio").or_default().push(value);
                 }
                 for (name, value) in [
                     ("active_delta_bytes", derived.active_delta_bytes),
@@ -2573,6 +2629,9 @@ impl<'a> Analysis<'a> {
                 }
             }
             for (name, distribution) in values {
+                if name == "reclaim_ratio" && distribution.len() != repetitions.len() {
+                    continue;
+                }
                 record_distribution(
                     &mut self.metrics,
                     &format!("parallel_n{agents}_{name}"),
@@ -3076,14 +3135,6 @@ fn aggregate_sweep_points(points: impl Iterator<Item = SweepPoint>) -> Result<Sw
     })
 }
 
-fn point_reclaim_ratio(point: SweepPoint) -> f64 {
-    let active = point.steady_bytes.saturating_sub(point.baseline_bytes);
-    if active == 0 {
-        return 0.0;
-    }
-    ((point.steady_bytes as f64 - point.post_close_bytes as f64) / active as f64).clamp(0.0, 1.0)
-}
-
 fn derive_sweep_point(
     series: &SampleSeries,
     observation: &SweepObservation,
@@ -3438,7 +3489,8 @@ mod tests {
     use super::*;
     use crate::evaluate::TestOutcome;
     use crate::process::{ProcIdentity, ProcOwnership, ProcessInfo, Sample};
-    use std::time::SystemTime;
+    use crate::report::{Report, ResourceSummary, TopologyMetric, write_bundle};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample(
         elapsed_ns: u64,
@@ -4018,6 +4070,27 @@ mod tests {
                 .metrics
                 .contains_key("parallel_scaling_exponent_median")
         );
+        let n1 = metrics
+            .points
+            .iter()
+            .find(|(point, _)| point.agents == 1)
+            .map(|(_, derived)| derived)
+            .expect("N=1 metrics");
+        assert_eq!(n1.reclaim_ratio, None);
+        assert_eq!(
+            n1.reclaim_ratio_unavailable_reason,
+            Some(crate::sampler::ReclaimRatioUnavailableReason::IncompleteDenominatorCoverage)
+        );
+        assert!(
+            !certification
+                .metrics
+                .contains_key("parallel_n1_reclaim_ratio")
+        );
+        assert!(
+            !certification
+                .metrics
+                .contains_key("parallel_n1_reclaim_ratio_median")
+        );
         for number in [26, 28] {
             let row = certification
                 .rows
@@ -4038,6 +4111,126 @@ mod tests {
         assert!(
             matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("scaling-alpha"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_equality_in_one_target_repetition_never_publishes_an_aggregate_ratio() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let target_agents = ResourceTimingPlan::for_profile(ResourceProfile::Quick)
+            .sweep_widths
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let target = evidence
+            .sweep
+            .iter()
+            .find(|observation| {
+                observation.agents == target_agents && observation.identity.repetition == 0
+            })
+            .expect("target repetition");
+        let steady = evidence
+            .series
+            .samples
+            .iter()
+            .find(|sample| sample.phase == target.steady_phase)
+            .expect("steady sample")
+            .rss_bytes;
+        let baseline_phase = target.baseline_phase.clone();
+        for sample in evidence
+            .series
+            .samples
+            .iter_mut()
+            .filter(|sample| sample.phase == baseline_phase)
+        {
+            sample.rss_bytes = steady;
+            sample.pss_bytes = Some(steady);
+            sample.private_bytes = Some(steady);
+        }
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .expect("row 28");
+        assert!(
+            matches!(
+                &row.outcome,
+                TestOutcome::Error(message)
+                    if message.ends_with(
+                        "scaling alpha requires a strictly positive active delta at every width and repetition"
+                    )
+            ),
+            "unexpected row-28 outcome: {:?}",
+            row.outcome
+        );
+        assert!(certification.sweep_metrics.is_none());
+        let ratio_prefix = format!("parallel_n{target_agents}_reclaim_ratio");
+        assert!(
+            certification
+                .metrics
+                .keys()
+                .all(|name| !name.starts_with(&ratio_prefix))
+        );
+
+        let topology = "shared-daemon-sessions";
+        let profile = "quick";
+        let report = Report {
+            schema: 3,
+            spec_version: 2,
+            run_id: "synthetic-mixed-target-equality".to_owned(),
+            results: vec![row.clone()],
+            resource_metrics: certification
+                .metrics
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        TopologyMetric {
+                            value: *value,
+                            profile: profile.to_owned(),
+                            topology: topology.to_owned(),
+                            comparison_scope: "within-topology-only".to_owned(),
+                        },
+                    )
+                })
+                .collect(),
+            resource_summary: ResourceSummary {
+                topology: topology.to_owned(),
+                profile: profile.to_owned(),
+                comparison_scope: "within-topology-only".to_owned(),
+                ..ResourceSummary::default()
+            },
+            ..Report::default()
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!(
+            "ahrb-reclaim-equality-{}-{unique}",
+            std::process::id()
+        ));
+        write_bundle(&report, &output, false)?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("report.json"))?)?;
+        let markdown = std::fs::read_to_string(output.join("report.md"))?;
+        std::fs::remove_dir_all(output)?;
+
+        let written_metrics = json["resource_metrics"]
+            .as_object()
+            .expect("resource metrics object");
+        assert!(
+            written_metrics
+                .keys()
+                .all(|name| !name.starts_with(&ratio_prefix))
+        );
+        assert!(!markdown.contains(&ratio_prefix));
         Ok(())
     }
 
@@ -4081,8 +4274,95 @@ mod tests {
                 certification.metrics[&format!("parallel_n{agents}_active_delta_bytes")],
                 0.0
             );
+            assert!(
+                !certification
+                    .metrics
+                    .contains_key(&format!("parallel_n{agents}_reclaim_ratio"))
+            );
+            assert!(
+                !certification
+                    .metrics
+                    .contains_key(&format!("parallel_n{agents}_reclaim_ratio_median"))
+            );
         }
-        assert_row_28_fails(&evidence, "reclaim-ratio")
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .expect("row 28");
+        assert!(
+            matches!(&row.outcome, TestOutcome::Fail(message) if message.contains("reclaim-ratio-denominator"))
+        );
+        assert!(row.evidence.iter().any(|item| {
+            item.contains("reclaim-ratio-denominator") && item.contains("unavailable")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn real_zero_reclamation_remains_numeric_zero_and_fails_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let target_agents = ResourceTimingPlan::for_profile(ResourceProfile::Quick)
+            .sweep_widths
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let target_phases = evidence
+            .sweep
+            .iter()
+            .filter(|observation| observation.agents == target_agents)
+            .map(|observation| {
+                let steady = evidence
+                    .series
+                    .samples
+                    .iter()
+                    .find(|sample| sample.phase == observation.steady_phase)
+                    .map(|sample| sample.rss_bytes)
+                    .ok_or_else(|| AhrbError::Validation("steady sample is absent".to_owned()))?;
+                Ok((observation.post_close_phase.clone(), steady))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (phase, steady) in target_phases {
+            for sample in evidence
+                .series
+                .samples
+                .iter_mut()
+                .filter(|sample| sample.phase == phase)
+            {
+                sample.rss_bytes = steady;
+                sample.pss_bytes = Some(steady);
+                sample.private_bytes = Some(steady);
+            }
+        }
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        assert_eq!(
+            certification.metrics[&format!("parallel_n{target_agents}_reclaim_ratio")],
+            0.0
+        );
+        assert_eq!(
+            certification.metrics[&format!("parallel_n{target_agents}_reclaim_ratio_median")],
+            0.0
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .expect("row 28");
+        assert!(matches!(
+            &row.outcome,
+            TestOutcome::Fail(message) if message.starts_with("reclaim-ratio:")
+        ));
+        assert!(
+            row.evidence
+                .iter()
+                .any(|item| { item.starts_with("reclaim-ratio-denominator: active delta=") })
+        );
+        Ok(())
     }
 
     #[test]
