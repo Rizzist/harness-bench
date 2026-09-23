@@ -274,6 +274,15 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L16 `l16-reclaim-ratio-honesty` (2026-09-23)
+
+- [x] Implement (gpt-5.6-sol, 2 passes): `reclaim_ratio` returned 0.0 both for a genuine zero reclamation and for an absent denominator (steady <= baseline), so row 28 could publish `reclaim-ratio 0.000` with nothing measured. Now unavailable with a typed reason; row 28 records `reclaim-ratio-denominator`; completeness enforced before any aggregate ratio is published; genuine zero unchanged and failing; PASS thresholds unchanged.
+- [x] Verification (gpt-5.6-sol): pass 1 found no defect in the lane change (its only blocker, `hbench diff` rejecting a null `budget-enforcement` detail block, reproduced on clean master and is pre-existing, tracked with L10); pass 2 **SHIP** — full serial suite 581/581, CLI flows on mock, haider 0.0.971 and rick.
+- [x] Final review (GPT6-Astra): pass 1 NO-SHIP — an early error return published a `1.000` aggregate ratio alongside a row-28 ERROR, reproduced with production code; pass 2 **SHIP** after the ordering repair, its own reproducer re-run and closed.
+- [x] Complete: fast-forwarded onto `master`, pushed (verified tree = landed tree; master had not moved).
+
+Record: verified tree = `c361807` + diff sha256 `f7ebf0e1817b37882e65fe2f09282bc40db73caa751d33a10d354c8927748578`. Raw evidence: harness `state/lanes/l16-reclaim-ratio-honesty/` (outside Git).
+
 ## L8 `l8-references-macmini`
 
 - [ ] Worktree
