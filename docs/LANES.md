@@ -274,6 +274,15 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L20 `l20-row28-thread-plateau` (landed 2026-09-24)
+
+- [x] Decision (orchestrator, owner-delegated): row 28's exact `post_close == baseline` thread rule was stricter than rows 44/50 and failed bounded worker pools with no leak. Reproduced the plateau with AHRB's own row-28 shape on haider 0.0.971 before changing the oracle (15/15 repetitions bounded).
+- [x] Implement (gpt-5.6-sol, 2 passes): per-repetition `post_close <= measured workload maximum`; row-28-only cross-repetition growth = strict rise in every interval (row 29 unchanged); SPEC states the three-repetition limit.
+- [x] Verification (gpt-5.6-sol): v1 NO-SHIP (shared row-29 predicate flagged a one-step pool expansion, 2/8 honest runs) → repaired; v2 SHIP (0.0.971 ×6, 0.0.972 ×4 unmodified environment; strict-rise leak shape caught live 2/10).
+- [x] Integration (gpt-5.6-sol) onto L10: workload maximum taken from L10's dynamic sampler; full suite passed target by target.
+- [x] Final review (GPT6-Astra): **SHIP**. A separate pre-existing Haider 0.0.972 row-28 ERROR (untrustworthy N=1 plateau under load) reproduces on plain master, is neither caused nor masked by L20, and is tracked for L11.
+- [x] Complete: committed `a8647c3`, fast-forwarded and pushed (verified tree = landed tree).
+
 ## L10 `l10-measurement-fixes` (landed 2026-09-24)
 
 - [x] Implement (GPT6-Astra passes 1-2, gpt-5.6-sol passes 3-6): identity-safe macOS process sampling (all five per-identity skip paths mark counter evidence incomplete; closing `(pid,start_time)` check before any aggregate/CPU mutation; zombie final accounting retained); per-row submit-to-terminal timing; paced frames bound to their own physical attempt; driver reads appended journal bytes instead of re-reading history; drained 401 bodies; typed reader accepts genuine null detail blocks; row 60 ABSENT when the marker is undeclared; haider-agent log path declared.
