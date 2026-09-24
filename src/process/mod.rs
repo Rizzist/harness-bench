@@ -54,7 +54,8 @@ pub struct ProcessInfo {
 /// Timestamped resource counters for one owned process identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProcessSample {
-    /// Monotonic nanoseconds since sampler start.
+    /// Monotonic nanoseconds since sampler start; row-46 process records use
+    /// absolute CLOCK_MONOTONIC nanoseconds to match memory-time-samples.jsonl.
     pub elapsed_ns: u64,
     /// Wall-clock timestamp for evidence correlation.
     pub wall_time: SystemTime,
@@ -834,6 +835,59 @@ fn live_owned(snapshot: &OwnedRegistry) -> Result<BTreeSet<ProcIdentity>> {
     Ok(live)
 }
 
+/// Observe a direct child's exit while retaining its kernel counters for sampling.
+/// The caller must still reap the child after taking the final identity receipt.
+pub fn direct_child_exited_without_reap(pid: u32) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: info is a valid output buffer. WNOHANG is nonblocking and
+        // WNOWAIT preserves the child's wait status and pre-reap counters.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        // SAFETY: the buffer was zero-initialized and waitid succeeded.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: si_pid is valid in the successful child-status result.
+        Ok(unsafe { info.si_pid() } == pid as libc::pid_t)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Err(AhrbError::Unsupported(
+            "non-reaping child-exit observation is unavailable".into(),
+        ))
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn final_child_exit_observation_preserves_wait_status() {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 7"])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !direct_child_exited_without_reap(child.id()).unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(direct_child_exited_without_reap(child.id()).unwrap());
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+}
+
 #[cfg(unix)]
 fn reap_direct_child(pid: u32) {
     let Ok(pid) = i32::try_from(pid) else {
@@ -1213,8 +1267,20 @@ pub trait Sampler: Send {
     }
     /// Discover ownership from verified roots.
     fn discover(&mut self, roots: &[u32]) -> Result<ProcessTree>;
+    /// Discover identities that are live counter candidates. Platforms whose
+    /// ordinary discovery retains exited identities for final accounting must
+    /// exclude those identities from this view.
+    fn discover_live(&mut self, roots: &[u32]) -> Result<ProcessTree> {
+        self.discover(roots)
+    }
     /// Capture one boundary or cadence sample.
     fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample>;
+    /// Capture live process counters, excluding exited identities retained only
+    /// for final cumulative accounting. Missing counters on live identities remain
+    /// unavailable rather than being replaced with zeros.
+    fn sample_live(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
+        self.sample(tree, phase)
+    }
     /// Capture per-identity cumulative disk-write counters out of band.
     ///
     /// Implementations retain identities whose counters disappear in
@@ -1235,6 +1301,78 @@ pub trait Sampler: Send {
             "per-identity disk counters are not implemented by this sampler".to_owned(),
         ))
     }
+}
+
+/// Re-resolve a live tree when a process exits between membership discovery and
+/// its thread/FD counter reads.
+///
+/// Every retry is checked against the `(pid,start-time)` identities observed by
+/// earlier attempts, so PID reuse is an error rather than replacement evidence.
+/// Missing counters are never filled with zero. An empty sample is accepted only
+/// when the freshly discovered live view itself produces no live processes.
+pub(crate) fn sample_live_with_counter_retries(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    phase: &str,
+    max_attempts: u32,
+    context: &str,
+) -> Result<(ProcessTree, Sample)> {
+    if max_attempts == 0 {
+        return Err(AhrbError::Validation(format!(
+            "{context} live-counter retry count must be positive"
+        )));
+    }
+    let mut identities_by_pid = BTreeMap::<u32, ProcIdentity>::new();
+    let mut accounting_warnings = Vec::new();
+    for attempt in 1..=max_attempts {
+        let tree = sampler.discover_live(roots)?;
+        for identity in tree.members.keys() {
+            if let Some(previous) = identities_by_pid.get(&identity.pid)
+                && previous != identity
+            {
+                return Err(AhrbError::Protocol(format!(
+                    "{context} PID {} changed start-time identity from {} to {} during live-counter retry",
+                    identity.pid, previous.start_time, identity.start_time
+                )));
+            }
+            identities_by_pid.entry(identity.pid).or_insert(*identity);
+        }
+        let mut sample = sampler.sample_live(&tree, phase)?;
+        accounting_warnings.append(&mut sample.cpu_accounting_warnings);
+        let discovered_identities: BTreeSet<ProcIdentity> = tree.members.keys().copied().collect();
+        let process_identities: BTreeSet<ProcIdentity> = sample
+            .processes
+            .iter()
+            .map(|process| process.identity)
+            .collect();
+        let sample_identities: BTreeSet<ProcIdentity> = sample
+            .process_samples
+            .iter()
+            .map(|process| process.process.identity)
+            .collect();
+        let counters_complete = sample.open_fds.is_some()
+            && sample.thread_count.is_some()
+            && process_identities == discovered_identities
+            && sample_identities == discovered_identities
+            && sample
+                .process_samples
+                .iter()
+                .all(|process| process.thread_count.is_some() && process.open_fds.is_some());
+        if counters_complete {
+            sample.cpu_accounting_warnings = accounting_warnings;
+            return Ok((tree, sample));
+        }
+        if attempt == max_attempts {
+            return Err(AhrbError::Protocol(format!(
+                "{context} could not collect complete live thread/FD counters after {max_attempts} identity-safe attempts"
+            )));
+        }
+        // Give a live-to-exit transition time to settle before rediscovery.
+        // Back-to-back libproc reads can otherwise observe the same transient
+        // omission on every bounded attempt.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    unreachable!("positive bounded retry loop always returns")
 }
 
 /// Reap a direct child with `wait4` and return supplemental terminal usage.
@@ -1299,6 +1437,215 @@ mod tests {
             pid,
             start_time: u64::from(pid).saturating_mul(10),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CounterRaceResolution {
+        Empty,
+        Exit,
+        OmittedThenSameIdentity,
+        SameIdentity,
+        ReusedPid,
+    }
+
+    struct CounterRaceSampler {
+        discoveries: u32,
+        resolution: CounterRaceResolution,
+    }
+
+    impl CounterRaceSampler {
+        fn new(resolution: CounterRaceResolution) -> Self {
+            Self {
+                discoveries: 0,
+                resolution,
+            }
+        }
+
+        fn process_identity(&self) -> Option<ProcIdentity> {
+            match (self.discoveries, self.resolution) {
+                (_, CounterRaceResolution::Empty) => None,
+                (1, _) => Some(ProcIdentity {
+                    pid: 42,
+                    start_time: 100,
+                }),
+                (_, CounterRaceResolution::Exit) => None,
+                (
+                    _,
+                    CounterRaceResolution::OmittedThenSameIdentity
+                    | CounterRaceResolution::SameIdentity,
+                ) => Some(ProcIdentity {
+                    pid: 42,
+                    start_time: 100,
+                }),
+                (_, CounterRaceResolution::ReusedPid) => Some(ProcIdentity {
+                    pid: 42,
+                    start_time: 200,
+                }),
+            }
+        }
+    }
+
+    impl Sampler for CounterRaceSampler {
+        fn discover(&mut self, _roots: &[u32]) -> Result<ProcessTree> {
+            self.discoveries = self.discoveries.saturating_add(1);
+            let mut tree = ProcessTree::default();
+            if let Some(identity) = self.process_identity() {
+                tree.roots.insert(identity);
+                tree.members.insert(
+                    identity,
+                    ProcessInfo {
+                        identity,
+                        ppid: 0,
+                        command: "counter-race".to_owned(),
+                        ownership: ProcOwnership::DeclaredRoot,
+                    },
+                );
+            }
+            Ok(tree)
+        }
+
+        fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
+            let complete = self.discoveries > 1 || tree.members.is_empty();
+            let wall_time = SystemTime::now();
+            let omit_process = self.discoveries == 1
+                && matches!(
+                    self.resolution,
+                    CounterRaceResolution::OmittedThenSameIdentity
+                );
+            let process_samples = tree
+                .members
+                .values()
+                .filter(|_| !omit_process)
+                .cloned()
+                .map(|process| ProcessSample {
+                    elapsed_ns: u64::from(self.discoveries),
+                    wall_time,
+                    phase: phase.to_owned(),
+                    process,
+                    rss_bytes: 1,
+                    pss_bytes: None,
+                    private_bytes: None,
+                    footprint_bytes: None,
+                    rss_crosscheck_bytes: None,
+                    cpu_ns: 1,
+                    open_fds: Some(1),
+                    thread_count: complete.then_some(1),
+                })
+                .collect::<Vec<_>>();
+            Ok(Sample {
+                elapsed_ns: u64::from(self.discoveries),
+                wall_time,
+                phase: phase.to_owned(),
+                rss_bytes: u64::try_from(process_samples.len()).unwrap(),
+                pss_bytes: None,
+                private_bytes: None,
+                footprint_bytes: None,
+                rss_crosscheck_bytes: None,
+                cgroup_memory_bytes: None,
+                cgroup_peak_bytes: None,
+                cpu_ns: u64::try_from(process_samples.len()).unwrap(),
+                open_fds: (!omit_process).then(|| u64::try_from(process_samples.len()).unwrap()),
+                thread_count: (complete && !omit_process)
+                    .then(|| u64::try_from(process_samples.len()).unwrap()),
+                collection_ns: 1,
+                collection_wall_ns: 1,
+                processes: tree
+                    .members
+                    .values()
+                    .filter(|_| !omit_process)
+                    .cloned()
+                    .collect(),
+                process_samples,
+                cpu_accounting_warnings: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn live_counter_retry_resolves_the_same_identity_or_its_exit() -> Result<()> {
+        for resolution in [
+            CounterRaceResolution::Exit,
+            CounterRaceResolution::SameIdentity,
+        ] {
+            let mut sampler = CounterRaceSampler::new(resolution);
+            let (tree, sample) = sample_live_with_counter_retries(
+                &mut sampler,
+                &[42],
+                "counter-race",
+                3,
+                "test counter race",
+            )?;
+            assert_eq!(sampler.discoveries, 2);
+            assert!(sample.thread_count.is_some());
+            match resolution {
+                CounterRaceResolution::Exit => {
+                    assert!(tree.members.is_empty());
+                    assert!(sample.processes.is_empty());
+                }
+                CounterRaceResolution::SameIdentity => {
+                    assert_eq!(tree.members.len(), 1);
+                    assert_eq!(sample.processes[0].identity.start_time, 100);
+                    assert_eq!(sample.thread_count, Some(1));
+                }
+                CounterRaceResolution::ReusedPid => unreachable!(),
+                CounterRaceResolution::Empty => unreachable!(),
+                CounterRaceResolution::OmittedThenSameIdentity => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_counter_retry_rejects_an_omitted_attempt_before_same_identity_success() -> Result<()> {
+        let mut sampler = CounterRaceSampler::new(CounterRaceResolution::OmittedThenSameIdentity);
+        let (tree, sample) = sample_live_with_counter_retries(
+            &mut sampler,
+            &[42],
+            "omitted-counter-attempt",
+            3,
+            "test omitted counter attempt",
+        )?;
+        assert_eq!(sampler.discoveries, 2);
+        assert_eq!(tree.members.len(), 1);
+        assert_eq!(sample.processes.len(), 1);
+        assert_eq!(sample.process_samples.len(), 1);
+        assert_eq!(sample.processes[0].identity.start_time, 100);
+        assert_eq!(sample.open_fds, Some(1));
+        assert_eq!(sample.thread_count, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn live_counter_retry_accepts_a_verified_empty_tree() -> Result<()> {
+        let mut sampler = CounterRaceSampler::new(CounterRaceResolution::Empty);
+        let (tree, sample) = sample_live_with_counter_retries(
+            &mut sampler,
+            &[42],
+            "empty-counter-tree",
+            3,
+            "test empty counter tree",
+        )?;
+        assert_eq!(sampler.discoveries, 1);
+        assert!(tree.members.is_empty());
+        assert!(sample.processes.is_empty());
+        assert!(sample.process_samples.is_empty());
+        assert_eq!(sample.open_fds, Some(0));
+        assert_eq!(sample.thread_count, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn live_counter_retry_rejects_pid_reuse() {
+        let mut sampler = CounterRaceSampler::new(CounterRaceResolution::ReusedPid);
+        let error = sample_live_with_counter_retries(
+            &mut sampler,
+            &[42],
+            "counter-race",
+            3,
+            "test counter race",
+        )
+        .expect_err("PID reuse must not satisfy a missing same-identity counter");
+        assert!(error.to_string().contains("changed start-time identity"));
     }
 
     #[test]

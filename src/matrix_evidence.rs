@@ -427,6 +427,11 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
             "documented retry_max_attempts/base_delay/max_delay policy is absent".to_owned(),
         );
     }
+    if row == 60 && manifest.capture.truncation_marker.is_none() {
+        return CapabilityStatus::Absent(
+            "capture.truncation_marker declaration is absent".to_owned(),
+        );
+    }
     CapabilityStatus::Supported
 }
 
@@ -1257,6 +1262,18 @@ const fn fmax(name: &str, value: f64) -> Check<'_> {
 #[cfg(test)]
 mod wave4_tests {
     use super::*;
+
+    #[test]
+    fn large_output_missing_marker_is_absent() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("adapters/mock/manifest.toml");
+        let mut manifest = crate::manifest::load(&path).expect("load mock manifest");
+        manifest.capture.truncation_marker = None;
+        assert!(matches!(
+            capability_for_row(&manifest, 60),
+            CapabilityStatus::Absent(reason) if reason.contains("truncation_marker")
+        ));
+    }
 
     #[test]
     fn observability_capabilities_come_only_from_adapter_declarations() {

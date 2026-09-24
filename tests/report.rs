@@ -1194,7 +1194,6 @@ fn resource_summary_is_pure_post_processing_of_existing_external_evidence() {
     let summary = summarize_resources(
         &samples,
         &membership,
-        4,
         &[10_000_000, 30_000_000],
         Some(8.0),
         Some(12.0),
@@ -1204,8 +1203,11 @@ fn resource_summary_is_pure_post_processing_of_existing_external_evidence() {
     assert_eq!(summary.peak_rss_mib, 30.0);
     assert_eq!(summary.mean_rss_mib, 20.0);
     assert_eq!(summary.median_rss_mib, 20.0);
-    assert_eq!(summary.cpu_total_s, 4.0);
-    assert_eq!(summary.cpu_per_turn_ms, 1_000.0);
+    // Mixed collector endpoints cannot establish a CPU/turn measurement.
+    let json = serde_json::to_value(&summary).unwrap();
+    assert!(json.get("cpu_total_s").is_none());
+    assert!(json.get("cpu_per_turn_ms").is_none());
+    assert!(summary.cpu_per_turn_p50_ms.is_none());
     assert_eq!(summary.wall_per_turn_ms, 20.0);
     assert_eq!(summary.sampler_overhead_pct, 5.0);
     let line = render_resource_summary(&summary);
@@ -1213,4 +1215,70 @@ fn resource_summary_is_pure_post_processing_of_existing_external_evidence() {
     assert!(line.contains("idle_rss_mib=8.000"));
     assert!(line.contains("parallel_beta_mib_per_agent=12.000"));
     assert!(line.ends_with("sampler_overhead_pct=5.000"));
+}
+
+#[test]
+fn legacy_cpu_is_absent_for_cross_collector_counter_resets_and_old_indexes() {
+    let mut samples = [sample(1_000, 10, 9_000_000), sample(500, 20, 2_000_000)];
+    samples[0].phase = "resource-sweep-collector".into();
+    samples[1].phase = "row54-independent-collector".into();
+    let summary = summarize_resources(&samples, &[], &[], None, None, None);
+    let serialized = serde_json::to_value(summary).unwrap();
+    assert!(serialized.get("cpu_total_s").is_none());
+    assert!(serialized.get("cpu_per_turn_ms").is_none());
+    assert!(serialized.get("cpu_per_turn_p50_ms").is_none());
+    let historical = serde_json::json!({
+        "peak_rss_mib": 1.0, "cpu_per_turn_ms": 0.079763,
+        "wall_per_turn_ms": 1.0, "sampler_overhead_pct": 0.0
+    });
+    let indexed: ahrb::results::IndexedResourceSummary =
+        serde_json::from_value(historical).unwrap();
+    assert!(indexed.cpu_per_turn_p50_ms.is_none());
+    assert!(indexed.cpu_per_turn_p95_ms.is_none());
+    assert!(
+        serde_json::to_value(indexed)
+            .unwrap()
+            .get("cpu_per_turn_ms")
+            .is_none()
+    );
+}
+
+#[test]
+fn every_matrix_row_serializes_wall_seconds_and_matching_junit_time() {
+    let mut report = Report::default();
+    for definition in ahrb::scenarios::all() {
+        let mut result = classify(
+            definition.row,
+            definition.id,
+            definition.pillar,
+            Some(true),
+            &[],
+            None,
+        );
+        result.metadata.wall_duration_s = f64::from(definition.row) / 8.0;
+        result.metadata.wall_duration_scope = "submit-to-terminal".into();
+        report.results.push(result);
+    }
+    let directory =
+        std::env::temp_dir().join(format!("ahrb-row-time-report-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    ahrb::report::write_bundle(&report, &directory, true).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("report.json")).unwrap()).unwrap();
+    let junit = std::fs::read_to_string(directory.join("junit.xml")).unwrap();
+    assert_eq!(json["results"].as_array().unwrap().len(), 73);
+    for result in &report.results {
+        let row = json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["row"] == result.row)
+            .unwrap();
+        assert_eq!(row["wall_duration_s"], result.metadata.wall_duration_s);
+        assert!(junit.contains(&format!(
+            "name=\"{}-{}\" time=\"{:.9}\"",
+            result.row, result.id, result.metadata.wall_duration_s
+        )));
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }

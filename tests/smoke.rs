@@ -10,8 +10,23 @@ fn output_directory() -> PathBuf {
     std::env::temp_dir().join(format!("ahrb-full-smoke-test-{}", std::process::id()))
 }
 
-#[tokio::test]
-async fn mock_harness_exercises_the_non_resource_report_pipeline() -> Result<()> {
+#[test]
+fn mock_harness_exercises_the_non_resource_report_pipeline() -> Result<()> {
+    // Do not let RUST_MIN_STACK hide a regression in the public runner future.
+    std::thread::Builder::new()
+        .name("ahrb-smoke-small-stack".to_owned())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(exercise_non_resource_report_pipeline())
+        })?
+        .join()
+        .expect("smoke thread panicked")
+}
+
+async fn exercise_non_resource_report_pipeline() -> Result<()> {
     let _subprocess_guard = common::serialize_ahrb_subprocesses();
     let output = output_directory();
     match std::fs::remove_dir_all(&output) {

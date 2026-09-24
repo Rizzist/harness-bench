@@ -59,6 +59,12 @@ pub struct TestResult {
 /// Additive v2 metadata shared by every matrix result.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TestResultMetadata {
+    /// External row wall seconds; zero with `not-launched` means no workload clock.
+    #[serde(default)]
+    pub wall_duration_s: f64,
+    /// submit-to-terminal, submit-to-interruption, operation, or not-launched.
+    #[serde(default = "default_wall_duration_scope")]
+    pub wall_duration_scope: String,
     /// `core`, `optional-facet`, or `informational`.
     #[serde(default = "default_core_requirement")]
     pub requirement: String,
@@ -80,6 +86,10 @@ pub struct TestResultMetadata {
     pub reference_envelope_pass: Option<bool>,
 }
 
+fn default_wall_duration_scope() -> String {
+    "not-launched".into()
+}
+
 fn default_core_requirement() -> String {
     "core".to_owned()
 }
@@ -87,6 +97,8 @@ fn default_core_requirement() -> String {
 impl Default for TestResultMetadata {
     fn default() -> Self {
         Self {
+            wall_duration_s: 0.0,
+            wall_duration_scope: default_wall_duration_scope(),
             requirement: default_core_requirement(),
             capability: None,
             capability_declared: None,
@@ -123,6 +135,8 @@ impl TestResultMetadata {
         let reference_envelope_pass =
             (informational && measurement_complete).then_some(matches!(outcome, TestOutcome::Pass));
         Self {
+            wall_duration_s: 0.0,
+            wall_duration_scope: default_wall_duration_scope(),
             requirement: requirement.to_owned(),
             capability,
             capability_declared: None,

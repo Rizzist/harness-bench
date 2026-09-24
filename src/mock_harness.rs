@@ -1846,6 +1846,7 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     let mut pre_terminal_child_ms = 0_u64;
     let mut lingering_child_ms = 0_u64;
     let mut plaintext_stdout = false;
+    let mut late_tool_arguments_ms = 0_u64;
     let mut config_args = Vec::new();
     let mut index = 0_usize;
     while index < args.len() {
@@ -1886,6 +1887,11 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
                         "lingering child delay exceeds 10000 ms".into(),
                     ));
                 }
+            }
+            "--late-tool-arguments-ms" => {
+                late_tool_arguments_ms = value
+                    .parse()
+                    .map_err(|_| AhrbError::Usage("invalid late-tool-arguments delay".into()))?;
             }
             "--post-output-delay-ms" => {
                 post_output_delay_ms = value
@@ -2121,8 +2127,37 @@ async fn exec_turn(args: &[String]) -> Result<i32> {
     if plaintext_stdout {
         println!("Turn completed: {:?}", terminal.event);
     } else {
-        for event in events {
+        let mut finalized_calls = BTreeMap::new();
+        for mut event in events {
+            if late_tool_arguments_ms > 0 && event.event == EventVocab::ToolCall {
+                let call_id = required_str(&event.payload, "call_id")?.to_owned();
+                let metadata = serde_json::to_vec(&event.payload)?
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                finalized_calls.insert(call_id.clone(), json!({
+                    "id": format!("{}:arguments-finalized", event.id),
+                    "payload": {"event":"completed","item":{
+                        "item":"tool_call","call_id":call_id,"name":"process_exec",
+                        "args":{"command":format!("# {}{}", crate::events::NATIVE_FIXTURE_METADATA_PREFIX, metadata)}
+                    }}
+                }));
+                event.payload["name"] = json!("process_exec");
+                event.payload["arguments"] = json!({});
+            }
             println!("{}", serde_json::to_string(&event)?);
+            if late_tool_arguments_ms > 0 {
+                std::io::stdout().flush()?;
+                tokio::time::sleep(Duration::from_millis(late_tool_arguments_ms)).await;
+                if event.event == EventVocab::ToolResult
+                    && let Some(call_id) = event.payload.get("call_id").and_then(Value::as_str)
+                    && let Some(completed) = finalized_calls.remove(call_id)
+                {
+                    println!("{}", serde_json::to_string(&completed)?);
+                    std::io::stdout().flush()?;
+                    tokio::time::sleep(Duration::from_millis(late_tool_arguments_ms)).await;
+                }
+            }
         }
     }
     std::io::stdout().flush()?;

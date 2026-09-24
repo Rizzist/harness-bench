@@ -137,3 +137,17 @@ The version-pinned Goose source describes [provider URL resolution](https://gith
 and [isolated paths](https://github.com/aaif-goose/goose/blob/v1.49.0/crates/goose/src/config/paths.rs).
 Installed CLI help, Aider's installed Python source, and Cline's generated disposable
 provider file are the local configuration references for this lane.
+
+Haider's `0.0.970-measurement-json-v2` declaration was checked against the pinned
+0.0.970 executable (SHA-256 `dd40b86e7334ed87dae04d14b032dc5912f83f050980e0fbb97594e6b76c503b`,
+dev/debug preflight build). `run --help` lists JSONL, timeout, start/status/stop/replay
+and describes allow-writes/allow-exec as compatibility aliases. It does not document
+ordinary session continuation. No continuation or close binding is inferred.
+Disposable-profile observations establish `home/.haider/dev-profile/daemon.log`
+and `daemon-logs/haiderd-<pid>-<timestamp>-0.log`. The active generation and
+`daemon.log` share device/inode, so the manifest declares the stable alias once.
+Row 47 accepts file paths, not globs; archived-generation retention is not declared
+bounded. Observed native
+result previews have `truncated=false` and BLAKE3 transcript digests, without a
+verified row-60 marker containing original bytes, retained payload bytes, and the
+full-stream SHA-256. Row 60 therefore remains ERROR pending actual marker evidence.

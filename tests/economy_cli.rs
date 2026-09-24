@@ -372,3 +372,75 @@ fn per_invocation_mock_uses_its_declared_effect_workspace() {
 
     std::fs::remove_dir_all(output).expect("remove mock-exec economy output");
 }
+
+#[test]
+fn late_native_tool_arguments_complete_economy_without_duplicate_events() {
+    let _guard = common::serialize_ahrb_subprocesses();
+    let root = std::env::temp_dir().join(format!("ahrb-late-arguments-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let source = std::fs::read_to_string("adapters/mock-exec/manifest.toml")
+        .unwrap()
+        .replace("source = \"journal-file\"", "source = \"stdout\"")
+        .replace(
+            "\"exec-turn\",",
+            "\"exec-turn\", \"--late-tool-arguments-ms\", \"25\",",
+        );
+    let manifest = root.join("manifest.toml");
+    std::fs::write(&manifest, source).unwrap();
+    let output = root.join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["run", "--pillar", "economy", "--manifest"])
+        .arg(&manifest)
+        .args(["--profile", "quick", "--no-save", "--output"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Report =
+        serde_json::from_slice(&std::fs::read(output.join("report.json")).unwrap()).unwrap();
+    let summary = report.economy_summary.unwrap();
+    assert_eq!(summary.completion, EconomyCompletion::Completed);
+    assert!(summary.effects_verified.all_verified);
+    let ids = report
+        .events
+        .iter()
+        .filter_map(|event| event.get("id").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), report.events.len());
+    assert!(
+        report
+            .lifecycle_notes
+            .iter()
+            .any(|note| note.starts_with("collector-span "))
+    );
+    assert!(
+        report
+            .lifecycle_notes
+            .iter()
+            .any(|note| note.starts_with("collector-terminal-return "))
+    );
+    let spans = std::fs::read_to_string(output.join("collector-spans.jsonl")).unwrap();
+    for line in spans.lines() {
+        let span: serde_json::Value = serde_json::from_str(line).unwrap();
+        if span["kind"] == "batch" {
+            let times = [
+                "poll_started_ns",
+                "receipt_ns",
+                "normalization_started_ns",
+                "normalized_ns",
+                "persisted_ns",
+            ]
+            .map(|key| span[key].as_u64().unwrap());
+            assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        assert!(span.get("arguments").is_none());
+        assert!(span.get("prompt").is_none());
+    }
+    std::fs::remove_dir_all(&report.profile_path).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

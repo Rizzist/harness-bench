@@ -805,3 +805,25 @@ fn codex_manifest_overrides_context_and_ignores_nonfatal_metadata_items() -> Res
     }));
     Ok(())
 }
+
+#[test]
+fn haider_970_measurement_declarations_do_not_invent_lifecycle_or_truncation() {
+    let manifest = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
+    assert_eq!(manifest.identity.revision, "0.0.970-measurement-json-v2");
+    assert_eq!(
+        manifest.resources.log_paths.as_ref().unwrap(),
+        &["{{profile}}/home/.haider/dev-profile/daemon.log"]
+    );
+    assert!(
+        manifest
+            .resources
+            .log_paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|path| path.contains("{{profile}}/home/.haider/dev-profile/"))
+    );
+    assert!(manifest.sessions.continue_turn.is_empty());
+    assert!(manifest.sessions.close_delete.is_empty());
+    assert!(manifest.capture.truncation_marker.is_none());
+}

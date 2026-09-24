@@ -179,6 +179,20 @@ impl<'de> Deserialize<'de> for ReportDetails {
         use serde::de::Error as _;
         let values = BTreeMap::<String, Value>::deserialize(deserializer)?;
         for (name, value) in &values {
+            // Historical unmeasured Wave-4 evaluations emitted null. Preserve
+            // absence verbatim while still validating every present detail block.
+            if value.is_null()
+                && matches!(
+                    name.as_str(),
+                    "injection-surface"
+                        | "budget-enforcement"
+                        | "usage-reporting"
+                        | "headless-permission-model"
+                        | "secrets-hygiene-on-disk"
+                )
+            {
+                continue;
+            }
             let validation = match name.as_str() {
                 name if crate::storage::ROWS.contains(&name) => {
                     crate::storage::evidence::validate_details(name, value)
@@ -822,6 +836,18 @@ pub struct StreamChunkObservation {
     pub actor: String,
     /// Stable streaming case name.
     pub case: String,
+    /// Physical response route; repeated ordinals across attempts are distinct frames.
+    #[serde(default)]
+    pub scenario: String,
+    /// Accepted checkpoint within the route.
+    #[serde(default)]
+    pub checkpoint: String,
+    /// One-based physical provider attempt (zero means unknown in an old bundle).
+    #[serde(default)]
+    pub attempt: u64,
+    /// HTTP protocol frontend.
+    #[serde(default)]
+    pub frontend: String,
     /// One-based frame ordinal.
     pub ordinal: u32,
     /// AHRB-owned scheduled monotonic boundary.
@@ -1050,10 +1076,6 @@ pub struct ResourceSummary {
     pub mean_rss_mib: f64,
     /// Median effective owned-tree memory over all samples.
     pub median_rss_mib: f64,
-    /// Cumulative owned-tree CPU delta over the sampled run.
-    pub cpu_total_s: f64,
-    /// Cumulative owned-tree CPU divided by executed workflow turns.
-    pub cpu_per_turn_ms: f64,
     /// Mean external AHRB turn wall clock.
     pub wall_per_turn_ms: f64,
     /// Nearest-rank median external turn wall clock.
@@ -1366,6 +1388,26 @@ pub fn write_bundle(report: &Report, directory: &Path, junit: bool) -> Result<()
     }
     write_jsonl(&directory.join("processes.jsonl"), &report.processes)?;
     write_jsonl(&directory.join("membership.jsonl"), &report.membership)?;
+    let collector_spans = report
+        .lifecycle_notes
+        .iter()
+        .filter_map(|note| {
+            note.strip_prefix("collector-span ")
+                .map(|value| ("batch", value))
+                .or_else(|| {
+                    note.strip_prefix("collector-terminal-return ")
+                        .map(|value| ("terminal-return", value))
+                })
+        })
+        .map(|(kind, text)| -> Result<Value> {
+            let mut value: Value = serde_json::from_str(text)?;
+            value["kind"] = Value::String(kind.to_owned());
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !collector_spans.is_empty() {
+        write_jsonl(&directory.join("collector-spans.jsonl"), &collector_spans)?;
+    }
     write_jsonl(&directory.join("events.jsonl"), &report.events)?;
     write_jsonl(
         &directory.join("model-requests.jsonl"),
@@ -1759,12 +1801,10 @@ pub fn render_markdown(report: &Report) -> String {
 /// Build the concise resource-summary line shared by `ahrb run` and `hbench`.
 pub fn render_resource_summary(summary: &ResourceSummary) -> String {
     let mut output = format!(
-        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} cpu_total_s={:.3} cpu_per_turn_ms={:.3} wall_per_turn_ms={:.3} wall_per_turn_p50_ms={} wall_per_turn_p95_ms={} wall_per_turn_max_ms={} wall_per_turn_mad_ms={} wall_per_turn_jitter_ratio={} latency_class={} time_to_first_model_request_p50_ms={} time_to_first_model_request_p95_ms={} time_to_first_model_request_max_ms={} memory_time_integral_mib_s_per_turn={} memory_time_integral_coverage_ratio={} memory_time_integral_max_sample_gap_ms={} cpu_per_turn_p50_ms={} cpu_per_turn_p95_ms={} cpu_class={}",
+        "resource_summary peak_rss_mib={:.3} mean_rss_mib={:.3} median_rss_mib={:.3} wall_per_turn_ms={:.3} wall_per_turn_p50_ms={} wall_per_turn_p95_ms={} wall_per_turn_max_ms={} wall_per_turn_mad_ms={} wall_per_turn_jitter_ratio={} latency_class={} time_to_first_model_request_p50_ms={} time_to_first_model_request_p95_ms={} time_to_first_model_request_max_ms={} memory_time_integral_mib_s_per_turn={} memory_time_integral_coverage_ratio={} memory_time_integral_max_sample_gap_ms={} cpu_per_turn_p50_ms={} cpu_per_turn_p95_ms={} cpu_class={}",
         summary.peak_rss_mib,
         summary.mean_rss_mib,
         summary.median_rss_mib,
-        summary.cpu_total_s,
-        summary.cpu_per_turn_ms,
         summary.wall_per_turn_ms,
         optional_milliseconds(summary.wall_per_turn_p50_ms),
         optional_milliseconds(summary.wall_per_turn_p95_ms),
@@ -1846,11 +1886,9 @@ fn optional_bool(value: Option<bool>) -> &'static str {
 /// clocks; this function performs no sampling and does not interact with a
 /// harness. On macOS effective memory is physical footprint, while on Linux it
 /// is PSS when available and RSS otherwise.
-#[allow(clippy::too_many_arguments)]
 pub fn summarize_resources(
     samples: &[Sample],
     membership: &[MembershipSample],
-    workflow_turns: u64,
     turn_wall_ns: &[u64],
     idle_rss_mib: Option<f64>,
     parallel_beta_mib_per_agent: Option<f64>,
@@ -1876,15 +1914,6 @@ pub fn summarize_resources(
             let lower = memory[length / 2 - 1] as f64;
             (lower + upper) / 2.0
         }
-    };
-    let cpu_ns = samples
-        .first()
-        .zip(samples.last())
-        .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns));
-    let cpu_per_turn_ms = if workflow_turns == 0 {
-        0.0
-    } else {
-        cpu_ns as f64 / workflow_turns as f64 / 1_000_000.0
     };
     let wall_per_turn_ms = if turn_wall_ns.is_empty() {
         0.0
@@ -1914,8 +1943,6 @@ pub fn summarize_resources(
         peak_rss_mib: peak_bytes as f64 / MIB,
         mean_rss_mib: mean_bytes / MIB,
         median_rss_mib: median_bytes / MIB,
-        cpu_total_s: cpu_ns as f64 / 1_000_000_000.0,
-        cpu_per_turn_ms,
         wall_per_turn_ms,
         wall_per_turn_p50_ms: None,
         wall_per_turn_p95_ms: None,
@@ -3648,10 +3675,11 @@ fn render_junit(report: &Report) -> String {
     for result in results {
         let _ = writeln!(
             output,
-            "  <testcase classname=\"{:?}\" name=\"{}-{}\">",
+            "  <testcase classname=\"{:?}\" name=\"{}-{}\" time=\"{:.9}\">",
             result.pillar,
             result.row,
-            xml_escape(&result.id)
+            xml_escape(&result.id),
+            result.metadata.wall_duration_s
         );
         match &result.outcome {
             TestOutcome::Pass => {}
@@ -3697,6 +3725,33 @@ mod wave4_schema_tests {
         assert_eq!(
             WAVE4_METRIC_KEYS.last().copied(),
             Some("compaction_transparency.score")
+        );
+    }
+
+    #[test]
+    fn historical_unmeasured_wave4_null_details_round_trip_without_defaults() {
+        let nulls = serde_json::json!({
+            "injection-surface": null,
+            "budget-enforcement": null,
+            "usage-reporting": null,
+            "headless-permission-model": null,
+            "secrets-hygiene-on-disk": null,
+        });
+        let mut report = serde_json::to_value(Report::default()).unwrap();
+        report["details"] = nulls.clone();
+        let parsed: Report = serde_json::from_value(report).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap()["details"], nulls);
+        assert!(
+            serde_json::from_value::<ReportDetails>(serde_json::json!({
+                "budget-enforcement": {"cases": "invalid"}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReportDetails>(serde_json::json!({
+                "memory-time-integral": null
+            }))
+            .is_err()
         );
     }
 

@@ -429,6 +429,33 @@ fn validate_trickle_frames(
     if response_headers_ns == 0 {
         return Err("provider response-header boundary is missing".to_owned());
     }
+    let mut physical: BTreeMap<_, Vec<u32>> = BTreeMap::new();
+    for frame in frames {
+        physical
+            .entry((
+                &frame.scenario,
+                &frame.actor,
+                &frame.checkpoint,
+                frame.attempt,
+                &frame.frontend,
+            ))
+            .or_default()
+            .push(frame.ordinal);
+    }
+    for (identity, ordinals) in &mut physical {
+        ordinals.sort_unstable();
+        if *ordinals != (1..=expected_count).collect::<Vec<_>>() {
+            return Err(format!(
+                "physical response {identity:?} has paced ordinals {ordinals:?}; expected 1..={expected_count}; receipts retained without deduplication"
+            ));
+        }
+    }
+    if physical.len() != 1 {
+        return Err(format!(
+            "paced trial observed {} physical responses; expected exactly one complete response",
+            physical.len()
+        ));
+    }
     if frames.len() != expected_count as usize {
         return Err(format!(
             "observed {} paced frames; expected {expected_count}",
@@ -1529,12 +1556,32 @@ mod tests {
                 actor: "actor".to_owned(),
                 checkpoint: "start".to_owned(),
                 attempt: 1,
+                frontend: "direct".to_owned(),
                 ordinal,
                 scheduled_ns: headers_ns + u64::from(ordinal) * 1_000_000_000,
                 frame_yielded_ns: headers_ns + u64::from(ordinal) * 1_000_000_000 + 1_000_000,
                 bytes: 1,
             })
             .collect()
+    }
+
+    #[test]
+    fn retries_cannot_fabricate_one_complete_paced_response() {
+        let headers = 1_000_000_000;
+        let mut frames = paced_frames(headers, 2);
+        let mut retry = paced_frames(headers + 3_000_000_000, 3);
+        for frame in &mut retry {
+            frame.attempt = 2;
+        }
+        frames.extend(retry);
+        let error = validate_trickle_frames(&frames, headers, 5).err().unwrap();
+        assert!(error.contains("physical response"));
+        assert!(error.contains("receipts retained without deduplication"));
+        assert_eq!(frames.len(), 5);
+        let mut duplicate = paced_frames(headers, 5);
+        duplicate[4].ordinal = 4;
+        assert!(validate_trickle_frames(&duplicate, headers, 5).is_err());
+        assert!(validate_trickle_frames(&paced_frames(headers, 5), headers, 5).is_ok());
     }
 
     fn cpu_samples(headers_ns: u64, final_ns: u64, cpu_ns: u64) -> Vec<ModelWaitCpuSample> {

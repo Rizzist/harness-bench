@@ -28,6 +28,7 @@ use crate::manifest::{ArgvPosition, InjectionComponent, InjectionMethod, Manifes
 use crate::mock_harness::OwnedEgressLedgerRecord;
 use crate::process::{
     DiskIdentityStatus, ProcessSample, ProcessTree, Sample, Sampler, TreeDiskTracker,
+    sample_live_with_counter_retries,
 };
 use crate::report::{
     EgressAttempt, FilesystemSnapshot, Fingerprint, LatencyVsTurnIndexEvaluation, MembershipSample,
@@ -155,6 +156,7 @@ struct RunState {
 
 #[derive(Clone, Default)]
 struct RunProgress {
+    timings: crate::row_timing::Ledger,
     inner: Arc<Mutex<RunProgressState>>,
 }
 
@@ -207,6 +209,7 @@ struct ModelRequestEfficiencyTrials {
 }
 
 struct TurnLatencyTrials {
+    lifecycle_notes: Vec<String>,
     events: Vec<NormalizedEvent>,
     requests: Vec<crate::fake_model::ModelRequestRecord>,
     turns: Vec<TurnObservation>,
@@ -220,6 +223,8 @@ struct TimeToFirstModelRequestTrials {
 }
 
 struct MemoryTimeIntegralTrials {
+    lifecycle_notes: Vec<String>,
+    processes: Vec<crate::process::ProcessSample>,
     events: Vec<NormalizedEvent>,
     requests: Vec<crate::fake_model::ModelRequestRecord>,
     evidence: MemoryTimeIntegralEvidence,
@@ -4199,6 +4204,7 @@ fn row_timeout<T>(
     match result {
         Ok(value) => Ok(Some(value)),
         Err(AhrbError::Timeout(detail)) => {
+            progress.timings.finish(row);
             let detail = format!("turn timeout: {detail}");
             row_errors.insert(row, detail.clone());
             progress.update(|state| {
@@ -4260,6 +4266,7 @@ fn write_interrupted_report(
 ) -> Result<()> {
     let manifest_hash = crate::manifest::hash(manifest)?;
     let selected_rows: Vec<u8> = selected.iter().map(|definition| definition.row).collect();
+    let timings = progress.timings.clone();
     let progress = progress.snapshot()?;
     let mut results: Vec<TestResult> = selected
         .iter()
@@ -4322,6 +4329,7 @@ fn write_interrupted_report(
                 .unwrap_or(fallback)
         })
         .collect();
+    timings.apply(&mut results);
     crate::report::record_capability_declarations(&mut results, manifest);
     let mut raw_events = Vec::new();
     for events in progress.events.values() {
@@ -4379,6 +4387,18 @@ fn write_interrupted_report(
 }
 
 async fn run_inner(
+    options: RunOptions,
+    manifest: Manifest,
+    progress: RunProgress,
+    persistence: crate::results::RunPersistence,
+) -> Result<i32> {
+    let timings = progress.timings.clone();
+    timings
+        .scope(run_inner_timed(options, manifest, progress, persistence))
+        .await
+}
+
+async fn run_inner_timed(
     options: RunOptions,
     manifest: Manifest,
     progress: RunProgress,
@@ -4558,14 +4578,17 @@ async fn run_inner(
         Vec::new()
     };
     let per_invocation_collection = if resource_selected && per_invocation_topology(&manifest) {
-        match collect_per_invocation_resource_observations(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &workflow,
-            &model_environment,
-            &credential,
-            selected_rows.contains(&49),
+        match crate::row_timing::rows(
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 49],
+            collect_per_invocation_resource_observations(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &workflow,
+                &model_environment,
+                &credential,
+                selected_rows.contains(&49),
+            ),
         )
         .await
         {
@@ -4606,13 +4629,16 @@ async fn run_inner(
         && per_invocation_collection.is_none()
         && !per_invocation_topology(&manifest)
     {
-        match collect_resource_evidence(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &workflow,
-            &model_environment,
-            &credential,
+        match crate::row_timing::rows(
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 49],
+            collect_resource_evidence(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &workflow,
+                &model_environment,
+                &credential,
+            ),
         )
         .await
         {
@@ -4682,13 +4708,15 @@ async fn run_inner(
                 let session = driver
                     .create_session(&format!("{}:{actor_name}", workflow.scenario))
                     .await?;
-                driver
-                    .submit(
+                crate::row_timing::with_rows(
+                    &[*row],
+                    driver.submit(
                         &session,
                         &actor.prompt,
                         &format!("row-{row}-turn-{}", index + 1),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 launched.push(session);
             }
             Ok(launched)
@@ -4903,13 +4931,22 @@ async fn run_inner(
 
     if let Some(session) = sessions.get(&37).and_then(|items| items.first()) {
         let row_result: Result<Vec<NormalizedEvent>> = async {
-            let original = collect_session_terminal(
-                &mut driver,
-                session,
-                None,
-                Duration::from_millis(manifest.resources.turn_timeout_ms),
-            )
-            .await?;
+            let original = if manifest.hooks.completion.is_empty() {
+                collect_session_terminal(
+                    &mut driver,
+                    session,
+                    None,
+                    Duration::from_millis(manifest.resources.turn_timeout_ms),
+                )
+                .await?
+            } else {
+                collect_session_terminal_and_completion_hook(
+                    &mut driver,
+                    session,
+                    Duration::from_millis(manifest.resources.turn_timeout_ms),
+                )
+                .await?
+            };
             let native_resume = manifest.transport.kind == TransportKind::Exec
                 && !manifest.sessions.resume_control.is_empty();
             let replayed = if native_resume {
@@ -4981,7 +5018,8 @@ async fn run_inner(
                 .iter()
                 .filter(|event| is_terminal(&event.event))
                 .count();
-            let unchanged = validate_recovered_suffix(&original, None, &replayed).is_ok();
+            let replay_validation = validate_recovered_suffix(&original, None, &replayed);
+            let unchanged = replay_validation.is_ok();
             let valid = unchanged && accepted == 1 && effects == 1 && terminals == 1;
             resume_idempotency_valid = Some(valid);
             let mechanism = if native_resume {
@@ -4990,7 +5028,10 @@ async fn run_inner(
                 "disk reopen plus duplicate submit"
             };
             resume_idempotency_detail = Some(format!(
-                "{mechanism} preserved the exact durable session journal: unchanged={unchanged}, accepted={accepted}, committed_effects={effects}, terminals={terminals}"
+                "{mechanism} preserved the exact durable session journal: unchanged={unchanged}, accepted={accepted}, committed_effects={effects}, terminals={terminals}{}",
+                replay_validation
+                    .err()
+                    .map_or_else(String::new, |detail| format!("; replay validation: {detail}"))
             ));
             Ok(original)
         }
@@ -5167,6 +5208,7 @@ async fn run_inner(
         .map(|evidence| evidence.lifecycle_notes.clone())
         .unwrap_or_default();
     if needs_recovery {
+        let recovery_timing_driver = driver.timing_identity();
         let recovery_started = Instant::now();
         let recovery_roots = if main_roots.is_empty() {
             driver.owned_pids()
@@ -5217,6 +5259,7 @@ async fn run_inner(
                 &profile_root,
                 false,
             )?;
+            crate::row_timing::rebind_driver(recovery_timing_driver, recovered.timing_identity());
             recovered.start().await?;
             recovered.await_readiness().await?;
             crash_recovery_ms = Some(recovery_started.elapsed().as_secs_f64() * 1_000.0);
@@ -5373,6 +5416,15 @@ async fn run_inner(
                     .map(|event| crate::driver::Cursor(event.cursor));
                 match recovered.replay_persisted(session, after).await {
                     Ok(suffix) => {
+                        // Durable replay is itself the terminal observation for
+                        // this recovered public session. Attribute it explicitly
+                        // at the recovery boundary even when the concrete driver
+                        // also reports attach/replay observations internally.
+                        crate::row_timing::observed(
+                            recovered.timing_identity(),
+                            &session.0,
+                            &suffix,
+                        );
                         journal_recovered_events = Some(suffix.len());
                         match validate_recovered_suffix(&original, after, &suffix) {
                             Ok(()) => {
@@ -5431,16 +5483,33 @@ async fn run_inner(
         lifecycle_notes.extend(driver.lifecycle_notes());
     }
 
+    // Recovery/replay rows have now reached their own public completion
+    // boundaries. Freeze them before any independent derived-row collector can
+    // run, even when the successful operation returned an existing durable
+    // terminal rather than emitting a new terminal identity.
+    if crash_recovery_valid.is_some() {
+        progress.timings.complete(35);
+    }
+    if resume_idempotency_valid.is_some() {
+        progress.timings.complete(37);
+    }
+    if journal_recovery_valid.is_some() {
+        progress.timings.complete(40);
+    }
+
     // Derived-row workloads own independent drivers and provider ledgers. Run
     // them only after the v1 driver has completed its terminal or recovery
     // lifecycle so their duration cannot change any v1 observation.
     let row42_trials = if selected_rows.contains(&42) || selected_rows.contains(&44) {
-        match collect_model_request_efficiency_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
-            selected_rows.contains(&44),
+        match crate::row_timing::rows(
+            &[42, 44],
+            collect_model_request_efficiency_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+                selected_rows.contains(&44),
+            ),
         )
         .await
         {
@@ -5468,8 +5537,11 @@ async fn run_inner(
         None
     };
     let row43_trials = if selected_rows.contains(&43) {
-        match collect_turn_latency_trials(&manifest, options.profile, &profile_root, &manifest_hash)
-            .await
+        match crate::row_timing::rows(
+            &[43],
+            collect_turn_latency_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 events.insert(43_u8, trials.events.clone());
@@ -5494,11 +5566,14 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 50),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_session_residue_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[50],
+            collect_session_residue_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5520,11 +5595,14 @@ async fn run_inner(
         None
     };
     let row45_trials = if selected_rows.contains(&45) {
-        match collect_time_to_first_model_request_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[45],
+            collect_time_to_first_model_request_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5550,11 +5628,14 @@ async fn run_inner(
         None
     };
     let row46_trials = if selected_rows.contains(&46) {
-        match collect_memory_time_integral_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[46],
+            collect_memory_time_integral_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5575,8 +5656,11 @@ async fn run_inner(
         None
     };
     let row47_trials = if selected_rows.contains(&47) {
-        match collect_disk_io_trials(&manifest, options.profile, &profile_root, &manifest_hash)
-            .await
+        match crate::row_timing::rows(
+            &[47],
+            collect_disk_io_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 events.insert(47_u8, trials.events.clone());
@@ -5595,11 +5679,14 @@ async fn run_inner(
         None
     };
     let row48_trials = if selected_rows.contains(&48) {
-        match collect_model_wait_cpu_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[48],
+            collect_model_wait_cpu_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5627,11 +5714,14 @@ async fn run_inner(
             ),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_context_recovery_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[51, 73],
+            collect_context_recovery_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5671,11 +5761,14 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 52),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_resume_latency_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[52],
+            collect_resume_latency_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5700,11 +5793,14 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 53),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_journal_torn_tail_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[53],
+            collect_journal_torn_tail_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5732,7 +5828,11 @@ async fn run_inner(
                 .max_agents
                 .is_some_and(|value| value >= 32))
     {
-        match collect_fanout_trials(&manifest, options.profile, &profile_root, &manifest_hash).await
+        match crate::row_timing::rows(
+            &[54, 55],
+            collect_fanout_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 if selected_rows.contains(&54) {
@@ -5769,11 +5869,9 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 56),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_child_failure_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[56],
+            collect_child_failure_trials(&manifest, options.profile, &profile_root, &manifest_hash),
         )
         .await
         {
@@ -5798,11 +5896,9 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 57),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_signal_matrix_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[57],
+            collect_signal_matrix_trials(&manifest, options.profile, &profile_root, &manifest_hash),
         )
         .await
         {
@@ -5827,8 +5923,11 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 58),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_retry_budget_trials(&manifest, options.profile, &profile_root, &manifest_hash)
-            .await
+        match crate::row_timing::rows(
+            &[58],
+            collect_retry_budget_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 events.insert(58_u8, trials.events.clone());
@@ -5847,11 +5946,14 @@ async fn run_inner(
         None
     };
     let row59_trials = if selected_rows.contains(&59) {
-        match collect_slow_stream_stall_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[59],
+            collect_slow_stream_stall_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5871,9 +5973,16 @@ async fn run_inner(
     } else {
         None
     };
-    let row60_trials = if selected_rows.contains(&60) {
-        match collect_large_output_trials(&manifest, options.profile, &profile_root, &manifest_hash)
-            .await
+    let row60_trials = if selected_rows.contains(&60)
+        && matches!(
+            crate::matrix_evidence::capability_for_row(&manifest, 60),
+            crate::matrix_evidence::CapabilityStatus::Supported
+        ) {
+        match crate::row_timing::rows(
+            &[60],
+            collect_large_output_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 events.insert(60_u8, trials.events.clone());
@@ -5892,11 +6001,14 @@ async fn run_inner(
         None
     };
     let row61_trials = if selected_rows.contains(&61) {
-        match collect_workspace_fault_trials(
-            &manifest,
-            options.profile,
-            &profile_root,
-            &manifest_hash,
+        match crate::row_timing::rows(
+            &[61],
+            collect_workspace_fault_trials(
+                &manifest,
+                options.profile,
+                &profile_root,
+                &manifest_hash,
+            ),
         )
         .await
         {
@@ -5917,8 +6029,11 @@ async fn run_inner(
         None
     };
     let row62_trials = if selected_rows.contains(&62) {
-        match collect_offline_mode_trials(&manifest, options.profile, &profile_root, &manifest_hash)
-            .await
+        match crate::row_timing::rows(
+            &[62],
+            collect_offline_mode_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 events.insert(62_u8, trials.events.clone());
@@ -5941,7 +6056,12 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 65),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_injection_surface_trials(&manifest, &profile_root, &manifest_hash).await {
+        match crate::row_timing::rows(
+            &[65],
+            collect_injection_surface_trials(&manifest, &profile_root, &manifest_hash),
+        )
+        .await
+        {
             Ok(trials) => Some(trials),
             Err(error) => {
                 let detail = format!("injection-surface evidence collection: {error}");
@@ -5960,12 +6080,15 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 66),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_budget_enforcement(
-            &manifest,
-            &variables,
-            &environment,
-            engine.as_ref(),
-            options.profile,
+        match crate::row_timing::rows(
+            &[66],
+            collect_budget_enforcement(
+                &manifest,
+                &variables,
+                &environment,
+                engine.as_ref(),
+                options.profile,
+            ),
         )
         .await
         {
@@ -5987,12 +6110,15 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 70),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_headless_permissions(
-            &manifest,
-            &variables,
-            &environment,
-            &profile_root,
-            options.profile,
+        match crate::row_timing::rows(
+            &[70],
+            collect_headless_permissions(
+                &manifest,
+                &variables,
+                &environment,
+                &profile_root,
+                options.profile,
+            ),
         )
         .await
         {
@@ -6014,7 +6140,12 @@ async fn run_inner(
             crate::matrix_evidence::capability_for_row(&manifest, 68),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
-        match collect_session_cli(&manifest, &variables, &environment, options.profile).await {
+        match crate::row_timing::rows(
+            &[68],
+            collect_session_cli(&manifest, &variables, &environment, options.profile),
+        )
+        .await
+        {
             Ok(evaluation) => evaluation,
             Err(error) => {
                 let detail = format!("session-ops-cli evidence collection: {error}");
@@ -6035,8 +6166,11 @@ async fn run_inner(
         }
     };
     let determinism_trials = if selected_rows.contains(&63) || selected_rows.contains(&64) {
-        match collect_determinism_trials(&manifest, options.profile, &profile_root, &manifest_hash)
-            .await
+        match crate::row_timing::rows(
+            &[63, 64],
+            collect_determinism_trials(&manifest, options.profile, &profile_root, &manifest_hash),
+        )
+        .await
         {
             Ok(trials) => {
                 if selected_rows.contains(&63) {
@@ -6068,7 +6202,7 @@ async fn run_inner(
         None
     };
 
-    let state = RunState {
+    let mut state = RunState {
         events,
         sessions,
         samples,
@@ -6113,6 +6247,7 @@ async fn run_inner(
         request_records.extend(trials.requests.clone());
     }
     if let Some(trials) = &row43_trials {
+        state.lifecycle_notes.extend(trials.lifecycle_notes.clone());
         request_records.extend(trials.requests.clone());
     }
     if let Some(trials) = &row50_trials {
@@ -6122,6 +6257,7 @@ async fn run_inner(
         request_records.extend(trials.requests.clone());
     }
     if let Some(trials) = &row46_trials {
+        state.lifecycle_notes.extend(trials.lifecycle_notes.clone());
         request_records.extend(trials.requests.clone());
     }
     if let Some(trials) = &row47_trials {
@@ -6235,16 +6371,6 @@ async fn run_inner(
     } else {
         &state.samples
     };
-    let workflow_turns = if state.per_invocation_resources.is_empty() {
-        resource_evidence_turns(&resource_evidence)
-    } else {
-        state
-            .per_invocation_resources
-            .iter()
-            .fold(0_u64, |total, observation| {
-                total.saturating_add(u64::from(observation.completed_processes))
-            })
-    };
     let turn_wall_ns = if state.per_invocation_resources.is_empty() {
         resource_evidence.turn_wall_ns.as_slice()
     } else {
@@ -6261,7 +6387,6 @@ async fn run_inner(
     let mut resource_summary = summarize_resources(
         summary_samples,
         &membership,
-        workflow_turns,
         turn_wall_ns,
         idle_rss_mib,
         resource_certification
@@ -6808,8 +6933,16 @@ async fn run_inner(
         options.profile,
     );
     crate::report::record_capability_declarations(&mut results, &manifest);
-    if !state.lifecycle_notes.is_empty() {
-        let note = format!("daemon lifecycle: {}", state.lifecycle_notes.join("; "));
+    let lifecycle_diagnostics = state
+        .lifecycle_notes
+        .iter()
+        .filter(|note| {
+            !note.starts_with("collector-") && !note.starts_with("row46-client-final-before-reap ")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !lifecycle_diagnostics.is_empty() {
+        let note = format!("daemon lifecycle: {}", lifecycle_diagnostics.join("; "));
         for result in results
             .iter_mut()
             .filter(|result| matches!(result.row, 28 | 36))
@@ -6817,6 +6950,7 @@ async fn run_inner(
             result.evidence.push(note.clone());
         }
     }
+    progress.timings.apply(&mut results);
     results.sort_by_key(|result| result.row);
     progress.update(|state| {
         for result in &results {
@@ -7316,7 +7450,10 @@ async fn run_inner(
             raw_events.push(serde_json::to_value(event)?);
         }
     }
-    let processes = process_observations(&state.samples);
+    let mut processes = process_observations(&state.samples);
+    if let Some(trials) = &row46_trials {
+        processes.extend(trials.processes.clone());
+    }
     let model_requests = request_records
         .into_iter()
         .map(serde_json::to_value)
@@ -7394,12 +7531,26 @@ async fn run_inner(
                 chunks.extend(trials.stream_chunks.clone());
             }
             chunks.sort_by(|left, right| {
-                (left.repetition, &left.case, &left.actor, left.ordinal).cmp(&(
-                    right.repetition,
-                    &right.case,
-                    &right.actor,
-                    right.ordinal,
-                ))
+                (
+                    left.repetition,
+                    &left.case,
+                    &left.actor,
+                    &left.scenario,
+                    &left.checkpoint,
+                    left.attempt,
+                    &left.frontend,
+                    left.ordinal,
+                )
+                    .cmp(&(
+                        right.repetition,
+                        &right.case,
+                        &right.actor,
+                        &right.scenario,
+                        &right.checkpoint,
+                        right.attempt,
+                        &right.frontend,
+                        right.ordinal,
+                    ))
             });
             chunks
         },
@@ -10109,6 +10260,11 @@ async fn collect_signal_matrix_case(
                 .await?
             }
         };
+        crate::row_timing::observed(
+            driver.as_ref() as *const dyn Driver as *const () as usize,
+            &session.0,
+            &first_terminal_events,
+        );
         let exit = wait_for_signal_process_exit(
             &mut driver,
             &session,
@@ -10481,7 +10637,7 @@ fn sample_process_hygiene(
         loop {
             attempt = attempt.saturating_add(1);
             let tree = sampler.discover(roots)?;
-            let mut candidate = sampler.sample(&tree, phase)?;
+            let mut candidate = sampler.sample_live(&tree, phase)?;
             accounting_warnings.append(&mut candidate.cpu_accounting_warnings);
             let counters_complete = candidate
                 .process_samples
@@ -12516,6 +12672,8 @@ fn row50_baseline_counters(samples: &[Sample]) -> Result<Row50ProcessCounters> {
     })
 }
 
+const ROW50_LIVE_COUNTER_ATTEMPTS: u32 = 32;
+
 fn row50_sample_owned_tree(
     sampler: &mut dyn Sampler,
     roots: &[u32],
@@ -12526,13 +12684,19 @@ fn row50_sample_owned_tree(
             "row-50 daemon exposes no owned process root".to_owned(),
         ));
     }
-    let tree = sampler.discover(roots)?;
+    let (tree, sample) = sample_live_with_counter_retries(
+        sampler,
+        roots,
+        phase,
+        ROW50_LIVE_COUNTER_ATTEMPTS,
+        "row-50 daemon owned-tree sample",
+    )?;
     if tree.members.is_empty() {
         return Err(AhrbError::Protocol(
             "row-50 daemon owned tree disappeared during a sweep".to_owned(),
         ));
     }
-    sampler.sample(&tree, phase)
+    Ok(sample)
 }
 
 fn row50_peak_counters(samples: &[Sample], label: &str) -> Result<Row50ProcessCounters> {
@@ -12591,10 +12755,16 @@ async fn collect_row50_invocation_terminal(
     let started = Instant::now();
     let mut samples = Vec::new();
     let events = loop {
-        let tree = sampler.discover(roots)?;
+        let (tree, sample) = sample_live_with_counter_retries(
+            sampler,
+            roots,
+            phase,
+            ROW50_LIVE_COUNTER_ATTEMPTS,
+            "row-50 invocation sample",
+        )?;
         crate::process::track_process_tree(&tree)?;
-        if !tree.members.is_empty() {
-            samples.push(sampler.sample(&tree, phase)?);
+        if !sample.processes.is_empty() {
+            samples.push(sample);
         }
         let remaining = deadline.checked_sub(started.elapsed()).ok_or_else(|| {
             AhrbError::Timeout(format!("session {} did not terminalize", session.0))
@@ -12619,7 +12789,13 @@ async fn collect_row50_invocation_terminal(
     let reclaim_started = Instant::now();
     let reclaim_timeout = Duration::from_secs(2);
     loop {
-        let tree = sampler.discover(roots)?;
+        let (tree, residue_sample) = sample_live_with_counter_retries(
+            sampler,
+            roots,
+            phase,
+            ROW50_LIVE_COUNTER_ATTEMPTS,
+            "row-50 invocation reclaim sample",
+        )?;
         crate::process::track_process_tree(&tree)?;
         if tree.members.is_empty() {
             return Ok((
@@ -12634,7 +12810,19 @@ async fn collect_row50_invocation_terminal(
                 true,
             ));
         }
-        let residue_sample = sampler.sample(&tree, phase)?;
+        if residue_sample.processes.is_empty() {
+            return Ok((
+                events,
+                samples,
+                Row50ProcessCounters {
+                    memory_bytes: 0,
+                    open_fds: 0,
+                    threads: 0,
+                    processes: 0,
+                },
+                true,
+            ));
+        }
         let residue_counters = row50_process_counters(&residue_sample)?;
         samples.push(residue_sample);
         if reclaim_started.elapsed() >= reclaim_timeout {
@@ -13613,6 +13801,7 @@ async fn collect_turn_latency_repetition(
             .copied();
     }
     Ok(TurnLatencyTrials {
+        lifecycle_notes: driver.lifecycle_notes(),
         events,
         requests,
         turns: observations,
@@ -13631,6 +13820,7 @@ async fn collect_turn_latency_trials(
     };
     let repetitions = ResourceTimingPlan::for_profile(ResourceProfile::from(profile)).repetitions;
     let mut combined = TurnLatencyTrials {
+        lifecycle_notes: Vec::new(),
         events: Vec::new(),
         requests: Vec::new(),
         turns: Vec::new(),
@@ -13644,6 +13834,7 @@ async fn collect_turn_latency_trials(
             turns,
         )
         .await?;
+        combined.lifecycle_notes.extend(trial.lifecycle_notes);
         combined.events.extend(trial.events);
         combined.requests.extend(trial.requests);
         combined.turns.extend(trial.turns);
@@ -15629,10 +15820,12 @@ async fn collect_time_to_first_model_request_trials(
 }
 
 struct MemoryTimeSamplerCollection {
+    processes: Vec<crate::process::ProcessSample>,
     samples: Vec<MemoryTimeIntegralSample>,
 }
 
 struct MemoryTimeSamplerThread {
+    processes: Arc<Mutex<Vec<crate::process::ProcessSample>>>,
     roots: Arc<Mutex<Vec<u32>>>,
     samples: Arc<Mutex<Vec<MemoryTimeIntegralSample>>>,
     stop: Arc<(Mutex<bool>, Condvar)>,
@@ -15666,10 +15859,15 @@ impl MemoryTimeSamplerThread {
     ) -> Result<()> {
         let started = Instant::now();
         loop {
-            let observed = self.snapshot()?.iter().any(|sample| {
-                sample.monotonic_ns >= boundary_ns
-                    && (!require_owned_process || sample.owned_processes > 0)
-            });
+            let observed = self
+                .samples
+                .lock()
+                .map_err(|_| AhrbError::Protocol("row-46 sampler samples lock poisoned".into()))?
+                .last()
+                .is_some_and(|sample| {
+                    sample.monotonic_ns >= boundary_ns
+                        && (!require_owned_process || sample.owned_processes > 0)
+                });
             if observed {
                 return Ok(());
             }
@@ -15681,6 +15879,47 @@ impl MemoryTimeSamplerThread {
                     } else {
                         ""
                     }
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn wait_for_client_sample_after(
+        &self,
+        boundary: u64,
+        clients: &[u32],
+        timeout: Duration,
+    ) -> Result<Vec<crate::process::ProcIdentity>> {
+        if clients.is_empty() {
+            return Err(AhrbError::Protocol(
+                "row-46 exec trial has no client root".into(),
+            ));
+        }
+        let started = Instant::now();
+        loop {
+            let identities = {
+                let samples = self.processes.lock().map_err(|_| {
+                    AhrbError::Protocol("row-46 process evidence lock poisoned".into())
+                })?;
+                clients
+                    .iter()
+                    .map(|pid| {
+                        samples
+                            .iter()
+                            .rev()
+                            .take_while(|sample| sample.elapsed_ns >= boundary)
+                            .find(|sample| sample.process.identity.pid == *pid)
+                            .map(|sample| sample.process.identity)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            };
+            if let Some(identities) = identities {
+                return Ok(identities);
+            }
+            if started.elapsed() >= timeout {
+                return Err(AhrbError::Protocol(format!(
+                    "row-46 missing client CPU receipt for roots {clients:?} after {boundary}"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -15704,7 +15943,12 @@ impl MemoryTimeSamplerThread {
             .join()
             .map_err(|_| AhrbError::Protocol("row-46 sampler thread panicked".to_owned()))??;
         let samples = self.snapshot()?;
-        Ok(MemoryTimeSamplerCollection { samples })
+        let processes = self
+            .processes
+            .lock()
+            .map_err(|_| AhrbError::Protocol("row-46 process evidence lock poisoned".into()))?
+            .clone();
+        Ok(MemoryTimeSamplerCollection { samples, processes })
     }
 }
 
@@ -15721,7 +15965,11 @@ fn collect_memory_time_sample(
     sampler: &mut dyn Sampler,
     roots: &[u32],
     repetition: u32,
-) -> Result<(MemoryTimeIntegralSample, Vec<String>)> {
+) -> Result<(
+    MemoryTimeIntegralSample,
+    Vec<String>,
+    Vec<crate::process::ProcessSample>,
+)> {
     let wall_started = Instant::now();
     let cpu_started = sampler_thread_cpu_ns()?;
     let tree = sampler.discover(roots)?;
@@ -15739,6 +15987,16 @@ fn collect_memory_time_sample(
         .iter()
         .map(serde_json::to_string)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let processes = sample
+        .process_samples
+        .iter()
+        .cloned()
+        .map(|mut process| {
+            process.elapsed_ns = monotonic_ns;
+            process.phase = format!("memory-time-integral-r{repetition}");
+            process
+        })
+        .collect();
     Ok((
         MemoryTimeIntegralSample {
             repetition,
@@ -15751,6 +16009,7 @@ fn collect_memory_time_sample(
             cpu_accounting_warnings: warnings.clone(),
         },
         warnings,
+        processes,
     ))
 }
 
@@ -15765,6 +16024,8 @@ fn start_memory_time_sampler(
         .unwrap_or(cadence);
     let roots = Arc::new(Mutex::new(initial_roots));
     let samples = Arc::new(Mutex::new(Vec::<MemoryTimeIntegralSample>::new()));
+    let processes = Arc::new(Mutex::new(Vec::new()));
+    let thread_processes = Arc::clone(&processes);
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let thread_roots = Arc::clone(&roots);
     let thread_samples = Arc::clone(&samples);
@@ -15791,7 +16052,13 @@ fn start_memory_time_sampler(
                     let _ = ready_tx.send(ready);
                     first = false;
                 }
-                let (mut sample, sample_warnings) = collected?;
+                let (mut sample, sample_warnings, process_samples) = collected?;
+                thread_processes
+                    .lock()
+                    .map_err(|_| {
+                        AhrbError::Protocol("row-46 process evidence lock poisoned".into())
+                    })?
+                    .extend(process_samples);
                 {
                     let mut values = thread_samples.lock().map_err(|_| {
                         AhrbError::Protocol("row-46 sampler samples lock was poisoned".to_owned())
@@ -15836,6 +16103,7 @@ fn start_memory_time_sampler(
         Ok(Ok(())) => Ok(MemoryTimeSamplerThread {
             roots,
             samples,
+            processes,
             stop,
             join: Some(join),
         }),
@@ -16476,6 +16744,37 @@ fn row47_terminal_record_count(path: &Path, manifest: &Manifest) -> Result<u64> 
     Ok(count)
 }
 
+/// Exec clients are sibling owned roots even when a daemon persists. Shared by
+/// storage and resource trials; neither topology may omit these direct children.
+fn active_trial_roots(driver: &HarnessDriver, daemon_roots: &[u32]) -> Vec<u32> {
+    let mut roots = daemon_roots.to_vec();
+    roots.extend(driver.owned_pids());
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+fn client_pre_reap_event_path(
+    driver: &HarnessDriver,
+    manifest: &Manifest,
+    profile: &Path,
+    session: &crate::driver::SessionId,
+) -> Result<PathBuf> {
+    if manifest.events.source == "journal-file" {
+        Ok(PathBuf::from(crate::manifest::render_template(
+            &manifest.events.path,
+            &BTreeMap::from([
+                ("profile".into(), profile.to_string_lossy().into_owned()),
+                ("session_id".into(), session.0.clone()),
+            ]),
+        )?))
+    } else {
+        driver.live_event_path(session).ok_or_else(|| {
+            AhrbError::Protocol("missing client terminal-before-reap event path".into())
+        })
+    }
+}
+
 async fn row47_wait_for_pre_reap_terminal(
     path: &Path,
     manifest: &Manifest,
@@ -16903,6 +17202,9 @@ async fn collect_memory_time_integral_trials(
         sampler_cadence_ns: duration_ns(counter_cadence),
         ..MemoryTimeIntegralEvidence::default()
     };
+    let exec_clients = manifest.transport.kind == TransportKind::Exec;
+    let mut lifecycle_notes = Vec::new();
+    let mut processes = Vec::new();
     let mut all_events = Vec::new();
     let mut all_requests = Vec::new();
     for repetition in 1..=plan.repetitions {
@@ -16974,7 +17276,7 @@ async fn collect_memory_time_integral_trials(
             &environment,
             &variables,
             &profile_root,
-            per_invocation,
+            exec_clients,
             outer_turn_timeout(manifest),
         )?;
         driver.start().await?;
@@ -16990,12 +17292,13 @@ async fn collect_memory_time_integral_trials(
             }
             roots
         };
-        let sampler = start_memory_time_sampler(repetition, daemon_roots, counter_cadence)?;
+        let sampler = start_memory_time_sampler(repetition, daemon_roots.clone(), counter_cadence)?;
         let session = driver
             .create_session(&format!("{}:row46", workflow.scenario))
             .await?;
         let session_id_hash = stable_evidence_hash(&session.0);
 
+        let mut client_identities = Vec::new();
         let warmup_boundary_count = driver.completed_turn_boundaries().len();
         driver
             .submit(
@@ -17004,8 +17307,8 @@ async fn collect_memory_time_integral_trials(
                 &format!("row-46-r{repetition}-warmup"),
             )
             .await?;
-        if per_invocation {
-            let roots = driver.session_pids(&session);
+        if exec_clients {
+            let roots = active_trial_roots(&driver, &daemon_roots);
             if roots.is_empty() {
                 return Err(AhrbError::Protocol(format!(
                     "row-46 repetition {repetition} warm-up exposed no process root"
@@ -17013,16 +17316,38 @@ async fn collect_memory_time_integral_trials(
             }
             sampler.set_roots(&roots)?;
             let sampling_boundary = monotonic_timestamp_ns();
-            sampler
-                .wait_for_sample_after(sampling_boundary, true, outer_turn_timeout(manifest))
+            client_identities = sampler
+                .wait_for_client_sample_after(
+                    sampling_boundary,
+                    &driver.session_pids(&session),
+                    outer_turn_timeout(manifest),
+                )
                 .await?;
             driver.release_invocations().await?;
+        }
+        if exec_clients {
+            let path = client_pre_reap_event_path(&driver, manifest, &profile_root, &session)?;
+            row47_wait_for_pre_reap_terminal(&path, manifest, 0, outer_turn_timeout(manifest))
+                .await?;
+            driver.observe_exits_before_reap().await?;
+            let final_identities = sampler
+                .wait_for_client_sample_after(
+                    monotonic_timestamp_ns(),
+                    &driver.session_pids(&session),
+                    outer_turn_timeout(manifest),
+                )
+                .await?;
+            if final_identities != client_identities {
+                return Err(AhrbError::Protocol(
+                    "row-46 warmup client identity changed before final receipt".into(),
+                ));
+            }
         }
         let warmup_events =
             collect_session_terminal(&mut driver, &session, None, outer_turn_timeout(manifest))
                 .await?;
         let mut after = warmup_events.iter().map(|event| Cursor(event.cursor)).max();
-        if per_invocation {
+        if exec_clients {
             let boundary = await_completed_turn_boundary(
                 &mut driver,
                 &session,
@@ -17031,7 +17356,7 @@ async fn collect_memory_time_integral_trials(
                 outer_turn_timeout(manifest),
             )
             .await?;
-            sampler.set_roots(&[])?;
+            sampler.set_roots(&daemon_roots)?;
             sampler
                 .wait_for_sample_after(boundary.exit_ns, false, outer_turn_timeout(manifest))
                 .await?;
@@ -17097,8 +17422,8 @@ async fn collect_memory_time_integral_trials(
                     &format!("row-46-r{repetition}-turn-{turn:03}"),
                 )
                 .await?;
-            if per_invocation {
-                let roots = driver.session_pids(&session);
+            if exec_clients {
+                let roots = active_trial_roots(&driver, &daemon_roots);
                 if roots.is_empty() {
                     return Err(AhrbError::Protocol(format!(
                         "row-46 repetition {repetition} turn {turn} exposed no process root"
@@ -17106,10 +17431,54 @@ async fn collect_memory_time_integral_trials(
                 }
                 sampler.set_roots(&roots)?;
                 let sampling_boundary = monotonic_timestamp_ns();
-                sampler
-                    .wait_for_sample_after(sampling_boundary, true, outer_turn_timeout(manifest))
+                client_identities = sampler
+                    .wait_for_client_sample_after(
+                        sampling_boundary,
+                        &driver.session_pids(&session),
+                        outer_turn_timeout(manifest),
+                    )
                     .await?;
                 driver.release_invocations().await?;
+            }
+            if exec_clients {
+                let path = client_pre_reap_event_path(&driver, manifest, &profile_root, &session)?;
+                let previous = if manifest.events.source == "journal-file" {
+                    u64::from(turn)
+                } else {
+                    0
+                };
+                row47_wait_for_pre_reap_terminal(
+                    &path,
+                    manifest,
+                    previous,
+                    outer_turn_timeout(manifest),
+                )
+                .await?;
+                let terminal_observed_ns = monotonic_timestamp_ns();
+                driver.observe_exits_before_reap().await?;
+                let client_exit_observed_ns = monotonic_timestamp_ns();
+                let clients = driver.session_pids(&session);
+                let final_identities = sampler
+                    .wait_for_client_sample_after(
+                        client_exit_observed_ns,
+                        &clients,
+                        outer_turn_timeout(manifest),
+                    )
+                    .await?;
+                if final_identities != client_identities {
+                    return Err(AhrbError::Protocol(
+                        "row-46 client identity changed before final receipt".into(),
+                    ));
+                }
+                lifecycle_notes.push(format!(
+                    "row46-client-final-before-reap {}",
+                    json!({
+                        "repetition": repetition, "turn": turn, "clients": final_identities,
+                        "terminal_observed_ns": terminal_observed_ns,
+                        "client_exit_observed_ns": client_exit_observed_ns,
+                        "final_sample_observed_ns": monotonic_timestamp_ns(),
+                    })
+                ));
             }
             let suffix = collect_session_terminal_with_poll(
                 &mut driver,
@@ -17136,6 +17505,17 @@ async fn collect_memory_time_integral_trials(
                 )));
             }
             all_events.extend(suffix);
+            if exec_clients && !per_invocation {
+                await_completed_turn_boundary(
+                    &mut driver,
+                    &session,
+                    after,
+                    previous_boundary_count,
+                    outer_turn_timeout(manifest),
+                )
+                .await?;
+                sampler.set_roots(&daemon_roots)?;
+            }
             let boundary = if per_invocation {
                 Some(
                     await_completed_turn_boundary(
@@ -17152,7 +17532,7 @@ async fn collect_memory_time_integral_trials(
             };
             let (launch_ns, exit_ns, turn_wall_ns, sample_after_ns) =
                 if let Some(boundary) = boundary {
-                    sampler.set_roots(&[])?;
+                    sampler.set_roots(&daemon_roots)?;
                     (
                         Some(boundary.launch_ns),
                         Some(boundary.exit_ns),
@@ -17185,6 +17565,7 @@ async fn collect_memory_time_integral_trials(
             driver.close(&session).await?;
         }
         driver.shutdown().await?;
+        lifecycle_notes.extend(driver.lifecycle_notes());
         server.shutdown().await?;
         all_requests.extend(engine.request_records().await);
         let collection = sampler.finish()?;
@@ -17211,6 +17592,7 @@ async fn collect_memory_time_integral_trials(
                 total.saturating_add(sample.collection_cpu_ns)
             });
         evidence.samples.extend(collection.samples);
+        processes.extend(collection.processes);
     }
     all_requests.sort_by(|left, right| {
         (
@@ -17229,6 +17611,8 @@ async fn collect_memory_time_integral_trials(
             ))
     });
     Ok(MemoryTimeIntegralTrials {
+        lifecycle_notes,
+        processes,
         events: all_events,
         requests: all_requests,
         evidence,
@@ -17323,50 +17707,126 @@ struct PacedFrameWait<'a> {
     engine: &'a FakeModelEngine,
     actor: &'a str,
     expected_count: u32,
-    response_headers_ns: u64,
     outer_deadline_ms: u64,
     sampler: Option<&'a mut Box<dyn Sampler>>,
     roots: &'a [u32],
     cpu_samples: &'a mut Vec<ModelWaitCpuSample>,
 }
 
+fn complete_paced_response(
+    records: &[crate::fake_model::ModelRequestRecord],
+    frames: &[crate::fake_model::ModelFrameObservation],
+    expected_count: u32,
+) -> Result<Option<crate::fake_model::ModelRequestRecord>> {
+    let frontend_matches = |dialect: &str, frontend: &str| {
+        frontend.is_empty()
+            || frontend == "direct"
+            || matches!(
+                (dialect, frontend),
+                ("openai-chat-completions", "/v1/chat/completions")
+                    | ("openai-responses", "/v1/responses")
+                    | ("anthropic-messages", "/v1/messages")
+            )
+    };
+    let mut physical: BTreeMap<_, Vec<u32>> = BTreeMap::new();
+    for frame in frames {
+        physical
+            .entry((
+                frame.scenario.as_str(),
+                frame.actor.as_str(),
+                frame.checkpoint.as_str(),
+                frame.attempt,
+                frame.frontend.as_str(),
+            ))
+            .or_default()
+            .push(frame.ordinal);
+    }
+    let expected = (1..=expected_count).collect::<Vec<_>>();
+    let complete = physical
+        .into_iter()
+        .filter_map(|(identity, mut ordinals)| {
+            ordinals.sort_unstable();
+            (ordinals == expected).then_some(identity)
+        })
+        .collect::<Vec<_>>();
+    if complete.len() > 1 {
+        return Err(AhrbError::Protocol(format!(
+            "paced trial completed {} physical responses; expected one",
+            complete.len()
+        )));
+    }
+    let Some((scenario, actor, checkpoint, attempt, frontend)) = complete.first().copied() else {
+        return Ok(None);
+    };
+    let record = records
+        .iter()
+        .find(|record| {
+            record.request.scenario == scenario
+                && record.request.actor == actor
+                && record.request.checkpoint == checkpoint
+                && record.attempt == attempt
+                && frontend_matches(&record.request.dialect, frontend)
+                && record.response_headers_ns.is_some()
+        })
+        .cloned()
+        .ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "paced response {scenario}/{actor}/{checkpoint}/attempt-{attempt}/{frontend} has frames but no matching response-header record"
+            ))
+        })?;
+    Ok(Some(record))
+}
+
 async fn wait_for_paced_frames(
     mut wait: PacedFrameWait<'_>,
-) -> Result<Vec<crate::fake_model::ModelFrameObservation>> {
-    let deadline_ns = wait
-        .response_headers_ns
-        .checked_add(wait.outer_deadline_ms.saturating_mul(1_000_000))
-        .ok_or_else(|| AhrbError::Validation("streaming row deadline overflow".to_owned()))?;
+) -> Result<(
+    Vec<crate::fake_model::ModelFrameObservation>,
+    crate::fake_model::ModelRequestRecord,
+)> {
     let mut next_cpu_sample = Instant::now();
     loop {
+        let records = wait.engine.request_records().await;
         let frames = wait
             .engine
             .frame_observations()?
             .into_iter()
             .filter(|frame| frame.actor == wait.actor)
             .collect::<Vec<_>>();
-        if frames.len() == wait.expected_count as usize {
+        // Completion and every timing boundary belong to one physical
+        // response, never to an earlier retry that happened to publish headers.
+        if let Some(record) = complete_paced_response(&records, &frames, wait.expected_count)? {
             if let Some(sampler) = wait.sampler.as_deref_mut() {
                 wait.cpu_samples
                     .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
             }
-            return Ok(frames);
+            return Ok((frames, record));
         }
-        if frames.len() > wait.expected_count as usize {
-            return Err(AhrbError::Protocol(format!(
-                "streaming provider yielded {} paced frames for {}; expected {}",
-                frames.len(),
-                wait.actor,
-                wait.expected_count
-            )));
-        }
-        if monotonic_timestamp_ns() >= deadline_ns {
-            return Err(AhrbError::Timeout(format!(
-                "streaming provider yielded {} of {} paced frames for {}",
-                frames.len(),
-                wait.expected_count,
-                wait.actor
-            )));
+        let latest_header = records
+            .iter()
+            .filter(|record| {
+                record.request.actor == wait.actor && record.request.checkpoint == "start"
+            })
+            .filter_map(|record| record.response_headers_ns.map(|header| (header, record)))
+            .max_by_key(|(header, _)| *header);
+        let deadline_reached = latest_header.is_some_and(|(header, _)| {
+            monotonic_timestamp_ns()
+                >= header.saturating_add(wait.outer_deadline_ms.saturating_mul(1_000_000))
+        });
+        if deadline_reached {
+            if let Some(sampler) = wait.sampler.as_deref_mut() {
+                wait.cpu_samples
+                    .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
+            }
+            // Incomplete evidence must survive the outer deadline so the oracle
+            // can issue ERROR with the actual attempt/frame identities.
+            let record = latest_header
+                .map(|(_, record)| record.clone())
+                .ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "paced response deadline elapsed without a header record".to_owned(),
+                    )
+                })?;
+            return Ok((frames, record));
         }
         if let Some(sampler) = wait.sampler.as_deref_mut()
             && Instant::now() >= next_cpu_sample
@@ -17376,6 +17836,67 @@ async fn wait_for_paced_frames(
             next_cpu_sample = Instant::now() + Duration::from_millis(100);
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(test)]
+mod paced_response_tests {
+    use super::*;
+    use crate::fake_model::{ModelFrameObservation, ModelRequest, ModelRequestRecord};
+
+    fn record(attempt: u64, response_headers_ns: u64) -> ModelRequestRecord {
+        ModelRequestRecord {
+            request: ModelRequest {
+                dialect: "openai-chat-completions".to_owned(),
+                endpoint: "/v1/chat/completions".to_owned(),
+                model: "ahrb-fake-v1".to_owned(),
+                scenario: "paced".to_owned(),
+                actor: "actor".to_owned(),
+                checkpoint: "start".to_owned(),
+                canonical: json!({}),
+                credential_fingerprint: "fixture".to_owned(),
+                stream: true,
+            },
+            canonical_hash: "fixture".to_owned(),
+            attempts: attempt,
+            accepted: true,
+            semantic_ordinal: 1,
+            attempt,
+            received_ns: response_headers_ns.saturating_sub(1),
+            body_bytes: 1,
+            input_tokens: None,
+            role: "primary".to_owned(),
+            side_channel_kind: None,
+            response_status: Some(200),
+            response_headers_ns: Some(response_headers_ns),
+            response_first_frame_yield_ns: None,
+            response_last_frame_yield_ns: None,
+            semantic_attempts_total: 2,
+        }
+    }
+
+    #[test]
+    fn paced_frames_select_their_own_retry_header() -> Result<()> {
+        let first = record(1, 1_000);
+        let second = record(2, 3_000);
+        let frames = (1..=5)
+            .map(|ordinal| ModelFrameObservation {
+                scenario: "paced".to_owned(),
+                actor: "actor".to_owned(),
+                checkpoint: "start".to_owned(),
+                attempt: 2,
+                frontend: "/v1/chat/completions".to_owned(),
+                ordinal,
+                scheduled_ns: 3_000 + u64::from(ordinal) * 1_000_000_000,
+                frame_yielded_ns: 3_000 + u64::from(ordinal) * 1_000_000_000,
+                bytes: 1,
+            })
+            .collect::<Vec<_>>();
+        let selected = complete_paced_response(&[first, second], &frames, 5)?
+            .expect("complete second physical response");
+        assert_eq!(selected.attempt, 2);
+        assert_eq!(selected.response_headers_ns, Some(3_000));
+        Ok(())
     }
 }
 
@@ -19644,7 +20165,7 @@ async fn collect_streaming_case(
         }
     }
     let header_record = wait_for_response_headers(&engine, &actor_name, row_deadline).await?;
-    let response_headers_ns = header_record
+    let mut response_headers_ns = header_record
         .response_headers_ns
         .ok_or_else(|| AhrbError::Protocol("provider header boundary disappeared".to_owned()))?;
     if let Some(sampler) = sampler.as_deref_mut() {
@@ -19653,17 +20174,20 @@ async fn collect_streaming_case(
     let frames = if case == "stall" {
         Vec::new()
     } else {
-        wait_for_paced_frames(PacedFrameWait {
+        let (frames, paced_record) = wait_for_paced_frames(PacedFrameWait {
             engine: &engine,
             actor: &actor_name,
             expected_count: count,
-            response_headers_ns,
             outer_deadline_ms,
             sampler: sampler.as_mut(),
             roots: &roots,
             cpu_samples: &mut cpu_samples,
         })
-        .await?
+        .await?;
+        response_headers_ns = paced_record.response_headers_ns.ok_or_else(|| {
+            AhrbError::Protocol("paced response header boundary disappeared".to_owned())
+        })?;
+        frames
     };
     let cpu_ns = if measure_cpu {
         let final_frame_yield_ns = frames
@@ -19739,6 +20263,10 @@ fn streaming_chunks(
             repetition,
             actor: actor.to_owned(),
             case: case.to_owned(),
+            scenario: frame.scenario.clone(),
+            checkpoint: frame.checkpoint.clone(),
+            attempt: frame.attempt,
+            frontend: frame.frontend.clone(),
             ordinal: frame.ordinal,
             scheduled_ns: frame.scheduled_ns,
             frame_yielded_ns: frame.frame_yielded_ns,
@@ -20528,6 +21056,7 @@ async fn collect_terminals(
                     Ok(events) => events,
                     Err(AhrbError::Timeout(detail)) => {
                         let detail = format!("turn timeout: {detail}");
+                        progress.timings.finish(*row);
                         errors.insert(*row, detail.clone());
                         progress.update(|state| {
                             state.row_errors.insert(*row, detail);
@@ -20592,6 +21121,7 @@ async fn collect_terminals(
                     }
                 } else {
                     let row_detail = format!("turn timeout: {detail}");
+                    progress.timings.finish(*row);
                     errors.insert(*row, row_detail.clone());
                     progress.update(|state| {
                         state.row_errors.insert(*row, row_detail);
@@ -20615,6 +21145,36 @@ async fn collect_session_terminal(
 ) -> Result<Vec<NormalizedEvent>> {
     collect_session_terminal_with_poll(driver, session, after, deadline, Duration::from_millis(10))
         .await
+}
+
+async fn collect_session_terminal_and_completion_hook(
+    driver: &mut HarnessDriver,
+    session: &crate::driver::SessionId,
+    deadline: Duration,
+) -> Result<Vec<NormalizedEvent>> {
+    let started = Instant::now();
+    loop {
+        let events = driver.attach(session, None).await?;
+        let terminal_cursor = events
+            .iter()
+            .filter(|event| is_terminal(&event.event))
+            .map(|event| event.cursor)
+            .max();
+        if terminal_cursor.is_some_and(|terminal| {
+            events
+                .iter()
+                .any(|event| event.event == EventVocab::HookCompleted && event.cursor > terminal)
+        }) {
+            return Ok(events);
+        }
+        if started.elapsed() >= deadline {
+            return Err(AhrbError::Timeout(format!(
+                "session {} terminalized without its durable completion hook",
+                session.0
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn collect_session_terminal_with_poll(
@@ -23662,6 +24222,8 @@ async fn collect_resource_evidence(
         }
         for (order, agents) in widths.into_iter().enumerate() {
             let group = run_resource_group(
+                manifest,
+                &repetition_root,
                 &mut collector,
                 &mut driver,
                 &roots,
@@ -23802,6 +24364,8 @@ async fn run_resource_warmup(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_resource_group(
+    manifest: &Manifest,
+    profile_root: &Path,
     collector: &mut ResourceCollector,
     driver: &mut HarnessDriver,
     roots: &[u32],
@@ -23875,7 +24439,11 @@ async fn run_resource_group(
     if agents == 1 {
         collector.sample_once(roots, &turn_cpu_phase)?;
     }
+    driver.set_invocation_gating(true);
+    let dynamic_roots = Arc::new(Mutex::new(roots.to_vec()));
+    let operation_roots = Arc::clone(&dynamic_roots);
     let operation = async {
+        let started = Instant::now();
         for (index, (_, prompt, session)) in sessions.iter().enumerate() {
             driver
                 .submit(
@@ -23888,7 +24456,17 @@ async fn run_resource_group(
                     ),
                 )
                 .await?;
+            *operation_roots
+                .lock()
+                .map_err(|_| AhrbError::Protocol("resource roots lock poisoned".into()))? =
+                active_trial_roots(driver, roots);
         }
+        // Let the existing membership collector register every gated client.
+        tokio::time::sleep(Duration::from_millis(
+            timing.membership_cadence_ms.saturating_mul(2),
+        ))
+        .await;
+        driver.release_invocations().await?;
         let cohort = sessions
             .iter()
             .map(|(_, _, session)| session.clone())
@@ -23899,6 +24477,57 @@ async fn run_resource_group(
                 Duration::from_millis(timing.reclaim_deadline_ms.min(200)),
             )
             .await;
+        if manifest.transport.kind == TransportKind::Exec {
+            for (_, _, session) in &sessions {
+                let path = client_pre_reap_event_path(driver, manifest, profile_root, session)?;
+                row47_wait_for_pre_reap_terminal(
+                    &path,
+                    manifest,
+                    0,
+                    Duration::from_millis(timing.reclaim_deadline_ms),
+                )
+                .await?;
+            }
+            driver.observe_exits_before_reap().await?;
+        } else {
+            wait_resource_terminals(
+                driver,
+                &sessions,
+                &completion_turn_keys,
+                completion_hook_required,
+                Duration::from_millis(timing.reclaim_deadline_ms),
+            )
+            .await?;
+        }
+        tokio::time::sleep(
+            Duration::from_millis(timing.barrier_hold_ms).saturating_sub(started.elapsed()),
+        )
+        .await;
+        Ok(())
+    };
+    collector
+        .sample_until_dynamic(dynamic_roots.clone(), &workload_phase, operation)
+        .await?;
+    if manifest.transport.kind == TransportKind::Exec {
+        let active_roots = dynamic_roots
+            .lock()
+            .map_err(|_| AhrbError::Protocol("resource roots lock poisoned".into()))?
+            .clone();
+        let final_sample =
+            collector.sample_once(&active_roots, &format!("{prefix}-client-final-before-reap"))?;
+        for (_, _, session) in &sessions {
+            for pid in driver.session_pids(session) {
+                if !final_sample
+                    .process_samples
+                    .iter()
+                    .any(|sample| sample.process.identity.pid == pid)
+                {
+                    return Err(AhrbError::Protocol(format!(
+                        "row-25 missing client final pre-reap CPU receipt for {pid}"
+                    )));
+                }
+            }
+        }
         wait_resource_terminals(
             driver,
             &sessions,
@@ -23906,16 +24535,9 @@ async fn run_resource_group(
             completion_hook_required,
             Duration::from_millis(timing.reclaim_deadline_ms),
         )
-        .await
-    };
-    let sampling = collector.sample_phase(
-        roots,
-        &workload_phase,
-        Duration::from_millis(timing.barrier_hold_ms),
-    );
-    let (barrier_result, sample_result) = tokio::join!(operation, sampling);
-    barrier_result?;
-    sample_result?;
+        .await?;
+    }
+    driver.set_invocation_gating(false);
     collector
         .sample_phase(roots, &cold_phase, collector.counter_cadence)
         .await?;
@@ -24519,10 +25141,16 @@ async fn await_owned_tree_settled(
 ) -> Result<bool> {
     let started = Instant::now();
     loop {
-        let members = sampler.discover(roots)?.members;
-        let remaining = members
-            .keys()
-            .filter(|identity| !excluded.contains(&identity.pid))
+        let tree = sampler.discover(roots)?;
+        // Discovery intentionally retains exited identities so final CPU/I/O
+        // counters remain available before reap. Cleanup is a live-membership
+        // question, so use the platform's live view instead of counting those
+        // retained identities as residue.
+        let live = sampler.sample_live(&tree, "cleanup-live-membership")?;
+        let remaining = live
+            .processes
+            .iter()
+            .filter(|process| !excluded.contains(&process.identity.pid))
             .count();
         if remaining == 0 {
             return Ok(true);
@@ -24827,29 +25455,6 @@ fn membership_report_samples(
         .collect::<Vec<_>>();
     membership.sort_by_key(|sample| (sample.elapsed_ns, sample.lane, sample.phase.clone()));
     membership
-}
-
-fn resource_evidence_turns(evidence: &ResourceEvidence) -> u64 {
-    let warmup = evidence
-        .warmup
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .fold(0_u64, |total, observation| {
-            total.saturating_add(u64::from(observation.completed_turns))
-        });
-    let sweep = evidence.sweep.iter().fold(0_u64, |total, observation| {
-        total.saturating_add(u64::from(observation.agents))
-    });
-    let long_horizon = evidence
-        .long_horizon
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .fold(0_u64, |total, observation| {
-            total.saturating_add(u64::from(observation.completed_turns))
-        });
-    warmup.saturating_add(sweep).saturating_add(long_horizon)
 }
 
 fn enforce_sampler_overhead(rows: &mut [TestResult], sampler_overhead_pct: f64) {

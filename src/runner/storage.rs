@@ -967,10 +967,7 @@ async fn collect_repetition(
             .submit(&session, &fixture::prompt(turn)?, &key)
             .await?;
         // Exec clients are direct owned roots even when a warm daemon persists.
-        let mut roots = daemon_roots.clone();
-        roots.extend(driver.owned_pids());
-        roots.sort_unstable();
-        roots.dedup();
+        let roots = active_trial_roots(&driver, &daemon_roots);
         let client_roots = if exec_clients {
             driver.session_pids(&session)
         } else {
@@ -989,17 +986,9 @@ async fn collect_repetition(
             ));
         }
         let pre_reap = if exec_clients {
-            if manifest.events.source == "journal-file" {
-                Some(PathBuf::from(crate::manifest::render_template(
-                    &manifest.events.path,
-                    &BTreeMap::from([
-                        ("profile".into(), profile.to_string_lossy().into_owned()),
-                        ("session_id".into(), session.0.clone()),
-                    ]),
-                )?))
-            } else {
-                driver.live_event_path(&session)
-            }
+            Some(client_pre_reap_event_path(
+                &driver, manifest, &profile, &session,
+            )?)
         } else {
             None
         };

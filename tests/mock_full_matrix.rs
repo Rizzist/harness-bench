@@ -101,6 +101,11 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
     for result in &report.results {
         assert!(matches!(result.outcome, TestOutcome::Pass));
         assert!(
+            result.metadata.wall_duration_s > 0.0,
+            "row {} has no executed wall clock",
+            result.row
+        );
+        assert!(
             !result.evidence.is_empty(),
             "passing row {} has no evaluated evidence",
             result.row
@@ -301,18 +306,11 @@ fn full_matrix_certifies_the_reference_mock_with_complete_artifacts() {
         "reported peak {} differs from sampled peak {sampled_peak}",
         report.resource_summary.peak_rss_mib
     );
-    let sampled_cpu_s = report
-        .samples
-        .first()
-        .zip(report.samples.last())
-        .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns))
-        as f64
-        / 1_000_000_000.0;
     assert!(
-        (report.resource_summary.cpu_total_s - sampled_cpu_s).abs()
-            <= f64::EPSILON * sampled_cpu_s.abs().max(1.0),
-        "reported CPU {} differs from sampled CPU {sampled_cpu_s}",
-        report.resource_summary.cpu_total_s
+        serde_json::to_value(&report.resource_summary)
+            .unwrap()
+            .get("cpu_total_s")
+            .is_none()
     );
     assert!(report.resource_metrics.values().all(|metric| {
         metric.topology == "shared-daemon-sessions"

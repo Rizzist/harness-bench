@@ -155,6 +155,35 @@ struct MacProcessCounters {
     thread_count: Option<u64>,
 }
 
+#[cfg(test)]
+struct CounterReadTestFault {
+    target_pid: u32,
+    omit_task_details: u32,
+    replace_on_rusage_call: u32,
+    rusage_calls: u32,
+    replacement_start_time: u64,
+    replacement_usage: RusageInfoV4,
+    replacement_task: ProcTaskInfo,
+    rusage_unavailable: bool,
+    replacement_visible: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COUNTER_READ_TEST_FAULT: std::cell::RefCell<Option<CounterReadTestFault>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct CounterReadTestFaultGuard;
+
+#[cfg(test)]
+impl Drop for CounterReadTestFaultGuard {
+    fn drop(&mut self) {
+        COUNTER_READ_TEST_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+
 /// Prefix through revision 1 of Darwin's `task_vm_info` structure.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -207,6 +236,7 @@ unsafe extern "C" {
 pub struct MacOsSampler {
     started: Instant,
     known: BTreeSet<ProcIdentity>,
+    live_in_last_discovery: BTreeSet<ProcIdentity>,
     verified_roots: BTreeMap<u32, ProcIdentity>,
     verified_groups: BTreeMap<ProcIdentity, u32>,
     excluded_roots: BTreeSet<ProcIdentity>,
@@ -224,6 +254,7 @@ impl Default for MacOsSampler {
         Self {
             started: Instant::now(),
             known: BTreeSet::new(),
+            live_in_last_discovery: BTreeSet::new(),
             verified_roots: BTreeMap::new(),
             verified_groups: BTreeMap::new(),
             excluded_roots: BTreeSet::new(),
@@ -239,6 +270,210 @@ impl Default for MacOsSampler {
 }
 
 impl MacOsSampler {
+    fn sample_with_liveness(
+        &mut self,
+        tree: &ProcessTree,
+        phase: &str,
+        include_zombies: bool,
+    ) -> Result<Sample> {
+        let collection_started = Instant::now();
+        let mut rss_bytes = 0_u64;
+        let mut footprint_bytes = 0_u64;
+        let mut rss_crosscheck_bytes = 0_u64;
+        let mut open_fds = 0_u64;
+        let mut thread_count = 0_u64;
+        let mut complete_open_fds = true;
+        let mut complete_thread_count = true;
+        let mut complete_crosscheck = true;
+        let mut counters = Vec::new();
+        let mut live_cpu = BTreeMap::new();
+        let mut child_rollup_cpu = BTreeMap::new();
+        let mut platform_cpu_warnings = Vec::new();
+        let identities_by_pid: BTreeMap<u32, ProcIdentity> = tree
+            .members
+            .keys()
+            .map(|identity| (identity.pid, *identity))
+            .collect();
+        let current_parents: BTreeMap<ProcIdentity, ProcIdentity> = tree
+            .members
+            .iter()
+            .filter_map(|(identity, process)| {
+                identities_by_pid
+                    .get(&process.ppid)
+                    .map(|parent| (*identity, *parent))
+            })
+            .collect();
+
+        for (identity, process) in &tree.members {
+            let Some(current) = read_bsd_info(identity.pid, include_zombies)? else {
+                complete_open_fds = false;
+                complete_thread_count = false;
+                complete_crosscheck = false;
+                continue;
+            };
+            if identity_of(&current) != *identity {
+                complete_open_fds = false;
+                complete_thread_count = false;
+                complete_crosscheck = false;
+                continue;
+            }
+
+            let Some(usage) = rusage_for_sample(identity.pid)? else {
+                complete_open_fds = false;
+                complete_thread_count = false;
+                complete_crosscheck = false;
+
+                // ESRCH can be the expected live-to-exit transition. If BSD
+                // identity lookup still proves that the same process is live,
+                // however, this counter read is internally contradictory and
+                // must not be hidden by accepting a later retry.
+                if read_bsd_info(identity.pid, include_zombies)?
+                    .is_some_and(|after| identity_of(&after) == *identity)
+                {
+                    return Err(AhrbError::Protocol(format!(
+                        "rusage reported PID {} unavailable while identity ({},{}) remained live",
+                        identity.pid, identity.pid, identity.start_time
+                    )));
+                }
+                continue;
+            };
+            let process_open_fds = u64::from(current.pbi_nfiles);
+            let (process_threads, proc_crosscheck) = match task_details_for_sample(identity.pid)? {
+                Some(details) => {
+                    let threads = u64::try_from(details.pti_threadnum).map_err(|_| {
+                        AhrbError::Protocol(format!(
+                            "proc_pidinfo returned a negative thread count for PID {}",
+                            identity.pid
+                        ))
+                    })?;
+                    (Some(threads), Some(details.pti_resident_size))
+                }
+                None => (None, None),
+            };
+            let process_crosscheck = task_vm_resident(identity.pid).or(proc_crosscheck);
+
+            // Every counter above is addressed by PID. Revalidate the full process identity
+            // after the final read, before committing any value to aggregates or CPU tracker
+            // state. A disappearing or reused PID is an incomplete observation for this tree;
+            // callers that require complete counters can rediscover and retry safely.
+            let Some(after) = read_bsd_info(identity.pid, include_zombies)? else {
+                complete_open_fds = false;
+                complete_thread_count = false;
+                complete_crosscheck = false;
+                continue;
+            };
+            if identity_of(&after) != *identity {
+                complete_open_fds = false;
+                complete_thread_count = false;
+                complete_crosscheck = false;
+                continue;
+            }
+
+            let process_cpu_ns = normalize_cpu_counter(
+                *identity,
+                usage.ri_user_time.saturating_add(usage.ri_system_time),
+                self.last_self_cpu.get(identity).copied(),
+                "macos-self-cpu-jitter-clamped",
+                &mut platform_cpu_warnings,
+            )?;
+            let child_cpu_ns = normalize_cpu_counter(
+                *identity,
+                usage
+                    .ri_child_user_time
+                    .saturating_add(usage.ri_child_system_time),
+                self.child_rollup_cpu.get(identity).copied(),
+                "macos-child-cpu-jitter-clamped",
+                &mut platform_cpu_warnings,
+            )?;
+            rss_bytes = rss_bytes.saturating_add(usage.ri_resident_size);
+            footprint_bytes = footprint_bytes.saturating_add(usage.ri_phys_footprint);
+            live_cpu.insert(*identity, process_cpu_ns);
+            child_rollup_cpu.insert(*identity, child_cpu_ns);
+            open_fds = open_fds.saturating_add(process_open_fds);
+            match process_threads {
+                Some(threads) => thread_count = thread_count.saturating_add(threads),
+                None => complete_thread_count = false,
+            }
+            match process_crosscheck {
+                Some(value) => {
+                    rss_crosscheck_bytes = rss_crosscheck_bytes.saturating_add(value);
+                }
+                None => complete_crosscheck = false,
+            }
+            counters.push(MacProcessCounters {
+                process: process_info(&after, process.ownership.clone()),
+                rss_bytes: usage.ri_resident_size,
+                footprint_bytes: usage.ri_phys_footprint,
+                rss_crosscheck_bytes: process_crosscheck,
+                cpu_ns: process_cpu_ns,
+                open_fds: process_open_fds,
+                thread_count: process_threads,
+            });
+        }
+
+        let mut cpu_update = self.cpu.update(&live_cpu)?;
+        cpu_update.warnings.extend(platform_cpu_warnings);
+        let unsampled_child_cpu_ns = self.reconcile_child_cpu(
+            &live_cpu,
+            &current_parents,
+            &child_rollup_cpu,
+            &cpu_update.newly_missing,
+            &cpu_update.readmitted_after_miss,
+        )?;
+        let cpu_ns = cpu_update
+            .cumulative_ns
+            .saturating_add(unsampled_child_cpu_ns);
+        let elapsed_ns = duration_ns(self.started.elapsed());
+        let wall_time = SystemTime::now();
+        let phase = phase.to_owned();
+        let processes = counters
+            .iter()
+            .map(|counter| counter.process.clone())
+            .collect();
+        let process_samples = counters
+            .into_iter()
+            .map(|counter| ProcessSample {
+                elapsed_ns,
+                wall_time,
+                phase: phase.clone(),
+                process: counter.process,
+                rss_bytes: counter.rss_bytes,
+                pss_bytes: None,
+                private_bytes: None,
+                footprint_bytes: Some(counter.footprint_bytes),
+                rss_crosscheck_bytes: counter.rss_crosscheck_bytes,
+                cpu_ns: counter.cpu_ns,
+                open_fds: Some(counter.open_fds),
+                thread_count: counter.thread_count,
+            })
+            .collect();
+
+        Ok(Sample {
+            elapsed_ns,
+            wall_time,
+            phase,
+            rss_bytes,
+            pss_bytes: None,
+            private_bytes: None,
+            footprint_bytes: Some(footprint_bytes),
+            rss_crosscheck_bytes: complete_crosscheck.then_some(rss_crosscheck_bytes),
+            cgroup_memory_bytes: None,
+            cgroup_peak_bytes: None,
+            cpu_ns,
+            open_fds: complete_open_fds.then_some(open_fds),
+            thread_count: complete_thread_count.then_some(thread_count),
+            collection_ns: self
+                .discovery_ns
+                .saturating_add(duration_ns(collection_started.elapsed())),
+            collection_wall_ns: self
+                .discovery_ns
+                .saturating_add(duration_ns(collection_started.elapsed())),
+            processes,
+            process_samples,
+            cpu_accounting_warnings: cpu_update.warnings,
+        })
+    }
+
     fn reconcile_child_cpu(
         &mut self,
         current_self_cpu: &BTreeMap<ProcIdentity, u64>,
@@ -428,7 +663,7 @@ impl Sampler for MacOsSampler {
         let mut pending: BTreeSet<u32> = roots.iter().copied().collect();
         let mut process_groups: BTreeSet<u32> = self.verified_groups.values().copied().collect();
         for pid in roots {
-            if let Some(info) = bsd_info(*pid)? {
+            if let Some(info) = counter_bsd_info(*pid)? {
                 if info.pbi_pgid != 0 {
                     process_groups.insert(info.pbi_pgid);
                 }
@@ -444,174 +679,39 @@ impl Sampler for MacOsSampler {
             if by_pid.contains_key(&pid) {
                 continue;
             }
-            if let Some(info) = bsd_info(pid)? {
+            if let Some(info) = counter_bsd_info(pid)? {
                 by_pid.insert(pid, info);
                 pending.extend(list_pids_for(PROC_PPID_ONLY, pid)?);
             }
         }
+        let live_in_discovery: BTreeSet<ProcIdentity> = by_pid
+            .values()
+            .filter(|info| info.pbi_status != libc::SZOMB)
+            .map(identity_of)
+            .collect();
         let result = self.discover_from_table(roots, &by_pid);
         self.discovery_ns = duration_ns(discovery_started.elapsed());
         let tree = result?;
+        self.live_in_last_discovery = live_in_discovery;
         crate::process::track_process_tree(&tree)?;
         Ok(tree)
     }
 
+    fn discover_live(&mut self, roots: &[u32]) -> Result<ProcessTree> {
+        let mut tree = self.discover(roots)?;
+        tree.roots
+            .retain(|identity| self.live_in_last_discovery.contains(identity));
+        tree.members
+            .retain(|identity, _| self.live_in_last_discovery.contains(identity));
+        Ok(tree)
+    }
+
     fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
-        let collection_started = Instant::now();
-        let mut rss_bytes = 0_u64;
-        let mut footprint_bytes = 0_u64;
-        let mut rss_crosscheck_bytes = 0_u64;
-        let mut open_fds = 0_u64;
-        let mut thread_count = 0_u64;
-        let mut complete_thread_count = true;
-        let mut complete_crosscheck = true;
-        let mut counters = Vec::new();
-        let mut live_cpu = BTreeMap::new();
-        let mut child_rollup_cpu = BTreeMap::new();
-        let mut platform_cpu_warnings = Vec::new();
-        let identities_by_pid: BTreeMap<u32, ProcIdentity> = tree
-            .members
-            .keys()
-            .map(|identity| (identity.pid, *identity))
-            .collect();
-        let current_parents: BTreeMap<ProcIdentity, ProcIdentity> = tree
-            .members
-            .iter()
-            .filter_map(|(identity, process)| {
-                identities_by_pid
-                    .get(&process.ppid)
-                    .map(|parent| (*identity, *parent))
-            })
-            .collect();
+        self.sample_with_liveness(tree, phase, true)
+    }
 
-        for (identity, process) in &tree.members {
-            let Some(current) = bsd_info(identity.pid)? else {
-                continue;
-            };
-            if identity_of(&current) != *identity {
-                continue;
-            }
-
-            let Some(usage) = rusage(identity.pid)? else {
-                continue;
-            };
-            rss_bytes = rss_bytes.saturating_add(usage.ri_resident_size);
-            footprint_bytes = footprint_bytes.saturating_add(usage.ri_phys_footprint);
-            let process_cpu_ns = normalize_cpu_counter(
-                *identity,
-                usage.ri_user_time.saturating_add(usage.ri_system_time),
-                self.last_self_cpu.get(identity).copied(),
-                "macos-self-cpu-jitter-clamped",
-                &mut platform_cpu_warnings,
-            )?;
-            live_cpu.insert(*identity, process_cpu_ns);
-            let child_cpu_ns = normalize_cpu_counter(
-                *identity,
-                usage
-                    .ri_child_user_time
-                    .saturating_add(usage.ri_child_system_time),
-                self.child_rollup_cpu.get(identity).copied(),
-                "macos-child-cpu-jitter-clamped",
-                &mut platform_cpu_warnings,
-            )?;
-            child_rollup_cpu.insert(*identity, child_cpu_ns);
-            let process_open_fds = u64::from(current.pbi_nfiles);
-            open_fds = open_fds.saturating_add(process_open_fds);
-            let (process_threads, proc_crosscheck) = match task_details(identity.pid)? {
-                Some(details) => {
-                    let threads = u64::try_from(details.pti_threadnum).map_err(|_| {
-                        AhrbError::Protocol(format!(
-                            "proc_pidinfo returned a negative thread count for PID {}",
-                            identity.pid
-                        ))
-                    })?;
-                    thread_count = thread_count.saturating_add(threads);
-                    (Some(threads), Some(details.pti_resident_size))
-                }
-                None => {
-                    complete_thread_count = false;
-                    (None, None)
-                }
-            };
-            let process_crosscheck = task_vm_resident(identity.pid).or(proc_crosscheck);
-            match process_crosscheck {
-                Some(value) => {
-                    rss_crosscheck_bytes = rss_crosscheck_bytes.saturating_add(value);
-                }
-                None => complete_crosscheck = false,
-            }
-            counters.push(MacProcessCounters {
-                process: process_info(&current, process.ownership.clone()),
-                rss_bytes: usage.ri_resident_size,
-                footprint_bytes: usage.ri_phys_footprint,
-                rss_crosscheck_bytes: process_crosscheck,
-                cpu_ns: process_cpu_ns,
-                open_fds: process_open_fds,
-                thread_count: process_threads,
-            });
-        }
-
-        let mut cpu_update = self.cpu.update(&live_cpu)?;
-        cpu_update.warnings.extend(platform_cpu_warnings);
-        let unsampled_child_cpu_ns = self.reconcile_child_cpu(
-            &live_cpu,
-            &current_parents,
-            &child_rollup_cpu,
-            &cpu_update.newly_missing,
-            &cpu_update.readmitted_after_miss,
-        )?;
-        let cpu_ns = cpu_update
-            .cumulative_ns
-            .saturating_add(unsampled_child_cpu_ns);
-        let elapsed_ns = duration_ns(self.started.elapsed());
-        let wall_time = SystemTime::now();
-        let phase = phase.to_owned();
-        let processes = counters
-            .iter()
-            .map(|counter| counter.process.clone())
-            .collect();
-        let process_samples = counters
-            .into_iter()
-            .map(|counter| ProcessSample {
-                elapsed_ns,
-                wall_time,
-                phase: phase.clone(),
-                process: counter.process,
-                rss_bytes: counter.rss_bytes,
-                pss_bytes: None,
-                private_bytes: None,
-                footprint_bytes: Some(counter.footprint_bytes),
-                rss_crosscheck_bytes: counter.rss_crosscheck_bytes,
-                cpu_ns: counter.cpu_ns,
-                open_fds: Some(counter.open_fds),
-                thread_count: counter.thread_count,
-            })
-            .collect();
-
-        Ok(Sample {
-            elapsed_ns,
-            wall_time,
-            phase,
-            rss_bytes,
-            pss_bytes: None,
-            private_bytes: None,
-            footprint_bytes: Some(footprint_bytes),
-            rss_crosscheck_bytes: complete_crosscheck.then_some(rss_crosscheck_bytes),
-            cgroup_memory_bytes: None,
-            cgroup_peak_bytes: None,
-            cpu_ns,
-            open_fds: Some(open_fds),
-            thread_count: complete_thread_count.then_some(thread_count),
-            collection_ns: self
-                .discovery_ns
-                .saturating_add(duration_ns(collection_started.elapsed())),
-            collection_wall_ns: self
-                .discovery_ns
-                .saturating_add(duration_ns(collection_started.elapsed())),
-            processes,
-            process_samples,
-            cpu_accounting_warnings: cpu_update.warnings,
-        })
+    fn sample_live(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
+        self.sample_with_liveness(tree, phase, false)
     }
 
     fn disk_counter_preflight(&mut self) -> Result<()> {
@@ -654,28 +754,28 @@ impl Sampler for MacOsSampler {
     }
 
     fn disk_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
-        let Some(current) = bsd_info_including_zombies(identity.pid)? else {
+        let Some(current) = counter_bsd_info(identity.pid)? else {
             return Ok(None);
         };
         if identity_of(&current) != identity {
             return Ok(None);
         }
         let value = rusage(identity.pid)?.map(|usage| usage.ri_diskio_byteswritten);
-        let Some(after) = bsd_info_including_zombies(identity.pid)? else {
+        let Some(after) = counter_bsd_info(identity.pid)? else {
             return Ok(None);
         };
         Ok((identity_of(&after) == identity).then_some(value).flatten())
     }
 
     fn disk_read_counter_for_identity(&mut self, identity: ProcIdentity) -> Result<Option<u64>> {
-        let Some(current) = bsd_info_including_zombies(identity.pid)? else {
+        let Some(current) = counter_bsd_info(identity.pid)? else {
             return Ok(None);
         };
         if identity_of(&current) != identity {
             return Ok(None);
         }
         let value = rusage(identity.pid)?.map(|usage| usage.ri_diskio_bytesread);
-        let Some(after) = bsd_info_including_zombies(identity.pid)? else {
+        let Some(after) = counter_bsd_info(identity.pid)? else {
             return Ok(None);
         };
         Ok((identity_of(&after) == identity).then_some(value).flatten())
@@ -807,16 +907,16 @@ fn skip_nuls(buffer: &[u8], offset: &mut usize) {
 }
 
 fn bsd_info(pid: u32) -> Result<Option<ProcBsdInfo>> {
-    bsd_info_with_zombies(pid, false)
+    read_bsd_info(pid, false)
 }
 
-// Darwin exposes final rusage for an unreaped zombie. The identity guards must
-// use the matching lookup policy; ordinary discovery still excludes zombies.
-fn bsd_info_including_zombies(pid: u32) -> Result<Option<ProcBsdInfo>> {
-    bsd_info_with_zombies(pid, true)
+// Darwin exposes final rusage for an unreaped zombie. Counter discovery and
+// identity guards include zombies; live hygiene filters them separately.
+fn counter_bsd_info(pid: u32) -> Result<Option<ProcBsdInfo>> {
+    read_bsd_info(pid, true)
 }
 
-fn bsd_info_with_zombies(pid: u32, include_zombies: bool) -> Result<Option<ProcBsdInfo>> {
+fn read_bsd_info(pid: u32, include_zombies: bool) -> Result<Option<ProcBsdInfo>> {
     let pid = c_int::try_from(pid)
         .map_err(|_| AhrbError::Validation("PID exceeds Darwin pid_t range".to_owned()))?;
     // SAFETY: the all-zero representation is valid for this C output struct.
@@ -828,12 +928,25 @@ fn bsd_info_with_zombies(pid: u32, include_zombies: bool) -> Result<Option<ProcB
         proc_pidinfo(
             pid,
             PROC_PIDTBSDINFO,
+            // XNU proc_pidinfo uses nonzero arg to include zombie identities for
+            // this flavor. proc_pid_rusage supports their final counters too.
             u64::from(include_zombies),
             (&mut info as *mut ProcBsdInfo).cast::<c_void>(),
             size,
         )
     };
     if read == size {
+        #[cfg(test)]
+        COUNTER_READ_TEST_FAULT.with(|fault| {
+            let fault = fault.borrow();
+            if let Some(fault) = fault.as_ref()
+                && fault.target_pid == info.pbi_pid
+                && fault.replacement_visible
+            {
+                info.pbi_start_tvsec = fault.replacement_start_time / 1_000_000;
+                info.pbi_start_tvusec = fault.replacement_start_time % 1_000_000;
+            }
+        });
         return Ok(Some(info));
     }
     if read == 0 {
@@ -894,6 +1007,30 @@ fn task_details(pid: u32) -> Result<Option<ProcTaskInfo>> {
     )))
 }
 
+fn task_details_for_sample(pid: u32) -> Result<Option<ProcTaskInfo>> {
+    #[cfg(test)]
+    {
+        let injected = COUNTER_READ_TEST_FAULT.with(|fault| {
+            let mut fault = fault.borrow_mut();
+            let fault = fault.as_mut()?;
+            if fault.target_pid != pid {
+                return None;
+            }
+            if fault.omit_task_details > 0 {
+                fault.omit_task_details -= 1;
+                return Some(None);
+            }
+            fault
+                .replacement_visible
+                .then_some(Some(fault.replacement_task))
+        });
+        if let Some(injected) = injected {
+            return Ok(injected);
+        }
+    }
+    task_details(pid)
+}
+
 fn rusage(pid: u32) -> Result<Option<RusageInfoV4>> {
     let pid = c_int::try_from(pid)
         .map_err(|_| AhrbError::Validation("PID exceeds Darwin pid_t range".to_owned()))?;
@@ -923,6 +1060,32 @@ fn rusage(pid: u32) -> Result<Option<RusageInfoV4>> {
     } else {
         Err(error.into())
     }
+}
+
+fn rusage_for_sample(pid: u32) -> Result<Option<RusageInfoV4>> {
+    #[cfg(test)]
+    {
+        let injected = COUNTER_READ_TEST_FAULT.with(|fault| {
+            let mut fault = fault.borrow_mut();
+            let fault = fault.as_mut()?;
+            if fault.target_pid != pid {
+                return None;
+            }
+            fault.rusage_calls = fault.rusage_calls.saturating_add(1);
+            if fault.rusage_calls == fault.replace_on_rusage_call {
+                if fault.rusage_unavailable {
+                    return Some(None);
+                }
+                fault.replacement_visible = true;
+                return Some(Some(fault.replacement_usage));
+            }
+            None
+        });
+        if let Some(injected) = injected {
+            return Ok(injected);
+        }
+    }
+    rusage(pid)
 }
 
 fn task_vm_resident(pid: u32) -> Option<u64> {
@@ -992,6 +1155,57 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inject_counter_read_fault(
+        target_pid: u32,
+        replacement_start_time: u64,
+        replacement_cpu_ns: u64,
+        rusage_unavailable: bool,
+    ) -> CounterReadTestFaultGuard {
+        // SAFETY: all-zero is valid for both C output structures before the
+        // fields used by this deterministic test seam are assigned.
+        let mut replacement_usage: RusageInfoV4 = unsafe { zeroed() };
+        replacement_usage.ri_user_time = replacement_cpu_ns;
+        replacement_usage.ri_resident_size = 91_000_000;
+        replacement_usage.ri_phys_footprint = 92_000_000;
+        // SAFETY: see the comment above.
+        let mut replacement_task: ProcTaskInfo = unsafe { zeroed() };
+        replacement_task.pti_threadnum = 17;
+        replacement_task.pti_resident_size = 93_000_000;
+        COUNTER_READ_TEST_FAULT.with(|fault| {
+            let mut fault = fault.borrow_mut();
+            assert!(fault.is_none(), "counter-read test fault already installed");
+            *fault = Some(CounterReadTestFault {
+                target_pid,
+                omit_task_details: 1,
+                replace_on_rusage_call: 2,
+                rusage_calls: 0,
+                replacement_start_time,
+                replacement_usage,
+                replacement_task,
+                rusage_unavailable,
+                replacement_visible: false,
+            });
+        });
+        CounterReadTestFaultGuard
+    }
+
+    fn inject_counter_read_pid_replacement(
+        target_pid: u32,
+        replacement_start_time: u64,
+        replacement_cpu_ns: u64,
+    ) -> CounterReadTestFaultGuard {
+        inject_counter_read_fault(
+            target_pid,
+            replacement_start_time,
+            replacement_cpu_ns,
+            false,
+        )
+    }
+
+    fn inject_counter_read_rusage_disappearance(target_pid: u32) -> CounterReadTestFaultGuard {
+        inject_counter_read_fault(target_pid, 0, 0, true)
+    }
 
     fn fixture_process(pid: u32, ppid: u32, start_time: u64, name: &str) -> ProcBsdInfo {
         // SAFETY: the all-zero representation is valid for this C data struct.
@@ -1094,6 +1308,137 @@ mod tests {
     }
 
     #[test]
+    fn final_zombie_identity_and_cpu_remain_available_until_reap() -> Result<()> {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 7"]).process_group(0);
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !crate::process::direct_child_exited_without_reap(pid)? {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut sampler = MacOsSampler::default();
+        let tree = sampler.discover(&[pid])?;
+        let identity = *tree.roots.iter().next().expect("final zombie identity");
+        let final_sample = sampler.sample(&tree, "final-before-reap")?;
+        let process = final_sample
+            .process_samples
+            .iter()
+            .find(|sample| sample.process.identity == identity)
+            .expect("final per-process CPU receipt");
+        assert!(process.cpu_ns > 0);
+        assert!(sampler.disk_counter_for_identity(identity)?.is_some());
+        let live_tree = sampler.discover_live(&[pid])?;
+        assert!(live_tree.roots.is_empty());
+        assert!(live_tree.members.is_empty());
+        let live_sample = sampler.sample_live(&tree, "live-hygiene-before-reap")?;
+        assert!(live_sample.process_samples.is_empty());
+        assert!(live_sample.processes.is_empty());
+        let retained = sampler.sample(&tree, "final-after-live-sample")?;
+        assert!(retained.cpu_ns >= final_sample.cpu_ns);
+        assert!(retained.process_samples.iter().any(|sample| {
+            sample.process.identity == identity && sample.cpu_ns >= process.cpu_ns
+        }));
+        assert!(sampler.disk_counter_for_identity(identity)?.is_some());
+        assert_eq!(child.wait()?.code(), Some(7));
+        crate::process::retire_process(pid)?;
+        let after = sampler.discover(&[])?;
+        assert!(sampler.sample(&after, "after-reap")?.cpu_ns >= final_sample.cpu_ns);
+        Ok(())
+    }
+
+    #[test]
+    fn live_counter_retry_rejects_pid_replacement_during_the_counter_read() -> Result<()> {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        let mut sampler = MacOsSampler::default();
+        let initial = sampler.discover(&[pid])?;
+        let identity = *initial.roots.iter().next().ok_or_else(|| {
+            AhrbError::Protocol("counter-read test root was not discovered".to_owned())
+        })?;
+        let replacement_cpu_ns = 4_000_000_000_000_u64;
+        let replacement_start_time = identity.start_time.saturating_add(1);
+        let fault =
+            inject_counter_read_pid_replacement(pid, replacement_start_time, replacement_cpu_ns);
+
+        let sampled = crate::process::sample_live_with_counter_retries(
+            &mut sampler,
+            &[pid],
+            "counter-read-pid-replacement",
+            3,
+            "counter-read PID replacement test",
+        );
+        let (rusage_calls, replacement_visible) = COUNTER_READ_TEST_FAULT.with(|state| {
+            let state = state.borrow();
+            let state = state.as_ref().expect("counter-read test fault state");
+            (state.rusage_calls, state.replacement_visible)
+        });
+        drop(fault);
+        child.kill()?;
+        child.wait()?;
+
+        let error = sampled.expect_err(
+            "a replacement exposed during a complete retry must not supply owned counters",
+        );
+        assert!(error.to_string().contains("changed start-time identity"));
+        assert_eq!(rusage_calls, 2, "replacement must occur on the retry read");
+        assert!(replacement_visible);
+        assert_ne!(
+            sampler.last_self_cpu.get(&identity).copied(),
+            Some(replacement_cpu_ns),
+            "replacement CPU must not be committed under the original identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_counter_retry_rejects_rusage_disappearance_while_identity_remains_live() -> Result<()> {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        let mut sampler = MacOsSampler::default();
+        let initial = sampler.discover(&[pid])?;
+        assert_eq!(initial.members.len(), 1);
+        let fault = inject_counter_read_rusage_disappearance(pid);
+
+        let sampled = crate::process::sample_live_with_counter_retries(
+            &mut sampler,
+            &[pid],
+            "counter-read-rusage-disappearance",
+            3,
+            "counter-read rusage disappearance test",
+        );
+        let (rusage_calls, replacement_visible) = COUNTER_READ_TEST_FAULT.with(|state| {
+            let state = state.borrow();
+            let state = state.as_ref().expect("counter-read test fault state");
+            (state.rusage_calls, state.replacement_visible)
+        });
+        drop(fault);
+        child.kill()?;
+        child.wait()?;
+
+        let error = sampled.expect_err(
+            "a live identity omitted after rusage disappearance must not become zero evidence",
+        );
+        assert!(
+            error.to_string().contains("rusage reported PID ")
+                && error.to_string().contains(" remained live")
+        );
+        assert_eq!(rusage_calls, 2, "rusage must disappear on the retry read");
+        assert!(!replacement_visible);
+        Ok(())
+    }
+
+    #[test]
     fn discovers_and_samples_current_process() -> Result<()> {
         let mut sampler = MacOsSampler::default();
         let tree = sampler.discover(&[std::process::id()])?;
@@ -1102,7 +1447,7 @@ mod tests {
                 .keys()
                 .any(|identity| identity.pid == std::process::id())
         );
-        let sample = sampler.sample(&tree, "self")?;
+        let sample = sampler.sample_live(&tree, "self")?;
         assert!(sample.rss_bytes > 0);
         assert!(sample.footprint_bytes.unwrap_or(0) > 0);
         assert!(sample.open_fds.unwrap_or(0) > 0);

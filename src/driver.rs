@@ -10,7 +10,7 @@ use crate::events::{
     EventNormalizer, EventVocab, NATIVE_FIXTURE_METADATA_PREFIX, NormalizedEvent, rule_matches,
 };
 use crate::manifest::{EventMapping, ExitContract, Probe, ShutdownResult};
-use crate::process::{ProcIdentity, Sample, Sampler};
+use crate::process::{ProcIdentity, Sample, Sampler, sample_live_with_counter_retries};
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -490,15 +490,17 @@ async fn observe_registered_command_tree(
     let audit_timeout = command_timeout.saturating_add(Duration::from_secs(2));
     let mut samples = Vec::new();
     loop {
-        let tree = sampler.discover(&[pid])?;
+        let (tree, sample) = sample_live_with_counter_retries(
+            sampler.as_mut(),
+            &[pid],
+            &phase,
+            3,
+            "public close-delete process observation",
+        )?;
         crate::process::track_process_tree(&tree)?;
-        let current_sample = if tree.members.is_empty() {
-            None
-        } else {
-            Some(sampler.sample(&tree, &phase)?)
-        };
+        let current_sample = (!sample.processes.is_empty()).then_some(sample);
         samples.extend(current_sample.iter().cloned());
-        if finished.load(Ordering::Acquire) && tree.members.is_empty() {
+        if finished.load(Ordering::Acquire) && current_sample.is_none() {
             return Ok((samples, None));
         }
         if started.elapsed() >= audit_timeout {
@@ -1265,6 +1267,9 @@ pub trait Driver: Send {
     fn reap_after_external_kill(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+    /// Stable in-process identity used only to continue an external timing
+    /// scope across a cold driver replacement.
+    fn timing_identity(&self) -> usize;
     /// Observe a cohort with an adapter-declared readiness command. This is
     /// advisory only: resource PASS fencing uses durable terminal state and
     /// thin-client exit status.
@@ -1274,6 +1279,12 @@ pub trait Driver: Send {
         _timeout: Duration,
     ) -> DriverFuture<'_, Option<Value>> {
         Box::pin(async { Ok(None) })
+    }
+    /// Arm subsequent exec invocations before their workload begins.
+    fn set_invocation_gating(&mut self, _enabled: bool) {}
+    /// Observe client exits without reaping, retaining counters for final sampling.
+    fn observe_exits_before_reap(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
     /// Release benchmark launch gates after resource membership is armed.
     fn release_invocations(&mut self) -> DriverFuture<'_, ()> {
@@ -1487,6 +1498,10 @@ impl<T: Transport> GenericDriver<T> {
 }
 
 impl<T: Transport> Driver for GenericDriver<T> {
+    fn timing_identity(&self) -> usize {
+        self as *const Self as usize
+    }
+
     fn start(&mut self) -> DriverFuture<'_, ()> {
         self.transport.start()
     }
@@ -1519,6 +1534,7 @@ impl<T: Transport> Driver for GenericDriver<T> {
         let key = key.to_owned();
         let operation = self.operations.submit.clone();
         Box::pin(async move {
+            crate::row_timing::submitted(self as *const Self as usize, &session, &key);
             self.call(
                 &operation,
                 json!({ "session_id": session, "prompt": prompt, "key": key }),
@@ -1543,7 +1559,9 @@ impl<T: Transport> Driver for GenericDriver<T> {
                 )
                 .await?;
             let events = value.get("events").cloned().unwrap_or(value);
-            Ok(serde_json::from_value(events)?)
+            let events: Vec<NormalizedEvent> = serde_json::from_value(events)?;
+            crate::row_timing::observed(self as *const Self as usize, &session, &events);
+            Ok(events)
         })
     }
 
@@ -1867,7 +1885,7 @@ pub struct PerInvocationConfig {
     pub run_id_pointer: String,
     /// Client-side upper bound for a single invocation.
     pub timeout: Duration,
-    /// Maximum source bytes parsed per invocation.
+    /// Bound for exit-contract capture and an incomplete streaming source record.
     pub max_output_bytes: usize,
     /// Hold fresh processes behind a launch gate until samplers establish
     /// durable ownership of their unique process groups.
@@ -1896,6 +1914,7 @@ struct ActiveInvocation {
     started: std::time::Instant,
     launch_ns: u64,
     wall_prefix_ns: u64,
+    exit_observed_without_reap: bool,
     turn: u64,
 }
 
@@ -1906,6 +1925,26 @@ struct ExecSession {
     client_exit: ClientExit,
     control_evidence: Vec<Value>,
     close_delete_process_observation: Option<CloseDeleteProcessObservation>,
+}
+
+/// Parsed source cursor; incomplete records stay buffered until their delimiter.
+#[derive(Default)]
+struct ExecSourceCursor {
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
+    modified: Option<std::time::SystemTime>,
+    offset: u64,
+    pending: Vec<u8>,
+    records: Vec<Value>,
+    record_base: usize,
+    turn: u64,
+}
+
+#[derive(Default)]
+struct ExecEventCache {
+    events: BTreeMap<u64, NormalizedEvent>,
+    current: BTreeMap<String, NormalizedEvent>,
+    turn: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2066,7 +2105,8 @@ fn canonicalize_native_fixture_event(
     }
     let native_call_id = event
         .payload
-        .get("call_id")
+        .get("native_call_id")
+        .or_else(|| event.payload.get("call_id"))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let call = embedded_fixture_call(&event.payload).or_else(|| {
@@ -2083,21 +2123,26 @@ fn canonicalize_native_fixture_event(
         );
     }
     if let Some(native_name) = payload.get("name").cloned() {
-        payload.insert("native_name".to_owned(), native_name);
+        payload
+            .entry("native_name".to_owned())
+            .or_insert(native_name);
     }
     payload.insert("call_id".to_owned(), Value::String(call.call_id.clone()));
     payload.insert("name".to_owned(), Value::String(call.name.clone()));
     match event.event {
         EventVocab::ToolCall => {
             if let Some(native_arguments) = payload.get("arguments").cloned() {
-                payload.insert("native_arguments".to_owned(), native_arguments);
+                payload
+                    .entry("native_arguments".to_owned())
+                    .or_insert(native_arguments);
             }
             payload.insert("arguments".to_owned(), call.arguments.clone());
         }
         EventVocab::ToolResult => {
             payload.insert("arguments".to_owned(), call.arguments.clone());
             let native_result = payload
-                .get("result")
+                .get("native_result")
+                .or_else(|| payload.get("result"))
                 .cloned()
                 .unwrap_or_else(|| Value::Object(payload.clone()));
             payload.insert("native_result".to_owned(), native_result.clone());
@@ -2127,6 +2172,8 @@ pub struct PerInvocationDriver {
     storage_controls: std::sync::Mutex<Vec<storage_control::StorageControlReceipt>>,
     lifecycle_notes: Vec<String>,
     unmapped_payload_kinds: BTreeSet<String>,
+    event_caches: BTreeMap<String, ExecEventCache>,
+    source_cursors: BTreeMap<String, ExecSourceCursor>,
 }
 
 impl PerInvocationDriver {
@@ -2150,6 +2197,8 @@ impl PerInvocationDriver {
             storage_controls: std::sync::Mutex::new(Vec::new()),
             lifecycle_notes: Vec::new(),
             unmapped_payload_kinds: BTreeSet::new(),
+            event_caches: BTreeMap::new(),
+            source_cursors: BTreeMap::new(),
         }
     }
 
@@ -2186,6 +2235,10 @@ impl PerInvocationDriver {
     }
 
     fn load_sessions(&mut self) -> Result<()> {
+        // Restart/recovery may legitimately replace a native journal. Rehydrate
+        // canonical IDs from durable evidence rather than reusing live offsets.
+        self.source_cursors.clear();
+        self.event_caches.clear();
         std::fs::create_dir_all(&self.state_root)?;
         let mut entries =
             std::fs::read_dir(&self.state_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2353,38 +2406,206 @@ impl PerInvocationDriver {
     }
 
     fn source_records(
-        &self,
+        &mut self,
         session: &PersistedExecSession,
         stdout_path: Option<&Path>,
-    ) -> Result<(Vec<Value>, Vec<u8>)> {
-        let stdout = match stdout_path {
-            Some(path) => Self::bounded_read(path, self.config.max_output_bytes, false)?,
-            None => Vec::new(),
-        };
-        let bytes = match self.config.events.source.as_str() {
-            "stdout" => stdout.clone(),
+        finished: bool,
+    ) -> Result<(Vec<Value>, usize)> {
+        use std::io::{Read as _, Seek as _};
+        let path = match self.config.events.source.as_str() {
+            "stdout" => stdout_path.map(Path::to_path_buf).unwrap_or_default(),
             "journal-file" => {
                 let variables = self.invocation_variables(session, "", "");
-                let path = crate::manifest::render_template(&self.config.events.path, &variables)?;
-                // Earlier records are already present in AHRB's normalized cache;
-                // retain the newest bounded tail so a growing journal cannot hide
-                // later turns beyond a permanently capped prefix.
-                Self::bounded_read(Path::new(&path), self.config.max_output_bytes, true)?
+                PathBuf::from(crate::manifest::render_template(
+                    &self.config.events.path,
+                    &variables,
+                )?)
             }
             other => {
                 return Err(AhrbError::Validation(format!(
-                    "per-invocation events.source must be stdout or journal-file, not {other:?}"
+                    "unsupported exec event source {other:?}"
                 )));
             }
         };
-        let records = if self.config.events.source == "journal-file"
-            && matches!(self.config.events.framing.as_str(), "jsonl" | "json-seq")
-        {
-            parse_journal_records(&bytes)?
-        } else {
-            parse_event_records(&bytes, &self.config.events.framing)?
+        let cursor = self
+            .source_cursors
+            .entry(session.local_id.clone())
+            .or_default();
+        if cursor.path != path {
+            *cursor = ExecSourceCursor {
+                path: path.clone(),
+                turn: session.invocations,
+                ..Default::default()
+            };
+        } else if cursor.turn != session.invocations {
+            if self.config.events.framing != "json" {
+                cursor.record_base += cursor.records.len();
+            }
+            cursor.records.clear();
+            cursor.turn = session.invocations;
+        }
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((cursor.records.clone(), cursor.record_base));
+            }
+            Err(error) => return Err(error.into()),
         };
-        Ok((records, stdout))
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = file.metadata()?;
+            let identity = (metadata.dev(), metadata.ino());
+            if cursor.identity.is_some_and(|previous| previous != identity) {
+                return Err(AhrbError::Protocol(
+                    "exec event source replaced while collecting".into(),
+                ));
+            }
+            cursor.identity = Some(identity);
+        }
+        if file.metadata()?.len() < cursor.offset {
+            return Err(AhrbError::Protocol(
+                "exec event source truncated while collecting".into(),
+            ));
+        }
+        // Whole-JSON carriers have no record delimiter and are reparsed only when
+        // their metadata changes. Streaming carriers read each source byte once.
+        let maximum = self.config.max_output_bytes;
+        if self.config.events.framing == "json" {
+            let metadata = file.metadata()?;
+            let length = metadata.len();
+            let modified = metadata.modified().ok();
+            if length != cursor.offset || modified != cursor.modified {
+                if maximum > 0 && length > maximum as u64 {
+                    return Err(AhrbError::Protocol(
+                        "exec JSON source exceeds capture limit".into(),
+                    ));
+                }
+                let mut bytes = Vec::new();
+                if maximum > 0 {
+                    file.take((maximum as u64).saturating_add(1))
+                        .read_to_end(&mut bytes)?;
+                } else {
+                    file.read_to_end(&mut bytes)?;
+                }
+                if maximum > 0 && bytes.len() > maximum {
+                    return Err(AhrbError::Protocol(
+                        "exec JSON source exceeds capture limit".into(),
+                    ));
+                }
+                cursor.records = parse_event_records(&bytes, "json")?;
+                cursor.offset = bytes.len() as u64;
+                cursor.modified = modified;
+            }
+        } else {
+            let parse = |bytes: &[u8]| -> Result<Vec<Value>> {
+                if maximum > 0
+                    && bytes
+                        .split(|byte| *byte == b'\n')
+                        .any(|line| line.len() > maximum)
+                {
+                    return Err(AhrbError::Protocol(
+                        "exec source record exceeds capture limit".into(),
+                    ));
+                }
+                if self.config.events.source == "journal-file"
+                    && matches!(self.config.events.framing.as_str(), "jsonl" | "json-seq")
+                {
+                    parse_journal_records(bytes)
+                } else {
+                    parse_event_records(bytes, &self.config.events.framing)
+                }
+            };
+            file.seek(std::io::SeekFrom::Start(cursor.offset))?;
+            let mut chunk = [0_u8; 16_384];
+            loop {
+                let read = file.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                cursor.offset = cursor.offset.saturating_add(read as u64);
+                cursor.pending.extend_from_slice(&chunk[..read]);
+                if let Some(end) = cursor.pending.iter().rposition(|byte| *byte == b'\n') {
+                    let records = parse(&cursor.pending[..=end])?;
+                    cursor.pending.drain(..=end);
+                    cursor.records.extend(records);
+                }
+                if maximum > 0 && cursor.pending.len() > maximum {
+                    return Err(AhrbError::Protocol(
+                        "exec source record exceeds capture limit".into(),
+                    ));
+                }
+            }
+            if finished && self.config.events.source == "stdout" && !cursor.pending.is_empty() {
+                cursor.records.extend(parse(&cursor.pending)?);
+                cursor.pending.clear();
+            }
+        }
+        Ok((cursor.records.clone(), cursor.record_base))
+    }
+
+    fn take_event_cache(&mut self, session: &PersistedExecSession) -> Result<ExecEventCache> {
+        let mut cache = match self.event_caches.remove(&session.local_id) {
+            Some(cache) => cache,
+            None => {
+                let events = Self::read_cached_events(&self.events_path(&session.local_id))?;
+                ExecEventCache {
+                    current: events
+                        .iter()
+                        .cloned()
+                        .map(|event| (event.id.clone(), event))
+                        .collect(),
+                    events: events
+                        .into_iter()
+                        .map(|event| (event.cursor, event))
+                        .collect(),
+                    turn: session.invocations,
+                }
+            }
+        };
+        if cache.turn != session.invocations {
+            // Whole-JSON journals republish history; keep their ID index and
+            // absolute record positions so earlier invocations remain deduplicated.
+            if self.config.events.source != "journal-file" || self.config.events.framing != "json" {
+                cache.current.clear();
+            }
+            cache.turn = session.invocations;
+        }
+        Ok(cache)
+    }
+
+    fn persist_event_cache(
+        &mut self,
+        session: &PersistedExecSession,
+        mut cache: ExecEventCache,
+        changes: Vec<NormalizedEvent>,
+    ) -> Result<()> {
+        let path = self.events_path(&session.local_id);
+        let corrections = changes
+            .iter()
+            .any(|event| cache.events.contains_key(&event.cursor));
+        for event in &changes {
+            cache.current.insert(event.id.clone(), event.clone());
+            cache.events.insert(event.cursor, event.clone());
+        }
+        if corrections {
+            // Corrections preserve identity/order. Atomically publish the complete
+            // canonical cache; original native records remain in the source file.
+            let temporary = path.with_extension("jsonl.tmp");
+            std::fs::File::create(&temporary)?;
+            Self::append_cached_events(
+                &temporary,
+                &cache.events.values().cloned().collect::<Vec<_>>(),
+            )?;
+            std::fs::rename(temporary, &path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        } else {
+            Self::append_cached_events(&path, &changes)?;
+        }
+        self.event_caches.insert(session.local_id.clone(), cache);
+        Ok(())
     }
 
     fn raw_live_replay_records(&self, session: &PersistedExecSession) -> Result<Vec<Value>> {
@@ -2440,9 +2661,13 @@ impl PerInvocationDriver {
             .create(true)
             .append(true)
             .open(path)?;
-        for event in events {
-            serde_json::to_writer(&mut file, event)?;
-            file.write_all(b"\n")?;
+        {
+            let mut buffered = std::io::BufWriter::new(&mut file);
+            for event in events {
+                serde_json::to_writer(&mut buffered, event)?;
+                buffered.write_all(b"\n")?;
+            }
+            buffered.flush()?;
         }
         file.sync_all()?;
         Ok(())
@@ -2455,6 +2680,26 @@ impl PerInvocationDriver {
         existing: &BTreeMap<String, NormalizedEvent>,
         namespace: &str,
         allow_terminal: bool,
+    ) -> Result<Vec<NormalizedEvent>> {
+        Self::normalize_records_at(
+            mapping,
+            session,
+            records,
+            existing,
+            namespace,
+            allow_terminal,
+            0,
+        )
+    }
+
+    fn normalize_records_at(
+        mapping: &EventMapping,
+        session: &mut PersistedExecSession,
+        records: &[Value],
+        existing: &BTreeMap<String, NormalizedEvent>,
+        namespace: &str,
+        allow_terminal: bool,
+        record_base: usize,
     ) -> Result<Vec<NormalizedEvent>> {
         let mut output = Vec::new();
         let mut normalizer = EventNormalizer::default();
@@ -2500,12 +2745,46 @@ impl PerInvocationDriver {
             let Some(native_call_id) = item.get("call_id").and_then(Value::as_str) else {
                 continue;
             };
-            if fixture_calls.contains_key(native_call_id) {
-                continue;
-            }
-            if let Some(call) = embedded_fixture_call(item) {
+            let finalized = embedded_fixture_call(item).or_else(|| {
+                let arguments = item.get("args").or_else(|| item.get("arguments"))?;
+                let arguments = if let Some(encoded) = arguments.as_str() {
+                    serde_json::from_str::<Value>(encoded).ok()?
+                } else {
+                    arguments.clone()
+                };
+                if arguments.as_object().is_none_or(serde_json::Map::is_empty) {
+                    return None;
+                }
+                Some(AbstractFixtureCall {
+                    call_id: native_call_id.to_owned(),
+                    name: item.get("name")?.as_str()?.to_owned(),
+                    arguments,
+                })
+            });
+            if let Some(call) = finalized {
                 fixture_calls.insert(native_call_id.to_owned(), call);
             }
+        }
+        for event in existing.values() {
+            if !matches!(event.event, EventVocab::ToolCall | EventVocab::ToolResult) {
+                continue;
+            }
+            let native_id = event
+                .payload
+                .get("native_call_id")
+                .or_else(|| event.payload.get("call_id"))
+                .and_then(Value::as_str);
+            let Some(call) = native_id.and_then(|id| fixture_calls.get(id)) else {
+                continue;
+            };
+            if event.payload.get("arguments") == Some(&call.arguments)
+                && event.payload.get("name").and_then(Value::as_str) == Some(call.name.as_str())
+            {
+                continue;
+            }
+            let mut corrected = event.clone();
+            canonicalize_native_fixture_event(&mut corrected, &fixture_calls);
+            output.push(corrected);
         }
         let mut effective = mapping.clone();
         effective.id_pointer = "/_ahrb_id".to_owned();
@@ -2570,7 +2849,7 @@ impl PerInvocationDriver {
                         if let Ok(bytes) = serde_json::to_vec(raw) {
                             digest.update(bytes);
                         }
-                        digest.update(index.to_le_bytes());
+                        digest.update((record_base + index).to_le_bytes());
                         format!("{:x}", digest.finalize())
                     });
                     let id = format!(
@@ -2645,14 +2924,12 @@ impl PerInvocationDriver {
         active: &ActiveInvocation,
         completed: Option<std::process::ExitStatus>,
     ) -> Result<()> {
-        let cache_path = self.events_path(&session.local_id);
-        let cached = Self::read_cached_events(&cache_path)?;
-        let by_id: BTreeMap<String, NormalizedEvent> = cached
-            .iter()
-            .cloned()
-            .map(|event| (event.id.clone(), event))
-            .collect();
-        let (records, stdout) = self.source_records(session, Some(&active.stdout_path))?;
+        let poll_started_ns = crate::fake_model::monotonic_timestamp_ns();
+        let cache = self.take_event_cache(session)?;
+        let (records, record_base) =
+            self.source_records(session, Some(&active.stdout_path), completed.is_some())?;
+        let receipt_ns = crate::fake_model::monotonic_timestamp_ns();
+        let normalization_started_ns = receipt_ns;
         self.record_event_contract(&records)?;
         self.learn_harness_identifiers(session, &records);
         let namespace = if self.config.events.source == "stdout" {
@@ -2660,15 +2937,46 @@ impl PerInvocationDriver {
         } else {
             "journal".to_owned()
         };
-        let mut additions = Self::normalize_records(
+        // Hold the terminal and its suffix until the exit contract is known.
+        // Earlier records can be discarded from the parsed source buffer once
+        // durably indexed; late argument patches join through cache.current.
+        let consumed = if completed.is_some() {
+            records.len()
+        } else {
+            records
+                .iter()
+                .position(|raw| {
+                    let kind = raw
+                        .pointer(&self.config.events.type_pointer)
+                        .and_then(Value::as_str)
+                        .or_else(|| raw.get("type").and_then(Value::as_str))
+                        .or_else(|| raw.get("event").and_then(Value::as_str));
+                    self.config.events.rules.iter().any(|rule| {
+                        kind == Some(rule.matches.as_str())
+                            && rule_matches(raw, rule)
+                            && matches!(
+                                rule.event.as_str(),
+                                "terminal-success"
+                                    | "terminal-failure"
+                                    | "terminal-cancelled"
+                                    | "terminal-timeout"
+                            )
+                    })
+                })
+                .unwrap_or(records.len())
+        };
+        let mut additions = Self::normalize_records_at(
             &self.config.events,
             session,
-            &records,
-            &by_id,
+            &records[..consumed],
+            &cache.current,
             &namespace,
             completed.is_some(),
+            record_base,
         )?;
         if let Some(status) = completed {
+            let stdout =
+                Self::bounded_read(&active.stdout_path, self.config.max_output_bytes, false)?;
             let (expected, mut payload) = self.terminal_contract(status, &stdout);
             if payload.get("category").and_then(Value::as_str) == Some("idle-timeout")
                 && let Some(object) = payload.as_object_mut()
@@ -2699,7 +3007,7 @@ impl PerInvocationDriver {
                         .or_insert_with(|| value.clone());
                 }
             }
-            let mapped_terminal = additions.iter().chain(cached.iter()).rev().find(|event| {
+            let mapped_terminal = additions.iter().rev().find(|event| {
                 // Stdout records belong to one invocation. An earlier turn's
                 // terminal cannot replace this invocation's exit observation.
                 if self.config.events.source == "stdout"
@@ -2733,32 +3041,53 @@ impl PerInvocationDriver {
                 session.next_cursor = session.next_cursor.saturating_add(1);
             }
         }
-        Self::append_cached_events(&cache_path, &additions)
+        let normalized_ns = crate::fake_model::monotonic_timestamp_ns();
+        let changed = additions.len();
+        self.persist_event_cache(session, cache, additions)?;
+        if self.config.events.framing != "json"
+            && let Some(source) = self.source_cursors.get_mut(&session.local_id)
+        {
+            source.records.drain(..consumed);
+            source.record_base += consumed;
+        }
+        let persisted_ns = crate::fake_model::monotonic_timestamp_ns();
+        if changed > 0 {
+            self.lifecycle_notes.push(format!("collector-span {}", json!({
+                "session_hash": format!("{:x}", Sha256::digest(session.local_id.as_bytes())),
+                "turn": active.turn, "poll_started_ns": poll_started_ns, "receipt_ns": receipt_ns,
+                "normalization_started_ns": normalization_started_ns,
+                "normalized_ns": normalized_ns, "persisted_ns": persisted_ns,
+                "changed_events": changed,
+            })));
+        }
+        Ok(())
     }
 
     fn refresh_inactive_journal(&mut self, session: &mut PersistedExecSession) -> Result<()> {
         if self.config.events.source != "journal-file" {
             return Ok(());
         }
-        let cache_path = self.events_path(&session.local_id);
-        let cached = Self::read_cached_events(&cache_path)?;
-        let by_id: BTreeMap<String, NormalizedEvent> = cached
-            .iter()
-            .cloned()
-            .map(|event| (event.id.clone(), event))
-            .collect();
-        let (records, _) = self.source_records(session, None)?;
+        let cache = self.take_event_cache(session)?;
+        let (records, record_base) = self.source_records(session, None, true)?;
         self.record_event_contract(&records)?;
         self.learn_harness_identifiers(session, &records);
-        let additions = Self::normalize_records(
+        let additions = Self::normalize_records_at(
             &self.config.events,
             session,
             &records,
-            &by_id,
+            &cache.current,
             "journal",
             true,
+            record_base,
         )?;
-        Self::append_cached_events(&cache_path, &additions)
+        self.persist_event_cache(session, cache, additions)?;
+        if self.config.events.framing != "json"
+            && let Some(source) = self.source_cursors.get_mut(&session.local_id)
+        {
+            source.record_base += source.records.len();
+            source.records.clear();
+        }
+        Ok(())
     }
 
     fn record_event_contract(&mut self, records: &[Value]) -> Result<()> {
@@ -2935,14 +3264,32 @@ impl PerInvocationDriver {
     }
 
     fn cached_after(&self, id: &str, after: Option<Cursor>) -> Result<Vec<NormalizedEvent>> {
-        let mut events = Self::read_cached_events(&self.events_path(id))?;
-        events.retain(|event| after.is_none_or(|cursor| event.cursor > cursor.0));
-        events.sort_by_key(|event| event.cursor);
+        let events = if let Some(cache) = self.event_caches.get(id) {
+            cache
+                .events
+                .range((
+                    after.map_or(std::ops::Bound::Unbounded, |cursor| {
+                        std::ops::Bound::Excluded(cursor.0)
+                    }),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, event)| event.clone())
+                .collect()
+        } else {
+            let mut events = Self::read_cached_events(&self.events_path(id))?;
+            events.retain(|event| after.is_none_or(|cursor| event.cursor > cursor.0));
+            events.sort_by_key(|event| event.cursor);
+            events
+        };
         Ok(events)
     }
 }
 
 impl Driver for PerInvocationDriver {
+    fn timing_identity(&self) -> usize {
+        self as *const Self as usize
+    }
+
     fn start(&mut self) -> DriverFuture<'_, ()> {
         Box::pin(async move {
             self.load_sessions()?;
@@ -3045,6 +3392,7 @@ impl Driver for PerInvocationDriver {
         let prompt = prompt.to_owned();
         let key = key.to_owned();
         Box::pin(async move {
+            crate::row_timing::submitted(self as *const Self as usize, &id, &key);
             // `start` publishes the launcher PID before a resident daemon has
             // necessarily completed readiness and profile-local initialization,
             // so resource samplers can include cold startup. Never let the first
@@ -3150,6 +3498,7 @@ impl Driver for PerInvocationDriver {
                 started,
                 launch_ns,
                 wall_prefix_ns,
+                exit_observed_without_reap: false,
                 turn,
             });
             item.client_exit = ClientExit::Running;
@@ -3198,12 +3547,12 @@ impl Driver for PerInvocationDriver {
                 self.refresh_source(&mut persisted, &invocation, status)?;
                 if status.is_some() {
                     let exit_ns = crate::fake_model::monotonic_timestamp_ns();
-                    if let Some(pid) = invocation_pid {
-                        crate::process::retire_process(pid)?;
-                    }
                     let wall_ns = invocation
                         .wall_prefix_ns
                         .saturating_add(duration_ns(invocation.started.elapsed()));
+                    if let Some(pid) = invocation_pid {
+                        crate::process::retire_process(pid)?;
+                    }
                     self.completed_turn_wall_ns.push(wall_ns);
                     self.completed_turn_boundaries.push(CompletedTurnBoundary {
                         launch_ns: invocation.launch_ns,
@@ -3237,7 +3586,27 @@ impl Driver for PerInvocationDriver {
                     item.persisted = persisted;
                 }
             }
-            self.cached_after(&id, after)
+            let events = self.cached_after(&id, after)?;
+            crate::row_timing::observed(self as *const Self as usize, &id, &events);
+            if events.iter().any(|event| {
+                matches!(
+                    event.event,
+                    EventVocab::TerminalSuccess
+                        | EventVocab::TerminalFailure
+                        | EventVocab::TerminalCancelled
+                        | EventVocab::TerminalTimeout
+                )
+            }) {
+                self.lifecycle_notes.push(format!(
+                    "collector-terminal-return {}",
+                    json!({
+                        "session_hash": format!("{:x}", Sha256::digest(id.as_bytes())),
+                        "turn": self.sessions.get(&id).map(|item| item.persisted.invocations),
+                        "returned_terminal_ns": crate::fake_model::monotonic_timestamp_ns(),
+                    })
+                ));
+            }
+            Ok(events)
         })
     }
 
@@ -3414,7 +3783,7 @@ impl Driver for PerInvocationDriver {
                 }
             }
             let mut replayed = persisted;
-            if self.config.events.source == "stdout" {
+            let normalized = if self.config.events.source == "stdout" {
                 // Normalize the replay stream into AHRB cursors before applying
                 // the caller's AHRB cursor. An adapter-declared replay envelope
                 // has already been unwrapped above.
@@ -3428,7 +3797,7 @@ impl Driver for PerInvocationDriver {
                     true,
                 )?;
                 normalized.retain(|event| after.is_none_or(|cursor| event.cursor > cursor.0));
-                Ok(normalized)
+                normalized
             } else {
                 for record in &records {
                     if record
@@ -3455,8 +3824,10 @@ impl Driver for PerInvocationDriver {
                     &BTreeMap::new(),
                     "journal",
                     true,
-                )
-            }
+                )?
+            };
+            crate::row_timing::observed(self as *const Self as usize, &id, &normalized);
+            Ok(normalized)
         })
     }
 
@@ -3479,6 +3850,8 @@ impl Driver for PerInvocationDriver {
                         "could not reopen exec session {id:?} metadata: {error}"
                     ))
                 })?)?;
+            self.source_cursors.remove(&id);
+            self.event_caches.remove(&id);
             if !self.config.resume_control_command.is_empty() {
                 let command = self.config.resume_control_command.clone();
                 let evidence = self
@@ -3647,7 +4020,8 @@ impl Driver for PerInvocationDriver {
                         payload: json!({"status":"cancelled"}),
                     };
                     persisted.next_cursor = persisted.next_cursor.saturating_add(1);
-                    Self::append_cached_events(&self.events_path(&id), &[event])?;
+                    let cache = self.take_event_cache(&persisted)?;
+                    self.persist_event_cache(&persisted, cache, vec![event])?;
                 } else {
                     let command = self.config.cancel_command.clone();
                     let _ = self.run_control_command(&command, &persisted, None).await?;
@@ -3830,6 +4204,46 @@ impl Driver for PerInvocationDriver {
             }
             Ok(())
         })
+    }
+
+    fn observe_exits_before_reap(&mut self) -> DriverFuture<'_, ()> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            loop {
+                let mut pending = false;
+                for session in self.sessions.values_mut() {
+                    let Some(invocation) = session.active.as_mut() else {
+                        continue;
+                    };
+                    if invocation.exit_observed_without_reap {
+                        continue;
+                    }
+                    let pid = invocation.child.id().ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "exec client was reaped before final CPU observation".into(),
+                        )
+                    })?;
+                    if crate::process::direct_child_exited_without_reap(pid)? {
+                        invocation.exit_observed_without_reap = true;
+                    } else {
+                        pending = true;
+                    }
+                }
+                if !pending {
+                    return Ok(());
+                }
+                if started.elapsed() >= self.config.timeout {
+                    return Err(AhrbError::Timeout(
+                        "exec client did not exit before final CPU observation".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    }
+
+    fn set_invocation_gating(&mut self, enabled: bool) {
+        self.config.gate_launch = enabled;
     }
 
     fn release_invocations(&mut self) -> DriverFuture<'_, ()> {
@@ -5145,6 +5559,90 @@ mod tests {
     }
 
     #[test]
+    fn finalized_native_arguments_correct_prior_poll_without_reordering() {
+        let manifest =
+            crate::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
+        let mut session = PersistedExecSession {
+            local_id: "late-arguments".into(),
+            marker: "actor".into(),
+            harness_id: String::new(),
+            run_id: String::new(),
+            turns: 0,
+            invocations: 1,
+            next_cursor: 1,
+            closed: false,
+        };
+        let metadata = serde_json::to_vec(&json!({"call_id":"edit", "name":"write_fixture", "arguments":{"path":"economy-output.txt","content":"verified"}})).unwrap()
+            .iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let initial = vec![
+            json!({"event_id":"call", "payload":{"type":"item","event":"started","item":{"item":"tool_call","call_id":"native-edit","name":"process_exec","args":{}}}}),
+            json!({"event_id":"result", "payload":{"type":"tool_result","call_id":"native-edit","result":{"exit_code":0,"output":"ok"}}}),
+        ];
+        let first = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &mut session,
+            &initial,
+            &BTreeMap::new(),
+            "turn-1",
+            true,
+        )
+        .unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].payload["arguments"], json!({}));
+        let mut existing = first
+            .iter()
+            .cloned()
+            .map(|event| (event.id.clone(), event))
+            .collect::<BTreeMap<_, _>>();
+        let completed = vec![
+            json!({"event_id":"completed", "payload":{"type":"item","event":"completed","item":{
+                "item":"tool_call","call_id":"native-edit","name":"process_exec","args":{"command":format!("# {NATIVE_FIXTURE_METADATA_PREFIX}{metadata}")}
+            }}}),
+        ];
+        let corrections = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &mut session,
+            &completed,
+            &existing,
+            "turn-1",
+            true,
+        )
+        .unwrap();
+        assert_eq!(corrections.len(), 2);
+        assert_eq!(session.next_cursor, 3);
+        for event in corrections {
+            assert_eq!(event.cursor, existing[&event.id].cursor);
+            assert_eq!(event.payload["call_id"], "edit");
+            assert_eq!(event.payload["arguments"]["path"], "economy-output.txt");
+            existing.insert(event.id.clone(), event);
+        }
+        assert_eq!(existing.len(), 2);
+        assert!(
+            PerInvocationDriver::normalize_records(
+                &manifest.events,
+                &mut session,
+                &completed,
+                &existing,
+                "turn-1",
+                true
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let call = existing
+            .values()
+            .find(|event| event.event == EventVocab::ToolCall)
+            .unwrap();
+        let result = existing
+            .values()
+            .find(|event| event.event == EventVocab::ToolResult)
+            .unwrap();
+        assert!(call.cursor < result.cursor);
+        assert_eq!(call.payload["native_arguments"], json!({}));
+        assert_eq!(result.payload["native_result"]["exit_code"], 0);
+    }
+
+    #[test]
     fn exec_rules_support_nested_predicates_and_array_expansion() {
         let mapping = EventMapping {
             source: "stdout".to_owned(),
@@ -5903,6 +6401,213 @@ mod tests {
             .expect("existing marker skips repeated initialization");
         transport.stop().await.expect("stop restarted daemon");
         std::fs::remove_dir_all(logs).expect("remove daemon init logs");
+    }
+
+    #[test]
+    fn incremental_source_buffers_partial_lines_and_does_not_reread_prior_turns() {
+        use std::io::Write as _;
+        let profile = std::env::temp_dir().join(format!(
+            "ahrb-source-cursor-{}-{}",
+            std::process::id(),
+            DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&profile).unwrap();
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.events.source = "journal-file".into();
+        manifest.events.path = profile.join("source.jsonl").to_string_lossy().into_owned();
+        let mut driver = PerInvocationDriver::new(PerInvocationConfig {
+            daemon: None,
+            command: vec!["/usr/bin/true".to_owned()],
+            resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
+            close_delete_command: Vec::new(),
+            release_command: Vec::new(),
+            cancel_command: Vec::new(),
+            replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
+            environment: BTreeMap::new(),
+            base_variables: BTreeMap::new(),
+            profile_root: profile.clone(),
+            events: manifest.events,
+            exit: manifest.exit,
+            session_id_pointer: String::new(),
+            run_id_pointer: String::new(),
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4_096,
+            gate_launch: false,
+        });
+        let mut session = PersistedExecSession {
+            local_id: "cursor".into(),
+            marker: "actor".into(),
+            harness_id: String::new(),
+            run_id: String::new(),
+            turns: 0,
+            invocations: 1,
+            next_cursor: 1,
+            closed: false,
+        };
+        let path = profile.join("source.jsonl");
+        std::fs::write(&path, b"{\"id\":\"one\"}\n{\"id\":").unwrap();
+        let (records, base) = driver.source_records(&session, None, false).unwrap();
+        assert_eq!(records, vec![json!({"id":"one"})]);
+        assert_eq!(base, 0);
+        let offset = driver.source_cursors["cursor"].offset;
+        assert_eq!(
+            driver.source_records(&session, None, false).unwrap().0,
+            records
+        );
+        assert_eq!(driver.source_cursors["cursor"].offset, offset);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"\"two\"}\n").unwrap();
+        assert_eq!(
+            driver
+                .source_records(&session, None, false)
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+        session.invocations = 2;
+        file.write_all(b"{\"id\":\"three\"}\n").unwrap();
+        let (records, base) = driver.source_records(&session, None, false).unwrap();
+        assert_eq!(base, 2);
+        assert_eq!(records, vec![json!({"id":"three"})]);
+        file.write_all(b"{\"id\":\"final-without-newline\"}")
+            .unwrap();
+        assert_eq!(
+            driver
+                .source_records(&session, None, false)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        // A journal tail without LF is uncommitted; stdout may end with a valid record.
+        assert_eq!(
+            driver.source_records(&session, None, true).unwrap().0.len(),
+            1
+        );
+        file.write_all(b"\n").unwrap();
+        assert_eq!(
+            driver.source_records(&session, None, true).unwrap().0.len(),
+            2
+        );
+        let mut without_final_lf = std::fs::read(&path).unwrap();
+        without_final_lf.pop();
+        std::fs::write(&path, without_final_lf).unwrap();
+        driver.config.events.source = "stdout".into();
+        driver.source_cursors.clear();
+        assert_eq!(
+            driver
+                .source_records(&session, Some(&path), false)
+                .unwrap()
+                .0
+                .len(),
+            3
+        );
+        let (final_records, _) = driver.source_records(&session, Some(&path), true).unwrap();
+        assert_eq!(final_records.len(), 4);
+        assert_eq!(
+            final_records.last(),
+            Some(&json!({"id":"final-without-newline"}))
+        );
+        assert_eq!(
+            driver
+                .source_records(&session, Some(&path), true)
+                .unwrap()
+                .0,
+            final_records
+        );
+        driver.config.events.source = "journal-file".into();
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            driver
+                .source_records(&session, None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated")
+        );
+        // A whole-JSON journal republishes old records on the next invocation.
+        driver.config.events.framing = "json".into();
+        driver.source_cursors.clear();
+        std::fs::create_dir_all(&driver.state_root).unwrap();
+        let mut history = Vec::new();
+        for turn in 3..=4 {
+            session.invocations = turn;
+            history.push(json!({"id":format!("json-{turn}"),"event":"turn-accepted","session_id":"cursor","actor":"actor","payload":{}}));
+            std::fs::write(&path, serde_json::to_vec(&history).unwrap()).unwrap();
+            let (records, base) = driver.source_records(&session, None, false).unwrap();
+            assert_eq!(base, 0);
+            let cache = driver.take_event_cache(&session).unwrap();
+            let changes = PerInvocationDriver::normalize_records_at(
+                &driver.config.events,
+                &mut session,
+                &records,
+                &cache.current,
+                "journal",
+                true,
+                base,
+            )
+            .unwrap();
+            assert_eq!(
+                changes.len(),
+                1,
+                "historical JSON records must not be duplicated"
+            );
+            driver
+                .persist_event_cache(&session, cache, changes)
+                .unwrap();
+        }
+        assert_eq!(driver.cached_after("cursor", None).unwrap().len(), 2);
+        assert_eq!(session.next_cursor, 3);
+        let mut malformed = serde_json::to_vec(&history).unwrap();
+        malformed.extend_from_slice(b" invalid JSON suffix");
+        std::fs::write(&path, malformed).unwrap();
+        assert!(driver.source_records(&session, None, false).is_err());
+        // Limits apply to individual records, including records already carrying LF.
+        driver.config.max_output_bytes = 32;
+        driver.config.events.framing = "jsonl".into();
+        for oversized in [
+            format!("{{\"id\":\"{}\"}}\n", "x".repeat(64)),
+            format!("{{\"id\":\"{}\"}}", "x".repeat(64)),
+        ] {
+            driver.source_cursors.clear();
+            std::fs::write(&path, oversized).unwrap();
+            assert!(
+                driver
+                    .source_records(&session, None, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("capture limit")
+            );
+        }
+        driver.source_cursors.clear();
+        driver.config.events.framing = "json".into();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"id":"x".repeat(64)})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            driver
+                .source_records(&session, None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("capture limit")
+        );
+        driver.source_cursors.clear();
+        driver.config.events.framing = "jsonl".into();
+        std::fs::write(&path, "{\"id\":\"small\"}\n".repeat(2_000)).unwrap();
+        assert_eq!(
+            driver.source_records(&session, None, true).unwrap().0.len(),
+            2_000
+        );
+        std::fs::remove_dir_all(profile).unwrap();
     }
 
     #[tokio::test]

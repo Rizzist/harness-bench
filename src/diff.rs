@@ -1062,10 +1062,8 @@ fn outcome_label(outcome: &TestOutcome) -> &'static str {
 }
 
 const RESOURCE_FIELDS: &[&str] = &[
-    "cpu_per_turn_ms",
     "cpu_per_turn_p50_ms",
     "cpu_per_turn_p95_ms",
-    "cpu_total_s",
     "disk_write_bytes_per_turn_max",
     "disk_write_bytes_per_turn_p50",
     "disk_write_bytes_per_turn_p95",

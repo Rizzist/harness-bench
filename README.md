@@ -89,8 +89,15 @@ The directory contains the full report and JSONL evidence bundle (plus
 schema is `harness_id`, `harness_version`, `manifest_hash`, `ahrb_revision`,
 `platform`, `profile`, `rows_run`, `timestamp`, `counts` (`PASS`, `FAIL`,
 `UNSUPPORTED`, `ERROR`; `ABSENT` is counted as `ERROR`), `badge`,
-`resource_summary` (`peak_rss_mib`, `cpu_per_turn_ms`, `wall_per_turn_ms`,
+`resource_summary` (`peak_rss_mib`, `cpu_per_turn_p50_ms`, `cpu_per_turn_p95_ms`, `wall_per_turn_ms`,
 `sampler_overhead_pct`), `results_dir`, and `load_avg_1m`.
+
+Legacy `resource_summary.cpu_total_s` and `cpu_per_turn_ms` are retired: samples from
+different collectors have independent cumulative counters and workload windows. CPU
+comparisons use validated row-46 `cpu_per_turn_p50_ms` / `cpu_per_turn_p95_ms` only,
+within the same OS, topology and profile. These optional fields are also in the saved
+index and `hbench diff`; absent row-46 evidence stays absent. Historical unmeasured Wave-4 null detail blocks remain null when read; they do not become measurements. Historical legacy fields
+remain readable but are excluded from numeric comparisons and are not recomputed.
 
 Show the latest saved run per harness, or history, with:
 

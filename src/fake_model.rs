@@ -241,6 +241,9 @@ pub struct ModelFrameObservation {
     pub checkpoint: String,
     /// One-based physical request attempt.
     pub attempt: u64,
+    /// HTTP protocol frontend for this physical response (empty in old bundles).
+    #[serde(default)]
+    pub frontend: String,
     /// One-based frame ordinal within this response.
     pub ordinal: u32,
     /// Anchored monotonic scheduled boundary.
@@ -1202,6 +1205,7 @@ impl FakeModelEngine {
             actor: response.actor.clone(),
             checkpoint: response.checkpoint.clone(),
             attempt: response.attempt,
+            frontend: "direct".to_owned(),
         }
     }
 
@@ -1799,7 +1803,11 @@ impl FakeModelServer {
                 tokio::select! {
                     _ = &mut shutdown_receiver => break,
                     accepted = listener.accept() => {
-                        let (stream, _) = accepted?;
+                        let (stream, _) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) if transient_listener_accept_error(&error) => continue,
+                            Err(error) => return Err(error.into()),
+                        };
                         let connection_engine = Arc::clone(&task_engine);
                         let connection_physical_requests = Arc::clone(&task_physical_requests);
                         let connection_credential_rejections =
@@ -1873,6 +1881,15 @@ impl FakeModelServer {
             .await
             .map_err(|error| AhrbError::Protocol(format!("fake-model server task: {error}")))?
     }
+}
+
+fn transient_listener_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 /// A running fake-model HTTP server carried over a Unix-domain socket.
@@ -2404,6 +2421,10 @@ async fn serve_counted_request(
         .is_some_and(|expected| provider_path && !request_uses_credential(&request, expected));
     if rejected {
         credential_rejections.fetch_add(1, Ordering::AcqRel);
+        // Consume the bounded request body before closing this HTTP/1 connection. Returning the
+        // rejection while inbound bytes remain unread can make the peer observe ECONNRESET instead
+        // of the complete 401 response, which makes row 65's active credential control flaky.
+        let _rejected_body = collect_bounded(request.into_body()).await;
         let response = match response_from_parts(
             401,
             &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
@@ -2500,7 +2521,8 @@ async fn handle_http(
                 "context_window": window_tokens,
             }
         }))?;
-        let observation_sink = engine.frame_observation_sink(&selected);
+        let mut observation_sink = engine.frame_observation_sink(&selected);
+        observation_sink.frontend = path.clone();
         let response_body = DeterministicBody::from_fault(
             body,
             selected.fault.as_ref(),
@@ -2525,7 +2547,8 @@ async fn handle_http(
     let headers_ns = engine
         .mark_response_status(&selected, rendered.status)
         .await?;
-    let observation_sink = engine.frame_observation_sink(&selected);
+    let mut observation_sink = engine.frame_observation_sink(&selected);
+    observation_sink.frontend = path.clone();
     let response_body = DeterministicBody::from_fault(
         rendered.body,
         selected.fault.as_ref(),
@@ -3759,20 +3782,12 @@ impl DeterministicBody {
                 let observation_sink = observation_sink.ok_or_else(|| {
                     AhrbError::Protocol("trickle body lacks frame observation sink".to_owned())
                 })?;
-                let origin_instant = response_headers_ns.map(|headers_ns| {
-                    let observed_after_headers_ns = monotonic_timestamp_ns();
-                    let elapsed =
-                        Duration::from_nanos(observed_after_headers_ns.saturating_sub(headers_ns));
-                    let now = tokio::time::Instant::now();
-                    now.checked_sub(elapsed).unwrap_or(now)
-                });
                 Ok(Self {
                     state: BodyState::Trickle(TrickleBodyState {
                         payload: Bytes::from(bytes),
                         cadence_ms: *cadence_ms,
                         count: *count,
                         next_ordinal: 1,
-                        origin_instant,
                         origin_ns: response_headers_ns,
                         sleep: None,
                         observation_sink,
@@ -3917,6 +3932,7 @@ struct FrameObservationSink {
     actor: String,
     checkpoint: String,
     attempt: u64,
+    frontend: String,
 }
 
 impl FrameObservationSink {
@@ -3936,6 +3952,7 @@ impl FrameObservationSink {
             actor: self.actor.clone(),
             checkpoint: self.checkpoint.clone(),
             attempt: self.attempt,
+            frontend: self.frontend.clone(),
             ordinal,
             scheduled_ns,
             frame_yielded_ns,
@@ -3966,7 +3983,6 @@ struct TrickleBodyState {
     cadence_ms: u64,
     count: u32,
     next_ordinal: u64,
-    origin_instant: Option<tokio::time::Instant>,
     origin_ns: Option<u64>,
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     observation_sink: FrameObservationSink,
@@ -3980,24 +3996,8 @@ impl TrickleBodyState {
         if self.next_ordinal > u64::from(self.count) {
             return Poll::Ready(None);
         }
-        if self.origin_instant.is_none() {
+        if self.origin_ns.is_none() {
             self.origin_ns = Some(monotonic_timestamp_ns());
-            self.origin_instant = Some(tokio::time::Instant::now());
-        }
-        if self.sleep.is_none() {
-            let deadline = match self.scheduled_instant(self.next_ordinal) {
-                Ok(deadline) => deadline,
-                Err(error) => return Poll::Ready(Some(Err(error))),
-            };
-            self.sleep = Some(Box::pin(tokio::time::sleep_until(deadline)));
-        }
-        let Some(sleep) = self.sleep.as_mut() else {
-            return Poll::Ready(Some(Err(std::io::Error::other(
-                "trickle timer disappeared before polling",
-            ))));
-        };
-        if sleep.as_mut().poll(context).is_pending() {
-            return Poll::Pending;
         }
 
         let ordinal_u64 = self.next_ordinal;
@@ -4013,6 +4013,21 @@ impl TrickleBodyState {
             Ok(scheduled_ns) => scheduled_ns,
             Err(error) => return Poll::Ready(Some(Err(error))),
         };
+        loop {
+            if let Some(sleep) = self.sleep.as_mut() {
+                if sleep.as_mut().poll(context).is_pending() {
+                    return Poll::Pending;
+                }
+                self.sleep = None;
+            }
+            let observed_ns = monotonic_timestamp_ns();
+            if observed_ns >= scheduled_ns {
+                break;
+            }
+            self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_nanos(
+                scheduled_ns - observed_ns,
+            ))));
+        }
         let index = match usize::try_from(ordinal_u64.saturating_sub(1)) {
             Ok(index) => index,
             Err(_) => {
@@ -4026,6 +4041,8 @@ impl TrickleBodyState {
                 "trickle payload ended before its declared count",
             ))));
         };
+        // Tokio supplies wakeups, but CLOCK_MONOTONIC gates and timestamps the
+        // frame. An early wake therefore cannot predate its serialized schedule.
         let frame_yielded_ns = monotonic_timestamp_ns();
         if let Err(error) = self
             .observation_sink
@@ -4036,19 +4053,6 @@ impl TrickleBodyState {
         self.next_ordinal = self.next_ordinal.saturating_add(1);
         self.sleep = None;
         Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(&[byte])))))
-    }
-
-    fn scheduled_instant(&self, ordinal: u64) -> std::io::Result<tokio::time::Instant> {
-        let origin = self
-            .origin_instant
-            .ok_or_else(|| std::io::Error::other("trickle timer lacks its monotonic origin"))?;
-        let offset_ms = self
-            .cadence_ms
-            .checked_mul(ordinal)
-            .ok_or_else(|| std::io::Error::other("trickle timer offset overflow"))?;
-        origin
-            .checked_add(Duration::from_millis(offset_ms))
-            .ok_or_else(|| std::io::Error::other("trickle timer deadline overflow"))
     }
 
     fn scheduled_ns(&self, ordinal: u64) -> std::io::Result<u64> {
@@ -4261,6 +4265,20 @@ mod tests {
         response
     }
 
+    #[test]
+    fn listener_accept_retries_only_transient_peer_errors() {
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(transient_listener_accept_error(&std::io::Error::from(kind)));
+        }
+        assert!(!transient_listener_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
+
     #[tokio::test]
     async fn trickle_body_wakes_on_anchored_schedule_and_records_each_frame_once() -> Result<()> {
         use http_body_util::BodyExt as _;
@@ -4348,6 +4366,46 @@ mod tests {
                 .saturating_sub(observations[1].scheduled_ns),
             10_000_000
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trickle_body_rechecks_the_evidence_clock_after_an_early_timer_wake() -> Result<()> {
+        use http_body_util::BodyExt as _;
+
+        let workflow = simple_workflow();
+        let engine = FakeModelEngine::new(&workflow)?;
+        let frontend = OpenAiChatFrontend;
+        let request = frontend.parse(frontend.path(), &BTreeMap::new(), &request_body())?;
+        let response = engine.handle(request).await?;
+        let origin_ns = monotonic_timestamp_ns().saturating_add(250_000_000);
+        let mut body = DeterministicBody {
+            state: BodyState::Trickle(TrickleBodyState {
+                payload: Bytes::from_static(b"x"),
+                cadence_ms: 1,
+                count: 1,
+                next_ordinal: 1,
+                origin_ns: Some(origin_ns),
+                sleep: Some(Box::pin(tokio::time::sleep(Duration::ZERO))),
+                observation_sink: engine.frame_observation_sink(&response),
+            }),
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), body.frame())
+                .await
+                .is_err(),
+            "an early Tokio wake must not yield before CLOCK_MONOTONIC reaches the schedule"
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .map_err(|_| AhrbError::Timeout("test same-clock trickle gate".to_owned()))?
+            .ok_or_else(|| AhrbError::Protocol("test trickle body ended early".to_owned()))??;
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"x"));
+        let observations = engine.frame_observations()?;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].scheduled_ns, origin_ns + 1_000_000);
+        assert!(observations[0].frame_yielded_ns >= observations[0].scheduled_ns);
         Ok(())
     }
 
@@ -5329,19 +5387,22 @@ mod tests {
             Err(error) => return Err(error),
         };
 
-        let mut rejected_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
-        let rejected_request = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer credential-a\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
-            server.local_addr()
-        );
-        rejected_stream
-            .write_all(rejected_request.as_bytes())
-            .await?;
-        let mut rejected_response = Vec::new();
-        rejected_stream.read_to_end(&mut rejected_response).await?;
-        assert!(rejected_response.starts_with(b"HTTP/1.1 401"));
-        assert_eq!(server.physical_request_count(), 1);
-        assert_eq!(server.credential_rejection_count(), 1);
+        const REJECTION_TRIALS: u64 = 32;
+        for _ in 0..REJECTION_TRIALS {
+            let mut rejected_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+            let rejected_request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer credential-a\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                server.local_addr()
+            );
+            rejected_stream
+                .write_all(rejected_request.as_bytes())
+                .await?;
+            let mut rejected_response = Vec::new();
+            rejected_stream.read_to_end(&mut rejected_response).await?;
+            assert!(rejected_response.starts_with(b"HTTP/1.1 401"));
+        }
+        assert_eq!(server.physical_request_count(), REJECTION_TRIALS);
+        assert_eq!(server.credential_rejection_count(), REJECTION_TRIALS);
         assert!(engine.request_records().await.is_empty());
 
         let mut accepted_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
@@ -5356,8 +5417,8 @@ mod tests {
         let mut accepted_response = Vec::new();
         accepted_stream.read_to_end(&mut accepted_response).await?;
         assert!(accepted_response.starts_with(b"HTTP/1.1 200"));
-        assert_eq!(server.physical_request_count(), 2);
-        assert_eq!(server.credential_rejection_count(), 1);
+        assert_eq!(server.physical_request_count(), REJECTION_TRIALS + 1);
+        assert_eq!(server.credential_rejection_count(), REJECTION_TRIALS);
         assert_eq!(engine.request_records().await.len(), 1);
         server.shutdown().await?;
         let rebound_engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);

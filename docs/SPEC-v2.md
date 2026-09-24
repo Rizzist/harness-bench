@@ -1496,3 +1496,43 @@ V2 is complete only when:
 6. the v2 badge carries R, L, C, and A under the exact gating rules above;
 7. sampler overhead and confidence remain visible, no harness turn-path instrumentation
    was introduced, and row 62 never claims proxy-only confinement as proof.
+
+### Legacy CPU summary retirement (L10)
+
+`resource_summary.cpu_total_s` and `resource_summary.cpu_per_turn_ms` are no longer
+emitted. The legacy sample pool combines independent cumulative collector lifetimes
+and workload denominators, so its first/last endpoints cannot establish a valid CPU
+delta. Row 25 retains its own N=1 bracket; row 46 is the validated continuous-collector
+CPU distribution contract. New saved indexes retain optional row-46 p50/p95 fields,
+and `hbench diff` excludes the legacy fields even when reading historical bundles.
+Historical evidence is not rewritten and missing row-46 evidence is never zero.
+
+Streaming receipts preserve scenario, actor, checkpoint, physical attempt, HTTP
+frontend and ordinal. Ordinals are local to a physical response; receipt counts from
+retries cannot complete a logical trial. Every receipt is retained, and incomplete
+or duplicate physical schedules remain infrastructure ERROR under rows 48/59.
+
+Exec collector spans in `collector-spans.jsonl` (also in bundle `lifecycle_notes`)
+record content-free monotonic poll,
+source receipt, normalization, persistence, and returned-terminal boundaries. These
+are observer timings, not harness CPU or inferred native commit times. Row-46 records
+in `processes.jsonl` use `memory-time-integral-r<repetition>` phases and absolute
+monotonic `elapsed_ns` so they join directly to `memory-time-samples.jsonl`; final
+pre-reap client boundary receipts appear in `lifecycle_notes`. Direct clients are
+observed with non-reaping wait status before their final CPU samples. The driver
+retains its existing completion/reap boundary after final sampling and normalization;
+this includes observer wall overhead but brackets the retained final CPU counters.
+The earlier kernel-exit observation is recorded separately in the client receipts. On macOS, counter identity
+lookup includes zombies so libproc final counters survive until the driver reaps.
+
+
+Each matrix result includes `wall_duration_s` and `wall_duration_scope`; JUnit
+`testcase@time` carries the same duration in seconds. `submit-to-terminal` spans
+the first AHRB submit boundary through the last observed structured terminal for
+the row's workload, including repetitions and intervening waits. Shared workloads
+(e.g. resource rows and 42/44) share this interval: row times are not additive.
+Repeated attachment of a previously observed terminal does not extend a clock.
+CLI-only workloads use `operation` (operation launch through return).
+`submit-to-interruption` marks a started workload without a terminal receipt;
+`not-launched` with zero seconds marks no executed workload clock (also the
+backward-compatible default for older reports). No native timestamp is inferred.

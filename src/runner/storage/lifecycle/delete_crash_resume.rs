@@ -991,7 +991,21 @@ async fn crash_trial(
         }.await;
         let after=accounting::settle(&run.profile,&config,monotonic_timestamp_ns()).await?;
         boundary(progress,&config,8,rep,n,&format!("s9-r{rep}-post-resume"),&after);
-        let events=match resumed {Ok(v)=>v,Err(e)=>return Ok((CrashSummary {crash_residue_allocated_bytes:Some(bytes),crash_residue_files:Some(files),crash_resume_outcome:Some(CrashOutcome::Failed)},format!("resume refused/deadline: {e}")))};
+        let events=match resumed {Ok(v)=>v,Err(e)=> {
+            // A driver-level refusal/deadline means recovery failed. A durable
+            // journal parse error is stronger evidence: recovery reached the
+            // persisted record and proved it corrupt, even though no normalized
+            // terminal event can be returned.
+            let outcome = match &e {
+                AhrbError::Protocol(detail)
+                    if detail.starts_with("corrupt durable journal record:") =>
+                {
+                    CrashOutcome::Corrupt
+                }
+                _ => CrashOutcome::Failed,
+            };
+            return Ok((CrashSummary {crash_residue_allocated_bytes:Some(bytes),crash_residue_files:Some(files),crash_resume_outcome:Some(outcome)},format!("resume refused/deadline: {e}")))
+        }};
         d.resumed_cursor=events.iter().map(|e|e.cursor).min();d.resumed_session_id_hash=events.first().map(|e|stable_evidence_hash(&e.session_id));
         let after_bytes=std::fs::read(&journal)?;
         let prefix_ok=after_bytes.starts_with(&committed);

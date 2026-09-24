@@ -303,6 +303,17 @@ fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() 
         "reference per-invocation certification must exit zero"
     );
     assert_eq!(report.results.len(), 57);
+    for result in report
+        .results
+        .iter()
+        .filter(|result| matches!(result.outcome, TestOutcome::Pass))
+    {
+        assert!(
+            result.metadata.wall_duration_s > 0.0,
+            "row {} has no executed wall clock",
+            result.row
+        );
+    }
     let pass_count = report
         .results
         .iter()
@@ -409,14 +420,12 @@ fn per_invocation_reference_passes_and_core_underdeclaration_suppresses_badge() 
         .unwrap_or(0) as f64
         / (1024.0 * 1024.0);
     assert!((report.resource_summary.peak_rss_mib - sampled_peak).abs() <= 1e-9);
-    let sampled_cpu_s = report
-        .samples
-        .first()
-        .zip(report.samples.last())
-        .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns))
-        as f64
-        / 1_000_000_000.0;
-    assert!((report.resource_summary.cpu_total_s - sampled_cpu_s).abs() <= 1e-9);
+    assert!(
+        serde_json::to_value(&report.resource_summary)
+            .unwrap()
+            .get("cpu_total_s")
+            .is_none()
+    );
     assert!(junit.contains("failures=\"0\""));
     assert!(junit.contains("skipped=\"6\""));
     assert_exec_template_propagation(&report);

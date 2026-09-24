@@ -56,8 +56,12 @@ pub struct OutcomeCounts {
 pub struct IndexedResourceSummary {
     /// Peak owned-tree effective resident memory.
     pub peak_rss_mib: f64,
-    /// Owned-tree CPU per executed turn.
-    pub cpu_per_turn_ms: f64,
+    /// Validated row-46 owned-tree CPU distributions; absent when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_per_turn_p50_ms: Option<f64>,
+    /// Validated row-46 p95 CPU per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_per_turn_p95_ms: Option<f64>,
     /// Mean externally measured turn wall clock.
     pub wall_per_turn_ms: f64,
     /// Membership sampler CPU percentage.
@@ -422,7 +426,8 @@ fn index_entry(
         topology: report.resource_summary.topology.clone(),
         resource_summary: IndexedResourceSummary {
             peak_rss_mib: report.resource_summary.peak_rss_mib,
-            cpu_per_turn_ms: report.resource_summary.cpu_per_turn_ms,
+            cpu_per_turn_p50_ms: report.resource_summary.cpu_per_turn_p50_ms,
+            cpu_per_turn_p95_ms: report.resource_summary.cpu_per_turn_p95_ms,
             wall_per_turn_ms: report.resource_summary.wall_per_turn_ms,
             sampler_overhead_pct: report.resource_summary.sampler_overhead_pct,
             disk_write_bytes_per_turn_p50: report.resource_summary.disk_write_bytes_per_turn_p50,

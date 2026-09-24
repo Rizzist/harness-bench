@@ -67,7 +67,12 @@ fn per_invocation_resource_rows_measure_process_fanout_without_idle_penalty() {
     assert!(!report.resource_metrics.is_empty());
     assert!(report.resource_summary.peak_rss_mib > 0.0);
     assert!(report.resource_summary.mean_rss_mib > 0.0);
-    assert!(report.resource_summary.cpu_per_turn_ms >= 0.0);
+    assert!(
+        serde_json::to_value(&report.resource_summary)
+            .unwrap()
+            .get("cpu_per_turn_ms")
+            .is_none()
+    );
     assert!(report.resource_summary.wall_per_turn_ms > 0.0);
     assert!(report.resource_summary.idle_rss_mib.is_none());
     assert!(report.resource_summary.sampler_overhead_pct >= 0.0);
