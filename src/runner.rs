@@ -24538,6 +24538,10 @@ async fn run_resource_group(
         .await?;
     }
     driver.set_invocation_gating(false);
+    let maximum_workload_threads = phase_samples(&collector.series, &workload_phase)
+        .into_iter()
+        .filter_map(|sample| sample.thread_count)
+        .max();
     collector
         .sample_phase(roots, &cold_phase, collector.counter_cadence)
         .await?;
@@ -24644,6 +24648,7 @@ async fn run_resource_group(
             baseline_processes,
             post_close_processes,
             baseline_threads,
+            maximum_workload_threads,
             post_close_threads,
         },
     })

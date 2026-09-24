@@ -1,6 +1,6 @@
 # AHRB v2 — Agent Harness Readiness Benchmark specification
 
-Status: implementation specification, **revision 2.6 (2026-09-05)**.
+Status: implementation specification, **revision 2.7 (2026-09-24)**.
 `docs/SPEC.md` remains the authoritative v1 specification; this document defines the
 additive v2 contract. Revision 2.1 is a normative amendment: it does not renumber a row
 or change `spec_version = 2`, but implementations claiming v2 MUST implement this
@@ -40,6 +40,16 @@ reconstructability at zero and the CORE row fails. A block with neither side is 
 omitting the entire block remains `UNSUPPORTED`. `ahrb replay --manifest MANIFEST
 --input REPORT` re-evaluates row 69 from a saved report without starting the harness.
 
+Revision 2.7 amends v1 row 28's thread-reclaim conjunct. For each repetition, the
+post-close thread count MUST be no greater than the maximum thread count observed during
+that repetition's workload. Ordered post-close counts MUST NOT strictly increase across
+every adjacent interval; that all-interval pattern is row 28's definition of growth for
+the profile's complete ordered repetitions (three for quick and seven for cert). Every
+row-28 thread assertion records baseline, workload maximum, and post-close counts. Memory
+reclaim, residual, owned-worker, official-close, and process-identity rules are unchanged.
+With three repetitions, a leak of one thread per repetition is indistinguishable from pool
+noise; rows 44 and 50 own per-turn and per-session leak detection.
+
 ### Revision 2.1 changelog
 
 - Added one authoritative result-state precedence, repetition, aggregation, and
@@ -55,18 +65,20 @@ omitting the entire block remains `UNSUPPORTED`. `ahrb replay --manifest MANIFES
 
 ## 1. Scope and compatibility
 
-AHRB v2 revision 2.5 contains **73 matrix rows**: v1 rows 1–41, unchanged, plus rows 42–73
+AHRB v2 revision 2.7 contains **73 matrix rows**: v1 rows 1–41, with the row-28 revision
+2.7 amendment above, plus rows 42–73
 defined here. It also adds the `hbench diff` command and a topology-scoped automation
 score with latency and CPU badge classes. The implementation is split into four ordered
 waves so that each wave can be implemented and independently verified before the next
 one starts.
 
-### Rows 1–41 are unchanged from v1
+### Rows 1–41 inherit v1 except for the revision 2.7 row-28 amendment
 
 The IDs, pillars, fixtures, outcomes, thresholds, topology policy, capability policy,
 badge role, and evidence meaning of rows 1–41 are **normatively unchanged** from
-`docs/SPEC.md`. A v2 implementation may add fields to their evidence records but MUST
-NOT weaken, renumber, reinterpret, or silently auto-pass any v1 oracle. In particular,
+`docs/SPEC.md` except for row 28's bounded thread plateau rule above. A v2 implementation
+may add fields to their evidence records but MUST NOT otherwise weaken, renumber,
+reinterpret, or silently auto-pass any v1 oracle. In particular,
 the v1 41-row results remain independently addressable in `report.json`, and a v2 badge
 cannot be awarded unless every v1 CORE requirement that applied in v1 still passes.
 

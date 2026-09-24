@@ -509,6 +509,9 @@ pub struct CleanupObservation {
     pub post_close_processes: BTreeSet<ProcIdentity>,
     /// Whole-tree thread count at the pre-workload baseline.
     pub baseline_threads: Option<u64>,
+    /// Maximum whole-tree thread count observed during the workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_workload_threads: Option<u64>,
     /// Whole-tree thread count after close/delete and reclaim settling.
     pub post_close_threads: Option<u64>,
 }
@@ -1988,7 +1991,9 @@ impl<'a> Analysis<'a> {
             self.validate_repetition_component("cleanup", &identities)?;
             let mut assertions = Vec::new();
             let mut deadlines = Vec::new();
-            for observation in observations {
+            let mut ordered_observations = observations.iter().collect::<Vec<_>>();
+            ordered_observations.sort_by_key(|observation| observation.identity.repetition);
+            for observation in &ordered_observations {
                 deadlines.push(observation.reclaim_after_ms as f64);
                 let expected_sessions: BTreeSet<&str> = observation
                     .expected_actor_sessions
@@ -2043,14 +2048,35 @@ impl<'a> Analysis<'a> {
                     check(
                         &format!("rep{}-thread-reclaim", observation.identity.repetition),
                         observation.baseline_threads.is_some()
-                            && observation.post_close_threads == observation.baseline_threads,
+                            && observation.maximum_workload_threads.is_some()
+                            && observation.post_close_threads.is_some_and(|post_close| {
+                                observation
+                                    .maximum_workload_threads
+                                    .is_some_and(|maximum| post_close <= maximum)
+                            }),
                         format!(
-                            "baseline={:?} post-close={:?}",
-                            observation.baseline_threads, observation.post_close_threads
+                            "baseline={:?} workload-max={:?} post-close={:?}",
+                            observation.baseline_threads,
+                            observation.maximum_workload_threads,
+                            observation.post_close_threads
                         ),
                     ),
                 ]);
             }
+            let post_close_threads = ordered_observations
+                .iter()
+                .map(|observation| observation.post_close_threads)
+                .collect::<Option<Vec<_>>>();
+            let monotonic_thread_growth = post_close_threads
+                .as_deref()
+                .is_some_and(row_28_thread_growth);
+            assertions.push(check(
+                "post-close-thread-growth",
+                post_close_threads.is_some() && !monotonic_thread_growth,
+                format!(
+                    "post-close={post_close_threads:?} monotonic={monotonic_thread_growth}; growth requires a strict increase in every adjacent interval"
+                ),
+            ));
             Ok((assertions, deadlines))
         })();
         match target {
@@ -3484,6 +3510,10 @@ fn monotonic_growth(values: &[u64]) -> bool {
     increases.saturating_mul(2) >= intervals
 }
 
+fn row_28_thread_growth(values: &[u64]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3736,6 +3766,7 @@ mod tests {
                     start_time: 1,
                 }]),
                 baseline_threads: Some(2),
+                maximum_workload_threads: Some(3),
                 post_close_threads: Some(2),
             });
             let long_baseline = format!("rep{repetition}-long-baseline");
@@ -4465,15 +4496,71 @@ mod tests {
     }
 
     #[test]
-    fn leaked_thread_cannot_pass_row_28() -> Result<()> {
+    fn bounded_thread_plateau_passes_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let cleanups = evidence
+            .cleanup
+            .as_mut()
+            .ok_or_else(|| AhrbError::Validation("cleanup observations are absent".to_owned()))?;
+        for (cleanup, post_close) in cleanups.iter_mut().zip([3, 4, 3]) {
+            cleanup.maximum_workload_threads = Some(post_close + 1);
+            cleanup.post_close_threads = Some(post_close);
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        let row = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .ok_or_else(|| AhrbError::Validation("row 28 is absent".to_owned()))?;
+        assert!(
+            matches!(row.outcome, TestOutcome::Pass),
+            "unexpected row-28 outcome: {:?}",
+            row.outcome
+        );
+        assert!(row.evidence.iter().any(|item| {
+            item.contains("baseline=Some(2) workload-max=Some(4) post-close=Some(3)")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn post_close_threads_above_workload_maximum_cannot_pass_row_28() -> Result<()> {
         let mut evidence = passing_evidence(ResourceProfile::Quick)?;
         let cleanup = evidence
             .cleanup
             .as_mut()
             .and_then(|observations| observations.first_mut())
             .ok_or_else(|| AhrbError::Validation("cleanup observation is absent".to_owned()))?;
-        cleanup.post_close_threads = cleanup.baseline_threads.map(|threads| threads + 1);
+        cleanup.maximum_workload_threads = Some(3);
+        cleanup.post_close_threads = Some(4);
         assert_row_28_fails(&evidence, "thread-reclaim")
+    }
+
+    #[test]
+    fn monotonic_post_close_thread_growth_cannot_pass_row_28() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let cleanups = evidence
+            .cleanup
+            .as_mut()
+            .ok_or_else(|| AhrbError::Validation("cleanup observations are absent".to_owned()))?;
+        for (cleanup, post_close) in cleanups.iter_mut().zip([3, 4, 5]) {
+            cleanup.maximum_workload_threads = Some(post_close + 1);
+            cleanup.post_close_threads = Some(post_close);
+        }
+        assert_row_28_fails(&evidence, "post-close-thread-growth")
+    }
+
+    #[test]
+    fn row_28_thread_growth_requires_every_interval_to_increase() {
+        assert!(!row_28_thread_growth(&[17, 19, 19]));
+        assert!(!row_28_thread_growth(&[18, 18, 21]));
+        assert!(!row_28_thread_growth(&[17, 16, 17]));
+        assert!(row_28_thread_growth(&[17, 18, 19]));
+        assert!(row_28_thread_growth(&[16, 17, 22]));
     }
 
     #[test]

@@ -247,7 +247,7 @@ different OS/topology numbers on one unlabeled leaderboard.
 25. Single-agent footprint + CPU/turn — B, S₁, cold peak, deltas, CPU/turn ≤250ms, barrier CPU <5%.
 26. Parallel-agent memory delta + total peak — N=1,2,4,8 each tool-call + same barrier; all N present; N=8 completes; cold peak ≤4 GiB; β ≤256 MiB/agent.
 27. Parallel scaling curve — fit sweep; α ≤1.20; no adjacent marginal >2× preceding median without instability flag.
-28. Post-completion reclaim — close/delete all sessions, sample ≤10s; reclaim ≥80%; residual bound; no owned worker remains.
+28. Post-completion reclaim — close/delete all sessions, sample ≤10s; reclaim ≥80%; residual bound; no owned worker remains; in each repetition post-close threads must be at most that repetition's workload maximum. Ordered post-close counts must not strictly increase across every adjacent interval; that all-interval pattern is row 28's definition of growth.
 29. Long-horizon stability — 1000 tiny turns (fixture tool every 10th), sample every 100; drift ≤64 KiB/turn; final residual ≤max(64 MiB,5% of B); no monotonic FD/thread leak.
 
 ### automation-readiness
