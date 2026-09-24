@@ -274,6 +274,16 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L10 `l10-measurement-fixes` (landed 2026-09-24)
+
+- [x] Implement (GPT6-Astra passes 1-2, gpt-5.6-sol passes 3-6): identity-safe macOS process sampling (all five per-identity skip paths mark counter evidence incomplete; closing `(pid,start_time)` check before any aggregate/CPU mutation; zombie final accounting retained); per-row submit-to-terminal timing; paced frames bound to their own physical attempt; driver reads appended journal bytes instead of re-reading history; drained 401 bodies; typed reader accepts genuine null detail blocks; row 60 ABSENT when the marker is undeclared; haider-agent log path declared.
+- [x] Verification: v1-v5 NO-SHIP (F1-F4, row-50 race, early paced frame, Rick resets, FR1 PID reuse, V5-F1 skip paths), each repaired; v6 technically clean (522/522, mock-cert PASS, row 50 0/5, row 48 nonnegative).
+- [x] Integration (gpt-5.6-sol) onto `6e00af4`: eight conflict hunks against the storage lanes resolved keeping both sides; S9 crash-resume maps only an explicit corrupt-journal error to `Corrupt`. 612/612 serial, mock-cert PASS both badges, five combined exposures clean.
+- [x] Final review (GPT6-Astra, post-integration): **SHIP**. Native A/B on the same binaries: haider 47 ERROR->FAIL (real disk growth now measured), 49 FAIL->PASS (slope 49.7 -> 3.3 ms/100 turns: the old driver's per-turn history re-read was AHRB-side growth), 60 ERROR->ABSENT; rick 48/59 ERROR->FAIL, 60 ERROR->ABSENT, 65 ERROR->UNSUPPORTED.
+- [x] Complete: committed `83ab652`, fast-forwarded and pushed (verified tree = landed tree).
+
+Follow-up (non-blocking, from the review): stale "Row 60 remains ERROR" comment in `adapters/haider-agent/manifest.toml`. Raw evidence: harness `state/lanes/l10-measurement-fixes/` (outside Git).
+
 ## L16 `l16-reclaim-ratio-honesty` (2026-09-23)
 
 - [x] Implement (gpt-5.6-sol, 2 passes): `reclaim_ratio` returned 0.0 both for a genuine zero reclamation and for an absent denominator (steady <= baseline), so row 28 could publish `reclaim-ratio 0.000` with nothing measured. Now unavailable with a typed reason; row 28 records `reclaim-ratio-denominator`; completeness enforced before any aggregate ratio is published; genuine zero unchanged and failing; PASS thresholds unchanged.
