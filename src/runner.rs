@@ -20726,6 +20726,37 @@ fn mapped_tool_call(
     }))
 }
 
+fn mapped_row3_write_call(manifest: &Manifest, call_id: String, route: String) -> Result<Value> {
+    let semantic_arguments = json!({
+        "path": "a.txt",
+        "generate_content": "row3-dependency",
+        "route": route
+    });
+    let Some(alias) = manifest.tools.aliases.get("write") else {
+        return Ok(json!({
+            "id": call_id,
+            "name": "write_fixture",
+            "arguments": semantic_arguments
+        }));
+    };
+    Ok(json!({
+        "id": call_id,
+        "name": "write_fixture",
+        "arguments": semantic_arguments,
+        "_ahrb_native": {
+            "semantic": "write",
+            "aliases": alias.candidates(),
+            "bindings": manifest.tools.bindings,
+            "argv": [
+                fixture_program()?,
+                "write-row3-dependency",
+                "--path",
+                "a.txt"
+            ]
+        }
+    }))
+}
+
 fn fixture_program() -> Result<String> {
     let executable = std::env::current_exe()?;
     if let Some(parent) = executable.parent() {
@@ -20868,21 +20899,29 @@ fn scripted_row(
         }
         3 => {
             let second = route_marker(scenario, actor, "second");
-            let first_call = mapped_tool_call(
-                manifest,
-                "write",
-                "call-a".to_owned(),
-                json!({"path":"a.txt","content":"A","route":second}),
-            )?;
+            let first_call = mapped_row3_write_call(manifest, "call-a".to_owned(), second)?;
             let second_call = mapped_tool_call(
                 manifest,
                 "read",
                 "call-b".to_owned(),
-                json!({"path":"a.txt","expected_from_a":"A","route":terminal}),
+                json!({
+                    "path": "a.txt",
+                    "route": terminal
+                }),
             )?;
             vec![
                 response("start", json!({"tool_calls":[first_call]}), None),
-                response("second", json!({"tool_calls":[second_call]}), None),
+                response(
+                    "second",
+                    json!({
+                        "tool_calls": [second_call],
+                        "_ahrb_dependency_from_tool_result": {
+                            "call_id": "call-a",
+                            "argument": "expected_from_a"
+                        }
+                    }),
+                    None,
+                ),
                 response("terminal", success_value(), None),
             ]
         }
@@ -21326,12 +21365,23 @@ fn fixture_effect_matches(
     relative: &str,
     expected: &str,
 ) -> bool {
+    fixture_effect_values(profile_root, state, row, relative)
+        .iter()
+        .any(|content| content == expected)
+}
+
+fn fixture_effect_values(
+    profile_root: &Path,
+    state: &RunState,
+    row: u8,
+    relative: &str,
+) -> Vec<String> {
     state
         .sessions
         .get(&row)
         .into_iter()
         .flatten()
-        .any(|session| {
+        .flat_map(|session| {
             [
                 profile_root
                     .join("ahrb-exec-sessions")
@@ -21345,12 +21395,16 @@ fn fixture_effect_matches(
                     .join(relative),
             ]
             .iter()
-            .any(|path| {
-                std::fs::read_to_string(path)
-                    .map(|content| content == expected)
-                    .unwrap_or(false)
-            })
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect::<Vec<_>>()
         })
+        .collect()
+}
+
+fn row3_dependency_from_effect(profile_root: &Path, state: &RunState) -> Option<String> {
+    fixture_effect_values(profile_root, state, 3, "a.txt")
+        .into_iter()
+        .find(|content| crate::row3::is_dependency_value(content))
 }
 
 fn capability_for_profile(
@@ -22781,58 +22835,57 @@ fn evaluate_rows(
                             .windows(2)
                             .all(|pair| pair[0].zip(pair[1]).is_some_and(|(a, b)| a < b));
                     let write = positions[0].and_then(|position| events.get(position));
+                    let write_result = positions[1].and_then(|position| events.get(position));
                     let read = positions[2].and_then(|position| events.get(position));
                     let read_result = positions[3].and_then(|position| events.get(position));
-                    let semantic = write.is_some_and(|event| {
-                        event.payload.get("name").and_then(Value::as_str)
-                            == Some("write_fixture")
-                            && event
-                                .payload
-                                .pointer("/arguments/path")
-                                .and_then(Value::as_str)
-                                == Some("a.txt")
-                            && event
-                                .payload
-                                .pointer("/arguments/content")
-                                .and_then(Value::as_str)
-                                == Some("A")
-                    }) && read.is_some_and(|event| {
-                        event.payload.get("name").and_then(Value::as_str) == Some("read_fixture")
-                            && event
-                                .payload
-                                .pointer("/arguments/path")
-                                .and_then(Value::as_str)
-                                == Some("a.txt")
-                            && event
-                                .payload
-                                .pointer("/arguments/expected_from_a")
-                                .and_then(Value::as_str)
-                                == Some("A")
+                    let normalized_call = |event: Option<&NormalizedEvent>| {
+                        let event = event?;
+                        let name = event.payload.get("name")?.as_str()?;
+                        let arguments = event.payload.get("arguments")?;
+                        (!arguments.as_object().is_none_or(serde_json::Map::is_empty))
+                            .then(|| (name.to_owned(), arguments.clone()))
+                    };
+                    let request_call = |call_id: &str| {
+                        requests
+                            .iter()
+                            .filter(|record| record.request.actor == "r03")
+                            .find_map(|record| {
+                                crate::driver::embedded_fixture_call_for_id(
+                                    &record.request.canonical,
+                                    call_id,
+                                )
+                            })
+                    };
+                    let write_call = normalized_call(write).or_else(|| request_call("call-a"));
+                    let read_call = normalized_call(read).or_else(|| request_call("call-b"));
+                    let dependency_value = row3_dependency_from_effect(profile_root, state);
+                    let dependency_value = dependency_value.as_deref();
+                    let semantic = write_call.as_ref().is_some_and(|(name, arguments)| {
+                        name == "write_fixture"
+                            && arguments.get("path").and_then(Value::as_str) == Some("a.txt")
+                            && arguments.get("generate_content").and_then(Value::as_str)
+                                == Some("row3-dependency")
+                            && arguments.get("content").is_none()
+                    }) && read_call.as_ref().is_some_and(|(name, arguments)| {
+                        name == "read_fixture"
+                            && arguments.get("path").and_then(Value::as_str) == Some("a.txt")
+                            && arguments.get("expected_from_a").and_then(Value::as_str)
+                                == dependency_value
                     });
-                    let dependency = read_result.is_some_and(|event| {
-                        // The read-back content may sit directly on the result, or
-                        // inside a harness exec record that wraps tool stdout
-                        // (verified: haider 0.0.967 surfaces it as `output` on the
-                        // structured record parsed into `preview_record`). Trim so
-                        // a trailing newline from the exec capture does not matter.
-                        [
-                            "/result/content",
-                            "/result/stdout",
-                            "/result/aggregated_output",
-                            "/result/output",
-                            "/result/preview_record/output",
-                        ]
-                        .iter()
-                        .any(|pointer| {
-                            event
-                                .payload
-                                .pointer(pointer)
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                == Some("A")
+                    let dependency = dependency_value.is_some_and(|value| {
+                        write_result.is_some_and(|event| {
+                            crate::evidence_collectors::recorded_result_contains(
+                                &event.payload,
+                                value,
+                            )
+                        }) && read_result.is_some_and(|event| {
+                            crate::evidence_collectors::recorded_result_contains(
+                                &event.payload,
+                                value,
+                            )
                         })
                     });
-                    let effect = fixture_effect_matches(profile_root, state, 3, "a.txt", "A");
+                    let effect = dependency_value.is_some();
                     (
                         tool_calls == 2
                             && tool_results == 2

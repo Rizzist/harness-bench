@@ -20,6 +20,7 @@ pub mod process;
 pub mod report;
 pub mod resource_certification;
 pub mod results;
+pub mod row3;
 pub mod runner;
 pub mod sampler;
 pub mod scenarios;

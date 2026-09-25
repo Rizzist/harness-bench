@@ -4636,7 +4636,13 @@ fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) 
     match name {
         "write_fixture" | "fixture_write" => {
             let relative = safe_relative(required_str(args, "path")?)?;
-            let content = required_str(args, "content")?;
+            let generated =
+                args.get("generate_content").and_then(Value::as_str) == Some("row3-dependency");
+            let content = if generated {
+                crate::row3::fresh_dependency_value()?
+            } else {
+                required_str(args, "content")?.to_owned()
+            };
             if config.suppress_fixture_effects {
                 return Ok(json!({
                     "ok": false,
@@ -4679,7 +4685,15 @@ fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) 
                     };
                 }
             }
-            Ok(json!({ "ok": true, "bytes": content.len(), "path": required_str(args, "path")? }))
+            let mut result = json!({
+                "ok": true,
+                "bytes": content.len(),
+                "path": required_str(args, "path")?
+            });
+            if generated {
+                result["content"] = Value::String(content);
+            }
+            Ok(result)
         }
         "read_fixture" | "fixture_read" => {
             let relative = safe_relative(required_str(args, "path")?)?;
@@ -4827,7 +4841,20 @@ fn reconcile_fixture_effect(
         return Ok(());
     }
     let relative = safe_relative(required_str(args, "path")?)?;
-    let content = required_str(args, "content")?;
+    let generated = args.get("generate_content").and_then(Value::as_str) == Some("row3-dependency");
+    let content = if generated {
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|content| crate::row3::is_dependency_value(content))
+            .ok_or_else(|| {
+                AhrbError::Protocol(
+                    "generated row-3 write result omitted its complete dependency value".to_owned(),
+                )
+            })?
+    } else {
+        required_str(args, "content")?
+    };
     let path = workspace.join(relative);
     match fs::read(&path) {
         Ok(existing) if existing == content.as_bytes() => return Ok(()),

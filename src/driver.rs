@@ -1981,11 +1981,26 @@ fn decode_fixture_metadata(text: &str) -> Option<Value> {
 }
 
 fn embedded_fixture_call(value: &Value) -> Option<AbstractFixtureCall> {
+    embedded_fixture_call_matching(value, None)
+}
+
+pub(crate) fn embedded_fixture_call_for_id(
+    value: &Value,
+    expected_call_id: &str,
+) -> Option<(String, Value)> {
+    embedded_fixture_call_matching(value, Some(expected_call_id))
+        .map(|call| (call.name, call.arguments))
+}
+
+fn embedded_fixture_call_matching(
+    value: &Value,
+    expected_call_id: Option<&str>,
+) -> Option<AbstractFixtureCall> {
     match value {
         Value::String(text) => {
             if matches!(text.as_bytes().first(), Some(b'{') | Some(b'[')) {
                 if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                    if let Some(call) = embedded_fixture_call(&parsed) {
+                    if let Some(call) = embedded_fixture_call_matching(&parsed, expected_call_id) {
                         return Some(call);
                     }
                 }
@@ -2002,6 +2017,9 @@ fn embedded_fixture_call(value: &Value) -> Option<AbstractFixtureCall> {
                 let Some(call_id) = metadata.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
+                if expected_call_id.is_some_and(|expected| call_id != expected) {
+                    continue;
+                }
                 let Some(name) = metadata.get("name").and_then(Value::as_str) else {
                     continue;
                 };
@@ -2019,8 +2037,12 @@ fn embedded_fixture_call(value: &Value) -> Option<AbstractFixtureCall> {
             }
             None
         }
-        Value::Array(values) => values.iter().find_map(embedded_fixture_call),
-        Value::Object(object) => object.values().find_map(embedded_fixture_call),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| embedded_fixture_call_matching(value, expected_call_id)),
+        Value::Object(object) => object
+            .values()
+            .find_map(|value| embedded_fixture_call_matching(value, expected_call_id)),
         Value::Null | Value::Bool(_) | Value::Number(_) => None,
     }
 }
@@ -6132,6 +6154,40 @@ mod tests {
                 "{adapter}"
             );
         }
+    }
+
+    #[test]
+    fn embedded_fixture_lookup_selects_the_requested_call_id() {
+        let encoded = |call_id: &str, name: &str, arguments: Value| {
+            serde_json::to_vec(&json!({
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments
+            }))
+            .expect("serialize fixture metadata")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+        };
+        let value = json!({
+            "messages": [
+                format!(
+                    "{}{}",
+                    NATIVE_FIXTURE_METADATA_PREFIX,
+                    encoded("call-a", "write_fixture", json!({"content":"value-a"}))
+                ),
+                format!(
+                    "{}{}",
+                    NATIVE_FIXTURE_METADATA_PREFIX,
+                    encoded("call-b", "read_fixture", json!({"expected_from_a":"value-a"}))
+                )
+            ]
+        });
+        let (name, arguments) =
+            embedded_fixture_call_for_id(&value, "call-b").expect("find requested embedded call");
+        assert_eq!(name, "read_fixture");
+        assert_eq!(arguments["expected_from_a"], "value-a");
+        assert!(embedded_fixture_call_for_id(&value, "call-c").is_none());
     }
 
     #[test]

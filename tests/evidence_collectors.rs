@@ -65,6 +65,66 @@ fn assert_pass(result: TestResult) {
     );
 }
 
+fn assert_fail(result: TestResult) {
+    assert!(
+        matches!(result.outcome, TestOutcome::Fail(_)),
+        "unexpected outcome: {:?}; evidence={:?}",
+        result.outcome,
+        result.evidence
+    );
+}
+
+fn sequential_result(a_result: Value, b_arguments: Value) -> TestResult {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let expected = [
+        ExpectedToolCall {
+            call_id: "call-a".to_owned(),
+            name: "write_fixture".to_owned(),
+            arguments: json!({"path":"a.txt","generate_content":"row3-dependency"}),
+            dependency_value: None,
+        },
+        ExpectedToolCall {
+            call_id: "call-b".to_owned(),
+            name: "read_fixture".to_owned(),
+            arguments: json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+            dependency_value: Some(DEPENDENCY.to_owned()),
+        },
+    ];
+    let events = [
+        event(
+            1,
+            EventVocab::ToolCall,
+            json!({"call_id":"call-a","name":"write_fixture","arguments":{"path":"a.txt","generate_content":"row3-dependency"}}),
+        ),
+        event(
+            2,
+            EventVocab::ToolResult,
+            json!({"call_id":"call-a","result":a_result}),
+        ),
+        event(
+            3,
+            EventVocab::ToolCall,
+            json!({"call_id":"call-b","name":"read_fixture","arguments":b_arguments}),
+        ),
+        event(
+            4,
+            EventVocab::ToolResult,
+            json!({"call_id":"call-b","result":{"ok":true}}),
+        ),
+    ];
+    let evidence = collect_correctness_functionality(
+        3,
+        &CollectionInput {
+            events: &events,
+            expected_tools: &expected,
+            ..CollectionInput::default()
+        },
+    )
+    .expect("collect sequential dependency");
+    evaluate_row(&manifest(), 3, Some(&evidence))
+}
+
 #[test]
 fn collects_priority_row_1_from_real_model_records() {
     let records = [model_record("primary"), model_record("child")];
@@ -174,6 +234,105 @@ fn collects_priority_rows_2_and_3_with_exact_correlations() {
     let evidence =
         collect_correctness_functionality(3, &sequential_input).expect("collect sequential");
     assert_pass(evaluate_row(&manifest(), 3, Some(&evidence)));
+}
+
+#[test]
+fn sequential_dependency_accepts_decorated_a_output() {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let correct_b = || json!({"path":"a.txt","expected_from_a":DEPENDENCY});
+    for decorated in [
+        json!({"content":format!("{DEPENDENCY}\ncapture:effect-session-id-timestamp-1")}),
+        json!({"stdout":format!("tool prefix: {DEPENDENCY}")}),
+        json!({"content":{"wrapper":{"output":DEPENDENCY}}}),
+    ] {
+        assert_pass(sequential_result(decorated, correct_b()));
+    }
+}
+
+#[test]
+fn sequential_dependency_accepts_one_carrier_with_ordered_split_text_parts() {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let split = DEPENDENCY.len() / 2;
+    assert_pass(sequential_result(
+        json!({
+            "content":[
+                {"type":"text","text":&DEPENDENCY[..split]},
+                {"type":"text","text":&DEPENDENCY[split..]}
+            ]
+        }),
+        json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+    ));
+}
+
+#[test]
+fn sequential_dependency_does_not_join_unrelated_result_fields() {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let split = DEPENDENCY.len() / 2;
+    assert_fail(sequential_result(
+        json!({
+            "content":{
+                "first":&DEPENDENCY[..split],
+                "second":&DEPENDENCY[split..]
+            }
+        }),
+        json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+    ));
+}
+
+#[test]
+fn sequential_dependency_accepts_haider_971_capture_shape() {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let output = format!(
+        "{DEPENDENCY}\n[Capture: 1 bytes retained; at least 0 source bytes unavailable. Page the full secret-redacted capture with task_output({{\"cursor\":0,\"task_id\":\"capture:effect-session-ee3a49576bd05270b5c6037d27fbc0db-1-1789315543033-1\"}}); follow next_cursor until exhausted.]"
+    );
+    assert_pass(sequential_result(
+        json!({
+            "artifact":"blake3:e3a019bbb28110e6b007112d52974805e7cd1c605e6935faa62a20e91de7fe68",
+            "preview": serde_json::to_string(&json!({"output":output})).expect("serialize preview"),
+            "preview_record":{"output":output},
+            "truncated":false
+        }),
+        json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+    ));
+}
+
+#[test]
+fn sequential_dependency_rejects_context_loss_and_unproduced_values() {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let produced = json!({"content":format!("prefix {DEPENDENCY} footer")});
+
+    assert_fail(sequential_result(produced.clone(), json!({"path":"a.txt"})));
+    assert_fail(sequential_result(
+        produced,
+        json!({"path":"a.txt","expected_from_a":"AHRB row 3 different value"}),
+    ));
+    assert_fail(sequential_result(
+        json!({"content":"prefix without the produced dependency value"}),
+        json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+    ));
+    assert_fail(sequential_result(
+        json!({"content":"AHRB row 3 non-credential nonce 000 001"}),
+        json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+    ));
+}
+
+#[test]
+fn sequential_dependency_rejects_a_argument_echo_as_the_result() {
+    const DEPENDENCY: &str =
+        "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+    let invocation_arguments = json!({
+        "path":"a.txt",
+        "generate_content":"row3-dependency"
+    });
+    assert_fail(sequential_result(
+        json!({"content":serde_json::to_string(&invocation_arguments).expect("serialize arguments")}),
+        json!({"path":"a.txt","expected_from_a":DEPENDENCY}),
+    ));
 }
 
 #[test]

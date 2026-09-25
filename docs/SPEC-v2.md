@@ -50,6 +50,19 @@ reclaim, residual, owned-worker, official-close, and process-identity rules are 
 With three repetitions, a leak of one thread per repetition is indistinguishable from pool
 noise; rows 44 and 50 own per-turn and per-session leak detection.
 
+Revision 2.7 clarifies the unchanged v1 row-3 dependency oracle. A's executing fixture,
+not AHRB's pre-execution script, generates a fresh 96-bit value in the labeled decimal-
+octet form `AHRB row 3 non-credential nonce NNN ... NNN`, writes it to the workspace,
+and returns it in A's output. The value is absent from A's arguments and pre-execution
+fixture metadata. The fake provider extracts the complete value only from the tool-result
+carrier correlated to A, then constructs B's dependency argument from that extracted
+value. AHRB independently reads the exact workspace effect after execution as its
+expected value and requires the correlated A result, B argument, correlated B result,
+native A/result/B/result order, single success terminal, and exact filesystem effect to
+agree. Prefixes, footers, and structured wrappers may decorate the complete result.
+This detects ordinary argument/result serialization and dataflow mistakes; it is not an
+attestation against a malicious client that fabricates execution evidence.
+
 ### Revision 2.1 changelog
 
 - Added one authoritative result-state precedence, repetition, aggregation, and
@@ -72,11 +85,12 @@ score with latency and CPU badge classes. The implementation is split into four 
 waves so that each wave can be implemented and independently verified before the next
 one starts.
 
-### Rows 1–41 inherit v1 except for the revision 2.7 row-28 amendment
+### Rows 1–41 inherit v1 except for the revision 2.7 row-3 and row-28 amendments
 
 The IDs, pillars, fixtures, outcomes, thresholds, topology policy, capability policy,
 badge role, and evidence meaning of rows 1–41 are **normatively unchanged** from
-`docs/SPEC.md` except for row 28's bounded thread plateau rule above. A v2 implementation
+`docs/SPEC.md` except for row 3's execution-origin fixture requirement and row 28's bounded
+thread plateau rule above. A v2 implementation
 may add fields to their evidence records but MUST NOT otherwise weaken, renumber,
 reinterpret, or silently auto-pass any v1 oracle. In particular,
 the v1 41-row results remain independently addressable in `report.json`, and a v2 badge

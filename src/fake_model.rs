@@ -39,6 +39,7 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const BIND_MAX_ATTEMPTS: usize = 8;
 const BIND_BACKOFF_MS: u64 = 10;
 const DETERMINISTIC_THREAD_TITLE: &str = "AHRB benchmark thread";
+pub(crate) const SCRIPTED_DEPENDENCY_FROM_RESULT: &str = "_ahrb_dependency_from_tool_result";
 #[cfg(test)]
 const TITLE_SYSTEM_PROMPT: &str = "You are a title generator. You output ONLY a thread title.";
 
@@ -1337,14 +1338,59 @@ struct DeclaredTool {
 }
 
 fn adapt_scripted_tool_calls(value: &Value, request: &Value) -> Result<Value> {
-    let Some(calls) = value.get("tool_calls").and_then(Value::as_array) else {
-        return Ok(value.clone());
+    let mut adapted = value.clone();
+    if let Some(dependency) = adapted.get(SCRIPTED_DEPENDENCY_FROM_RESULT).cloned() {
+        let call_id = dependency
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AhrbError::Protocol("scripted dependency directive omitted its call_id".to_owned())
+            })?;
+        let argument = dependency
+            .get("argument")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AhrbError::Protocol("scripted dependency directive omitted its argument".to_owned())
+            })?;
+        let value = correlated_row3_dependency(request, call_id).ok_or_else(|| {
+            AhrbError::Protocol(format!(
+                "scripted dependent response did not observe call {call_id:?}'s complete execution-origin value"
+            ))
+        })?;
+        let calls = adapted
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                AhrbError::Protocol(
+                    "scripted dependency directive requires tool_calls[]".to_owned(),
+                )
+            })?;
+        if calls.len() != 1 {
+            return Err(AhrbError::Protocol(
+                "scripted dependency directive requires exactly one tool call".to_owned(),
+            ));
+        }
+        calls[0]
+            .get_mut("arguments")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                AhrbError::Protocol(
+                    "scripted dependent tool call arguments must be an object".to_owned(),
+                )
+            })?
+            .insert(argument.to_owned(), Value::String(value));
+        adapted
+            .as_object_mut()
+            .ok_or_else(|| AhrbError::Protocol("scripted response must be an object".to_owned()))?
+            .remove(SCRIPTED_DEPENDENCY_FROM_RESULT);
+    }
+    let Some(calls) = adapted.get("tool_calls").and_then(Value::as_array) else {
+        return Ok(adapted);
     };
     if !calls.iter().any(|call| call.get("_ahrb_native").is_some()) {
-        return Ok(value.clone());
+        return Ok(adapted);
     }
     let declared = declared_tools(request)?;
-    let mut adapted = value.clone();
     let adapted_calls = adapted
         .get_mut("tool_calls")
         .and_then(Value::as_array_mut)
@@ -1353,6 +1399,49 @@ fn adapt_scripted_tool_calls(value: &Value, request: &Value) -> Result<Value> {
         adapt_scripted_tool_call(call, &declared)?;
     }
     Ok(adapted)
+}
+
+fn row3_dependency_in_value(value: &Value) -> Option<String> {
+    if let Some(text) = crate::row3::ordered_text_content(value)
+        && let Some(dependency) = crate::row3::extract_dependency_value(&text)
+    {
+        return Some(dependency);
+    }
+    match value {
+        Value::String(text) => crate::row3::extract_dependency_value(text),
+        Value::Array(items) => items.iter().find_map(row3_dependency_in_value),
+        Value::Object(items) => items.values().find_map(row3_dependency_in_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
+}
+
+fn correlated_row3_dependency(value: &Value, expected_call_id: &str) -> Option<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| correlated_row3_dependency(item, expected_call_id)),
+        Value::Object(object) => {
+            let result_id = if object.get("role").and_then(Value::as_str) == Some("tool") {
+                object.get("tool_call_id").and_then(Value::as_str)
+            } else {
+                match object.get("type").and_then(Value::as_str) {
+                    Some("function_call_output") => object.get("call_id").and_then(Value::as_str),
+                    Some("tool_result") => object.get("tool_use_id").and_then(Value::as_str),
+                    _ => None,
+                }
+            };
+            if result_id == Some(expected_call_id) {
+                return ["content", "output", "result"]
+                    .iter()
+                    .filter_map(|key| object.get(*key))
+                    .find_map(row3_dependency_in_value);
+            }
+            object
+                .values()
+                .find_map(|item| correlated_row3_dependency(item, expected_call_id))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
 }
 
 fn declared_tools(request: &Value) -> Result<BTreeMap<String, DeclaredTool>> {
@@ -4842,6 +4931,103 @@ mod tests {
                 .and_then(Value::as_str),
             Some(command)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dependent_scripted_response_uses_only_the_correlated_execution_output() -> Result<()> {
+        let dependency =
+            "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+        let scripted = json!({
+            "tool_calls": [{
+                "id": "call-b",
+                "name": "read_fixture",
+                "arguments": {"path":"a.txt"}
+            }],
+            "_ahrb_dependency_from_tool_result": {
+                "call_id":"call-a",
+                "argument":"expected_from_a"
+            }
+        });
+        assert!(!serde_json::to_string(&scripted)?.contains(crate::row3::DEPENDENCY_PREFIX));
+        for request in [
+            json!({"messages":[{
+                "role":"tool",
+                "tool_call_id":"call-a",
+                "content":format!("prefix {dependency} capture footer")
+            }]}),
+            json!({"input":[{
+                "type":"function_call_output",
+                "call_id":"call-a",
+                "output":{"wrapper":{"output":dependency}}
+            }]}),
+            json!({"messages":[{"content":[{
+                "type":"tool_result",
+                "tool_use_id":"call-a",
+                "content":format!("{dependency}\nfooter")
+            }]}]}),
+            json!({"messages":[{
+                "role":"tool",
+                "tool_call_id":"call-a",
+                "content":[
+                    {"type":"text","text":&dependency[..dependency.len() / 2]},
+                    {"type":"text","text":&dependency[dependency.len() / 2..]}
+                ]
+            }]}),
+        ] {
+            let adapted = adapt_scripted_tool_calls(&scripted, &request)?;
+            assert!(adapted.get(SCRIPTED_DEPENDENCY_FROM_RESULT).is_none());
+            assert_eq!(
+                adapted.pointer("/tool_calls/0/arguments/expected_from_a"),
+                Some(&Value::String(dependency.to_owned()))
+            );
+        }
+
+        let partial = json!({"messages":[{
+            "role":"tool",
+            "tool_call_id":"call-a",
+            "content":"AHRB row 3 non-credential nonce 000 001"
+        }]});
+        let error = adapt_scripted_tool_calls(&scripted, &partial)
+            .expect_err("a partial dependency value must not unlock tool B");
+        assert!(
+            error
+                .to_string()
+                .contains("complete execution-origin value")
+        );
+
+        for invalid in [
+            json!({"messages":[{
+                "role":"assistant",
+                "tool_calls":[{"id":"call-a","arguments":{"generate_content":"row3-dependency"}}]
+            },{
+                "role":"tool",
+                "tool_call_id":"call-a",
+                "content":"{\"path\":\"a.txt\",\"generate_content\":\"row3-dependency\"}"
+            }]}),
+            json!({"messages":[{
+                "role":"tool",
+                "tool_call_id":"different-call",
+                "content":dependency
+            }]}),
+            json!({"messages":[{
+                "role":"tool",
+                "tool_call_id":"call-a",
+                "content":"AHRB row 3 non-credential nonce 999 999 999 999 999 999 999 999 999 999 999 999"
+            }]}),
+            json!({"messages":[{
+                "role":"tool",
+                "tool_call_id":"call-a",
+                "content":{
+                    "first":"AHRB row 3 non-credential nonce 000 001 002 003 004 005 ",
+                    "second":"006 007 008 009 010 255"
+                }
+            }]}),
+        ] {
+            adapt_scripted_tool_calls(&scripted, &invalid).expect_err(
+                "arguments, a different call, or an altered value must not unlock tool B",
+            );
+        }
         Ok(())
     }
 

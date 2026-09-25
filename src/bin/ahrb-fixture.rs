@@ -28,6 +28,16 @@ fn run(args: &[String]) -> Result<i32> {
             println!("wrote {} bytes to {}", content.len(), path.display());
             Ok(0)
         }
+        Some("write-row3-dependency") => {
+            let path = fixture_path(required(args, "--path")?)?;
+            let content = ahrb::row3::fresh_dependency_value()?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content.as_bytes())?;
+            println!("{content}");
+            Ok(0)
+        }
         Some("read") => {
             let path = fixture_path(required(args, "--path")?)?;
             print!("{}", std::fs::read_to_string(path)?);

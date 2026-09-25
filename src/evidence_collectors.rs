@@ -321,16 +321,30 @@ fn collect_sequential_tools(
             .iter()
             .filter_map(|event| event_call_id(event))
             .eq(expected_ids.iter().copied());
-    let dependency = input.expected_tools.get(1).is_some_and(|second| {
-        second.dependency_value.as_ref().is_some_and(|needle| {
-            calls
-                .get(1)
-                .and_then(|event| event.payload.get("arguments"))
-                .is_some_and(|arguments| json_contains(arguments, needle))
-        })
+    let dependency_value = input
+        .expected_tools
+        .get(1)
+        .and_then(|second| second.dependency_value.as_deref())
+        .filter(|value| !value.is_empty());
+    let a_result_contains_dependency = dependency_value.is_some_and(|value| {
+        results
+            .first()
+            .is_some_and(|event| recorded_result_contains(&event.payload, value))
     });
+    let b_contains_dependency = dependency_value.is_some_and(|value| {
+        calls
+            .get(1)
+            .and_then(|event| event.payload.get("arguments"))
+            .is_some_and(|arguments| json_contains(arguments, value))
+    });
+    let dependency = a_result_contains_dependency && b_contains_dependency;
     let effects = results.len() as u64;
     set_bool(values, "a_before_b", a_before_b);
+    set_bool(
+        values,
+        "a_result_contains_dependency",
+        a_result_contains_dependency,
+    );
     set_bool(values, "b_contains_a_output", dependency);
     set_bool(values, "correlations_correct", correlations);
     set_u64(values, "effects", effects);
@@ -893,6 +907,33 @@ fn json_contains(value: &Value, needle: &str) -> bool {
         Value::Object(items) => items.values().any(|item| json_contains(item, needle)),
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
+}
+
+fn logical_result_text_contains(value: &Value, needle: &str) -> bool {
+    crate::row3::ordered_text_content(value).is_some_and(|text| text.contains(needle))
+        || json_contains(value, needle)
+}
+
+/// Whether a normalized tool result records the complete dependency value in a
+/// recognized content field. The field may be a string or a structured wrapper;
+/// surrounding harness text is allowed, but the full value must be present.
+pub fn recorded_result_contains(payload: &Value, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    [
+        "/result/content",
+        "/result/stdout",
+        "/result/aggregated_output",
+        "/result/output",
+        "/result/preview_record/output",
+    ]
+    .iter()
+    .any(|pointer| {
+        payload
+            .pointer(pointer)
+            .is_some_and(|content| logical_result_text_contains(content, needle))
+    })
 }
 
 fn model_record_contains(record: &ModelRequestRecord, needle: &str) -> bool {
