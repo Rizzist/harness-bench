@@ -274,6 +274,16 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L15 `l15-capability-audit` (landed 2026-09-26)
+
+- [x] Capability audit of UNSUPPORTED/ERROR rows; adapters declare demonstrated capabilities; row 65 typed initialization carrier run as an isolated experiment (fresh catalogue selection, 128-bit URL path token, independent credentials, whole-invocation declared-listener attribution); row 57 credits only source terminals.
+- [x] Implementation/verification (gpt-5.6-sol impl-1..10, verify-1..10); GPT6-Astra final reviews 1 and 2 NO-SHIP → every finding repaired (catalogue/terminal/label/endpoint/listener isolation; credential derivation; declared native journal credit; attach; 0.0.972 attribution race).
+- [x] Integration onto L10/L20/L17 (gpt-5.6-sol, claude-opus-5-5) and orchestrator verify-11 (claude-opus-5-5): full suite; haider 0.0.970/0.0.971/0.0.972 row 65 PASS 0.833333 ×9, rows 57/69 measured FAIL, row 3 still PASS; all preserved non-PASS clients non-PASS.
+- [x] Final review: **SHIP by claude-opus-5-5 (orchestrator)** — owner-authorized substitute while Codex and Opus subagents were rate-limited; not an independent context.
+- [x] Complete: squashed to one commit whose tree equals the verified tree, fast-forwarded and pushed.
+
+Routed elsewhere: row-57 residue for reparented daemons → L19; rick `{{base_url}}/v1` → L18.
+
 ## L17 `l17-row3-decorated-output` (landed 2026-09-25)
 
 - [x] Implement (gpt-5.6-sol, 3 passes): row 3 accepts decorated tool output (Haider 0.0.971's capture footer was a false FAIL). A's executing fixture generates a fresh 96-bit value absent from A's arguments; the fake provider releases B only from the tool result correlated to A; scoring reads the expected value from A's workspace effect.
