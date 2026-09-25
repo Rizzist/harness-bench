@@ -809,7 +809,10 @@ fn codex_manifest_overrides_context_and_ignores_nonfatal_metadata_items() -> Res
 #[test]
 fn haider_970_measurement_declarations_do_not_invent_lifecycle_or_truncation() {
     let manifest = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
-    assert_eq!(manifest.identity.revision, "0.0.970-measurement-json-v2");
+    assert_eq!(
+        manifest.identity.revision,
+        "0.0.970-measurement-capability-audit-v3"
+    );
     assert_eq!(
         manifest.resources.log_paths.as_ref().unwrap(),
         &["{{profile}}/home/.haider/dev-profile/daemon.log"]

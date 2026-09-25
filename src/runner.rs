@@ -24,7 +24,9 @@ use crate::fake_model::{
     FakeModelUnixServer, ProviderMailboxRequest, ProviderMailboxResponse, is_transient_bind_error,
     monotonic_timestamp_ns,
 };
-use crate::manifest::{ArgvPosition, InjectionComponent, InjectionMethod, Manifest, TransportKind};
+use crate::manifest::{
+    ArgvPosition, InjectionArgvTarget, InjectionComponent, InjectionMethod, Manifest, TransportKind,
+};
 use crate::mock_harness::OwnedEgressLedgerRecord;
 use crate::process::{
     DiskIdentityStatus, ProcessSample, ProcessTree, Sample, Sampler, TreeDiskTracker,
@@ -366,6 +368,17 @@ struct InjectionTrialEvidence {
     carrier: String,
     baseline_provider_requests: u64,
     perturbed_provider_requests: u64,
+    baseline_initialization_catalog_requests: u64,
+    initialization_catalog_requests: u64,
+    initialization_catalog_credential_rejections: u64,
+    baseline_catalog_count_sample_ns: u64,
+    catalog_count_sample_ns: u64,
+    baseline_catalog_requests_at_session_start: u64,
+    catalog_requests_at_session_start: u64,
+    baseline_physical_requests: Vec<Value>,
+    physical_requests: Vec<Value>,
+    expected_base_url: String,
+    baseline_base_url: String,
     expected_endpoint_reached: bool,
     unexpected_endpoint_requests: u64,
     credential_accepted: bool,
@@ -429,6 +442,17 @@ fn evaluate_injection_surface(
                 "carrier": trial.carrier,
                 "baseline_provider_requests": trial.baseline_provider_requests,
                 "perturbed_provider_requests": trial.perturbed_provider_requests,
+                "baseline_initialization_catalog_requests": trial.baseline_initialization_catalog_requests,
+                "initialization_catalog_requests": trial.initialization_catalog_requests,
+                "initialization_catalog_credential_rejections": trial.initialization_catalog_credential_rejections,
+                "baseline_catalog_count_sample_ns": trial.baseline_catalog_count_sample_ns,
+                "catalog_count_sample_ns": trial.catalog_count_sample_ns,
+                "baseline_catalog_requests_at_session_start": trial.baseline_catalog_requests_at_session_start,
+                "catalog_requests_at_session_start": trial.catalog_requests_at_session_start,
+                "baseline_physical_requests": trial.baseline_physical_requests,
+                "physical_requests": trial.physical_requests,
+                "expected_base_url": trial.expected_base_url,
+                "baseline_base_url": trial.baseline_base_url,
                 "expected_endpoint_reached": trial.expected_endpoint_reached,
                 "unexpected_endpoint_requests": trial.unexpected_endpoint_requests,
                 "credential_accepted": trial.credential_accepted,
@@ -471,6 +495,997 @@ fn evaluate_injection_surface(
 mod injection_surface_tests {
     use super::*;
 
+    static PRODUCTION_COLLECTOR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn initializer_perturbation_survives_driver_rendering_and_preserves_traps() {
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec!["harnessd".to_owned()];
+        manifest.daemon.initialize = vec![
+            "harness".to_owned(),
+            "init".to_owned(),
+            "--base-url".to_owned(),
+            "{{base_url}}".to_owned(),
+            "--api-key-env".to_owned(),
+            "FAKE_KEY".to_owned(),
+        ];
+        let launch = manifest.transport.command.clone();
+        let component: InjectionComponent = toml::from_str(
+            r#"
+            method = "cli"
+            argv_target = "daemon-initialize"
+            argv_position = "replace-option"
+            argv = ["--base-url", "{{base_url}}"]
+        "#,
+        )
+        .unwrap();
+        let baseline = BTreeMap::from([
+            ("base_url".to_owned(), "http://127.0.0.1:1111".to_owned()),
+            ("credential".to_owned(), "fake-auth-a".to_owned()),
+        ]);
+        let mut trial = baseline.clone();
+        trial.insert("base_url".to_owned(), "http://127.0.0.1:2222".to_owned());
+        let mut environment = BTreeMap::from([
+            ("BASE_URL".to_owned(), baseline["base_url"].clone()),
+            ("FAKE_KEY".to_owned(), "fake-auth-b".to_owned()),
+        ]);
+        let original_environment = environment.clone();
+        apply_injection_component(
+            &mut manifest,
+            &component,
+            &trial["base_url"],
+            &trial,
+            &mut environment,
+            Path::new("/unused-profile"),
+        )
+        .unwrap();
+        let rendered = rendered_managed_daemon_config(
+            &manifest,
+            &environment,
+            &baseline,
+            Path::new("/unused-profile"),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered.initialize_command,
+            [
+                "harness",
+                "init",
+                "--base-url",
+                "http://127.0.0.1:2222",
+                "--api-key-env",
+                "FAKE_KEY"
+            ]
+        );
+        assert_eq!(rendered.environment, original_environment);
+        assert_eq!(manifest.transport.command, launch);
+        assert_eq!(baseline["base_url"], "http://127.0.0.1:1111");
+        assert_eq!(baseline["credential"], "fake-auth-a");
+        assert!(!command_contains_credential(&manifest, "fake-auth-b"));
+        manifest.daemon.initialize.push("fake-auth-b".to_owned());
+        assert!(command_contains_credential(&manifest, "fake-auth-b"));
+    }
+
+    #[test]
+    fn option_replacement_preserves_deferred_turn_arguments() {
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.transport.command = [
+            "harness",
+            "run",
+            "--model",
+            "{{model}}",
+            "--prompt",
+            "{{prompt}}",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let component: InjectionComponent = toml::from_str(
+            r#"
+            method = "cli"
+            argv_position = "replace-option"
+            argv = ["--model", "{{provider}}"]
+        "#,
+        )
+        .unwrap();
+        apply_injection_component(
+            &mut manifest,
+            &component,
+            "trap-model",
+            &BTreeMap::from([("provider".to_owned(), "trap-model".to_owned())]),
+            &mut BTreeMap::new(),
+            Path::new("/unused-profile"),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.transport.command,
+            [
+                "harness",
+                "run",
+                "--model",
+                "trap-model",
+                "--prompt",
+                "{{prompt}}"
+            ]
+        );
+    }
+
+    #[test]
+    fn omitted_cli_target_preserves_launch_routing() {
+        let component: InjectionComponent = toml::from_str(
+            r#"
+            method = "cli"
+            argv = ["--model", "{{provider}}"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(component.argv_target, InjectionArgvTarget::Launch);
+        for (kind, persistent, targets_daemon) in [
+            (TransportKind::Exec, true, false),
+            (TransportKind::SocketJsonrpc, true, true),
+            (TransportKind::Http, true, true),
+            (TransportKind::SocketJsonrpc, false, false),
+        ] {
+            let mut manifest =
+                crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+            manifest.transport.kind = kind;
+            manifest.transport.command = vec!["harness".to_owned()];
+            manifest.daemon.persistent = persistent;
+            manifest.daemon.start = vec!["harnessd".to_owned()];
+            manifest.daemon.initialize = vec!["initialize".to_owned()];
+            apply_injection_component(
+                &mut manifest,
+                &component,
+                "trap-model",
+                &BTreeMap::from([("provider".to_owned(), "trap-model".to_owned())]),
+                &mut BTreeMap::new(),
+                Path::new("/unused-profile"),
+            )
+            .unwrap();
+            assert_eq!(manifest.daemon.initialize, ["initialize"]);
+            if targets_daemon {
+                assert_eq!(manifest.daemon.start, ["harnessd", "--model", "trap-model"]);
+                assert_eq!(manifest.transport.command, ["harness"]);
+            } else {
+                assert_eq!(
+                    manifest.transport.command,
+                    ["harness", "--model", "trap-model"]
+                );
+                assert_eq!(manifest.daemon.start, ["harnessd"]);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn production_collector_rejects_catalog_selection_when_provider_carrier_is_ignored() {
+        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row65-ignored-selector-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("catalog_client.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib, sys, time, urllib.request
+cache = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "catalog-choice.json"
+if sys.argv[1] == "daemon":
+    request = urllib.request.Request(
+        os.environ["AHRB_MOCK_BASE_URL"] + "/v1/models",
+        headers={"Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"]},
+    )
+    catalog = json.load(urllib.request.urlopen(request))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"selected": catalog["data"][-1]["id"]}))
+    while True:
+        time.sleep(60)
+else:
+    prompt, session_id, actor = sys.argv[2:5]
+    body = json.dumps({
+        "model": json.loads(cache.read_text())["selected"],
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode()
+    request = urllib.request.Request(
+        os.environ["AHRB_MOCK_BASE_URL"] + "/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"],
+            "Content-Type": "application/json",
+        },
+    )
+    urllib.request.urlopen(request).read()
+    print(json.dumps({
+        "id": session_id + ":terminal",
+        "cursor": 1,
+        "session_id": session_id,
+        "actor": actor,
+        "event": "terminal-success",
+        "payload": {"status": "success"},
+    }), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "daemon".to_owned(),
+        ];
+        manifest.daemon.initialize = vec!["/usr/bin/true".to_owned()];
+        manifest.daemon.readiness.kind = "file".to_owned();
+        manifest.daemon.readiness.target = profile_root
+            .join("dr65/state/catalog-choice.json")
+            .to_string_lossy()
+            .into_owned();
+        manifest.daemon.readiness.timeout_ms = 5_000;
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            "{{prompt}}".to_owned(),
+            "{{session_id}}".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        let provider = &mut manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .unwrap()
+            .provider;
+        provider.method = InjectionMethod::Environment;
+        provider.environment = "L15_IGNORED_SELECTOR".to_owned();
+        provider.argv.clear();
+        provider.argv_position = ArgvPosition::Suffix;
+        provider.argv_target = InjectionArgvTarget::Launch;
+        crate::manifest::validate(&manifest).unwrap();
+
+        let trials = collect_injection_surface_trials(
+            &manifest,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        assert!(trials.evaluation.measurement_complete);
+        assert!(!trials.evaluation.baseline_runnable);
+        assert!(!trials.evaluation.passed);
+        assert_eq!(
+            trials.evaluation.metrics["injection_surface.provider_score"],
+            0.0
+        );
+        assert_eq!(trials.requests.len(), 4);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn production_collector_counts_catalog_request_arriving_after_initializer_exit() {
+        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row65-late-catalog-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("late_catalog_client.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib, sys, time, urllib.request
+
+mode = sys.argv[1]
+trigger = pathlib.Path(sys.argv[2])
+catalog_ready = trigger.with_suffix(".catalog-ready")
+if mode == "daemon":
+    ready = pathlib.Path(sys.argv[3])
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text("ready")
+    while not trigger.exists():
+        time.sleep(0.002)
+    # The public initializer has already exited when this delayed daemon task
+    # begins the catalogue request.
+    time.sleep(0.150)
+    settings = json.loads(trigger.read_text())
+    request = urllib.request.Request(
+        settings["base_url"] + "/v1/models",
+        headers={"Authorization": "Bearer " + settings["credential"]},
+    )
+    urllib.request.urlopen(request).read()
+    catalog_ready.write_text("ready")
+    while True:
+        time.sleep(60)
+elif mode == "init":
+    base_url = sys.argv[sys.argv.index("--base-url") + 1]
+    trigger.write_text(json.dumps({
+        "base_url": base_url,
+        "credential": os.environ["AHRB_MOCK_API_KEY"],
+    }))
+else:
+    model = sys.argv[sys.argv.index("--model") + 1]
+    prompt = sys.argv[sys.argv.index("--prompt") + 1]
+    session_id = sys.argv[sys.argv.index("--session-id") + 1]
+    actor = sys.argv[sys.argv.index("--actor") + 1]
+    while not catalog_ready.exists():
+        time.sleep(0.002)
+    settings = json.loads(trigger.read_text())
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode()
+    request = urllib.request.Request(
+        settings["base_url"] + "/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"],
+            "Content-Type": "application/json",
+        },
+    )
+    urllib.request.urlopen(request).read()
+    print(json.dumps({
+        "id": session_id + ":terminal",
+        "cursor": 1,
+        "session_id": session_id,
+        "actor": actor,
+        "event": "terminal-success",
+        "payload": {"status": "success"},
+    }), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let trigger = profile_root.join("dr65/state/late-catalog-trigger.json");
+        let ready = profile_root.join("dr65/state/late-catalog-daemon-ready");
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "daemon".to_owned(),
+            trigger.to_string_lossy().into_owned(),
+            ready.to_string_lossy().into_owned(),
+        ];
+        manifest.daemon.initialize = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "init".to_owned(),
+            trigger.to_string_lossy().into_owned(),
+            "--base-url".to_owned(),
+            "{{base_url}}".to_owned(),
+        ];
+        manifest.daemon.readiness.kind = "file".to_owned();
+        manifest.daemon.readiness.target = ready.to_string_lossy().into_owned();
+        manifest.daemon.readiness.timeout_ms = 5_000;
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            trigger.to_string_lossy().into_owned(),
+            "--model".to_owned(),
+            "{{model}}".to_owned(),
+            "--prompt".to_owned(),
+            "{{prompt}}".to_owned(),
+            "--session-id".to_owned(),
+            "{{session_id}}".to_owned(),
+            "--actor".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        let surface = manifest.capabilities.injection_surface.as_mut().unwrap();
+        surface.provider.method = InjectionMethod::Cli;
+        surface.provider.environment.clear();
+        surface.provider.argv = vec!["--model".to_owned(), "{{provider}}".to_owned()];
+        surface.provider.argv_position = ArgvPosition::ReplaceOption;
+        surface.provider.argv_target = InjectionArgvTarget::Launch;
+        surface.base_url.method = InjectionMethod::Cli;
+        surface.base_url.environment.clear();
+        surface.base_url.argv = vec!["--base-url".to_owned(), "{{base_url}}".to_owned()];
+        surface.base_url.argv_position = ArgvPosition::ReplaceOption;
+        surface.base_url.argv_target = InjectionArgvTarget::DaemonInitialize;
+        crate::manifest::validate(&manifest).unwrap();
+
+        let trials = collect_injection_surface_trials(
+            &manifest,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        assert!(
+            trials.evaluation.baseline_runnable,
+            "late catalogue evidence: {}",
+            trials.evaluation.details
+        );
+        assert!(trials.evaluation.passed);
+        for case in trials.evaluation.details["verification_cases"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(case["baseline_catalog_requests_at_session_start"], 0);
+            assert_eq!(case["baseline_initialization_catalog_requests"], 1);
+            assert_eq!(case["catalog_requests_at_session_start"], 0);
+            assert_eq!(case["initialization_catalog_requests"], 1);
+            let sample = case["catalog_count_sample_ns"].as_u64().unwrap();
+            let catalog_received = case["physical_requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|request| request["catalog"] == true)
+                .unwrap()["received_ns"]
+                .as_u64()
+                .unwrap();
+            assert!(catalog_received > sample);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn production_collector_rejects_credential_derived_from_baseline_and_invocation_count() {
+        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row65-derived-credential-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        let state = root.join("credential-count");
+        let decisions = state.with_extension("jsonl");
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("credential_client.py");
+        std::fs::write(
+            &script,
+            r#"import hashlib, json, os, pathlib, sys
+# The declared L15_UNUSED_CREDENTIAL carrier is deliberately ignored. The
+# fourth invocation derives the old trial value solely from baseline auth.
+state = pathlib.Path(sys.argv[1])
+count = int(state.read_text()) + 1 if state.exists() else 1
+state.write_text(str(count))
+baseline = os.environ["AHRB_MOCK_API_KEY"]
+selected = baseline.replace("ahrb-row65-a-", "ahrb-row65-b-", 1) if count == 4 else baseline
+with state.with_suffix(".jsonl").open("a") as stream:
+    stream.write(json.dumps({
+        "invocation": count,
+        "baseline_sha256": hashlib.sha256(baseline.encode()).hexdigest(),
+        "selected_sha256": hashlib.sha256(selected.encode()).hexdigest(),
+        "selection": "derived-B" if count == 4 else "baseline-A",
+        "ignored_carrier": "L15_UNUSED_CREDENTIAL",
+    }) + "\n")
+os.environ.pop("L15_UNUSED_CREDENTIAL", None)
+os.environ["AHRB_MOCK_API_KEY"] = selected
+os.execv(sys.argv[2], sys.argv[2:])
+"#,
+        )
+        .unwrap();
+
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        let mut wrapped = manifest.transport.command.clone();
+        wrapped[0] = std::env::current_dir()
+            .unwrap()
+            .join(&wrapped[0])
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            state.to_string_lossy().into_owned(),
+        ];
+        manifest.transport.command.extend(wrapped);
+        let credential = &mut manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .unwrap()
+            .credential;
+        credential.method = InjectionMethod::Environment;
+        credential.environment = "L15_UNUSED_CREDENTIAL".to_owned();
+        credential.argv.clear();
+        credential.argv_position = ArgvPosition::Suffix;
+        credential.argv_target = InjectionArgvTarget::Launch;
+        crate::manifest::validate(&manifest).unwrap();
+
+        let trials = collect_injection_surface_trials(
+            &manifest,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        assert!(trials.evaluation.measurement_complete);
+        assert!(trials.evaluation.baseline_runnable);
+        assert!(!trials.evaluation.passed);
+        assert_eq!(
+            trials.evaluation.metrics["injection_surface.credential_score"],
+            0.0
+        );
+        assert_eq!(
+            trials.evaluation.metrics["injection_surface.verified_components"],
+            2.0
+        );
+        let records = std::fs::read_to_string(decisions)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[3]["selection"], "derived-B");
+        assert_eq!(records[3]["ignored_carrier"], "L15_UNUSED_CREDENTIAL");
+        assert_ne!(
+            records[3]["selected_sha256"], records[3]["baseline_sha256"],
+            "the control must actually substitute the historical credential prefix"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn production_collector_hides_provider_trial_from_nondeclared_channels() {
+        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-r65-channels-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("channel_client.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib, sys, time, urllib.request
+
+mode = sys.argv[2]
+evidence = pathlib.Path(sys.argv[3])
+cache = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "catalog.json"
+if sys.argv[1] == "daemon":
+    try:
+        request = urllib.request.Request(
+            os.environ["AHRB_MOCK_BASE_URL"] + "/v1/models",
+            headers={"Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"]},
+        )
+        catalog = json.load(urllib.request.urlopen(request))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(catalog, sort_keys=True))
+    except Exception as error:
+        evidence.write_text(json.dumps({"initialize_error": repr(error)}) + "\n")
+        raise
+    while True:
+        time.sleep(60)
+
+prompt, session_id, marker = sys.argv[4:7]
+catalog = json.loads(cache.read_text())
+models = [entry["id"] for entry in catalog["data"]]
+baseline = next(model for model in models if model == "ahrb-fake-v1")
+alternate = next(model for model in models if model != baseline)
+profile = pathlib.Path(os.environ["XDG_CONFIG_HOME"]).parent
+environment = {
+    key: os.environ.get(key, "")
+    for key in [
+        "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR", "TMPDIR", "AHRB_MOCK_BASE_URL",
+        "AHRB_MOCK_API_KEY", "AHRB_MOCK_MODEL",
+    ]
+}
+config = (pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "provider.toml").read_text()
+store = {}
+for path in sorted(profile.rglob("*")):
+    if path.is_file():
+        try:
+            store[str(path.relative_to(profile))] = path.read_text()
+        except UnicodeDecodeError:
+            store[str(path.relative_to(profile))] = "<binary>"
+scenario, actor = marker.rsplit(":", 1)
+channels = {
+    "prompt": prompt,
+    "profile": str(profile),
+    "runtime": sorted(str(path.relative_to(profile)) for path in profile.rglob("*")),
+    "actor": actor,
+    "scenario": scenario,
+    "marker": marker,
+    "session": session_id,
+    "catalog": catalog,
+    "environment": environment,
+    "argv": sys.argv,
+    "cwd": os.getcwd(),
+    "generated_config": config,
+    "store": store,
+}
+if mode == "catalog":
+    selected = alternate
+else:
+    observed = json.dumps(channels[mode]).lower()
+    leaked = any(token in observed for token in [
+        "dr65-provider", "row65-provider", "row-65-provider", "r65-provider",
+    ])
+    selected = alternate if leaked else baseline
+with evidence.open("a") as stream:
+    stream.write(json.dumps({"mode": mode, "channels": channels, "selected": selected}, sort_keys=True) + "\n")
+body = json.dumps({
+    "model": selected,
+    "messages": [{"role": "user", "content": prompt}],
+    "stream": False,
+}).encode()
+request = urllib.request.Request(
+    os.environ["AHRB_MOCK_BASE_URL"] + "/v1/chat/completions",
+    data=body,
+    headers={
+        "Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"],
+        "Content-Type": "application/json",
+    },
+)
+urllib.request.urlopen(request).read()
+print(json.dumps({
+    "id": session_id + ":terminal",
+    "cursor": 1,
+    "session_id": session_id,
+    "actor": actor,
+    "event": "terminal-success",
+    "payload": {"status": "success"},
+}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        for mode in [
+            "prompt",
+            "profile",
+            "runtime",
+            "actor",
+            "scenario",
+            "marker",
+            "session",
+            "catalog",
+            "environment",
+            "argv",
+            "cwd",
+            "generated_config",
+            "store",
+        ] {
+            let profile_root = root.join(format!("root-{mode}"));
+            let evidence = root.join(format!("evidence-{mode}.jsonl"));
+            let mut manifest =
+                crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+            manifest.daemon.persistent = true;
+            manifest.daemon.start = vec![
+                "/usr/bin/python3".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "daemon".to_owned(),
+                mode.to_owned(),
+                evidence.to_string_lossy().into_owned(),
+            ];
+            manifest.daemon.initialize = vec!["/usr/bin/true".to_owned()];
+            manifest.daemon.readiness.kind = "file".to_owned();
+            manifest.daemon.readiness.target = profile_root
+                .join("dr65/state/catalog.json")
+                .to_string_lossy()
+                .into_owned();
+            manifest.daemon.readiness.timeout_ms = 5_000;
+            manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+            manifest.transport.command = vec![
+                "/usr/bin/python3".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "run".to_owned(),
+                mode.to_owned(),
+                evidence.to_string_lossy().into_owned(),
+                "{{prompt}}".to_owned(),
+                "{{session_id}}".to_owned(),
+                "{{marker}}".to_owned(),
+            ];
+            manifest.events.source = "stdout".to_owned();
+            manifest.events.path.clear();
+            let provider = &mut manifest
+                .capabilities
+                .injection_surface
+                .as_mut()
+                .unwrap()
+                .provider;
+            provider.method = InjectionMethod::Environment;
+            provider.environment = "L15_IGNORED_SELECTOR".to_owned();
+            provider.argv.clear();
+            provider.argv_position = ArgvPosition::Suffix;
+            provider.argv_target = InjectionArgvTarget::Launch;
+            crate::manifest::validate(&manifest).unwrap();
+
+            let trials = collect_injection_surface_trials(
+                &manifest,
+                &profile_root,
+                "0123456789abcdef0123456789abcdef",
+            )
+            .await
+            .unwrap();
+            assert!(trials.evaluation.measurement_complete, "mode {mode}");
+            assert!(!trials.evaluation.passed, "mode {mode}");
+            if mode == "catalog" {
+                assert!(!trials.evaluation.baseline_runnable, "mode {mode}");
+            } else {
+                assert!(
+                    trials.evaluation.baseline_runnable,
+                    "mode {mode}: {}",
+                    trials.evaluation.details
+                );
+                assert_eq!(
+                    trials.evaluation.metrics["injection_surface.provider_score"], 0.0,
+                    "mode {mode}"
+                );
+            }
+            assert_eq!(trials.requests.len(), 4, "mode {mode}");
+
+            let snapshots = std::fs::read_to_string(&evidence)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "mode {mode} did not write channel evidence: {error}; row-65 details: {}",
+                        trials.evaluation.details
+                    )
+                })
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(snapshots.len(), 4, "mode {mode}");
+            let normalize_provider_endpoint = |snapshot: &Value| {
+                let base_url = snapshot["channels"]["environment"]["AHRB_MOCK_BASE_URL"]
+                    .as_str()
+                    .unwrap();
+                serde_json::to_string(&snapshot["channels"])
+                    .unwrap()
+                    .replace(base_url, "<fresh-provider-endpoint>")
+            };
+            assert_eq!(
+                normalize_provider_endpoint(&snapshots[0]),
+                normalize_provider_endpoint(&snapshots[1]),
+                "baseline and provider trial differ beyond their fresh opaque endpoints and the declared carrier for mode {mode}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn production_collector_rejects_an_endpoint_retained_across_invocations() {
+        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-r65-retained-endpoint-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        let retained_endpoint = root.join("retained-endpoint.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("retained_endpoint_client.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib, sys, time, urllib.request
+
+retained_endpoint = pathlib.Path(sys.argv[2])
+if sys.argv[1] == "daemon":
+    current = os.environ["AHRB_MOCK_BASE_URL"]
+    if not retained_endpoint.exists():
+        retained_endpoint.write_text(current)
+    request = urllib.request.Request(
+        current + "/v1/models",
+        headers={"Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"]},
+    )
+    urllib.request.urlopen(request).read()
+    ready = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "retained-endpoint-ready"
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text("ready")
+    while True:
+        time.sleep(60)
+
+prompt, session_id, actor = sys.argv[3:6]
+body = json.dumps({
+    "model": os.environ["AHRB_MOCK_MODEL"],
+    "messages": [{"role": "user", "content": prompt}],
+    "stream": False,
+}).encode()
+request = urllib.request.Request(
+    retained_endpoint.read_text() + "/v1/chat/completions",
+    data=body,
+    headers={
+        "Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"],
+        "Content-Type": "application/json",
+    },
+)
+urllib.request.urlopen(request).read()
+print(json.dumps({
+    "id": session_id + ":terminal",
+    "cursor": 1,
+    "session_id": session_id,
+    "actor": actor,
+    "event": "terminal-success",
+    "payload": {"status": "success"},
+}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "daemon".to_owned(),
+            retained_endpoint.to_string_lossy().into_owned(),
+        ];
+        manifest.daemon.initialize = vec!["/usr/bin/true".to_owned()];
+        manifest.daemon.readiness.kind = "file".to_owned();
+        manifest.daemon.readiness.target = profile_root
+            .join("dr65/state/retained-endpoint-ready")
+            .to_string_lossy()
+            .into_owned();
+        manifest.daemon.readiness.timeout_ms = 5_000;
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            "run".to_owned(),
+            retained_endpoint.to_string_lossy().into_owned(),
+            "{{prompt}}".to_owned(),
+            "{{session_id}}".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        let base_url = &mut manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .unwrap()
+            .base_url;
+        base_url.method = InjectionMethod::Environment;
+        base_url.environment = "L15_IGNORED_BASE_URL".to_owned();
+        base_url.argv.clear();
+        base_url.argv_position = ArgvPosition::Suffix;
+        base_url.argv_target = InjectionArgvTarget::Launch;
+        crate::manifest::validate(&manifest).unwrap();
+
+        let trials = collect_injection_surface_trials(
+            &manifest,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        assert!(trials.evaluation.measurement_complete);
+        assert!(!trials.evaluation.passed);
+        assert_eq!(
+            trials.evaluation.metrics["injection_surface.base_url_score"],
+            0.0
+        );
+        let base_url = trials.evaluation.details["verification_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["component"] == "base_url")
+            .unwrap();
+        assert!(base_url["unexpected_endpoint_requests"].as_u64().unwrap() > 0);
+        assert_eq!(
+            trials.requests.len(),
+            3,
+            "the retained base-URL request must be rejected before semantic routing"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Opt-in carrier probe: four single-turn calls to local fake providers only.
+    /// Persistent CLIs must supply a foreground daemon command; never auto-detach.
+    #[tokio::test]
+    #[ignore = "requires explicit disposable real-CLI profile and evidence paths"]
+    async fn real_cli_injection_carriers() {
+        probe_real_cli_injection(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit disposable real-CLI profile and evidence paths"]
+    async fn real_cli_ignored_base_url_environment_is_detected() {
+        probe_real_cli_injection(true).await;
+    }
+
+    async fn probe_real_cli_injection(negative_base_url_control: bool) {
+        let manifest_path = std::env::var("AHRB_ROW65_MANIFEST").expect("manifest path");
+        let profile_root =
+            PathBuf::from(std::env::var("AHRB_ROW65_PROFILE_ROOT").expect("fresh profile root"));
+        let evidence_file =
+            PathBuf::from(std::env::var("AHRB_ROW65_EVIDENCE_FILE").expect("evidence file"));
+        assert!(
+            !profile_root.exists(),
+            "probe requires a fresh disposable profile"
+        );
+        let mut manifest = crate::manifest::load(Path::new(&manifest_path)).unwrap();
+        let manifest_hash = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&manifest_path).unwrap())
+        );
+        if manifest.daemon.persistent {
+            manifest.daemon.start = serde_json::from_str(
+                &std::env::var("AHRB_ROW65_FOREGROUND_COMMAND")
+                    .expect("explicit foreground daemon argv required"),
+            )
+            .unwrap();
+            assert!(!manifest.daemon.start.is_empty());
+            manifest.daemon.launcher_exits = false;
+        }
+        if negative_base_url_control {
+            let component = &mut manifest
+                .capabilities
+                .injection_surface
+                .as_mut()
+                .unwrap()
+                .base_url;
+            assert_eq!(component.argv_target, InjectionArgvTarget::DaemonInitialize);
+            component.method = InjectionMethod::Environment;
+            component.environment = manifest.fake_model.base_url_env.clone();
+            component.argv.clear();
+            component.argv_position = ArgvPosition::Suffix;
+            component.argv_target = InjectionArgvTarget::Launch;
+            crate::manifest::validate(&manifest).unwrap();
+        }
+        let result =
+            collect_injection_surface_trials(&manifest, &profile_root, &manifest_hash).await;
+        let evidence = match &result {
+            Ok(trials) => json!({
+                "manifest_path": manifest_path, "manifest_sha256": manifest_hash,
+                "profile_root": profile_root, "daemon_start": manifest.daemon.start,
+                "launcher_exits": manifest.daemon.launcher_exits,
+                "negative_base_url_environment_control": negative_base_url_control,
+                "baseline_runnable": trials.evaluation.baseline_runnable,
+                "measurement_complete": trials.evaluation.measurement_complete,
+                "measurement_error": trials.evaluation.measurement_error,
+                "passed": trials.evaluation.passed, "metrics": trials.evaluation.metrics,
+                "details": trials.evaluation.details, "requests": trials.requests,
+            }),
+            Err(error) => json!({"error": error.to_string(), "manifest_path": manifest_path,
+                "profile_root": profile_root}),
+        };
+        std::fs::write(evidence_file, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        let trials = result.expect("real CLI carrier collection");
+        if negative_base_url_control {
+            assert!(trials.evaluation.baseline_runnable);
+            assert!(!trials.evaluation.passed);
+            assert_eq!(
+                trials.evaluation.metrics["injection_surface.base_url_score"],
+                0.0
+            );
+            assert_eq!(
+                trials.evaluation.metrics["injection_surface.verified_components"],
+                2.0
+            );
+            let base_url = trials.evaluation.details["verification_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["component"] == "base_url")
+                .unwrap();
+            assert!(base_url["unexpected_endpoint_requests"].as_u64().unwrap() > 0);
+            return;
+        }
+        assert!(
+            trials.evaluation.passed,
+            "carrier evidence: {}",
+            trials.evaluation.details
+        );
+        assert_eq!(
+            trials.evaluation.metrics["injection_surface.verified_components"],
+            3.0
+        );
+    }
+
     fn evidence(
         component: &'static str,
         method: InjectionMethod,
@@ -482,6 +1497,17 @@ mod injection_surface_tests {
             carrier: injection_method_label(method).to_owned(),
             baseline_provider_requests: 1,
             perturbed_provider_requests: u64::from(verified),
+            baseline_initialization_catalog_requests: 0,
+            initialization_catalog_requests: 0,
+            initialization_catalog_credential_rejections: 0,
+            baseline_catalog_count_sample_ns: 0,
+            catalog_count_sample_ns: 0,
+            baseline_catalog_requests_at_session_start: 0,
+            catalog_requests_at_session_start: 0,
+            baseline_physical_requests: Vec::new(),
+            physical_requests: Vec::new(),
+            expected_base_url: String::new(),
+            baseline_base_url: String::new(),
             expected_endpoint_reached: verified,
             unexpected_endpoint_requests: 0,
             credential_accepted: verified,
@@ -8072,6 +9098,7 @@ fn rendered_managed_daemon_config(
             .map(PathBuf::from)
             .unwrap_or_else(|| profile_root.to_path_buf())
             .join("daemon-logs"),
+        invariant_log_names: variables.contains_key("ahrb_invariant_daemon_logs"),
     })
 }
 
@@ -8483,9 +9510,9 @@ fn build_workflow(
     ))
 }
 
-fn injection_surface_workflow(profile_root: &Path, label: &str) -> Workflow {
-    let scenario = format!("ahrb-row65-injection-{label}");
-    let actor = format!("r65-{label}");
+fn injection_surface_workflow(profile_root: &Path) -> Workflow {
+    let scenario = "ahrb-row65-injection".to_owned();
+    let actor = "r65".to_owned();
     Workflow {
         version: WORKFLOW_SCHEMA_VERSION,
         scenario: scenario.clone(),
@@ -8495,7 +9522,7 @@ fn injection_surface_workflow(profile_root: &Path, label: &str) -> Workflow {
                 id: actor.clone(),
                 parent: None,
                 prompt: format!(
-                    "AHRB injection-surface {label} {}",
+                    "AHRB injection-surface verification {}",
                     route_marker(&scenario, &actor, "start")
                 ),
                 workspace: profile_root
@@ -8521,10 +9548,15 @@ fn injection_carrier_label(component: &InjectionComponent) -> String {
     match component.method {
         InjectionMethod::Environment => format!("env:{}", component.environment),
         InjectionMethod::Cli => format!(
-            "cli:{}:{}",
+            "cli:{}{}:{}",
+            match component.argv_target {
+                InjectionArgvTarget::Launch => "",
+                InjectionArgvTarget::DaemonInitialize => "daemon-initialize:",
+            },
             match component.argv_position {
                 ArgvPosition::Prefix => "prefix",
                 ArgvPosition::Suffix => "suffix",
+                ArgvPosition::ReplaceOption => "replace-option",
             },
             match serde_json::to_string(&component.argv) {
                 Ok(value) => value,
@@ -8554,6 +9586,10 @@ fn insert_cli_injection(
             command.splice(1..1, argv);
         }
         ArgvPosition::Suffix => command.extend(argv),
+        ArgvPosition::ReplaceOption => {
+            let index = crate::manifest::injection_option_value_index(command, &argv)?;
+            command[index] = argv[1].clone();
+        }
     }
     Ok(())
 }
@@ -8640,14 +9676,21 @@ fn apply_injection_component(
         }
         InjectionMethod::Cli => {
             let rendered = render_argv(&component.argv, variables)?;
-            let command = if matches!(
-                manifest.transport.kind,
-                TransportKind::SocketJsonrpc | TransportKind::Http
-            ) && manifest.daemon.persistent
-            {
-                &mut manifest.daemon.start
-            } else {
-                &mut manifest.transport.command
+            // Resolve the component-specific value before the driver renders commands
+            // with baseline variables. Keep the baseline endpoint/auth trap intact.
+            let command = match component.argv_target {
+                InjectionArgvTarget::DaemonInitialize => &mut manifest.daemon.initialize,
+                InjectionArgvTarget::Launch => {
+                    if matches!(
+                        manifest.transport.kind,
+                        TransportKind::SocketJsonrpc | TransportKind::Http
+                    ) && manifest.daemon.persistent
+                    {
+                        &mut manifest.daemon.start
+                    } else {
+                        &mut manifest.transport.command
+                    }
+                }
             };
             insert_cli_injection(command, rendered, component.argv_position)?;
         }
@@ -8665,6 +9708,7 @@ fn command_contains_credential(manifest: &Manifest, credential: &str) -> bool {
         .command
         .iter()
         .chain(manifest.daemon.start.iter())
+        .chain(manifest.daemon.initialize.iter())
         .chain(manifest.sessions.create.iter())
         .chain(manifest.sessions.submit.iter())
         .chain(manifest.sessions.resume.iter())
@@ -8683,7 +9727,7 @@ fn injection_credential_fingerprints(credential: &str) -> BTreeSet<String> {
     .collect()
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct InjectionRunObservation {
     expected_records: Vec<crate::fake_model::ModelRequestRecord>,
     unexpected_records: Vec<crate::fake_model::ModelRequestRecord>,
@@ -8693,6 +9737,23 @@ struct InjectionRunObservation {
     active_baseline_credential_rejected: bool,
     terminal_success: bool,
     secret_in_argv: bool,
+    initialization_catalog_requests: u64,
+    initialization_catalog_credential_rejections: u64,
+    catalog_count_sample_ns: u64,
+    catalog_requests_at_session_start: u64,
+    physical_requests: Vec<Value>,
+    expected_base_url: String,
+    baseline_base_url: String,
+    expected_endpoint: InjectionTrapEndpoint,
+    exposed_endpoints: Vec<InjectionTrapEndpoint>,
+}
+
+const INJECTION_LISTENER_CANDIDATES: usize = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InjectionTrapEndpoint {
+    Tcp(SocketAddr),
+    Mailbox(PathBuf),
 }
 
 #[derive(Debug)]
@@ -8711,19 +9772,43 @@ impl BoundInjectionTrap {
     async fn bind(
         engine: Arc<FakeModelEngine>,
         credential: Option<&str>,
-        label: &str,
+        path_prefix: Option<&str>,
+        endpoint: Option<&InjectionTrapEndpoint>,
+        mailbox_directory: &Path,
     ) -> Result<Self> {
-        let address = SocketAddr::from(([127, 0, 0, 1], 0));
-        let tcp = if let Some(credential) = credential {
-            FakeModelServer::bind_requiring_credential(
-                address,
-                Arc::clone(&engine),
-                credential.to_owned(),
-            )
-            .await
-        } else {
-            FakeModelServer::bind(address, Arc::clone(&engine)).await
+        if let Some(InjectionTrapEndpoint::Mailbox(directory)) = endpoint {
+            if path_prefix.is_some() {
+                return Err(AhrbError::Unsupported(
+                    "row-65 tokenized base-URL trials require an HTTP listener".to_owned(),
+                ));
+            }
+            let server = if let Some(credential) = credential {
+                FakeModelMailboxServer::bind_requiring_credential(
+                    directory.clone(),
+                    engine,
+                    credential.to_owned(),
+                )
+                .await?
+            } else {
+                FakeModelMailboxServer::bind(directory.clone(), engine).await?
+            };
+            return Ok(Self {
+                server: InjectionTrapServer::Mailbox(server),
+                base_url: format!("ahrb+mailbox://{}", directory.display()),
+            });
+        }
+        let address = match endpoint {
+            Some(InjectionTrapEndpoint::Tcp(address)) => *address,
+            Some(InjectionTrapEndpoint::Mailbox(_)) => unreachable!(),
+            None => SocketAddr::from(([127, 0, 0, 1], 0)),
         };
+        let tcp = FakeModelServer::bind_with_row65_policy(
+            address,
+            Arc::clone(&engine),
+            credential.map(str::to_owned),
+            path_prefix.map(str::to_owned),
+        )
+        .await;
         match tcp {
             Ok(server) => {
                 let base_url = server.base_url();
@@ -8732,16 +9817,10 @@ impl BoundInjectionTrap {
                     base_url,
                 })
             }
+            Err(error) if endpoint.is_some() => Err(error),
+            Err(error) if path_prefix.is_some() => Err(error),
             Err(_tcp_error) => {
-                #[cfg(target_os = "macos")]
-                let root = PathBuf::from("/private/tmp");
-                #[cfg(not(target_os = "macos"))]
-                let root = PathBuf::from("/tmp");
-                let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                let directory = root.join(format!(
-                    "ahrb-r65-{}-{sequence}-{label}",
-                    std::process::id()
-                ));
+                let directory = mailbox_directory.to_path_buf();
                 let server = if let Some(credential) = credential {
                     FakeModelMailboxServer::bind_requiring_credential(
                         directory.clone(),
@@ -8760,6 +9839,15 @@ impl BoundInjectionTrap {
         }
     }
 
+    fn endpoint(&self) -> InjectionTrapEndpoint {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => InjectionTrapEndpoint::Tcp(server.local_addr()),
+            InjectionTrapServer::Mailbox(server) => {
+                InjectionTrapEndpoint::Mailbox(server.directory().to_path_buf())
+            }
+        }
+    }
+
     fn physical_request_count(&self) -> u64 {
         match &self.server {
             InjectionTrapServer::Tcp(server) => server.physical_request_count(),
@@ -8774,10 +9862,36 @@ impl BoundInjectionTrap {
         }
     }
 
-    async fn probe_rejected_credential(&self, credential: &str) -> Result<bool> {
+    fn path_rejection_count(&self) -> u64 {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => server.path_rejection_count(),
+            InjectionTrapServer::Mailbox(_) => 0,
+        }
+    }
+
+    fn catalog_request_counts(&self) -> (u64, u64) {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => server.catalog_request_counts(),
+            // The mailbox frontend only accepts model POSTs, not catalog GETs.
+            InjectionTrapServer::Mailbox(_) => (0, 0),
+        }
+    }
+
+    fn physical_request_records(&self) -> Vec<crate::fake_model::PhysicalHttpRequestRecord> {
+        match &self.server {
+            InjectionTrapServer::Tcp(server) => server.physical_request_records(),
+            InjectionTrapServer::Mailbox(_) => Vec::new(),
+        }
+    }
+
+    async fn probe_rejected_credential(
+        &self,
+        path_prefix: Option<&str>,
+        credential: &str,
+    ) -> Result<bool> {
         match &self.server {
             InjectionTrapServer::Tcp(server) => {
-                probe_rejected_credential(server.local_addr(), credential).await
+                probe_rejected_credential(server.local_addr(), path_prefix, credential).await
             }
             InjectionTrapServer::Mailbox(server) => {
                 probe_rejected_mailbox_credential(server.directory(), credential).await
@@ -8793,19 +9907,31 @@ impl BoundInjectionTrap {
     }
 }
 
-async fn probe_rejected_credential(address: SocketAddr, credential: &str) -> Result<bool> {
+async fn probe_rejected_credential(
+    address: SocketAddr,
+    path_prefix: Option<&str>,
+    credential: &str,
+) -> Result<bool> {
     let mut stream = tokio::net::TcpStream::connect(address).await?;
     let body = b"{}";
+    let path_prefix = path_prefix.unwrap_or_default();
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {credential}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path_prefix}/v1/chat/completions HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {credential}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(request.as_bytes()).await?;
     stream.write_all(body).await?;
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
-        .await
-        .map_err(|_| AhrbError::Timeout("row-65 credential rejection control".to_owned()))??;
+    let read_result =
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .map_err(|_| AhrbError::Timeout("row-65 credential rejection control".to_owned()))?;
+    if let Err(error) = read_result {
+        let complete_status_line = response.windows(2).any(|bytes| bytes == b"\r\n");
+        if error.kind() != std::io::ErrorKind::ConnectionReset || !complete_status_line {
+            return Err(error.into());
+        }
+    }
     let Some(first_line) = response
         .split(|byte| *byte == b'\n')
         .next()
@@ -8853,70 +9979,199 @@ async fn probe_rejected_mailbox_credential(directory: &Path, credential: &str) -
     Ok(response.id == id && response.status == 401 && response.error.is_none())
 }
 
+fn injection_trap_engine(
+    workflow: &Workflow,
+    manifest: &Manifest,
+    catalog_providers: &[String],
+) -> Result<FakeModelEngine> {
+    let mut engine = FakeModelEngine::with_request_roles(
+        workflow,
+        &manifest.model_roles,
+        &manifest.request_role_rules,
+    )?
+    .with_catalog_model(&manifest.fake_model.model);
+    for provider in catalog_providers {
+        engine = engine.with_catalog_model(provider);
+    }
+    Ok(engine)
+}
+
+struct InjectionListenerPolicy<'a> {
+    label: &'a str,
+    credential: Option<&'a str>,
+    path_prefix: Option<&'a str>,
+}
+
+async fn bind_injection_listener_candidates(
+    workflow: &Workflow,
+    manifest: &Manifest,
+    catalog_providers: &[String],
+    policy: InjectionListenerPolicy<'_>,
+    run_profile_root: &Path,
+    invocation_sequence: u64,
+) -> Result<Vec<(Arc<FakeModelEngine>, BoundInjectionTrap)>> {
+    let mut candidates: Vec<(Arc<FakeModelEngine>, BoundInjectionTrap)> =
+        Vec::with_capacity(INJECTION_LISTENER_CANDIDATES);
+    for index in 0..INJECTION_LISTENER_CANDIDATES {
+        let engine = Arc::new(injection_trap_engine(
+            workflow,
+            manifest,
+            catalog_providers,
+        )?);
+        let server = match BoundInjectionTrap::bind(
+            Arc::clone(&engine),
+            policy.credential,
+            policy.path_prefix,
+            None,
+            &run_profile_root.join(format!(
+                "dr65-candidate-provider-{invocation_sequence}-{index}"
+            )),
+        )
+        .await
+        {
+            Ok(server) => server,
+            Err(error) => {
+                for (_, candidate) in candidates {
+                    let _ = candidate.shutdown().await;
+                }
+                return Err(AhrbError::Protocol(format!(
+                    "row-65 {} candidate trap: {error}",
+                    policy.label
+                )));
+            }
+        };
+        candidates.push((engine, server));
+    }
+    let all_tcp = candidates
+        .iter()
+        .all(|(_, server)| matches!(server.endpoint(), InjectionTrapEndpoint::Tcp(_)));
+    let all_mailbox = candidates
+        .iter()
+        .all(|(_, server)| matches!(server.endpoint(), InjectionTrapEndpoint::Mailbox(_)));
+    if !all_tcp && !all_mailbox {
+        for (_, candidate) in candidates {
+            let _ = candidate.shutdown().await;
+        }
+        return Err(AhrbError::Protocol(format!(
+            "row-65 {} candidate traps used distinguishable transport kinds",
+            policy.label
+        )));
+    }
+    Ok(candidates)
+}
+
+fn choose_injection_expected_listener() -> Result<usize> {
+    let mut random = [0_u8; 1];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(usize::from(random[0]) % INJECTION_LISTENER_CANDIDATES)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn collect_injection_run(
     manifest: &Manifest,
     run_profile_root: &Path,
     label: &str,
     provider: &str,
+    catalog_providers: &[String],
     credential: &str,
     baseline_credential: &str,
     separate_baseline_listener: bool,
+    prior_endpoints: &[InjectionTrapEndpoint],
 ) -> Result<InjectionRunObservation> {
-    let profile_root = run_profile_root.join(format!("dr65-{label}"));
+    let profile_root = run_profile_root.join("dr65");
+    match std::fs::remove_dir_all(&profile_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     prepare_profile(manifest, &profile_root)?;
-    let workflow = injection_surface_workflow(&profile_root, label);
+    let workflow = injection_surface_workflow(&profile_root);
     workflow.validate()?;
-    let expected_engine = Arc::new(FakeModelEngine::with_request_roles(
-        &workflow,
-        &manifest.model_roles,
-        &manifest.request_role_rules,
-    )?);
-    let expected_server = BoundInjectionTrap::bind(
-        Arc::clone(&expected_engine),
-        (label == "credential").then_some(credential),
-        &format!("{label}-expected"),
-    )
-    .await
-    .map_err(|error| AhrbError::Protocol(format!("row-65 {label} expected trap: {error}")))?;
-    let expected_base_url = expected_server.base_url.clone();
-    let unexpected = if separate_baseline_listener {
-        let engine = Arc::new(FakeModelEngine::with_request_roles(
+    // Discovery is held invariant across baseline and component trials so it
+    // cannot disclose the provider value that the declared carrier must set.
+    let invocation_sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut unexpected = Vec::new();
+    for (index, endpoint) in prior_endpoints.iter().enumerate() {
+        let engine = Arc::new(injection_trap_engine(
             &workflow,
-            &manifest.model_roles,
-            &manifest.request_role_rules,
+            manifest,
+            catalog_providers,
         )?);
-        let server =
-            BoundInjectionTrap::bind(Arc::clone(&engine), None, &format!("{label}-baseline"))
-                .await
-                .map_err(|error| {
-                    AhrbError::Protocol(format!("row-65 {label} baseline trap: {error}"))
-                })?;
-        Some((engine, server))
+        let server = BoundInjectionTrap::bind(
+            Arc::clone(&engine),
+            None,
+            None,
+            Some(endpoint),
+            &run_profile_root.join(format!("dr65-prior-provider-{invocation_sequence}-{index}")),
+        )
+        .await
+        .map_err(|error| {
+            AhrbError::Protocol(format!("row-65 {label} prior endpoint trap: {error}"))
+        })?;
+        unexpected.push((engine, server));
+    }
+    // Bind every fresh candidate with the same behavior before assigning any
+    // role. Descriptor order, port order, and listener count therefore do not
+    // identify the endpoint named by the declared carrier.
+    let candidate_credential = (label == "credential").then_some(credential);
+    let path_prefix = if separate_baseline_listener {
+        let mut token = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
+        let token = format!("{:x}", Sha256::digest(token));
+        Some(format!("/ahrb-route-{}", &token[..32]))
     } else {
         None
     };
-    let baseline_base_url = unexpected
-        .as_ref()
-        .map_or(expected_base_url.as_str(), |(_, server)| {
-            server.base_url.as_str()
-        });
+    let mut candidates = bind_injection_listener_candidates(
+        &workflow,
+        manifest,
+        catalog_providers,
+        InjectionListenerPolicy {
+            label,
+            credential: candidate_credential,
+            path_prefix: path_prefix.as_deref(),
+        },
+        run_profile_root,
+        invocation_sequence,
+    )
+    .await?;
+    let expected_listener_slot = choose_injection_expected_listener()?;
+    let (expected_engine, expected_server) = candidates.swap_remove(expected_listener_slot);
+    unexpected.extend(candidates);
+    let expected_base_url = format!(
+        "{}{}",
+        expected_server.base_url,
+        path_prefix.as_deref().unwrap_or_default()
+    );
+    let baseline_base_url = if separate_baseline_listener {
+        unexpected
+            .last()
+            .ok_or_else(|| {
+                AhrbError::Protocol("row-65 baseline listener candidate disappeared".to_owned())
+            })?
+            .1
+            .base_url
+            .clone()
+    } else {
+        expected_base_url.clone()
+    };
     let variables = BTreeMap::from([
         (
             "profile".to_owned(),
             profile_root.to_string_lossy().into_owned(),
         ),
         ("endpoint".to_owned(), String::new()),
-        ("base_url".to_owned(), baseline_base_url.to_owned()),
+        ("base_url".to_owned(), baseline_base_url.clone()),
         ("credential".to_owned(), baseline_credential.to_owned()),
         ("model".to_owned(), manifest.fake_model.model.clone()),
         ("provider".to_owned(), manifest.fake_model.model.clone()),
+        ("ahrb_invariant_daemon_logs".to_owned(), "true".to_owned()),
     ]);
     let mut trial_manifest = manifest.clone();
     let mut environment = isolated_environment(&trial_manifest, &variables)?;
     environment.insert(
         manifest.fake_model.base_url_env.clone(),
-        baseline_base_url.to_owned(),
+        baseline_base_url.clone(),
     );
     environment.insert(
         manifest.fake_model.credential_env.clone(),
@@ -8944,7 +10199,7 @@ async fn collect_injection_run(
         &profile_root,
     )?;
     let mut base_url_variables = variables.clone();
-    base_url_variables.insert("base_url".to_owned(), expected_base_url);
+    base_url_variables.insert("base_url".to_owned(), expected_base_url.clone());
     let base_url_value = base_url_variables
         .get("base_url")
         .cloned()
@@ -8971,7 +10226,7 @@ async fn collect_injection_run(
         || command_contains_credential(&trial_manifest, baseline_credential);
     let active_baseline_credential_rejected = if label == "credential" {
         expected_server
-            .probe_rejected_credential(baseline_credential)
+            .probe_rejected_credential(path_prefix.as_deref(), baseline_credential)
             .await?
     } else {
         false
@@ -8990,21 +10245,27 @@ async fn collect_injection_run(
         false,
         outer_turn_timeout(&trial_manifest),
     )?;
-    let actor_name = format!("r65-{label}");
+    let actor_name = "r65".to_owned();
     let actor = workflow
         .actors
         .get(&actor_name)
         .ok_or_else(|| AhrbError::Protocol(format!("row-65 actor {actor_name:?} disappeared")))?;
     let mut terminal_success = false;
+    let mut catalog_counts_at_session_start = (0, 0);
+    let mut catalog_count_sample_ns = 0;
     let behavioral_run: Result<()> = async {
         driver.start().await?;
         driver.await_readiness().await?;
+        if trial_manifest.daemon.persistent && !trial_manifest.daemon.initialize.is_empty() {
+            // Credit only catalog GETs observed before any session or turn starts.
+            // Unknown requests and all wrong-listener traffic remain in the oracle.
+            catalog_count_sample_ns = crate::fake_model::monotonic_timestamp_ns();
+            catalog_counts_at_session_start = expected_server.catalog_request_counts();
+        }
         let session = driver
             .create_session(&format!("{}:{actor_name}", workflow.scenario))
             .await?;
-        driver
-            .submit(&session, &actor.prompt, &format!("row-65-{label}"))
-            .await?;
+        driver.submit(&session, &actor.prompt, "row-65").await?;
         let events = collect_session_terminal(
             &mut driver,
             &session,
@@ -9030,27 +10291,98 @@ async fn collect_injection_run(
         shutdown?;
     }
     let expected_records = expected_engine.request_records().await;
-    let expected_physical_requests = expected_server.physical_request_count();
+    let initialization_catalog_counts = expected_server.catalog_request_counts();
+    let mut physical_requests = expected_server
+        .physical_request_records()
+        .into_iter()
+        .map(|record| {
+            json!({
+                "listener": "declared",
+                "endpoint": format!("{:?}", expected_server.endpoint()),
+                "received_ns": record.received_ns,
+                "method": record.method,
+                "path": record.path,
+                "catalog": record.catalog,
+                "credential_rejected": record.credential_rejected,
+                "path_rejected": record.path_rejected,
+            })
+        })
+        .collect::<Vec<_>>();
+    let expected_path_rejections = expected_server.path_rejection_count();
+    let expected_physical_requests = expected_server
+        .physical_request_count()
+        .checked_sub(expected_path_rejections)
+        .ok_or_else(|| {
+            AhrbError::Protocol(
+                "row-65 path rejection count exceeded physical request count".to_owned(),
+            )
+        })?;
     let credential_rejections = expected_server.credential_rejection_count();
-    let unexpected_records = if let Some((engine, server)) = unexpected {
-        let records = engine.request_records().await;
-        let physical_requests = server.physical_request_count();
+    let expected_endpoint = expected_server.endpoint();
+    let mut exposed_endpoints = vec![expected_endpoint.clone()];
+    let mut unexpected_records = Vec::new();
+    let mut unexpected_physical_requests = expected_path_rejections;
+    for (engine, server) in unexpected {
+        unexpected_records.extend(engine.request_records().await);
+        unexpected_physical_requests += server.physical_request_count();
+        physical_requests.extend(server.physical_request_records().into_iter().map(|record| {
+            json!({
+                "listener": "other",
+                "endpoint": format!("{:?}", server.endpoint()),
+                "received_ns": record.received_ns,
+                "method": record.method,
+                "path": record.path,
+                "catalog": record.catalog,
+                "credential_rejected": record.credential_rejected,
+                "path_rejected": record.path_rejected,
+            })
+        }));
+        let endpoint = server.endpoint();
+        if !prior_endpoints.contains(&endpoint) {
+            exposed_endpoints.push(endpoint);
+        }
         server.shutdown().await?;
-        (records, physical_requests)
-    } else {
-        (Vec::new(), 0)
-    };
+    }
     expected_server.shutdown().await?;
     Ok(InjectionRunObservation {
         expected_records,
-        unexpected_records: unexpected_records.0,
+        unexpected_records,
         expected_physical_requests,
-        unexpected_physical_requests: unexpected_records.1,
+        unexpected_physical_requests,
         credential_rejections,
         active_baseline_credential_rejected,
         terminal_success,
         secret_in_argv,
+        initialization_catalog_requests: initialization_catalog_counts.0,
+        initialization_catalog_credential_rejections: initialization_catalog_counts.1,
+        catalog_count_sample_ns,
+        catalog_requests_at_session_start: catalog_counts_at_session_start.0,
+        physical_requests,
+        expected_base_url,
+        baseline_base_url,
+        expected_endpoint,
+        exposed_endpoints,
     })
+}
+
+fn retain_injection_endpoints(
+    prior_endpoints: &mut Vec<InjectionTrapEndpoint>,
+    observation: &InjectionRunObservation,
+) {
+    for endpoint in &observation.exposed_endpoints {
+        if !prior_endpoints.contains(endpoint) {
+            prior_endpoints.push(endpoint.clone());
+        }
+    }
+}
+
+fn fresh_injection_credential(label: &str) -> Result<String> {
+    let mut token = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
+    Ok(format!(
+        "ahrb-row65-{label}-{}",
+        &format!("{:x}", Sha256::digest(token))[..32]
+    ))
 }
 
 async fn collect_injection_surface_trials(
@@ -9063,26 +10395,104 @@ async fn collect_injection_surface_trials(
         .injection_surface
         .as_ref()
         .ok_or_else(|| AhrbError::Validation("row-65 requires injection_surface".to_owned()))?;
-    let baseline_credential = format!("ahrb-row65-a-{}", &manifest_hash[..16]);
-    let trap_credential = format!("ahrb-row65-b-{}", &manifest_hash[..16]);
-    let baseline = collect_injection_run(
-        manifest,
-        run_profile_root,
-        "baseline",
-        &manifest.fake_model.model,
-        &baseline_credential,
-        &baseline_credential,
-        false,
-    )
-    .await?;
+    // Use independent 128-bit random inputs. A client that observes baseline A
+    // must not be able to compute trial B from A or from invocation history.
+    let baseline_credential = fresh_injection_credential("a")?;
+    let trap_credential = fresh_injection_credential("b")?;
+    let mut probe_nonce = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut probe_nonce)?;
+    let mut probe_hasher = Sha256::new();
+    probe_hasher.update(manifest_hash.as_bytes());
+    probe_hasher.update(probe_nonce);
+    let probe_digest = format!("{:x}", probe_hasher.finalize());
+    let catalog_providers = (0_u8..16)
+        .map(|index| {
+            let mut hasher = Sha256::new();
+            hasher.update(probe_digest.as_bytes());
+            hasher.update([index]);
+            format!("ahrb-probe-{}", &format!("{:x}", hasher.finalize())[..24])
+        })
+        .collect::<Vec<_>>();
+    // Keep the selected provider away from both catalog edges. Clients that
+    // pick the first or last discovered alternative without reading the
+    // declared carrier therefore fail deterministically.
+    let provider_probe = catalog_providers[1 + usize::from(probe_nonce[1] % 14)].clone();
+    // Baseline and provider runs are otherwise observationally identical. Use
+    // a hidden order bit so process IDs, timing, or an external invocation
+    // counter cannot stand in for the provider carrier that is under test.
+    let provider_first =
+        probe_nonce[0] & 1 == 1 && surface.provider.method != InjectionMethod::Impossible;
+    let mut prior_endpoints = Vec::new();
+    let (baseline, mut provider_observation) = if provider_first {
+        let provider = collect_injection_run(
+            manifest,
+            run_profile_root,
+            "provider",
+            &provider_probe,
+            &catalog_providers,
+            &baseline_credential,
+            &baseline_credential,
+            false,
+            &prior_endpoints,
+        )
+        .await?;
+        retain_injection_endpoints(&mut prior_endpoints, &provider);
+        let baseline = collect_injection_run(
+            manifest,
+            run_profile_root,
+            "baseline",
+            &manifest.fake_model.model,
+            &catalog_providers,
+            &baseline_credential,
+            &baseline_credential,
+            false,
+            &prior_endpoints,
+        )
+        .await?;
+        retain_injection_endpoints(&mut prior_endpoints, &baseline);
+        (baseline, Some(provider))
+    } else {
+        let baseline = collect_injection_run(
+            manifest,
+            run_profile_root,
+            "baseline",
+            &manifest.fake_model.model,
+            &catalog_providers,
+            &baseline_credential,
+            &baseline_credential,
+            false,
+            &prior_endpoints,
+        )
+        .await?;
+        retain_injection_endpoints(&mut prior_endpoints, &baseline);
+        let provider = if surface.provider.method == InjectionMethod::Impossible {
+            None
+        } else {
+            let observation = collect_injection_run(
+                manifest,
+                run_profile_root,
+                "provider",
+                &provider_probe,
+                &catalog_providers,
+                &baseline_credential,
+                &baseline_credential,
+                false,
+                &prior_endpoints,
+            )
+            .await?;
+            retain_injection_endpoints(&mut prior_endpoints, &observation);
+            Some(observation)
+        };
+        (baseline, provider)
+    };
     let baseline_records = baseline
         .expected_records
         .iter()
-        .filter(|record| record.accepted && record.request.actor == "r65-baseline")
+        .filter(|record| record.accepted && record.request.actor == "r65")
         .collect::<Vec<_>>();
     let baseline_fingerprints = injection_credential_fingerprints(&baseline_credential);
     let baseline_runnable = baseline.terminal_success
-        && baseline.expected_physical_requests == 1
+        && baseline.expected_physical_requests == 1 + baseline.initialization_catalog_requests
         && baseline_records.len() == 1
         && baseline_records
             .iter()
@@ -9090,9 +10500,15 @@ async fn collect_injection_surface_trials(
         && baseline_records
             .iter()
             .all(|record| baseline_fingerprints.contains(&record.request.credential_fingerprint))
+        && baseline.unexpected_physical_requests == 0
         && !baseline.secret_in_argv;
     let baseline_provider_requests = baseline.expected_physical_requests;
+    let baseline_initialization_catalog_requests = baseline.initialization_catalog_requests;
+    let baseline_catalog_count_sample_ns = baseline.catalog_count_sample_ns;
+    let baseline_catalog_requests_at_session_start = baseline.catalog_requests_at_session_start;
+    let baseline_physical_requests = baseline.physical_requests.clone();
     let mut requests = baseline.expected_records;
+    requests.extend(baseline.unexpected_records);
     let mut evidence = Vec::new();
     for (component_name, component) in [
         ("provider", &surface.provider),
@@ -9106,6 +10522,17 @@ async fn collect_injection_surface_trials(
                 carrier: injection_carrier_label(component),
                 baseline_provider_requests,
                 perturbed_provider_requests: 0,
+                baseline_initialization_catalog_requests,
+                initialization_catalog_requests: 0,
+                initialization_catalog_credential_rejections: 0,
+                baseline_catalog_count_sample_ns,
+                catalog_count_sample_ns: 0,
+                baseline_catalog_requests_at_session_start,
+                catalog_requests_at_session_start: 0,
+                baseline_physical_requests: baseline_physical_requests.clone(),
+                physical_requests: Vec::new(),
+                expected_base_url: String::new(),
+                baseline_base_url: String::new(),
                 expected_endpoint_reached: false,
                 unexpected_endpoint_requests: 0,
                 credential_accepted: false,
@@ -9116,7 +10543,7 @@ async fn collect_injection_surface_trials(
             continue;
         }
         let provider = if component_name == "provider" {
-            "ahrb-trap-model"
+            provider_probe.as_str()
         } else {
             manifest.fake_model.model.as_str()
         };
@@ -9125,25 +10552,42 @@ async fn collect_injection_surface_trials(
         } else {
             baseline_credential.as_str()
         };
-        let observation = collect_injection_run(
-            manifest,
-            run_profile_root,
-            component_name,
-            provider,
-            credential,
-            &baseline_credential,
-            component_name == "base_url",
-        )
-        .await?;
-        let actor = format!("r65-{component_name}");
+        let observation = if component_name == "provider" {
+            provider_observation.take().ok_or_else(|| {
+                AhrbError::Protocol("row-65 provider observation disappeared".to_owned())
+            })?
+        } else {
+            collect_injection_run(
+                manifest,
+                run_profile_root,
+                component_name,
+                provider,
+                &catalog_providers,
+                credential,
+                &baseline_credential,
+                component_name == "base_url",
+                &prior_endpoints,
+            )
+            .await?
+        };
+        let newly_collected = component_name != "provider";
+        if newly_collected && prior_endpoints.contains(&observation.expected_endpoint) {
+            return Err(AhrbError::Protocol(
+                "row-65 expected provider endpoint was reused between isolated trials".to_owned(),
+            ));
+        }
+        if newly_collected {
+            retain_injection_endpoints(&mut prior_endpoints, &observation);
+        }
         let expected_records = observation
             .expected_records
             .iter()
-            .filter(|record| record.accepted && record.request.actor == actor)
+            .filter(|record| record.accepted && record.request.actor == "r65")
             .collect::<Vec<_>>();
         let expected_physical_requests = if component_name == "credential" { 2 } else { 1 };
         let expected_endpoint_reached = expected_records.len() == 1
-            && observation.expected_physical_requests == expected_physical_requests;
+            && observation.expected_physical_requests
+                == expected_physical_requests + observation.initialization_catalog_requests;
         let credential_fingerprints = injection_credential_fingerprints(credential);
         let credential_accepted = !expected_records.is_empty()
             && expected_records.iter().all(|record| {
@@ -9151,7 +10595,8 @@ async fn collect_injection_surface_trials(
             });
         let baseline_credential_rejected = component_name == "credential"
             && observation.active_baseline_credential_rejected
-            && observation.credential_rejections == 1;
+            && observation.credential_rejections
+                == 1 + observation.initialization_catalog_credential_rejections;
         let component_verified = baseline_runnable
             && observation.terminal_success
             && expected_endpoint_reached
@@ -9160,7 +10605,7 @@ async fn collect_injection_surface_trials(
             && !observation.secret_in_argv
             && match component_name {
                 "provider" => expected_records.iter().all(|record| {
-                    record.request.model == "ahrb-trap-model"
+                    record.request.model == provider_probe
                         && record.request.model != manifest.fake_model.model
                 }),
                 "base_url" => true,
@@ -9173,6 +10618,18 @@ async fn collect_injection_surface_trials(
             carrier: injection_carrier_label(component),
             baseline_provider_requests,
             perturbed_provider_requests: observation.expected_physical_requests,
+            baseline_initialization_catalog_requests,
+            initialization_catalog_requests: observation.initialization_catalog_requests,
+            initialization_catalog_credential_rejections: observation
+                .initialization_catalog_credential_rejections,
+            baseline_catalog_count_sample_ns,
+            catalog_count_sample_ns: observation.catalog_count_sample_ns,
+            baseline_catalog_requests_at_session_start,
+            catalog_requests_at_session_start: observation.catalog_requests_at_session_start,
+            baseline_physical_requests: baseline_physical_requests.clone(),
+            physical_requests: observation.physical_requests,
+            expected_base_url: observation.expected_base_url,
+            baseline_base_url: observation.baseline_base_url,
             expected_endpoint_reached,
             unexpected_endpoint_requests: observation.unexpected_physical_requests,
             credential_accepted,
@@ -9875,22 +11332,119 @@ fn signal_target_identity(
         })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalJournalProvenance {
+    DeclaredNative,
+    DriverCache,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalTerminalProvenance {
+    DeclaredNativeJournal,
+    NormalizedHarnessOutput,
+    DriverSynthesized,
+}
+
+#[derive(Debug)]
+struct SignalMatrixJournal {
+    events: Vec<NormalizedEvent>,
+    provenance: SignalJournalProvenance,
+}
+
+impl SignalMatrixJournal {
+    fn terminal_provenance(&self, event: &NormalizedEvent) -> SignalTerminalProvenance {
+        match self.provenance {
+            SignalJournalProvenance::DeclaredNative => {
+                SignalTerminalProvenance::DeclaredNativeJournal
+            }
+            SignalJournalProvenance::DriverCache
+                if event.payload.get("_ahrb_source_raw").is_some() =>
+            {
+                SignalTerminalProvenance::NormalizedHarnessOutput
+            }
+            SignalJournalProvenance::DriverCache => SignalTerminalProvenance::DriverSynthesized,
+        }
+    }
+
+    fn source_terminal_count(&self) -> u32 {
+        u32::try_from(
+            self.events
+                .iter()
+                .filter(|event| is_terminal(&event.event))
+                .filter(|event| {
+                    !matches!(
+                        self.terminal_provenance(event),
+                        SignalTerminalProvenance::DriverSynthesized
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+}
+
 fn read_signal_matrix_journal(
     manifest: &Manifest,
     variables: &BTreeMap<String, String>,
     profile_root: &Path,
     session: &crate::driver::SessionId,
 ) -> Result<Vec<NormalizedEvent>> {
-    if manifest.events.path.trim().is_empty() {
-        return Err(AhrbError::Protocol(
-            "row-57 durable event journal path is absent".to_owned(),
-        ));
-    }
-    let mut rendered_variables = variables.clone();
-    rendered_variables.insert("session_id".to_owned(), session.0.clone());
-    let rendered = crate::manifest::render_template(&manifest.events.path, &rendered_variables)?;
+    Ok(read_signal_matrix_journal_at(manifest, variables, profile_root, session, None)?.events)
+}
+
+fn read_signal_matrix_journal_at(
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+    session: &crate::driver::SessionId,
+    driver_journal: Option<&Path>,
+) -> Result<SignalMatrixJournal> {
+    let (journal, provenance) = if manifest.events.path.trim().is_empty() {
+        (
+            driver_journal
+                .ok_or_else(|| {
+                    AhrbError::Protocol("row-57 durable event journal path is absent".to_owned())
+                })?
+                .to_path_buf(),
+            SignalJournalProvenance::DriverCache,
+        )
+    } else {
+        let mut rendered_variables = variables.clone();
+        rendered_variables.insert("session_id".to_owned(), session.0.clone());
+        let rendered =
+            crate::manifest::render_template(&manifest.events.path, &rendered_variables)?;
+        (
+            PathBuf::from(rendered),
+            SignalJournalProvenance::DeclaredNative,
+        )
+    };
+    let driver_owned = provenance == SignalJournalProvenance::DriverCache;
     let canonical_profile = profile_root.canonicalize()?;
-    let canonical_journal = Path::new(&rendered).canonicalize()?;
+    let canonical_journal = match journal.canonicalize() {
+        Ok(path) => path,
+        Err(error) if driver_owned && error.kind() == std::io::ErrorKind::NotFound => {
+            let canonical_parent = journal
+                .parent()
+                .ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "row-57 driver journal has no containing directory".to_owned(),
+                    )
+                })?
+                .canonicalize()?;
+            if !canonical_parent.starts_with(&canonical_profile) {
+                return Err(AhrbError::Protocol(format!(
+                    "row-57 driver journal parent {} is outside {}",
+                    canonical_parent.display(),
+                    canonical_profile.display()
+                )));
+            }
+            return Ok(SignalMatrixJournal {
+                events: Vec::new(),
+                provenance,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !canonical_journal.starts_with(&canonical_profile) || !canonical_journal.is_file() {
         return Err(AhrbError::Protocol(format!(
             "row-57 journal {} is not a regular file inside {}",
@@ -9916,12 +11470,47 @@ fn read_signal_matrix_journal(
                 canonical_journal.display()
             ))
         })?;
-        if event.session_id == session.0 {
+        if driver_owned || event.session_id == session.0 {
             events.push(event);
         }
     }
     events.sort_by(|left, right| (left.cursor, &left.id).cmp(&(right.cursor, &right.id)));
-    Ok(events)
+    Ok(SignalMatrixJournal { events, provenance })
+}
+
+async fn refresh_signal_matrix_journal_if_needed(
+    driver: &mut HarnessDriver,
+    manifest: &Manifest,
+    variables: &BTreeMap<String, String>,
+    profile_root: &Path,
+    session: &crate::driver::SessionId,
+) -> Result<SignalMatrixJournal> {
+    let driver_journal = driver.durable_event_path(session);
+    let journal = read_signal_matrix_journal_at(
+        manifest,
+        variables,
+        profile_root,
+        session,
+        driver_journal.as_deref(),
+    )?;
+    if journal.events.iter().any(|event| is_terminal(&event.event))
+        || journal.provenance == SignalJournalProvenance::DeclaredNative
+    {
+        return Ok(journal);
+    }
+
+    // AHRB's stdout cache is populated by the per-invocation driver's attach
+    // path. A manifest-declared journal is already durable source evidence and
+    // must remain readable after a daemon has correctly closed its live RPC.
+    let _ = driver.attach(session, None).await?;
+    let driver_journal = driver.durable_event_path(session);
+    read_signal_matrix_journal_at(
+        manifest,
+        variables,
+        profile_root,
+        session,
+        driver_journal.as_deref(),
+    )
 }
 
 async fn wait_for_signal_fixture_hold(
@@ -10009,17 +11598,33 @@ async fn wait_for_signal_process_exit(
 }
 
 async fn wait_for_signal_terminal_receipt(
+    driver: &mut HarnessDriver,
     manifest: &Manifest,
     variables: &BTreeMap<String, String>,
     profile_root: &Path,
     session: &crate::driver::SessionId,
     deadline: Instant,
-) -> Result<(Vec<NormalizedEvent>, u64)> {
+    mut cleanup_at: Option<Instant>,
+) -> Result<(Vec<NormalizedEvent>, u64, bool)> {
+    let mut cleanup_escalated = false;
     loop {
-        let events = read_signal_matrix_journal(manifest, variables, profile_root, session)?;
+        let journal = refresh_signal_matrix_journal_if_needed(
+            driver,
+            manifest,
+            variables,
+            profile_root,
+            session,
+        )
+        .await?;
         let receipt_ns = monotonic_timestamp_ns();
-        if events.iter().any(|event| is_terminal(&event.event)) {
-            return Ok((events, receipt_ns));
+        if journal.events.iter().any(|event| is_terminal(&event.event)) {
+            return Ok((journal.events, receipt_ns, cleanup_escalated));
+        }
+        if cleanup_at.is_some_and(|at| Instant::now() >= at) {
+            driver.force_stop_session(session).await?;
+            cleanup_escalated = true;
+            cleanup_at = None;
+            continue;
         }
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -10049,12 +11654,14 @@ fn annotate_signal_matrix_events(
     case: SignalMatrixCase,
     origin_ns: u64,
     terminal_receipt_ns: u64,
+    cleanup_escalated: bool,
 ) {
     for event in events {
         let receipt = json!({
             "signal": case.label(),
             "origin_ns": origin_ns,
             "terminal_receipt_ns": terminal_receipt_ns,
+            "cleanup_escalated": cleanup_escalated,
         });
         if let Some(payload) = event.payload.as_object_mut() {
             payload.insert("_ahrb_row57_receipt".to_owned(), receipt);
@@ -10187,20 +11794,38 @@ async fn collect_signal_matrix_case(
         )
         .await?;
         let owned_tree = sampler.discover(&roots)?;
-        let target = signal_target_identity(&owned_tree, &roots)?;
+        let session_roots = driver.session_pids(&session);
+        let signal_roots = if session_roots.is_empty() {
+            &roots
+        } else {
+            &session_roots
+        };
+        let target = signal_target_identity(&owned_tree, signal_roots)?;
         #[cfg(unix)]
-        let (origin_ns, deadline, early_terminal_receipt) = if let Some(signal) = case.unix_signal() {
+        let (origin_ns, deadline, early_terminal_receipt, cleanup_at) = if let Some(signal) = case.unix_signal() {
             crate::process::deliver_registered_tree_signal(target, signal)?;
             let origin = monotonic_timestamp_ns();
             let deadline = Instant::now() + outer_deadline;
+            let cleanup_at = Instant::now()
+                + Duration::from_millis(manifest.daemon.grace_ms.saturating_add(250));
             let early_terminal_receipt = if case == SignalMatrixCase::Sigint2 {
                 let second_delivery_at = Instant::now() + Duration::from_millis(250);
                 loop {
-                    let events =
-                        read_signal_matrix_journal(manifest, &variables, &profile_root, &session)?;
+                    let journal = refresh_signal_matrix_journal_if_needed(
+                        &mut driver,
+                        manifest,
+                        &variables,
+                        &profile_root,
+                        &session,
+                    )
+                    .await?;
                     let receipt_ns = monotonic_timestamp_ns();
-                    if events.iter().any(|event| is_terminal(&event.event)) {
-                        break Some((events, receipt_ns));
+                    if journal
+                        .events
+                        .iter()
+                        .any(|event| is_terminal(&event.event))
+                    {
+                        break Some((journal.events, receipt_ns, false));
                     }
                     let now = Instant::now();
                     if now >= second_delivery_at {
@@ -10225,21 +11850,26 @@ async fn collect_signal_matrix_case(
             } else {
                 None
             };
-            (origin, deadline, early_terminal_receipt)
+            (origin, deadline, early_terminal_receipt, Some(cleanup_at))
         } else {
             driver.close_stdin().await?;
             (
                 monotonic_timestamp_ns(),
                 Instant::now() + outer_deadline,
                 None,
+                Some(
+                    Instant::now()
+                        + Duration::from_millis(manifest.daemon.grace_ms.saturating_add(250)),
+                ),
             )
         };
         #[cfg(not(unix))]
-        let (origin_ns, deadline, early_terminal_receipt) = if case == SignalMatrixCase::StdinEof {
+        let (origin_ns, deadline, early_terminal_receipt, cleanup_at) = if case == SignalMatrixCase::StdinEof {
             driver.close_stdin().await?;
             (
                 monotonic_timestamp_ns(),
                 Instant::now() + outer_deadline,
+                None,
                 None,
             )
         } else {
@@ -10247,15 +11877,18 @@ async fn collect_signal_matrix_case(
                 "row-57 Unix signal delivery is unavailable".to_owned(),
             ));
         };
-        let (first_terminal_events, terminal_ns) = match early_terminal_receipt {
+        let (first_terminal_events, terminal_ns, cleanup_escalated) =
+            match early_terminal_receipt {
             Some(receipt) => receipt,
             None => {
                 wait_for_signal_terminal_receipt(
+                    &mut driver,
                     manifest,
                     &variables,
                     &profile_root,
                     &session,
                     deadline,
+                    cleanup_at,
                 )
                 .await?
             }
@@ -10272,7 +11905,16 @@ async fn collect_signal_matrix_case(
             deadline,
         )
         .await?;
-        let mut events = read_signal_matrix_journal(manifest, &variables, &profile_root, &session)?;
+        let driver_journal = driver.durable_event_path(&session);
+        let journal = read_signal_matrix_journal_at(
+            manifest,
+            &variables,
+            &profile_root,
+            &session,
+            driver_journal.as_deref(),
+        )?;
+        let source_terminal_count = journal.source_terminal_count();
+        let mut events = journal.events;
         if first_terminal_events
             .iter()
             .filter(|event| is_terminal(&event.event))
@@ -10307,7 +11949,13 @@ async fn collect_signal_matrix_case(
         let terminal_count = u32::try_from(terminals.len()).map_or(u32::MAX, |value| value);
         drop(terminals);
         let residue_processes = signal_matrix_residue_count(sampler.as_mut(), &roots).await?;
-        annotate_signal_matrix_events(&mut events, case, origin_ns, terminal_ns);
+        annotate_signal_matrix_events(
+            &mut events,
+            case,
+            origin_ns,
+            terminal_ns,
+            cleanup_escalated,
+        );
         let requests = engine.request_records().await;
         let (exit_code, exit_was_signal) = match exit {
             ClientExit::Exited(code) => (code, code.is_none()),
@@ -10325,10 +11973,12 @@ async fn collect_signal_matrix_case(
                 not_applicable_reason: None,
                 delivery_succeeded: Some(true),
                 ownership_resolved: Some(true),
+                cleanup_escalated: Some(cleanup_escalated),
                 origin_ns: Some(origin_ns),
                 terminal_ns: Some(terminal_ns),
                 terminal_type,
                 terminal_count: Some(terminal_count),
+                source_terminal_count: Some(source_terminal_count),
                 exit_code,
                 exit_was_signal: Some(exit_was_signal),
                 residue_processes: Some(residue_processes),
@@ -10395,10 +12045,12 @@ async fn collect_signal_matrix_trials(
                     ),
                     delivery_succeeded: None,
                     ownership_resolved: None,
+                    cleanup_escalated: None,
                     origin_ns: None,
                     terminal_ns: None,
                     terminal_type: None,
                     terminal_count: None,
+                    source_terminal_count: None,
                     exit_code: None,
                     exit_was_signal: None,
                     residue_processes: None,
@@ -10419,6 +12071,196 @@ async fn collect_signal_matrix_trials(
         }
     }
     Ok(collected)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod signal_matrix_source_tests {
+    use super::*;
+
+    async fn collect_native_signal_fixture(manifest_path: &str) -> (Manifest, SignalMatrixTrials) {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row57-native-terminal-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = crate::manifest::load(Path::new(manifest_path)).unwrap();
+        assert!(!manifest.events.path.trim().is_empty());
+        let trials = collect_signal_matrix_trials(
+            &manifest,
+            Profile::Quick,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        (manifest, trials)
+    }
+
+    fn assert_native_signal_fixture_passes(manifest: &Manifest, trials: &SignalMatrixTrials) {
+        let applicable = trials
+            .evidence
+            .iter()
+            .filter(|trial| trial.applicable)
+            .collect::<Vec<_>>();
+        assert!(!applicable.is_empty());
+        assert!(
+            applicable
+                .iter()
+                .all(|trial| trial.source_terminal_count == Some(1))
+        );
+        let outer_deadline_ms = u64::try_from(outer_turn_timeout(manifest).as_millis()).unwrap();
+        let evaluation = evaluate_signal_matrix(
+            &trials.evidence,
+            1,
+            manifest.daemon.grace_ms,
+            outer_deadline_ms,
+        );
+        assert!(evaluation.measurement_complete);
+        assert!(evaluation.passed, "{}", evaluation.details);
+    }
+
+    async fn collect_python_signal_fixture(emits_terminal: bool) -> (Manifest, SignalMatrixTrials) {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row57-source-terminal-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("signal_client.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, signal, sys, urllib.request
+emit_terminal = sys.argv[1] == "emit"
+prompt, session_id, actor = sys.argv[2:5]
+def stop(signum, frame):
+    if emit_terminal:
+        print(json.dumps({
+            "id": session_id + ":terminal",
+            "cursor": 1,
+            "session_id": session_id,
+            "actor": actor,
+            "event": "terminal-cancelled",
+            "payload": {"status": "cancelled"},
+        }), flush=True)
+    sys.exit(130)
+for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(handled, stop)
+body = json.dumps({
+    "model": os.environ.get("AHRB_MOCK_MODEL", "ahrb-fake-v1"),
+    "messages": [{"role": "user", "content": prompt}],
+    "stream": True,
+}).encode()
+request = urllib.request.Request(
+    os.environ["AHRB_MOCK_BASE_URL"] + "/v1/chat/completions",
+    data=body,
+    headers={
+        "Authorization": "Bearer " + os.environ["AHRB_MOCK_API_KEY"],
+        "Content-Type": "application/json",
+    },
+)
+with urllib.request.urlopen(request, timeout=60) as response:
+    response.read()
+"#,
+        )
+        .unwrap();
+
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            script.to_string_lossy().into_owned(),
+            if emits_terminal { "emit" } else { "silent" }.to_owned(),
+            "{{prompt}}".to_owned(),
+            "{{session_id}}".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        crate::manifest::validate(&manifest).unwrap();
+        let trials = collect_signal_matrix_trials(
+            &manifest,
+            Profile::Quick,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        (manifest, trials)
+    }
+
+    #[tokio::test]
+    async fn production_collector_requires_a_source_backed_terminal() {
+        let (manifest, silent) = collect_python_signal_fixture(false).await;
+        assert!(
+            silent
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .all(|trial| trial.source_terminal_count == Some(0))
+        );
+        let outer_deadline_ms = u64::try_from(outer_turn_timeout(&manifest).as_millis()).unwrap();
+        let silent_evaluation = evaluate_signal_matrix(
+            &silent.evidence,
+            1,
+            manifest.daemon.grace_ms,
+            outer_deadline_ms,
+        );
+        assert!(silent_evaluation.measurement_complete);
+        assert!(!silent_evaluation.passed);
+        assert!(silent_evaluation.measurement_error.is_none());
+
+        let (manifest, emitted) = collect_python_signal_fixture(true).await;
+        assert!(
+            emitted
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .all(|trial| trial.source_terminal_count == Some(1))
+        );
+        let outer_deadline_ms = u64::try_from(outer_turn_timeout(&manifest).as_millis()).unwrap();
+        let emitted_evaluation = evaluate_signal_matrix(
+            &emitted.evidence,
+            1,
+            manifest.daemon.grace_ms,
+            outer_deadline_ms,
+        );
+        assert!(emitted_evaluation.measurement_complete);
+        assert!(emitted_evaluation.passed);
+    }
+
+    #[tokio::test]
+    async fn production_collector_credits_exec_native_journal_terminals() {
+        let (manifest, trials) =
+            collect_native_signal_fixture("adapters/mock-exec/manifest.toml").await;
+        assert_eq!(
+            trials
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .count(),
+            3
+        );
+        assert_native_signal_fixture_passes(&manifest, &trials);
+    }
+
+    #[tokio::test]
+    async fn production_collector_reads_daemon_native_journal_after_rpc_closes() {
+        let (manifest, trials) = collect_native_signal_fixture("adapters/mock/manifest.toml").await;
+        assert_eq!(
+            trials
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .count(),
+            4
+        );
+        assert_native_signal_fixture_passes(&manifest, &trials);
+    }
 }
 
 async fn collect_retry_budget_trials(

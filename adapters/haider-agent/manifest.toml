@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.970-measurement-json-v2"
+revision = "0.0.970-measurement-capability-audit-v3"
 
 [availability]
 exec_paths = ["haider"]
@@ -94,6 +94,10 @@ command = [
 ]
 timeout_ms = 30000
 
+[input]
+# The declared run command supplies -p; closed stdin is not its input surface.
+prompt_uses_stdin = false
+
 [sessions]
 list = ["haider", "sessions", "--json", "--no-spawn"]
 wait_ready = ["haider", "sessions", "wait-ready", "--count", "{{count}}", "--timeout", "{{timeout}}", "--json", "--no-spawn"]
@@ -148,15 +152,25 @@ schema_version_pointer = "/schema_version"
 schema_versions = [1]
 warn_unmapped_payload_kinds = true
 
-# Narrative is intentionally undeclared. The saved row-69 journals (for example
-# results/haider-agent/2026-09-02T17:06:20Z-3eac4351/report.json) retain only a
-# final completed agent_message at /payload/item/text, omit the pre-tool
-# assistant item, and contain no reasoning item; run_state state="thinking" is
-# lifecycle metadata, not model reasoning. The 40-run real-model study using
-# `haider run --output json` likewise exposed no text-stream or reasoning
-# events. Row 69 therefore remains honestly UNSUPPORTED until Haider journals
-# the complete model narrative.
+# Probed on 0.0.970 and 0.0.971 with AHRB's fake model: completed items
+# retain both pre/post-tool text and emitted reasoning, including in replay.
+# Use completion snapshots once; do not also concatenate their live deltas.
+# /actor is the exec driver's retained source-record binding to the AHRB actor;
+# native envelopes separately retain /run_id and /payload/provider_request.
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/payload/item/text"
+assistant_text_match_fields = { "/payload/event" = "completed", "/payload/item/item" = "agent_message" }
+assistant_text_aggregation = "complete-event"
+reasoning_event = "model-response"
+reasoning_pointer = "/payload/item/summary"
+reasoning_match_fields = { "/payload/event" = "completed", "/payload/item/item" = "reasoning" }
+reasoning_aggregation = "complete-event"
+turn_pointer = "/actor"
+
 [events.metadata]
+timestamp_pointer = "/committed_at_ms"
+timestamp_format = "unix-ms"
 schema_version_pointer = "/schema_version"
 schema_version_value = "1"
 
@@ -190,6 +204,12 @@ payload_bindings = { call_id = "/payload/call_id", result = "/payload/result" }
 [[events.rules]]
 matches = "item"
 match_fields = { "/payload/event" = "completed", "/payload/item/item" = "agent_message" }
+event = "model-response"
+payload_pointer = "/payload/item"
+
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "completed", "/payload/item/item" = "reasoning" }
 event = "model-response"
 payload_pointer = "/payload/item"
 
@@ -247,7 +267,7 @@ max_output_bytes = 1048576
 [cleanup]
 paths = ["{{profile}}"]
 
-# Row 60 remains ERROR: inspected native 0.0.970 result previews expose
+# Row 60 remains ABSENT: inspected native 0.0.970 result previews expose
 # truncated=false, but no verified model-visible marker carrying all four
 # required fields (truncated, original_bytes, payload_bytes, full SHA-256).
 # No large-output trial was present in the source bundle; inventing a regex
@@ -256,15 +276,18 @@ paths = ["{{profile}}"]
 redact_env = ["OPENAI_API_KEY"]
 max_bytes = 1048576
 
+# Replace existing option values: Haider rejects duplicate --model flags,
+# and the stored account endpoint must be changed during public initialization.
 [capabilities.injection_surface.provider]
 method = "cli"
 argv = ["--model", "ahrb/{{provider}}"]
-argv_position = "suffix"
+argv_position = "replace-option"
 
 [capabilities.injection_surface.base_url]
 method = "cli"
+argv_target = "daemon-initialize"
+argv_position = "replace-option"
 argv = ["--base-url", "{{base_url}}"]
-argv_position = "suffix"
 
 [capabilities.injection_surface.credential]
 method = "environment"
@@ -300,8 +323,15 @@ durable_journal = "haider run --replay <run-id> replays the daemon-owned durable
 # TODO(orchestrator): verify complete allow, filesystem-deny, and network-deny
 # argv before declaring headless_permission_model; `--allow-writes` and
 # `--allow-exec` alone do not prove denial granularity.
-# TODO(orchestrator): pin the exact mode-0600 account/auth credential file, or
-# revise SPEC-v2 rule 6 for env-only credentials, before declaring
-# secrets_hygiene_on_disk.
-# TODO(orchestrator): capture timestamp and exact usage metadata from the live
-# JSONL carrier; only `/schema_version = 1` is currently grounded.
+# TODO(orchestrator): SPEC-v2 rule 6 requires an exact generated mode-0600
+# credential template. This adapter instead passes the fake credential to
+# account initialization via --api-key-env; pin a supported initializer-owned
+# carrier contract before declaring secrets_hygiene_on_disk.
+# TODO(orchestrator): usage is emitted per provider response, including both
+# responses of a tool turn. Pin a supported tariff and one semantic-turn carrier
+# with all five fields before declaring usage_reporting; timestamps and durable
+# narrative are now grounded on 0.0.970/971.
+# TODO(orchestrator): native agent spawn/list/message/cancel/wait and hooks
+# exist, but AHRB's exec driver rejects spawn/steer/subturn/queue and its hook
+# wiring supplies only AHRB_MOCK_* variables. Implement generic public controls
+# and hook installation before adding those capability rationales.

@@ -196,10 +196,13 @@ pub struct SignalCaseTrial {
     pub not_applicable_reason: Option<String>,
     pub delivery_succeeded: Option<bool>,
     pub ownership_resolved: Option<bool>,
+    pub cleanup_escalated: Option<bool>,
     pub origin_ns: Option<u64>,
     pub terminal_ns: Option<u64>,
     pub terminal_type: Option<String>,
     pub terminal_count: Option<u32>,
+    /// Terminals normalized from harness output rather than synthesized exits.
+    pub source_terminal_count: Option<u32>,
     pub exit_code: Option<i32>,
     pub exit_was_signal: Option<bool>,
     pub residue_processes: Option<u32>,
@@ -253,13 +256,22 @@ pub fn evaluate_signal_matrix(
                 trial.case
             ));
         }
+        if trial.cleanup_escalated.is_none() {
+            return incomplete(format!(
+                "{} cleanup-escalation evidence is incomplete",
+                trial.case
+            ));
+        }
         let (Some(origin_ns), Some(terminal_ns)) = (trial.origin_ns, trial.terminal_ns) else {
             return incomplete(format!("{} origin/terminal boundary is absent", trial.case));
         };
         if terminal_ns < origin_ns {
             return incomplete(format!("{} terminal precedes delivery origin", trial.case));
         }
-        if trial.terminal_type.is_none() || trial.terminal_count.is_none() {
+        if trial.terminal_type.is_none()
+            || trial.terminal_count.is_none()
+            || trial.source_terminal_count.is_none()
+        {
             return incomplete(format!(
                 "{} structured terminal boundary is absent",
                 trial.case
@@ -279,7 +291,9 @@ pub fn evaluate_signal_matrix(
             || trial.terminal_ns.is_some()
             || trial.delivery_succeeded.is_some()
             || trial.ownership_resolved.is_some()
+            || trial.cleanup_escalated.is_some()
             || trial.terminal_count.is_some()
+            || trial.source_terminal_count.is_some()
             || trial.exit_was_signal.is_some()
             || trial.residue_processes.is_some()
         {
@@ -322,6 +336,8 @@ pub fn evaluate_signal_matrix(
                 trial.terminal_type.as_deref(),
                 Some("failure" | "cancelled")
             ) && trial.terminal_count == Some(1)
+                && trial.source_terminal_count == Some(1)
+                && trial.cleanup_escalated == Some(false)
                 && trial.exit_was_signal == Some(false)
                 && trial.exit_code.is_some()
                 && trial.residue_processes == Some(0)
@@ -552,10 +568,12 @@ mod tests {
             not_applicable_reason: None,
             delivery_succeeded: Some(true),
             ownership_resolved: Some(true),
+            cleanup_escalated: Some(false),
             origin_ns: Some(1_000_000),
             terminal_ns: Some(2_000_000),
             terminal_type: Some("cancelled".to_owned()),
             terminal_count: Some(1),
+            source_terminal_count: Some(1),
             exit_code: Some(0),
             exit_was_signal: Some(false),
             residue_processes: Some(0),
@@ -573,10 +591,12 @@ mod tests {
                 ),
                 delivery_succeeded: None,
                 ownership_resolved: None,
+                cleanup_escalated: None,
                 origin_ns: None,
                 terminal_ns: None,
                 terminal_type: None,
                 terminal_count: None,
+                source_terminal_count: None,
                 exit_code: None,
                 exit_was_signal: None,
                 residue_processes: None,
@@ -609,10 +629,12 @@ mod tests {
                     not_applicable_reason: None,
                     delivery_succeeded: Some(true),
                     ownership_resolved: Some(true),
+                    cleanup_escalated: Some(false),
                     origin_ns: Some(1),
                     terminal_ns: Some(2),
                     terminal_type: Some("cancelled".to_owned()),
                     terminal_count: Some(1),
+                    source_terminal_count: Some(1),
                     exit_code: None,
                     exit_was_signal: None,
                     residue_processes: Some(0),
@@ -624,10 +646,12 @@ mod tests {
                     not_applicable_reason: None,
                     delivery_succeeded: Some(true),
                     ownership_resolved: Some(true),
+                    cleanup_escalated: Some(false),
                     origin_ns: Some(1),
                     terminal_ns: Some(2),
                     terminal_type: Some("cancelled".to_owned()),
                     terminal_count: Some(1),
+                    source_terminal_count: Some(1),
                     exit_code: Some(0),
                     exit_was_signal: Some(false),
                     residue_processes: Some(0),
@@ -639,10 +663,12 @@ mod tests {
                     not_applicable_reason: None,
                     delivery_succeeded: Some(true),
                     ownership_resolved: Some(true),
+                    cleanup_escalated: Some(false),
                     origin_ns: Some(1),
                     terminal_ns: Some(2),
                     terminal_type: Some("cancelled".to_owned()),
                     terminal_count: Some(1),
+                    source_terminal_count: Some(1),
                     exit_code: Some(0),
                     exit_was_signal: Some(false),
                     residue_processes: Some(0),
@@ -654,10 +680,12 @@ mod tests {
                     not_applicable_reason: Some("typed non-control stdin".to_owned()),
                     delivery_succeeded: None,
                     ownership_resolved: None,
+                    cleanup_escalated: None,
                     origin_ns: None,
                     terminal_ns: None,
                     terminal_type: None,
                     terminal_count: None,
+                    source_terminal_count: None,
                     exit_code: None,
                     exit_was_signal: None,
                     residue_processes: None,
@@ -740,10 +768,12 @@ mod tests {
             not_applicable_reason: None,
             delivery_succeeded: Some(true),
             ownership_resolved: Some(true),
+            cleanup_escalated: Some(false),
             origin_ns: Some(1_000_000),
             terminal_ns: Some(2_000_000),
             terminal_type: Some("cancelled".to_owned()),
             terminal_count: Some(1),
+            source_terminal_count: Some(1),
             exit_code: Some(0),
             exit_was_signal: Some(false),
             residue_processes: Some(0),
@@ -759,6 +789,42 @@ mod tests {
         assert!(evaluated.measurement_complete);
         assert!(!evaluated.passed);
         assert!(evaluated.measurement_error.is_none());
+    }
+
+    #[test]
+    fn signal_matrix_synthesized_terminal_is_complete_fail() {
+        let trial = |case: &str| SignalCaseTrial {
+            repetition: 1,
+            case: case.to_owned(),
+            applicable: true,
+            not_applicable_reason: None,
+            delivery_succeeded: Some(true),
+            ownership_resolved: Some(true),
+            cleanup_escalated: Some(false),
+            origin_ns: Some(1_000_000),
+            terminal_ns: Some(2_000_000),
+            terminal_type: Some("cancelled".to_owned()),
+            terminal_count: Some(1),
+            source_terminal_count: Some(0),
+            exit_code: Some(130),
+            exit_was_signal: Some(false),
+            residue_processes: Some(0),
+        };
+        let evaluated = evaluate_signal_matrix(
+            &[
+                trial("sigterm"),
+                trial("sigint2"),
+                trial("sighup"),
+                trial("stdin-eof"),
+            ],
+            1,
+            2_000,
+            10_000,
+        );
+        assert!(evaluated.measurement_complete);
+        assert!(!evaluated.passed);
+        assert!(evaluated.measurement_error.is_none());
+        assert_eq!(evaluated.metrics["signal_matrix.passed_cases"], 0.0);
     }
 
     #[test]

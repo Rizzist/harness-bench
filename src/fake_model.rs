@@ -681,6 +681,7 @@ pub struct FakeModelEngine {
     request_role_rules: Vec<RequestRoleRule>,
     semantic_ordinals: BTreeMap<(String, String, String), u64>,
     context_window_tokens: Option<u64>,
+    catalog_models: Vec<String>,
     storage_context_gate: StdMutex<Option<Arc<StorageContextGate>>>,
     context_faulted_routes: Mutex<BTreeSet<(String, String, String)>>,
 }
@@ -748,6 +749,7 @@ impl FakeModelEngine {
             request_role_rules,
             semantic_ordinals,
             context_window_tokens,
+            catalog_models: vec!["ahrb-fake-v1".to_owned()],
             storage_context_gate: StdMutex::new(None),
             context_faulted_routes: Mutex::new(BTreeSet::new()),
         })
@@ -761,6 +763,14 @@ impl FakeModelEngine {
             .map_err(|_| AhrbError::Protocol("context gate lock poisoned".into()))? =
             Some(Arc::clone(&gate));
         Ok(gate)
+    }
+
+    /// Advertise an additional model used by a specific fake-provider trial.
+    pub(crate) fn with_catalog_model(mut self, model: &str) -> Self {
+        if !self.catalog_models.iter().any(|existing| existing == model) {
+            self.catalog_models.push(model.to_owned());
+        }
+        self
     }
 
     /// Advertised row-51 provider context window, when configured.
@@ -1846,6 +1856,26 @@ impl ProtocolFrontend for AnthropicMessagesFrontend {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PhysicalHttpRequestRecord {
+    pub received_ns: u64,
+    pub method: String,
+    pub path: String,
+    pub catalog: bool,
+    pub credential_rejected: bool,
+    pub path_rejected: bool,
+}
+
+#[derive(Debug, Default)]
+struct HttpRequestCounters {
+    physical: AtomicU64,
+    credential_rejections: AtomicU64,
+    catalog: AtomicU64,
+    catalog_credential_rejections: AtomicU64,
+    path_rejections: AtomicU64,
+    records: StdMutex<Vec<PhysicalHttpRequestRecord>>,
+}
+
 /// A running local fake-model HTTP server.
 #[derive(Debug)]
 pub struct FakeModelServer {
@@ -1853,40 +1883,59 @@ pub struct FakeModelServer {
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
     engine: Arc<FakeModelEngine>,
-    physical_requests: Arc<AtomicU64>,
-    credential_rejections: Arc<AtomicU64>,
+    counters: Arc<HttpRequestCounters>,
 }
 
 impl FakeModelServer {
     /// Bind a loopback/local address and start serving all built-in protocol frontends.
     pub async fn bind(addr: SocketAddr, engine: Arc<FakeModelEngine>) -> Result<Self> {
-        Self::bind_with_credential_policy(addr, engine, None).await
+        Self::bind_with_request_policy(addr, engine, None, None).await
     }
 
     /// Bind a fake provider that rejects every provider request whose API
     /// credential does not exactly match `credential`. This is reserved for
     /// row-65's active credential-carrier trap.
+    #[cfg(test)]
     pub(crate) async fn bind_requiring_credential(
         addr: SocketAddr,
         engine: Arc<FakeModelEngine>,
         credential: String,
     ) -> Result<Self> {
-        Self::bind_with_credential_policy(addr, engine, Some(Arc::<str>::from(credential))).await
+        Self::bind_with_request_policy(addr, engine, Some(Arc::<str>::from(credential)), None).await
     }
 
-    async fn bind_with_credential_policy(
+    /// Bind a row-65 provider with independently optional credential and path-prefix policies.
+    /// The prefix is removed before protocol routing only after an exact segment match.
+    pub(crate) async fn bind_with_row65_policy(
+        addr: SocketAddr,
+        engine: Arc<FakeModelEngine>,
+        required_credential: Option<String>,
+        required_path_prefix: Option<String>,
+    ) -> Result<Self> {
+        let required_path_prefix = required_path_prefix
+            .map(validate_required_path_prefix)
+            .transpose()?;
+        Self::bind_with_request_policy(
+            addr,
+            engine,
+            required_credential.map(Arc::<str>::from),
+            required_path_prefix,
+        )
+        .await
+    }
+
+    async fn bind_with_request_policy(
         addr: SocketAddr,
         engine: Arc<FakeModelEngine>,
         required_credential: Option<Arc<str>>,
+        required_path_prefix: Option<Arc<str>>,
     ) -> Result<Self> {
         let listener = retry_transient_bind(|| TcpListener::bind(addr)).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let task_engine = Arc::clone(&engine);
-        let physical_requests = Arc::new(AtomicU64::new(0));
-        let credential_rejections = Arc::new(AtomicU64::new(0));
-        let task_physical_requests = Arc::clone(&physical_requests);
-        let task_credential_rejections = Arc::clone(&credential_rejections);
+        let counters = Arc::new(HttpRequestCounters::default());
+        let task_counters = Arc::clone(&counters);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1898,18 +1947,17 @@ impl FakeModelServer {
                             Err(error) => return Err(error.into()),
                         };
                         let connection_engine = Arc::clone(&task_engine);
-                        let connection_physical_requests = Arc::clone(&task_physical_requests);
-                        let connection_credential_rejections =
-                            Arc::clone(&task_credential_rejections);
+                        let connection_counters = Arc::clone(&task_counters);
                         let connection_required_credential = required_credential.clone();
+                        let connection_required_path_prefix = required_path_prefix.clone();
                         tokio::spawn(async move {
                             let service = service_fn(move |request| {
                                 serve_counted_request(
                                     request,
                                     Arc::clone(&connection_engine),
-                                    Arc::clone(&connection_physical_requests),
-                                    Arc::clone(&connection_credential_rejections),
+                                    Arc::clone(&connection_counters),
                                     connection_required_credential.clone(),
+                                    connection_required_path_prefix.clone(),
                                 )
                             });
                             let result = http1::Builder::new()
@@ -1929,8 +1977,7 @@ impl FakeModelServer {
             shutdown: Some(shutdown_sender),
             task,
             engine,
-            physical_requests,
-            credential_rejections,
+            counters,
         })
     }
 
@@ -1952,13 +1999,39 @@ impl FakeModelServer {
     /// Number of physical HTTP requests received by this listener, including
     /// catalog probes, malformed requests, and authentication rejections.
     pub(crate) fn physical_request_count(&self) -> u64 {
-        self.physical_requests.load(Ordering::Acquire)
+        self.counters.physical.load(Ordering::Acquire)
+    }
+
+    /// Catalog GET requests and their auth rejections, still included in total counts.
+    pub(crate) fn catalog_request_counts(&self) -> (u64, u64) {
+        (
+            self.counters.catalog.load(Ordering::Acquire),
+            self.counters
+                .catalog_credential_rejections
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Sanitized physical request records in listener-receipt order. These
+    /// include catalogue probes and requests rejected before semantic routing.
+    pub(crate) fn physical_request_records(&self) -> Vec<PhysicalHttpRequestRecord> {
+        self.counters
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Number of physical provider requests actively rejected by the row-65
     /// credential policy.
     pub(crate) fn credential_rejection_count(&self) -> u64 {
-        self.credential_rejections.load(Ordering::Acquire)
+        self.counters.credential_rejections.load(Ordering::Acquire)
+    }
+
+    /// Number of physical requests rejected before provider routing because
+    /// they omitted or mismatched the required row-65 path prefix.
+    pub(crate) fn path_rejection_count(&self) -> u64 {
+        self.counters.path_rejections.load(Ordering::Acquire)
     }
 
     /// Gracefully stop accepting connections and wait for the listener task.
@@ -2478,6 +2551,39 @@ async fn serve_request(
     Ok(response)
 }
 
+fn validate_required_path_prefix(prefix: String) -> Result<Arc<str>> {
+    if prefix.len() < 2
+        || !prefix.starts_with('/')
+        || prefix.ends_with('/')
+        || prefix.contains('?')
+        || prefix.contains('#')
+    {
+        return Err(AhrbError::Validation(format!(
+            "fake-model path prefix must be one or more absolute path segments without a trailing slash: {prefix:?}"
+        )));
+    }
+    Ok(Arc::<str>::from(prefix))
+}
+
+fn strip_required_path_prefix(request: &mut Request<Incoming>, required_path_prefix: &str) -> bool {
+    let path = request.uri().path();
+    let Some(normalized_path) = path.strip_prefix(required_path_prefix) else {
+        return false;
+    };
+    if !normalized_path.starts_with('/') {
+        return false;
+    }
+    let path_and_query = request.uri().query().map_or_else(
+        || normalized_path.to_owned(),
+        |query| format!("{normalized_path}?{query}"),
+    );
+    let Ok(uri) = path_and_query.parse() else {
+        return false;
+    };
+    *request.uri_mut() = uri;
+    true
+}
+
 fn request_uses_credential(request: &Request<Incoming>, expected: &str) -> bool {
     let authorization = request
         .headers()
@@ -2497,19 +2603,76 @@ fn request_uses_credential(request: &Request<Incoming>, expected: &str) -> bool 
 }
 
 async fn serve_counted_request(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     engine: Arc<FakeModelEngine>,
-    physical_requests: Arc<AtomicU64>,
-    credential_rejections: Arc<AtomicU64>,
+    counters: Arc<HttpRequestCounters>,
     required_credential: Option<Arc<str>>,
+    required_path_prefix: Option<Arc<str>>,
 ) -> std::result::Result<Response<DeterministicBody>, Infallible> {
-    physical_requests.fetch_add(1, Ordering::AcqRel);
+    let received_ns = monotonic_timestamp_ns();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
+    counters.physical.fetch_add(1, Ordering::AcqRel);
+    if required_path_prefix
+        .as_deref()
+        .is_some_and(|prefix| !strip_required_path_prefix(&mut request, prefix))
+    {
+        counters.path_rejections.fetch_add(1, Ordering::AcqRel);
+        counters
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PhysicalHttpRequestRecord {
+                received_ns,
+                method,
+                path,
+                catalog: false,
+                credential_rejected: false,
+                path_rejected: true,
+            });
+        let response = match response_from_parts(
+            404,
+            &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+            DeterministicBody::full(Bytes::from_static(
+                b"{\"error\":{\"type\":\"unknown_endpoint\"}}",
+            )),
+        ) {
+            Ok(response) => response,
+            Err(error) => diagnostic_response(&error),
+        };
+        return Ok(response);
+    }
+    let catalog = request.method() == Method::GET && request.uri().path() == "/v1/models";
+    if catalog {
+        counters.catalog.fetch_add(1, Ordering::AcqRel);
+    }
     let provider_path = request.uri().path() != "/healthz";
     let rejected = required_credential
         .as_deref()
         .is_some_and(|expected| provider_path && !request_uses_credential(&request, expected));
     if rejected {
-        credential_rejections.fetch_add(1, Ordering::AcqRel);
+        counters
+            .credential_rejections
+            .fetch_add(1, Ordering::AcqRel);
+        if catalog {
+            counters
+                .catalog_credential_rejections
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    counters
+        .records
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(PhysicalHttpRequestRecord {
+            received_ns,
+            method,
+            path,
+            catalog,
+            credential_rejected: rejected,
+            path_rejected: false,
+        });
+    if rejected {
         // Consume the bounded request body before closing this HTTP/1 connection. Returning the
         // rejection while inbound bytes remain unread can make the peer observe ECONNRESET instead
         // of the complete 401 response, which makes row 65's active credential control flaky.
@@ -2542,21 +2705,19 @@ async fn handle_http(
         );
     }
     if request.method() == Method::GET && path == "/v1/models" {
-        let model = match engine.context_window_tokens() {
-            Some(tokens) => json!({
-                "object":"list",
-                "data":[{
-                    "id":"ahrb-fake-v1",
-                    "object":"model",
-                    "context_window":tokens,
-                    "context_length":tokens,
-                }]
-            }),
-            None => json!({
-                "object":"list",
-                "data":[{"id":"ahrb-fake-v1","object":"model"}]
-            }),
-        };
+        let models = engine
+            .catalog_models
+            .iter()
+            .map(|id| {
+                let mut model = json!({"id": id, "object": "model"});
+                if let Some(tokens) = engine.context_window_tokens() {
+                    model["context_window"] = json!(tokens);
+                    model["context_length"] = json!(tokens);
+                }
+                model
+            })
+            .collect::<Vec<_>>();
+        let model = json!({"object": "list", "data": models});
         return response_from_parts(
             200,
             &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
@@ -5551,6 +5712,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_counts_preserve_physical_and_auth_rejection_totals() -> Result<()> {
+        let _listener_guard = LOCAL_SERVER_TEST_LOCK.lock().await;
+        let _process_guard = acquire_process_server_test_lock()?;
+        let engine = Arc::new(
+            FakeModelEngine::new(&simple_workflow())?
+                .with_catalog_model("ahrb-trap-model")
+                .with_catalog_model("ahrb-trap-model"),
+        );
+        let server = FakeModelServer::bind_requiring_credential(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Arc::clone(&engine),
+            "credential-b".to_owned(),
+        )
+        .await?;
+        for (method, path, auth, status) in [
+            ("GET", "/v1/models", "", "401"),
+            (
+                "GET",
+                "/v1/models",
+                "Authorization: Bearer credential-b\r\n",
+                "200",
+            ),
+            ("GET", "/healthz", "", "200"),
+            ("POST", "/v1/models", "", "401"),
+            ("GET", "/unexpected", "", "401"),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n",
+                server.local_addr()
+            );
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            assert!(response.starts_with(format!("HTTP/1.1 {status}").as_bytes()));
+            if path == "/v1/models" && status == "200" {
+                let response = String::from_utf8_lossy(&response);
+                assert_eq!(response.matches("ahrb-trap-model").count(), 1);
+                assert_eq!(response.matches("ahrb-fake-v1").count(), 1);
+            }
+        }
+        assert_eq!(server.catalog_request_counts(), (2, 1));
+        assert_eq!(
+            server.physical_request_count(),
+            5,
+            "catalog traffic remains visible"
+        );
+        assert_eq!(
+            server.credential_rejection_count(),
+            3,
+            "catalog rejection remains visible"
+        );
+        let physical = server.physical_request_records();
+        assert_eq!(physical.len(), 5);
+        assert!(
+            physical
+                .windows(2)
+                .all(|pair| pair[0].received_ns <= pair[1].received_ns)
+        );
+        assert_eq!(physical[0].method, "GET");
+        assert_eq!(physical[0].path, "/v1/models");
+        assert!(physical[0].catalog);
+        assert!(physical[0].credential_rejected);
+        assert!(physical[1].catalog);
+        assert!(!physical[1].credential_rejected);
+        assert!(physical.iter().all(|record| !record.path_rejected));
+        assert!(
+            engine.request_records().await.is_empty(),
+            "catalog is not a model request"
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn credential_policy_actively_rejects_wrong_secret_and_counts_all_requests() -> Result<()>
     {
         let _listener_guard = LOCAL_SERVER_TEST_LOCK.lock().await;
@@ -5610,6 +5846,58 @@ mod tests {
         let rebound_engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);
         let rebound = FakeModelServer::bind(address, rebound_engine).await?;
         rebound.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn row65_path_prefix_rejects_missing_or_partial_values_and_preserves_routing()
+    -> Result<()> {
+        let _listener_guard = LOCAL_SERVER_TEST_LOCK.lock().await;
+        let _process_guard = acquire_process_server_test_lock()?;
+        let engine = Arc::new(FakeModelEngine::new(&simple_workflow())?);
+        let prefix = "/ahrb-route-0123456789abcdef0123456789abcdef";
+        let bound = FakeModelServer::bind_with_row65_policy(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Arc::clone(&engine),
+            None,
+            Some(prefix.to_owned()),
+        )
+        .await;
+        let server = match bound {
+            Ok(server) => server,
+            Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        for path in ["/v1/models", "/ahrb-route-0123456789abcdef/v1/models"] {
+            let mut stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                server.local_addr()
+            );
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            assert!(response.starts_with(b"HTTP/1.1 404"));
+        }
+
+        let mut catalog_stream = tokio::net::TcpStream::connect(server.local_addr()).await?;
+        let catalog_request = format!(
+            "GET {prefix}/v1/models HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            server.local_addr()
+        );
+        catalog_stream.write_all(catalog_request.as_bytes()).await?;
+        let mut catalog_response = Vec::new();
+        catalog_stream.read_to_end(&mut catalog_response).await?;
+        assert!(catalog_response.starts_with(b"HTTP/1.1 200"));
+
+        assert_eq!(server.physical_request_count(), 3);
+        assert_eq!(server.path_rejection_count(), 2);
+        assert_eq!(server.catalog_request_counts(), (1, 0));
+        assert!(engine.request_records().await.is_empty());
+        server.shutdown().await?;
         Ok(())
     }
 

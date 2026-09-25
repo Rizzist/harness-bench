@@ -2,7 +2,7 @@
 schema = 1
 id = "rick"
 name = "Rick"
-revision = "exec-stream-json-native-tools-v2"
+revision = "exec-stream-json-capability-audit-v3"
 
 [availability]
 exec_paths = ["rick"]
@@ -59,6 +59,10 @@ command = [
 ]
 timeout_ms = 30000
 
+[input]
+# This command uses a positional prompt, not the optional --prompt - mode.
+prompt_uses_stdin = false
+
 [sessions]
 
 [next_input]
@@ -92,15 +96,18 @@ source = "stdout"
 framing = "jsonl"
 id_pointer = "/session_id"
 
-# Stored real-run evidence: results/rick/2026-09-02T13:19:20Z-6208e81c/report.json.
-# `text` records carry one complete assistant item at /text and the source
-# envelope carries /actor. No stored reasoning/thinking record exists, so
-# reasoning is intentionally omitted.
+# Rick v0.1.18 fake-model probes emit complete text and thinking records at
+# /text, before and after tools. /actor is supplied by AHRB's exec driver in
+# the retained source record; Rick's native text/thinking records omit it.
 [events.narrative]
 assistant_text_event = "model-response"
 assistant_text_pointer = "/text"
 assistant_text_match_fields = { "/type" = "text" }
 assistant_text_aggregation = "complete-event"
+reasoning_event = "model-response"
+reasoning_pointer = "/text"
+reasoning_match_fields = { "/type" = "thinking" }
+reasoning_aggregation = "complete-event"
 turn_pointer = "/actor"
 
 [[events.rules]]
@@ -129,6 +136,10 @@ payload_bindings = { arguments = "/tool/input", result = "/tool" }
 
 [[events.rules]]
 matches = "text"
+event = "model-response"
+
+[[events.rules]]
+matches = "thinking"
 event = "model-response"
 
 [[events.rules]]
@@ -203,3 +214,8 @@ tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native
 # TODO(orchestrator): verify workspace-scoped filesystem and network denial
 # commands before declaring headless_permission_model; unscoped `--yolo` cannot
 # satisfy SPEC-v2 row 70.
+# v0.1.18 audit: exec accepts --sandbox, but rejects --no-network and --resume
+# even before the subcommand. `resume` requires a TTY; sessions/fork/export/prune
+# exist but do not provide headless continuation, cursor replay, or delete-by-ID.
+# `usage` records are per provider response and omit total/cost/semantic turns;
+# --max-turns is not a token/cost/time budget or a physical-retry limit.

@@ -1063,12 +1063,15 @@ pub struct InjectionComponent {
     /// Environment variable used by the environment method.
     #[serde(default)]
     pub environment: String,
-    /// CLI fragment used by the CLI method.
+    /// CLI fragment; replace-option requires an exact [option, value] pair.
     #[serde(default)]
     pub argv: Vec<String>,
     /// Placement of the CLI fragment relative to the public command.
     #[serde(default)]
     pub argv_position: ArgvPosition,
+    /// Public command receiving CLI injection; launch preserves the original routing.
+    #[serde(default)]
+    pub argv_target: InjectionArgvTarget,
     /// Exact generated-file path used by the generated-config method.
     #[serde(default)]
     pub generated_path: String,
@@ -1091,7 +1094,7 @@ pub enum InjectionMethod {
     Impossible,
 }
 
-/// Placement of an injection argv fragment.
+/// How a CLI injection argv is applied.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArgvPosition {
@@ -1100,6 +1103,19 @@ pub enum ArgvPosition {
     /// Append to the public command.
     #[default]
     Suffix,
+    /// Replace the value of one existing, uniquely matched long option.
+    ReplaceOption,
+}
+
+/// Public command selected by a CLI injection carrier.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InjectionArgvTarget {
+    /// Existing transport command, or daemon start for persistent socket/HTTP transports.
+    #[default]
+    Launch,
+    /// The public account/provider initialization command, before the first turn.
+    DaemonInitialize,
 }
 
 /// Headless permission-control declarations.
@@ -1925,16 +1941,54 @@ fn validate_wave_4_declarations(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Locate exactly one existing long-option value without rendering unrelated argv.
+pub(crate) fn injection_option_value_index(command: &[String], argv: &[String]) -> Result<usize> {
+    let invalid = || {
+        AhrbError::Validation(
+        "replace-option requires [--option, value] and exactly one existing option with a value".to_owned())
+    };
+    if argv.len() != 2 || !argv[0].starts_with("--") || argv[0].len() <= 2 || argv[0].contains('=')
+    {
+        return Err(invalid());
+    }
+    let mut matches = command
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, value)| **value == argv[0]);
+    let Some((index, _)) = matches.next() else {
+        return Err(invalid());
+    };
+    if matches.next().is_some()
+        || command
+            .get(index + 1)
+            .is_none_or(|value| value.starts_with('-'))
+    {
+        return Err(invalid());
+    }
+    Ok(index + 1)
+}
+
 fn validate_injection_surface(manifest: &Manifest) -> Result<()> {
     let Some(surface) = manifest.capabilities.injection_surface.as_ref() else {
         return Ok(());
     };
+    let mut replacement_targets = Vec::new();
+    let mut initialization_component_declared = false;
     for (label, component, placeholder, credential) in [
         ("provider", &surface.provider, "{{provider}}", false),
         ("base_url", &surface.base_url, "{{base_url}}", false),
         ("credential", &surface.credential, "{{credential}}", true),
     ] {
         let prefix = format!("capabilities.injection_surface.{label}");
+        if component.method != InjectionMethod::Cli
+            && (component.argv_target != InjectionArgvTarget::Launch
+                || component.argv_position != ArgvPosition::Suffix)
+        {
+            return Err(AhrbError::Validation(format!(
+                "{prefix} non-cli injection must not select an argv target or position"
+            )));
+        }
         if credential && component.method == InjectionMethod::Cli {
             return Err(AhrbError::Validation(format!(
                 "{prefix}.method cannot be cli because credentials are forbidden in argv"
@@ -1962,6 +2016,57 @@ fn validate_injection_surface(manifest: &Manifest) -> Result<()> {
                     return Err(AhrbError::Validation(format!(
                         "{prefix} cli injection requires only argv with {placeholder} exactly once"
                     )));
+                }
+                if placeholder_occurrences(&component.argv, "{{credential}}") != 0 {
+                    return Err(AhrbError::Validation(format!(
+                        "{prefix} credentials are forbidden in argv"
+                    )));
+                }
+                let command = match component.argv_target {
+                    InjectionArgvTarget::Launch => {
+                        if manifest.daemon.persistent
+                            && matches!(
+                                manifest.transport.kind,
+                                TransportKind::SocketJsonrpc | TransportKind::Http
+                            )
+                        {
+                            &manifest.daemon.start
+                        } else {
+                            &manifest.transport.command
+                        }
+                    }
+                    InjectionArgvTarget::DaemonInitialize => {
+                        if !manifest.daemon.persistent
+                            || manifest.transport.kind == TransportKind::StdinRpc
+                            || manifest.daemon.initialize.is_empty()
+                            || component.argv_position != ArgvPosition::ReplaceOption
+                        {
+                            return Err(AhrbError::Validation(format!(
+                                "{prefix} daemon-initialize requires a persistent exec/socket/HTTP daemon, a baseline initialize command, and replace-option"
+                            )));
+                        }
+                        &manifest.daemon.initialize
+                    }
+                };
+                if component.argv_position == ArgvPosition::ReplaceOption {
+                    injection_option_value_index(command, &component.argv)?;
+                    let target = (component.argv_target, component.argv[0].clone());
+                    if replacement_targets.contains(&target) {
+                        return Err(AhrbError::Validation(
+                            "injection components must not replace the same command option"
+                                .to_owned(),
+                        ));
+                    }
+                    if component.argv_target == InjectionArgvTarget::DaemonInitialize {
+                        if initialization_component_declared {
+                            return Err(AhrbError::Validation(
+                                "at most one injection component may replace daemon.initialize"
+                                    .to_owned(),
+                            ));
+                        }
+                        initialization_component_declared = true;
+                    }
+                    replacement_targets.push(target);
                 }
             }
             InjectionMethod::GeneratedConfig => {
@@ -2929,11 +3034,11 @@ pub(crate) fn resolve_executable(candidate: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod version_tests {
     use super::{
-        ArgvPosition, BudgetControls, DeleteMissingSemantics, EventMetadata, InjectionComponent,
-        InjectionMethod, InjectionSurface, Manifest, NarrativeAggregation, PermissionConfig,
-        PermissionMode, RequestRoleRule, SideChannelKind, TariffConfig, TariffSurface,
-        TimestampFormat, TruncationMarker, UsageScope, concise_version, render_session_store_paths,
-        validate,
+        ArgvPosition, BudgetControls, DeleteMissingSemantics, EventMetadata, InjectionArgvTarget,
+        InjectionComponent, InjectionMethod, InjectionSurface, Manifest, NarrativeAggregation,
+        PermissionConfig, PermissionMode, RequestRoleRule, SideChannelKind, TariffConfig,
+        TariffSurface, TimestampFormat, TruncationMarker, UsageScope, concise_version,
+        render_session_store_paths, validate,
     };
     use std::collections::BTreeMap;
 
@@ -2952,6 +3057,7 @@ mod version_tests {
             environment: String::new(),
             argv: Vec::new(),
             argv_position: ArgvPosition::Suffix,
+            argv_target: InjectionArgvTarget::Launch,
             generated_path: "{{profile}}/config/provider.toml".to_owned(),
             json_pointer: pointer.to_owned(),
         };
@@ -3177,6 +3283,152 @@ mod version_tests {
     }
 
     #[test]
+    fn initialization_injection_requires_an_unambiguous_existing_option() {
+        let mut manifest = wave_4_manifest();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec!["harnessd".to_owned()];
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest.daemon.initialize = vec![
+            "harness".to_owned(),
+            "--base-url".to_owned(),
+            "{{base_url}}".to_owned(),
+        ];
+        let initializer: InjectionComponent = toml::from_str(
+            r#"
+            method = "cli"
+            argv_target = "daemon-initialize"
+            argv_position = "replace-option"
+            argv = ["--base-url", "{{base_url}}"]
+        "#,
+        )
+        .unwrap();
+        manifest
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .unwrap()
+            .base_url = initializer;
+        validate(&manifest).expect("initializer option carrier");
+        let encoded = toml::to_string(&manifest).unwrap();
+        let decoded: Manifest = toml::from_str(&encoded).unwrap();
+        validate(&decoded).expect("initializer carrier round trip");
+        assert_eq!(
+            decoded
+                .capabilities
+                .injection_surface
+                .unwrap()
+                .base_url
+                .argv_target,
+            InjectionArgvTarget::DaemonInitialize
+        );
+        for command in [
+            vec![],
+            vec!["harness", "--other", "value"],
+            vec!["harness", "--base-url"],
+            vec!["harness", "--base-url", "--other"],
+            vec!["harness", "--base-url", "one", "--base-url", "two"],
+        ] {
+            let mut invalid = manifest.clone();
+            invalid.daemon.initialize = command.into_iter().map(str::to_owned).collect();
+            assert!(validate(&invalid).is_err(), "missing or ambiguous option");
+        }
+        let mut invalid = manifest.clone();
+        invalid.daemon.persistent = false;
+        assert!(validate(&invalid).is_err());
+        let mut invalid = manifest.clone();
+        invalid.transport.kind = super::TransportKind::StdinRpc;
+        assert!(
+            validate(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("persistent exec/socket/HTTP daemon")
+        );
+        let mut invalid = manifest.clone();
+        invalid
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .unwrap()
+            .base_url
+            .argv_position = ArgvPosition::Suffix;
+        assert!(
+            validate(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("replace-option")
+        );
+        let mut invalid = manifest.clone();
+        invalid
+            .capabilities
+            .injection_surface
+            .as_mut()
+            .unwrap()
+            .base_url
+            .argv
+            .push("{{credential}}".to_owned());
+        assert!(
+            validate(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("credentials are forbidden")
+        );
+        let mut invalid = manifest;
+        let surface = invalid.capabilities.injection_surface.as_mut().unwrap();
+        surface.provider = surface.base_url.clone();
+        surface.provider.argv[1] = "{{provider}}".to_owned();
+        assert!(
+            validate(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("same command option")
+        );
+    }
+
+    #[test]
+    fn initialization_injection_allows_only_one_component_across_distinct_options() {
+        let mut manifest = wave_4_manifest();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec!["harnessd".to_owned()];
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest.daemon.initialize = [
+            "harness",
+            "--base-url",
+            "{{base_url}}",
+            "--response-open-timeout",
+            "30",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let surface = manifest.capabilities.injection_surface.as_mut().unwrap();
+        surface.base_url = toml::from_str(
+            r#"
+            method = "cli"
+            argv_target = "daemon-initialize"
+            argv_position = "replace-option"
+            argv = ["--base-url", "{{base_url}}"]
+        "#,
+        )
+        .unwrap();
+        surface.provider = toml::from_str(
+            r#"
+            method = "cli"
+            argv_target = "daemon-initialize"
+            argv_position = "replace-option"
+            argv = ["--response-open-timeout", "{{provider}}"]
+        "#,
+        )
+        .unwrap();
+
+        assert!(
+            validate(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("at most one injection component may replace daemon.initialize")
+        );
+    }
+
+    #[test]
     fn injection_surface_enforces_exclusive_carriers_and_never_allows_credential_cli() {
         let mut manifest = wave_4_manifest();
         let surface = manifest
@@ -3189,6 +3441,7 @@ mod version_tests {
             environment: String::new(),
             argv: vec!["--model".to_owned(), "{{provider}}".to_owned()],
             argv_position: ArgvPosition::Prefix,
+            argv_target: InjectionArgvTarget::Launch,
             generated_path: String::new(),
             json_pointer: String::new(),
         };
@@ -3197,6 +3450,7 @@ mod version_tests {
             environment: "AHRB_BASE_URL".to_owned(),
             argv: Vec::new(),
             argv_position: ArgvPosition::Suffix,
+            argv_target: InjectionArgvTarget::Launch,
             generated_path: String::new(),
             json_pointer: String::new(),
         };

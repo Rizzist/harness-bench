@@ -147,6 +147,8 @@ pub struct ManagedDaemonConfig {
     pub grace: Duration,
     /// Fresh run directory that receives bounded daemon stdout/stderr files.
     pub log_directory: PathBuf,
+    /// Use stable log basenames for directly comparable fresh-profile runs.
+    pub invariant_log_names: bool,
 }
 
 #[derive(Debug)]
@@ -811,7 +813,11 @@ async fn start_managed_daemon_inner(
     launch_pid: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<ManagedDaemonProcess> {
     std::fs::create_dir_all(&config.log_directory)?;
-    let sequence = DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = if config.invariant_log_names {
+        0
+    } else {
+        DAEMON_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    };
     let stdout = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1189,6 +1195,11 @@ pub trait Driver: Send {
     fn live_event_path(&self, _session: &SessionId) -> Option<PathBuf> {
         None
     }
+    /// Path to the driver's fsync-backed normalized event journal, when the
+    /// source transport does not expose a manifest-declared journal itself.
+    fn durable_event_path(&self, _session: &SessionId) -> Option<PathBuf> {
+        None
+    }
     /// Attach strictly after a durable cursor.
     fn attach(
         &mut self,
@@ -1244,6 +1255,15 @@ pub trait Driver: Send {
     }
     /// Cancel active work.
     fn cancel(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
+    /// Force-reap one active invocation after a benchmark grace boundary.
+    /// This cleanup path must not invoke a harness control command.
+    fn force_stop_session(&mut self, _session: &SessionId) -> DriverFuture<'_, ()> {
+        Box::pin(async {
+            Err(AhrbError::Unsupported(
+                "driver has no command-free forced session cleanup".to_owned(),
+            ))
+        })
+    }
     /// Close a session through the topology's ordinary lifecycle surface.
     fn close(&mut self, session: &SessionId) -> DriverFuture<'_, ()>;
     /// Invoke the manifest-declared real close-delete operation. Topologies
@@ -3535,6 +3555,10 @@ impl Driver for PerInvocationDriver {
             .map(|active| active.stdout_path.clone())
     }
 
+    fn durable_event_path(&self, session: &SessionId) -> Option<PathBuf> {
+        Some(self.events_path(&session.0))
+    }
+
     fn attach(
         &mut self,
         session: &SessionId,
@@ -4088,6 +4112,48 @@ impl Driver for PerInvocationDriver {
                     );
                 }
             }
+            Ok(())
+        })
+    }
+
+    fn force_stop_session(&mut self, session: &SessionId) -> DriverFuture<'_, ()> {
+        let id = session.0.clone();
+        Box::pin(async move {
+            let active = self
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("unknown exec session {id:?}")))?
+                .active
+                .take();
+            let Some(mut invocation) = active else {
+                return Ok(());
+            };
+            let invocation_pid = invocation.child.id();
+            stop_managed_child(&mut invocation.child, Duration::from_millis(100)).await?;
+            let status = invocation.child.try_wait()?.ok_or_else(|| {
+                AhrbError::Protocol("force-stopped thin client could not be reaped".to_owned())
+            })?;
+            let mut persisted = self
+                .sessions
+                .get(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("exec session {id:?} disappeared")))?
+                .persisted
+                .clone();
+            self.refresh_source(&mut persisted, &invocation, Some(status))?;
+            if self.config.events.source == "journal-file" {
+                self.refresh_inactive_journal(&mut persisted)?;
+            }
+            if let Some(pid) = invocation_pid {
+                crate::process::retire_process(pid)?;
+            }
+            persisted.turns = persisted.turns.saturating_add(1);
+            Self::persist_session_at(&self.metadata_path(&id), &persisted)?;
+            let item = self
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| AhrbError::Protocol(format!("exec session {id:?} disappeared")))?;
+            item.persisted = persisted;
+            item.client_exit = ClientExit::Exited(status.code());
             Ok(())
         })
     }
@@ -6391,6 +6457,7 @@ mod tests {
                 shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.clone(),
+                invariant_log_names: false,
             },
         );
         transport.start().await.expect("start managed daemon");
@@ -6444,6 +6511,7 @@ mod tests {
                 shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.join("logs"),
+                invariant_log_names: false,
             },
         );
         transport.start().await.expect("start initialized daemon");
@@ -6768,6 +6836,7 @@ mod tests {
             shutdown_result: ShutdownResult::default(),
             grace: Duration::from_millis(100),
             log_directory: profile.join("daemon-logs"),
+            invariant_log_names: false,
         };
         let mut driver = PerInvocationDriver::new(PerInvocationConfig {
             daemon: Some(daemon),
@@ -6833,6 +6902,7 @@ mod tests {
             shutdown_result: ShutdownResult::default(),
             grace: Duration::from_millis(100),
             log_directory: profile.join("daemon-logs"),
+            invariant_log_names: false,
         };
         let mut driver = PerInvocationDriver::new(PerInvocationConfig {
             daemon: Some(daemon),
@@ -7119,6 +7189,7 @@ mod tests {
                 shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(500),
                 log_directory: profile.join("logs"),
+                invariant_log_names: false,
             },
         );
         transport.start().await.expect("start detached daemon");
@@ -7186,6 +7257,7 @@ mod tests {
                 },
                 grace: Duration::from_millis(2_000),
                 log_directory: logs.clone(),
+                invariant_log_names: false,
             },
         );
         let error = transport
@@ -7239,6 +7311,7 @@ mod tests {
                 },
                 grace: Duration::from_millis(250),
                 log_directory: logs.clone(),
+                invariant_log_names: false,
             },
         );
         let error = transport
@@ -7503,6 +7576,7 @@ mod tests {
                 shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.clone(),
+                invariant_log_names: false,
             },
         );
         let error = transport
@@ -7550,6 +7624,7 @@ mod tests {
                 shutdown_result: ShutdownResult::default(),
                 grace: Duration::from_millis(100),
                 log_directory: logs.clone(),
+                invariant_log_names: false,
             },
         );
         transport.start().await.expect("start managed daemon");
