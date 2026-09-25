@@ -274,6 +274,15 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L17 `l17-row3-decorated-output` (landed 2026-09-25)
+
+- [x] Implement (gpt-5.6-sol, 3 passes): row 3 accepts decorated tool output (Haider 0.0.971's capture footer was a false FAIL). A's executing fixture generates a fresh 96-bit value absent from A's arguments; the fake provider releases B only from the tool result correlated to A; scoring reads the expected value from A's workspace effect.
+- [x] Verification: gpt-5.6-sol v1 SHIP → GPT6-Astra final review NO-SHIP (argument-echo client passed) → repaired; v2 NO-SHIP (split text parts rejected) → repaired; v3 behavioural checks PASS; claude-opus-5-5 v4 **SHIP** on the tree rebased onto L10+L20 (full suite 38/38; haider 0.0.970/0.0.971/0.0.972 row 3 PASS; argument-echo FAIL; split parts PASS; 972 matrix identical to master).
+- [x] Final review: **SHIP by claude-opus-5-5 (orchestrator)** — owner-authorized substitute while Codex and Opus subagents were rate-limited; not an independent context.
+- [x] Complete: committed `d949044`, fast-forwarded and pushed (verified tree = landed tree).
+
+Follow-ups (non-blocking): `extract_dependency_value` early `?` inside its loop; SPEC-v2 scope sentence should name the row-3 amendment.
+
 ## L20 `l20-row28-thread-plateau` (landed 2026-09-24)
 
 - [x] Decision (orchestrator, owner-delegated): row 28's exact `post_close == baseline` thread rule was stricter than rows 44/50 and failed bounded worker pools with no leak. Reproduced the plateau with AHRB's own row-28 shape on haider 0.0.971 before changing the oracle (15/15 repetitions bounded).
