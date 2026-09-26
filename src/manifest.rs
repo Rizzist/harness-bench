@@ -825,6 +825,10 @@ pub struct ProcessOwnership {
     /// Executable basenames that may be reparented.
     #[serde(default)]
     pub executable_names: Vec<String>,
+    /// Advisory-lock files that must have no external owner after teardown.
+    /// Every template is relative to the disposable `{{profile}}` root.
+    #[serde(default)]
+    pub profile_lock_paths: Vec<String>,
 }
 
 /// Limits requested from the harness.
@@ -1477,6 +1481,13 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         if manifest.isolation.roots.contains_key(name) {
             return Err(AhrbError::Validation(format!(
                 "isolation environment variable {name:?} is declared as both a directory root and a non-directory binding"
+            )));
+        }
+    }
+    for template in &manifest.process.profile_lock_paths {
+        if !profile_scoped_template(template) {
+            return Err(AhrbError::Validation(format!(
+                "process.profile_lock_paths entry {template:?} must be lexically contained under {{{{profile}}}}"
             )));
         }
     }
@@ -3775,6 +3786,18 @@ mod version_tests {
         manifest.resources.journal_paths = Some(vec!["{{profile}}/../journal".to_owned()]);
         let error = validate(&manifest).expect_err("traversing journal path must be rejected");
         assert!(error.to_string().contains("resources.journal_paths"));
+    }
+
+    #[test]
+    fn process_lock_paths_must_be_profile_scoped() {
+        let mut manifest = wave_2_manifest();
+        manifest.process.profile_lock_paths =
+            vec!["{{profile}}/home/.harness/profile.lock".to_owned()];
+        validate(&manifest).expect("profile-contained lock declaration is valid");
+
+        manifest.process.profile_lock_paths = vec!["/tmp/shared.lock".to_owned()];
+        let error = validate(&manifest).expect_err("global lock path must be rejected");
+        assert!(error.to_string().contains("process.profile_lock_paths"));
     }
 
     #[test]

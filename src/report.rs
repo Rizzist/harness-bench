@@ -3049,6 +3049,8 @@ fn ownership_label(ownership: &ProcOwnership) -> &'static str {
         ProcOwnership::CgroupMember => "cgroup-member",
         ProcOwnership::ProcessGroupMember => "process-group-member",
         ProcOwnership::Reparented => "reparented",
+        ProcOwnership::ProfilePath => "profile-path",
+        ProcOwnership::LockHolder => "lock-holder",
     }
 }
 

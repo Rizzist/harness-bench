@@ -1,7 +1,17 @@
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+static PROCESS_REGISTRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn lock_process_registry_test() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_REGISTRY_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock process-registry integration test")
+}
 
 fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
@@ -22,6 +32,7 @@ fn pid_exists(pid: u32) -> bool {
 
 #[test]
 fn cleanup_reaps_child_and_grandchild_process_tree() {
+    let _serial = lock_process_registry_test();
     let root = std::env::temp_dir().join(format!("ahrb-cleanup-tree-{}", std::process::id()));
     if root.exists() {
         std::fs::remove_dir_all(&root).expect("remove stale cleanup fixture");
@@ -84,6 +95,364 @@ fn cleanup_reaps_child_and_grandchild_process_tree() {
     assert!(!pid_exists(grandchild_pid));
     drop(root_child);
     std::fs::remove_dir_all(root).expect("remove cleanup fixture");
+}
+
+#[test]
+fn profile_owned_reparented_survivor_is_recorded_reaped_and_lock_audited() {
+    let sequence = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_nanos();
+    let _serial = lock_process_registry_test();
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-profile-owned-{}-{sequence}",
+        std::process::id(),
+    ));
+    assert!(!root.exists(), "profile-owned fixture root must be fresh");
+    let profile = root.join("dr57/sigint2-r1");
+    std::fs::create_dir_all(&profile).expect("create disposable profile");
+    let pid_file = root.join("daemon.pid");
+    let lock_file = profile.join("home/.haider/dev-profile/lock");
+    let launcher = Command::new(env!("CARGO_BIN_EXE_ahrb-fixture"))
+        .args([
+            "profile-daemon-launcher",
+            "--profile",
+            profile.to_str().expect("UTF-8 profile"),
+            "--pid-file",
+            pid_file.to_str().expect("UTF-8 pid file"),
+            "--lock-file",
+            lock_file.to_str().expect("UTF-8 lock file"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn exiting daemon launcher");
+    let launcher_pid = launcher.id();
+    assert!(
+        launcher
+            .wait_with_output()
+            .expect("wait for daemon launcher")
+            .status
+            .success()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (daemon_pid, observed) = loop {
+        if let Some(pid) = read_pid(&pid_file) {
+            let found = ahrb::process::discover_profile_owned_processes(
+                &root,
+                &["ahrb-fixture".to_owned()],
+            )
+            .expect("discover profile-owned daemon");
+            if let Some(process) = found.iter().find(|process| process.identity.pid == pid) {
+                break (pid, process.clone());
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "profile daemon did not become visible"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_ne!(observed.ppid, launcher_pid, "daemon was not reparented");
+    assert_eq!(
+        observed.ownership,
+        ahrb::process::ProcOwnership::ProfilePath
+    );
+
+    let held =
+        ahrb::process::audit_profile_lock(&profile, &lock_file).expect("audit held profile lock");
+    assert!(matches!(
+        held,
+        ahrb::process::ProfileLockAudit::Held { holder_pid, .. } if holder_pid == Some(daemon_pid)
+    ));
+
+    ahrb::process::track_profile_owned_processes(std::slice::from_ref(&observed))
+        .expect("register profile-owned daemon");
+    let cleanup = ahrb::process::cleanup_owned_processes_with_evidence(Duration::from_millis(100))
+        .expect("reap profile-owned daemon");
+    assert!(
+        cleanup
+            .observed
+            .iter()
+            .any(|process| process.identity == observed.identity),
+        "pre-reap observation omitted the detached daemon"
+    );
+    assert!(cleanup.reaped.contains(&observed.identity));
+    assert!(cleanup.survivors.is_empty());
+    assert!(!pid_exists(daemon_pid));
+
+    let unlocked = ahrb::process::audit_profile_lock(&profile, &lock_file)
+        .expect("audit released profile lock");
+    assert!(matches!(
+        unlocked,
+        ahrb::process::ProfileLockAudit::Unlocked { .. }
+    ));
+    std::fs::remove_dir_all(root).expect("remove profile-owned fixture");
+}
+
+fn fresh_fixture_root(label: &str) -> std::path::PathBuf {
+    let sequence = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("ahrb-{label}-{}-{sequence}", std::process::id(),));
+    assert!(!root.exists(), "fixture root must be fresh");
+    root
+}
+
+/// Launch a detached fixture daemon that `flock(2)`s `lock_file`, naming the
+/// profile by its *resolved* path (as Haider does), and wait for its PID.
+fn spawn_flock_daemon(profile_arg: &Path, pid_file: &Path, lock_file: &Path) -> u32 {
+    let launcher = Command::new(env!("CARGO_BIN_EXE_ahrb-fixture"))
+        .args([
+            "profile-daemon-launcher",
+            "--profile",
+            profile_arg.to_str().expect("UTF-8 profile"),
+            "--pid-file",
+            pid_file.to_str().expect("UTF-8 pid file"),
+            "--lock-file",
+            lock_file.to_str().expect("UTF-8 lock file"),
+            "--lock-kind",
+            "flock",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run exiting daemon launcher");
+    assert!(launcher.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = read_pid(pid_file)
+            && matches!(
+                ahrb::process::audit_profile_lock(Path::new("/"), lock_file),
+                Ok(ahrb::process::ProfileLockAudit::Held { .. })
+            )
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "flock daemon did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Row-57 regression on Haider 0.0.970/0.0.971: the lock is a `flock(2)` lock
+/// (macOS `F_GETLK` reports `l_pid = -1`) and the daemon names the resolved
+/// `/private/...` spelling of AHRB's profile. Teardown must still observe the
+/// daemon, attribute and reap it, re-audit the lock, and finish `PASS`.
+#[cfg(target_os = "macos")]
+#[test]
+fn teardown_reaps_unknown_owner_flock_holder_and_reaudits() {
+    let _serial = lock_process_registry_test();
+    let root = fresh_fixture_root("unknown-owner-lock");
+    let profile = root.join("dr57/sigint2-r1");
+    std::fs::create_dir_all(profile.join("home/.haider/dev-profile")).expect("create profile");
+    let resolved_profile = std::fs::canonicalize(&profile).expect("resolve profile");
+    assert_ne!(
+        resolved_profile, profile,
+        "temp dir must be a symlinked alias"
+    );
+    let lock_file = profile.join("home/.haider/dev-profile/lock");
+    let daemon_pid = spawn_flock_daemon(
+        &resolved_profile,
+        &root.join("daemon.pid"),
+        &resolved_profile.join("home/.haider/dev-profile/lock"),
+    );
+
+    // The kernel cannot name a flock owner: still held, owner unknown.
+    let held = ahrb::process::audit_profile_lock(&profile, &lock_file).expect("audit");
+    assert!(matches!(
+        held,
+        ahrb::process::ProfileLockAudit::Held {
+            holder_pid: None,
+            ..
+        }
+    ));
+    // The open-file scan identifies the holder instead.
+    let openers = ahrb::process::lock_file_openers(&lock_file).expect("scan lock openers");
+    assert!(
+        openers
+            .iter()
+            .any(|process| process.identity.pid == daemon_pid)
+    );
+    // Discovery under AHRB's lexical root matches the resolved argv spelling.
+    let discovered =
+        ahrb::process::discover_profile_owned_processes(&root, &["ahrb-fixture".to_owned()])
+            .expect("discover profile-owned daemon");
+    assert!(
+        discovered
+            .iter()
+            .any(|process| process.identity.pid == daemon_pid)
+    );
+
+    let teardown = ahrb::process::teardown_owned_processes(
+        &root,
+        &["ahrb-fixture".to_owned()],
+        &[(profile.clone(), lock_file.clone())],
+    );
+    assert_eq!(teardown.status, "PASS", "errors: {:?}", teardown.errors);
+    assert!(
+        teardown
+            .observed_owned_processes
+            .iter()
+            .any(|process| process.identity.pid == daemon_pid
+                && process.ownership == ahrb::process::ProcOwnership::ProfilePath),
+        "daemon must be recorded as observed before reaping"
+    );
+    assert!(
+        teardown
+            .reaped_processes
+            .iter()
+            .any(|identity| identity.pid == daemon_pid)
+    );
+    assert!(teardown.surviving_processes.is_empty());
+    assert!(matches!(
+        teardown.profile_locks.as_slice(),
+        [ahrb::process::ProfileLockAudit::Unlocked { .. }]
+    ));
+    assert!(!pid_exists(daemon_pid));
+    std::fs::remove_dir_all(root).expect("remove fixture root");
+}
+
+/// A declared-executable holder whose argv never names the profile (so profile
+/// discovery cannot see it) is identified through the unknown-owner lock,
+/// recorded, reaped in a bounded lock round, and the lock is re-audited.
+#[cfg(target_os = "macos")]
+#[test]
+fn teardown_attributes_and_reaps_lock_holder_invisible_to_argv_discovery() {
+    let _serial = lock_process_registry_test();
+    let root = fresh_fixture_root("argv-invisible-holder");
+    let outside = fresh_fixture_root("argv-invisible-outside");
+    let profile = root.join("dr57/sigint2-r1");
+    std::fs::create_dir_all(&profile).expect("create profile");
+    std::fs::create_dir_all(&outside).expect("create outside directory");
+    let lock_file = profile.join("lock");
+    std::fs::write(&lock_file, b"").expect("create lock file");
+    let lock_alias = outside.join("lock-alias");
+    std::os::unix::fs::symlink(&lock_file, &lock_alias).expect("link lock alias");
+    let holder_pid = spawn_flock_daemon(&outside, &outside.join("holder.pid"), &lock_alias);
+    assert!(
+        ahrb::process::discover_profile_owned_processes(&root, &["ahrb-fixture".to_owned()])
+            .expect("discover")
+            .is_empty(),
+        "fixture must be invisible to argv discovery"
+    );
+
+    let teardown = ahrb::process::teardown_owned_processes(
+        &root,
+        &["ahrb-fixture".to_owned()],
+        &[(profile.clone(), lock_file.clone())],
+    );
+    let alive = pid_exists(holder_pid);
+    if alive {
+        // SAFETY: the PID was written by this test's own fixture.
+        unsafe {
+            libc::kill(holder_pid as i32, libc::SIGKILL);
+        }
+    }
+    assert_eq!(teardown.status, "PASS", "errors: {:?}", teardown.errors);
+    assert!(!alive);
+    let [evidence] = teardown.lock_holders.as_slice() else {
+        panic!(
+            "expected one lock-holder round: {:?}",
+            teardown.lock_holders
+        );
+    };
+    assert_eq!(evidence.round, 1);
+    assert_eq!(evidence.kernel_owner_pid, None);
+    assert_eq!(evidence.identified_by, "open-file-scan");
+    assert!(evidence.unowned_holders.is_empty());
+    assert!(
+        evidence
+            .holders
+            .iter()
+            .any(|holder| holder.identity.pid == holder_pid
+                && holder.ownership == ahrb::process::ProcOwnership::LockHolder)
+    );
+    assert!(
+        teardown
+            .observed_owned_processes
+            .iter()
+            .any(|process| process.identity.pid == holder_pid)
+    );
+    assert!(
+        teardown
+            .reaped_processes
+            .iter()
+            .any(|identity| identity.pid == holder_pid)
+    );
+    assert!(matches!(
+        teardown.profile_locks.as_slice(),
+        [ahrb::process::ProfileLockAudit::Unlocked { .. }]
+    ));
+    std::fs::remove_dir_all(root).expect("remove fixture root");
+    std::fs::remove_dir_all(outside).expect("remove outside directory");
+}
+
+/// When the holder of a still-held profile lock is not attributable to the
+/// adapter, teardown never signals it, yet it still returns a complete `ERROR`
+/// record: the held lock, the identified holder, and the observed evidence.
+#[cfg(target_os = "macos")]
+#[test]
+fn teardown_lock_held_after_bounded_reaping_is_error_with_evidence() {
+    let _serial = lock_process_registry_test();
+    let root = fresh_fixture_root("held-lock-error");
+    let profile = root.join("dr57/sigint2-r1");
+    std::fs::create_dir_all(&profile).expect("create profile");
+    let lock_file = profile.join("lock");
+    let holder_pid = spawn_flock_daemon(&profile, &root.join("holder.pid"), &lock_file);
+
+    // Declared executables do not include the fixture: it is not AHRB-owned.
+    let teardown = ahrb::process::teardown_owned_processes(
+        &root,
+        &["haiderd".to_owned()],
+        &[(profile.clone(), lock_file.clone())],
+    );
+    let alive = pid_exists(holder_pid);
+    // Stop exactly the holder this test started before asserting.
+    // SAFETY: the PID was written by this test's own fixture.
+    unsafe {
+        libc::kill(holder_pid as i32, libc::SIGKILL);
+    }
+    assert!(alive, "an unowned holder must never be signalled");
+    assert_eq!(teardown.status, "ERROR");
+    assert!(
+        teardown.errors.iter().any(
+            |error| error.contains("remained held after bounded reaping")
+                && error.contains("kernel owner PID unknown")
+        ),
+        "errors: {:?}",
+        teardown.errors
+    );
+    assert!(matches!(
+        teardown.profile_locks.as_slice(),
+        [ahrb::process::ProfileLockAudit::Held {
+            holder_pid: None,
+            ..
+        }]
+    ));
+    assert!(!teardown.lock_holders.is_empty());
+    assert!(teardown.lock_holders.iter().all(|evidence| {
+        evidence.identified_by == "open-file-scan"
+            && evidence
+                .unowned_holders
+                .iter()
+                .any(|identity| identity.pid == holder_pid)
+            && evidence
+                .holders
+                .iter()
+                .any(|holder| holder.identity.pid == holder_pid)
+    }));
+    assert!(
+        teardown
+            .reaped_processes
+            .iter()
+            .all(|identity| identity.pid != holder_pid)
+    );
+    std::fs::remove_dir_all(root).expect("remove fixture root");
 }
 
 fn signal_during_doctor_probe_reaps_probe_descendants(signal: i32, label: &str) {

@@ -127,6 +127,10 @@ fn run(args: &[String]) -> Result<i32> {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()?;
+            // Keep the launch root inspectable long enough for the ownership
+            // registry to capture its `(pid,start_time)` before deliberately
+            // exiting and leaving the registered descendants behind.
+            std::thread::sleep(std::time::Duration::from_millis(50));
             Ok(0)
         }
         Some("process-tree-child") => {
@@ -146,6 +150,50 @@ fn run(args: &[String]) -> Result<i32> {
             std::fs::write(grandchild_pid, std::process::id().to_string())?;
             park_forever()
         }
+        Some("profile-daemon-launcher") => {
+            let profile = required(args, "--profile")?;
+            let pid_file = required(args, "--pid-file")?;
+            let executable = std::env::current_exe()?;
+            let mut command = std::process::Command::new(executable);
+            command
+                .arg("profile-daemon")
+                .arg("--profile")
+                .arg(profile)
+                .arg("--pid-file")
+                .arg(pid_file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(lock_file) = optional(args, "--lock-file") {
+                command.arg("--lock-file").arg(lock_file);
+            }
+            if let Some(lock_kind) = optional(args, "--lock-kind") {
+                command.arg("--lock-kind").arg(lock_kind);
+            }
+            let _child = command.spawn()?;
+            Ok(0)
+        }
+        Some("profile-daemon") => {
+            #[cfg(unix)]
+            {
+                // SAFETY: the fixture is a fresh child and deliberately
+                // detaches to reproduce a reparented daemon.
+                let _ = unsafe { libc::setsid() };
+            }
+            let _profile = required(args, "--profile")?;
+            let pid_file = PathBuf::from(required(args, "--pid-file")?);
+            let flock = optional(args, "--lock-kind") == Some("flock");
+            let lock_file = optional(args, "--lock-file")
+                .map(PathBuf::from)
+                .map(|path| lock_fixture_file(path, flock))
+                .transpose()?;
+            if let Some(parent) = pid_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&pid_file, std::process::id().to_string())?;
+            let _lock_file = lock_file;
+            park_forever()
+        }
         Some(other) => Err(AhrbError::Usage(format!(
             "unknown fixture command {other:?}"
         ))),
@@ -154,6 +202,55 @@ fn run(args: &[String]) -> Result<i32> {
                 .to_owned(),
         )),
     }
+}
+
+fn optional<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|argument| argument == flag)
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str)
+}
+
+/// Hold `path` locked for the fixture's lifetime: a POSIX record lock by
+/// default, or a `flock(2)` lock (whose owner `F_GETLK` cannot name on macOS).
+#[cfg(unix)]
+fn lock_fixture_file(path: PathBuf, flock: bool) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    if flock {
+        // SAFETY: `file` is open for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        return Ok(file);
+    }
+    let lock = libc::flock {
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+        l_type: libc::F_WRLCK,
+        l_whence: libc::SEEK_SET as i16,
+    };
+    // SAFETY: `file` is open and `lock` is a valid flock input structure.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn lock_fixture_file(_path: PathBuf, _flock: bool) -> Result<std::fs::File> {
+    Err(AhrbError::Unsupported(
+        "profile lock fixture requires fcntl".to_owned(),
+    ))
 }
 
 fn emit_deterministic(bytes: u64) -> Result<()> {

@@ -453,6 +453,67 @@ pub(crate) fn process_identity_and_group(pid: u32) -> Result<Option<(ProcIdentit
     Ok(Some((process.identity(), process.process_group)))
 }
 
+pub(crate) fn process_info_for_identity(identity: ProcIdentity) -> Result<Option<ProcessInfo>> {
+    let path = Path::new("/proc")
+        .join(identity.pid.to_string())
+        .join("stat");
+    let Some(stat) = read_transient_text(&path)? else {
+        return Ok(None);
+    };
+    let process = parse_stat(identity.pid, &stat)?;
+    Ok((process.identity() == identity).then(|| process.to_info(ProcOwnership::Reparented)))
+}
+
+fn read_process_arguments(proc_root: &Path, pid: u32) -> Result<Option<Vec<String>>> {
+    let path = proc_root.join(pid.to_string()).join("cmdline");
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if transient_process_error(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect(),
+    ))
+}
+
+pub(crate) fn profile_owned_processes(
+    profile_roots: &[PathBuf],
+    executable_names: &[String],
+) -> Result<Vec<ProcessInfo>> {
+    let proc_root = Path::new("/proc");
+    let declared = executable_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let before = read_process_table(proc_root)?;
+    let mut matches = Vec::new();
+    for process in before.into_values() {
+        if !declared.contains(process.command.as_str()) {
+            continue;
+        }
+        let Some(arguments) = read_process_arguments(proc_root, process.pid)? else {
+            continue;
+        };
+        if !crate::process::argv_names_profile(&arguments, profile_roots) {
+            continue;
+        }
+        let Some(after) =
+            read_transient_text(&proc_root.join(process.pid.to_string()).join("stat"))?
+        else {
+            continue;
+        };
+        let after = parse_stat(process.pid, &after)?;
+        if after.identity() == process.identity() {
+            matches.push(after.to_info(ProcOwnership::ProfilePath));
+        }
+    }
+    Ok(matches)
+}
+
 pub(crate) fn process_group_members(
     process_group: u32,
     minimum_start: u64,

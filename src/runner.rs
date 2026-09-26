@@ -91,11 +91,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static CREATED_PROFILES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+type RunTeardownAudit = crate::process::RunTeardownEvidence;
 
 type HarnessDriver = Box<dyn Driver>;
 
@@ -3626,11 +3629,14 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
     let outcome = match outcome {
         Ok(Ok(code)) => Ok(code),
         Ok(Err(error)) => {
-            let error = match ensure_owned_cleanup() {
-                Ok(()) => error,
-                Err(cleanup_error) => AhrbError::Protocol(format!(
-                    "{error}; abort cleanup also failed: {cleanup_error}"
-                )),
+            let teardown_audit = run_teardown_audit(&manifest, &persistence.profile_path);
+            let error = if teardown_audit.errors.is_empty() {
+                error
+            } else {
+                AhrbError::Protocol(format!(
+                    "{error}; abort teardown also failed: {}",
+                    teardown_audit.errors.join("; ")
+                ))
             };
             crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
             write_abort_report(
@@ -3640,6 +3646,7 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
                 &progress,
                 &persistence,
                 &error.to_string(),
+                Some(&teardown_audit),
             )?;
             eprintln!(
                 "ahrb: run aborted for manifest {}: {error}; wrote {}",
@@ -3649,9 +3656,16 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
             return Ok(2);
         }
         Err(_) => {
-            ensure_owned_cleanup()?;
+            let teardown_audit = run_teardown_audit(&manifest, &persistence.profile_path);
             let detail = format!("deadline after {deadline_secs}s");
-            let error = AhrbError::Timeout(detail.clone());
+            let error = if teardown_audit.errors.is_empty() {
+                AhrbError::Timeout(detail.clone())
+            } else {
+                AhrbError::Protocol(format!(
+                    "{detail}; deadline teardown failed: {}",
+                    teardown_audit.errors.join("; ")
+                ))
+            };
             crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
             write_deadline_report(
                 &options,
@@ -3660,6 +3674,7 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
                 &progress,
                 &persistence,
                 &detail,
+                Some(&teardown_audit),
             )?;
             eprintln!(
                 "ahrb: run deadline reached after {:.3}s; stopped launching rows and wrote {}",
@@ -3669,7 +3684,12 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
             Ok(2)
         }
     };
-    let cleanup = ensure_owned_cleanup();
+    let final_audit = run_teardown_audit(&manifest, &persistence.profile_path);
+    let cleanup = if final_audit.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AhrbError::Protocol(final_audit.errors.join("; ")))
+    };
     match (outcome, cleanup) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -5208,6 +5228,70 @@ fn ensure_owned_cleanup() -> Result<()> {
     }
 }
 
+fn created_profiles_under(run_root: &Path) -> Result<Vec<PathBuf>> {
+    let profiles = CREATED_PROFILES
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .map_err(|_| {
+            AhrbError::Protocol("created-profile registry lock was poisoned".to_owned())
+        })?;
+    Ok(profiles
+        .iter()
+        .filter(|profile| profile.starts_with(run_root))
+        .cloned()
+        .collect())
+}
+
+/// Render the adapter's profile-lock declarations for every disposable profile
+/// created under `run_root`, then record, reap and lock-audit its owned
+/// processes (`crate::process::teardown_owned_processes`).
+fn run_teardown_audit(manifest: &Manifest, run_root: &Path) -> RunTeardownAudit {
+    let mut errors = Vec::new();
+    let mut locks = Vec::new();
+    match created_profiles_under(run_root) {
+        Ok(profiles) => {
+            for profile in profiles {
+                let variables = BTreeMap::from([(
+                    "profile".to_owned(),
+                    profile.to_string_lossy().into_owned(),
+                )]);
+                for template in &manifest.process.profile_lock_paths {
+                    match crate::manifest::render_template(template, &variables) {
+                        Ok(path) => {
+                            let path = PathBuf::from(path);
+                            if path.starts_with(&profile) {
+                                locks.push((profile.clone(), path));
+                            } else {
+                                errors.push(format!(
+                                    "declared profile lock {} escaped disposable profile {}",
+                                    path.display(),
+                                    profile.display()
+                                ));
+                            }
+                        }
+                        Err(error) => errors.push(format!(
+                            "profile lock template {template:?} failed to render: {error}"
+                        )),
+                    }
+                }
+            }
+        }
+        Err(error) => errors.push(format!("created-profile registry unavailable: {error}")),
+    }
+
+    let mut audit = crate::process::teardown_owned_processes(
+        run_root,
+        &manifest.process.executable_names,
+        &locks,
+    );
+    if !errors.is_empty() {
+        errors.append(&mut audit.errors);
+        audit.errors = errors;
+        audit.status = "ERROR";
+    }
+    audit
+}
+
 fn selected_definitions(
     options: &RunOptions,
 ) -> Result<Vec<&'static crate::scenarios::TestDefinition>> {
@@ -5249,6 +5333,7 @@ fn write_deadline_report(
     progress: &RunProgress,
     persistence: &crate::results::RunPersistence,
     detail: &str,
+    teardown_audit: Option<&RunTeardownAudit>,
 ) -> Result<()> {
     write_interrupted_report(
         options,
@@ -5258,6 +5343,7 @@ fn write_deadline_report(
         persistence,
         detail,
         RunInterruption::Deadline,
+        teardown_audit,
     )
 }
 
@@ -5268,6 +5354,7 @@ fn write_abort_report(
     progress: &RunProgress,
     persistence: &crate::results::RunPersistence,
     detail: &str,
+    teardown_audit: Option<&RunTeardownAudit>,
 ) -> Result<()> {
     write_interrupted_report(
         options,
@@ -5277,6 +5364,7 @@ fn write_abort_report(
         persistence,
         detail,
         RunInterruption::Abort,
+        teardown_audit,
     )
 }
 
@@ -5289,6 +5377,7 @@ fn write_interrupted_report(
     persistence: &crate::results::RunPersistence,
     detail: &str,
     interruption: RunInterruption,
+    teardown_audit: Option<&RunTeardownAudit>,
 ) -> Result<()> {
     let manifest_hash = crate::manifest::hash(manifest)?;
     let selected_rows: Vec<u8> = selected.iter().map(|definition| definition.row).collect();
@@ -5364,7 +5453,7 @@ fn write_interrupted_report(
         }
     }
     let automation = automation_score(&results);
-    let details = ReportDetails::from(BTreeMap::from([
+    let mut details = ReportDetails::from(BTreeMap::from([
         (
             "automation-score".to_owned(),
             json!({
@@ -5379,6 +5468,9 @@ fn write_interrupted_report(
             json!({"measurement_complete": false}),
         ),
     ]));
+    if let Some(teardown_audit) = teardown_audit {
+        details.insert("teardown".to_owned(), serde_json::to_value(teardown_audit)?);
+    }
     let report = Report {
         schema: 3,
         spec_version: 2,
@@ -7360,9 +7452,23 @@ async fn run_inner_timed(
     if let Some(active_server) = server {
         active_server.shutdown().await?;
     }
-    // Final cleanup is part of the run outcome, not a post-report afterthought:
-    // a protocol-level residue failure must be persisted as an aborted run.
-    ensure_owned_cleanup()?;
+    // Evidence collectors have finished, including their delayed residue
+    // observations. Reap only now so cleanup cannot erase a row finding.
+    let teardown_audit = run_teardown_audit(&manifest, &profile_root);
+    let teardown_failed = teardown_audit.status == "ERROR";
+    state.lifecycle_notes.push(format!(
+        "teardown {} observed={} reaped={} survivors={} lock_audits={}{}",
+        teardown_audit.status,
+        teardown_audit.observed_owned_processes.len(),
+        teardown_audit.reaped_processes.len(),
+        teardown_audit.surviving_processes.len(),
+        teardown_audit.profile_locks.len(),
+        if teardown_audit.errors.is_empty() {
+            String::new()
+        } else {
+            format!(" errors={}", teardown_audit.errors.join("; "))
+        }
+    ));
 
     let resource_evidence = state
         .resource_evidence
@@ -8216,6 +8322,10 @@ async fn run_inner_timed(
         metrics.extend(row73_evaluation.metrics.clone());
     }
     let mut details = ReportDetails::default();
+    details.insert(
+        "teardown".to_owned(),
+        serde_json::to_value(&teardown_audit)?,
+    );
     if selected_rows.contains(&47) {
         let mut disk_details = row47_evaluation.details.clone();
         if let Some(object) = disk_details.as_object_mut() {
@@ -8609,14 +8719,20 @@ async fn run_inner_timed(
     if automation_components_missing {
         println!("badge_note A unavailable until rows 65-72 are measured");
     }
-    Ok(suite_exit_code(
+    let suite_code = suite_exit_code(
         &report.results,
         report
             .badge
             .as_ref()
             .and_then(crate::report::ReportBadge::matrix),
         &manifest,
-    ))
+    );
+    if teardown_failed {
+        eprintln!("ahrb: teardown ERROR: {}", teardown_audit.errors.join("; "));
+        Ok(2)
+    } else {
+        Ok(suite_code)
+    }
 }
 
 fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
@@ -8638,6 +8754,11 @@ fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
         }
     })?;
     set_owner_private(profile_root)?;
+    CREATED_PROFILES
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .map_err(|_| AhrbError::Protocol("created-profile registry lock was poisoned".to_owned()))?
+        .insert(profile_root.to_path_buf());
     let variables = BTreeMap::from([(
         "profile".to_owned(),
         profile_root.to_string_lossy().into_owned(),
@@ -11744,15 +11865,29 @@ async fn wait_for_signal_terminal_receipt(
     }
 }
 
-async fn signal_matrix_residue_count(sampler: &mut dyn Sampler, roots: &[u32]) -> Result<u32> {
-    let started = Instant::now();
-    loop {
-        let count = sampler.discover(roots)?.members.len();
-        if count == 0 || started.elapsed() >= Duration::from_millis(2_000) {
-            return Ok(u32::try_from(count).map_or(u32::MAX, |value| value));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+async fn signal_matrix_residue_count(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    profile_root: &Path,
+    executable_names: &[String],
+) -> Result<(u32, Vec<crate::process::ProcessInfo>)> {
+    // Row 57 specifies a delayed two-second audit. Do not return early on an
+    // empty parent/group sample: a detached daemon may become visible only by
+    // its disposable-profile argv after its launcher exits.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    let tree = sampler.discover(roots)?;
+    let profile_owned =
+        crate::process::discover_profile_owned_processes(profile_root, executable_names)?;
+    crate::process::track_profile_owned_processes(&profile_owned)?;
+    let mut processes = tree.members;
+    for process in profile_owned {
+        processes.insert(process.identity, process);
     }
+    let processes = processes.into_values().collect::<Vec<_>>();
+    Ok((
+        u32::try_from(processes.len()).unwrap_or(u32::MAX),
+        processes,
+    ))
 }
 
 fn annotate_signal_matrix_events(
@@ -12054,7 +12189,13 @@ async fn collect_signal_matrix_case(
             .map(str::to_owned);
         let terminal_count = u32::try_from(terminals.len()).map_or(u32::MAX, |value| value);
         drop(terminals);
-        let residue_processes = signal_matrix_residue_count(sampler.as_mut(), &roots).await?;
+        let (residue_processes, residue_identities) = signal_matrix_residue_count(
+            sampler.as_mut(),
+            &roots,
+            &profile_root,
+            &manifest.process.executable_names,
+        )
+        .await?;
         annotate_signal_matrix_events(
             &mut events,
             case,
@@ -12088,6 +12229,7 @@ async fn collect_signal_matrix_case(
                 exit_code,
                 exit_was_signal: Some(exit_was_signal),
                 residue_processes: Some(residue_processes),
+                residue_identities,
             },
             events,
             requests,
@@ -12160,6 +12302,7 @@ async fn collect_signal_matrix_trials(
                     exit_code: None,
                     exit_was_signal: None,
                     residue_processes: None,
+                    residue_identities: Vec::new(),
                 });
                 continue;
             }
@@ -27895,6 +28038,18 @@ mod resource_sampler_tests {
                 );
             })
             .expect("record partial progress");
+        let teardown_audit = RunTeardownAudit {
+            status: "PASS",
+            observed_owned_processes: Vec::new(),
+            reaped_processes: vec![crate::process::ProcIdentity {
+                pid: 41,
+                start_time: 9001,
+            }],
+            surviving_processes: Vec::new(),
+            profile_locks: Vec::new(),
+            lock_holders: Vec::new(),
+            errors: Vec::new(),
+        };
         write_deadline_report(
             &options,
             &manifest,
@@ -27902,6 +28057,7 @@ mod resource_sampler_tests {
             &progress,
             &persistence,
             "deadline after 1s",
+            Some(&teardown_audit),
         )
         .expect("write partial deadline report");
         let report: Report = serde_json::from_slice(
@@ -27919,6 +28075,8 @@ mod resource_sampler_tests {
         ));
         assert!(report.results[1].evidence[0].contains("active"));
         assert!(report.results[2].evidence[0].contains("not launched"));
+        assert_eq!(report.details["teardown"]["status"], "PASS");
+        assert_eq!(report.details["teardown"]["reaped_processes"][0]["pid"], 41);
         std::fs::remove_dir_all(output).expect("remove partial deadline output");
     }
 

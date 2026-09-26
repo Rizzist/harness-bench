@@ -252,6 +252,7 @@ failures = { usage = 2, provider = 65, unavailable = 69, software = 70, io = 74,
 
 [process]
 executable_names = ["haiderd", "haider"]
+profile_lock_paths = ["{{profile}}/home/.haider/dev-profile/lock"]
 
 [resources]
 # Observed in the disposable 0.0.970 profile: daemon.log is a hardlink to

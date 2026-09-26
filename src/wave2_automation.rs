@@ -206,6 +206,8 @@ pub struct SignalCaseTrial {
     pub exit_code: Option<i32>,
     pub exit_was_signal: Option<bool>,
     pub residue_processes: Option<u32>,
+    #[serde(default)]
+    pub residue_identities: Vec<crate::process::ProcessInfo>,
 }
 
 /// Row-57 result.
@@ -280,8 +282,14 @@ pub fn evaluate_signal_matrix(
         if trial.exit_code.is_none() && trial.exit_was_signal.is_none() {
             return incomplete(format!("{} process exit boundary is absent", trial.case));
         }
-        if trial.residue_processes.is_none() {
+        let Some(residue_processes) = trial.residue_processes else {
             return incomplete(format!("{} residue observation is absent", trial.case));
+        };
+        if usize::try_from(residue_processes).ok() != Some(trial.residue_identities.len()) {
+            return incomplete(format!(
+                "{} residue count does not match its identity evidence",
+                trial.case
+            ));
         }
     }
     for trial in trials.iter().filter(|trial| !trial.applicable) {
@@ -296,6 +304,7 @@ pub fn evaluate_signal_matrix(
             || trial.source_terminal_count.is_some()
             || trial.exit_was_signal.is_some()
             || trial.residue_processes.is_some()
+            || !trial.residue_identities.is_empty()
         {
             return incomplete(
                 "only stdin-eof may be not_applicable with a typed reason".to_owned(),
@@ -577,6 +586,7 @@ mod tests {
             exit_code: Some(0),
             exit_was_signal: Some(false),
             residue_processes: Some(0),
+            residue_identities: Vec::new(),
         };
         let trials = vec![
             signal_trial("sigterm"),
@@ -600,6 +610,7 @@ mod tests {
                 exit_code: None,
                 exit_was_signal: None,
                 residue_processes: None,
+                residue_identities: Vec::new(),
             },
         ];
         let evaluated = evaluate_signal_matrix(&trials, 1, 2_000, 10_000);
@@ -616,6 +627,67 @@ mod tests {
         assert!(evaluated.details["cases"][3]["terminal_count"].is_null());
         assert!(evaluated.details["cases"][3]["exit_was_signal"].is_null());
         assert_eq!(evaluated.details["cases"][0]["signal"], "sigterm");
+    }
+
+    #[test]
+    fn signal_matrix_retains_profile_owned_residue_identity() {
+        // Every case is otherwise a clean pass (source-credited terminal, no
+        // escalation), so the only failure is the recorded SIGINTx2 residue.
+        let trial = |case: &str, residue: bool| SignalCaseTrial {
+            repetition: 1,
+            case: case.to_owned(),
+            applicable: true,
+            not_applicable_reason: None,
+            delivery_succeeded: Some(true),
+            ownership_resolved: Some(true),
+            cleanup_escalated: Some(false),
+            origin_ns: Some(1_000_000),
+            terminal_ns: Some(2_000_000),
+            terminal_type: Some("cancelled".to_owned()),
+            terminal_count: Some(1),
+            source_terminal_count: Some(1),
+            exit_code: Some(0),
+            exit_was_signal: Some(false),
+            residue_processes: Some(u32::from(residue)),
+            residue_identities: residue
+                .then_some(crate::process::ProcessInfo {
+                    identity: crate::process::ProcIdentity {
+                        pid: 41,
+                        start_time: 9001,
+                    },
+                    ppid: 1,
+                    command: "haiderd".to_owned(),
+                    ownership: crate::process::ProcOwnership::ProfilePath,
+                })
+                .into_iter()
+                .collect(),
+        };
+        let evaluated = evaluate_signal_matrix(
+            &[
+                trial("sigterm", false),
+                trial("sigint2", true),
+                trial("sighup", false),
+                trial("stdin-eof", false),
+            ],
+            1,
+            2_000,
+            10_000,
+        );
+        assert!(evaluated.measurement_complete);
+        assert!(!evaluated.passed);
+        assert_eq!(
+            evaluated.metrics["signal_matrix.sigint2_residue_processes"],
+            1.0
+        );
+        assert_eq!(
+            evaluated.details["cases"][1]["residue_identities"][0]["identity"]["pid"],
+            41
+        );
+        assert_eq!(
+            evaluated.details["cases"][1]["residue_identities"][0]["ownership"],
+            "profile-path"
+        );
+        assert_eq!(evaluated.metrics["signal_matrix.passed_cases"], 3.0);
     }
 
     #[test]
@@ -638,6 +710,7 @@ mod tests {
                     exit_code: None,
                     exit_was_signal: None,
                     residue_processes: Some(0),
+                    residue_identities: Vec::new(),
                 },
                 SignalCaseTrial {
                     repetition: 1,
@@ -655,6 +728,7 @@ mod tests {
                     exit_code: Some(0),
                     exit_was_signal: Some(false),
                     residue_processes: Some(0),
+                    residue_identities: Vec::new(),
                 },
                 SignalCaseTrial {
                     repetition: 1,
@@ -672,6 +746,7 @@ mod tests {
                     exit_code: Some(0),
                     exit_was_signal: Some(false),
                     residue_processes: Some(0),
+                    residue_identities: Vec::new(),
                 },
                 SignalCaseTrial {
                     repetition: 1,
@@ -689,6 +764,7 @@ mod tests {
                     exit_code: None,
                     exit_was_signal: None,
                     residue_processes: None,
+                    residue_identities: Vec::new(),
                 },
             ],
             1,
@@ -777,6 +853,7 @@ mod tests {
             exit_code: Some(0),
             exit_was_signal: Some(false),
             residue_processes: Some(0),
+            residue_identities: Vec::new(),
         };
         let mut trials = vec![
             trial("sigterm"),
@@ -809,6 +886,7 @@ mod tests {
             exit_code: Some(130),
             exit_was_signal: Some(false),
             residue_processes: Some(0),
+            residue_identities: Vec::new(),
         };
         let evaluated = evaluate_signal_matrix(
             &[

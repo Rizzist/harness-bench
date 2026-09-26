@@ -8,6 +8,7 @@ pub mod macos;
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,10 +37,84 @@ pub enum ProcOwnership {
     ProcessGroupMember,
     /// Verified reparented process matching adapter evidence.
     Reparented,
+    /// Executable and argv identify a disposable profile created by this run.
+    ProfilePath,
+    /// Holds an adapter-declared lock inside a disposable profile of this run.
+    LockHolder,
+}
+
+/// One process observed before the teardown signal and its final disposition.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TeardownProcess {
+    /// Stable identity used for every signal and liveness check.
+    #[serde(flatten)]
+    pub identity: ProcIdentity,
+    /// Executable basename observed with the identity.
+    pub command: String,
+    /// Parent observed before teardown; a value of one is valid owned residue.
+    pub ppid: u32,
+    /// Why AHRB attributed the process to this run.
+    pub ownership: ProcOwnership,
+}
+
+/// Bounded TERM-to-KILL cleanup evidence.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ProcessTeardownEvidence {
+    /// Live identities observed before the first teardown signal.
+    pub observed: Vec<TeardownProcess>,
+    /// Observed identities gone after TERM or KILL.
+    pub reaped: Vec<ProcIdentity>,
+    /// Observed identities still live after the bounded cleanup.
+    pub survivors: Vec<ProcIdentity>,
+}
+
+/// Result of `fcntl(F_GETLK)` for one adapter-declared profile lock.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "outcome")]
+pub enum ProfileLockAudit {
+    /// The harness never created the declared lock file.
+    Absent {
+        profile: PathBuf,
+        lock_path: PathBuf,
+    },
+    /// No other process holds a conflicting write lock.
+    Unlocked {
+        profile: PathBuf,
+        lock_path: PathBuf,
+    },
+    /// A conflicting lock remains. `holder_pid` is the kernel-reported owner;
+    /// it is `None` when `F_GETLK` cannot attribute the lock to a process
+    /// (macOS reports `l_pid = -1` for `flock(2)`/OFD-style locks). Such a lock
+    /// is still held and its holder must be identified by other means.
+    Held {
+        profile: PathBuf,
+        lock_path: PathBuf,
+        holder_pid: Option<u32>,
+    },
+}
+
+impl ProfileLockAudit {
+    /// Lock file this audit refers to.
+    pub fn lock_path(&self) -> &Path {
+        match self {
+            Self::Absent { lock_path, .. }
+            | Self::Unlocked { lock_path, .. }
+            | Self::Held { lock_path, .. } => lock_path,
+        }
+    }
+
+    /// Disposable profile that declared the lock.
+    pub fn profile(&self) -> &Path {
+        match self {
+            Self::Absent { profile, .. }
+            | Self::Unlocked { profile, .. }
+            | Self::Held { profile, .. } => profile,
+        }
+    }
 }
 
 /// One process in an owned tree.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProcessInfo {
     /// Stable identity.
     pub identity: ProcIdentity,
@@ -726,6 +801,553 @@ pub fn track_process_tree(tree: &ProcessTree) -> Result<()> {
     Ok(())
 }
 
+fn argument_names_profile(argument: &str, profile_root: &Path) -> bool {
+    let root = profile_root.to_string_lossy();
+    if root.is_empty() {
+        return false;
+    }
+    let matches = |candidate: &str| {
+        candidate == root
+            || candidate
+                .strip_prefix(root.as_ref())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    };
+    matches(argument)
+        || argument
+            .split_once('=')
+            .is_some_and(|(flag, value)| flag.starts_with('-') && matches(value))
+}
+
+pub(crate) fn argv_names_profile(arguments: &[String], profile_roots: &[PathBuf]) -> bool {
+    arguments.iter().any(|argument| {
+        profile_roots
+            .iter()
+            .any(|root| argument_names_profile(argument, root))
+    })
+}
+
+/// Spellings under which a process may name `profile_root` in its argv. A
+/// harness commonly canonicalizes its store path, and macOS temporary roots
+/// are symlinks (`/tmp` -> `/private/tmp`, `/var` -> `/private/var`), so the
+/// lexical root AHRB created and the resolved root are both ownership keys.
+pub(crate) fn profile_root_aliases(profile_root: &Path) -> Vec<PathBuf> {
+    let mut aliases = vec![profile_root.to_path_buf()];
+    // Resolve the longest existing ancestor so a profile that was already
+    // removed (or not yet created) still maps to its resolved spelling.
+    let resolved = profile_root.ancestors().find_map(|ancestor| {
+        let resolved = std::fs::canonicalize(ancestor).ok()?;
+        let rest = profile_root.strip_prefix(ancestor).ok()?;
+        Some(if rest.as_os_str().is_empty() {
+            resolved
+        } else {
+            resolved.join(rest)
+        })
+    });
+    if let Some(resolved) = resolved
+        && !aliases.contains(&resolved)
+    {
+        aliases.push(resolved);
+    }
+    aliases
+}
+
+#[cfg(test)]
+mod profile_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn argv_profile_match_requires_a_path_boundary() {
+        let root = &[PathBuf::from("/tmp/ahrb-run/dr57/sigint2-r1")];
+        assert!(argv_names_profile(
+            &[
+                "--store-dir".into(),
+                "/tmp/ahrb-run/dr57/sigint2-r1/home".into()
+            ],
+            root,
+        ));
+        assert!(argv_names_profile(
+            &["--store-dir=/tmp/ahrb-run/dr57/sigint2-r1/home".into()],
+            root,
+        ));
+        assert!(!argv_names_profile(
+            &["/tmp/ahrb-run/dr57/sigint2-r10/home".into()],
+            root,
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_aliases_include_the_resolved_temporary_root() {
+        // Haider passes `/private/tmp/...` to its daemon when AHRB created
+        // `/tmp/...`; missing that alias hid the row-57 orphan.
+        let root = Path::new("/tmp/ahrb-alias-probe-absent/dr57/sigint2-r1");
+        let aliases = profile_root_aliases(root);
+        assert_eq!(
+            aliases,
+            vec![
+                root.to_path_buf(),
+                PathBuf::from("/private/tmp/ahrb-alias-probe-absent/dr57/sigint2-r1"),
+            ]
+        );
+        assert!(argv_names_profile(
+            &[
+                "--store-dir".into(),
+                "/private/tmp/ahrb-alias-probe-absent/dr57/sigint2-r1/home/.haider/dev-profile"
+                    .into()
+            ],
+            &aliases,
+        ));
+        assert!(!argv_names_profile(
+            &["/private/tmp/ahrb-alias-probe-absent/dr57/sigint2-r10/home".into()],
+            &aliases,
+        ));
+    }
+}
+
+/// Find live adapter processes whose executable and immutable argv identify a
+/// disposable profile. This ownership source remains valid after reparenting
+/// and process-group changes.
+pub fn discover_profile_owned_processes(
+    profile_root: &Path,
+    executable_names: &[String],
+) -> Result<Vec<ProcessInfo>> {
+    if !profile_root.is_absolute() {
+        return Err(AhrbError::Validation(format!(
+            "profile-owned process discovery requires an absolute root: {}",
+            profile_root.display()
+        )));
+    }
+    if executable_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let roots = profile_root_aliases(profile_root);
+    #[cfg(target_os = "macos")]
+    let mut processes = macos::profile_owned_processes(&roots, executable_names)?;
+    #[cfg(target_os = "linux")]
+    let mut processes = linux::profile_owned_processes(&roots, executable_names)?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let mut processes = return Err(AhrbError::Unsupported(
+        "profile-owned process discovery is implemented only on macOS and Linux".to_owned(),
+    ));
+    processes.sort_by_key(|process| process.identity);
+    processes.dedup_by_key(|process| process.identity);
+    Ok(processes)
+}
+
+/// Register profile-attributed identities so process-wide emergency and final
+/// cleanup paths retain them even when their original parent has exited.
+pub fn track_profile_owned_processes(processes: &[ProcessInfo]) -> Result<()> {
+    let mut registry = registry_lock()?;
+    for process in processes {
+        registry.observed.insert(process.identity);
+        record_signal_target(&SIGNAL_PIDS, process.identity.pid);
+    }
+    Ok(())
+}
+
+/// Query a profile lock without acquiring it. `F_GETLK` reports conflicting
+/// owners and does not disturb either the lock file or the owning process.
+#[cfg(unix)]
+pub fn audit_profile_lock(profile: &Path, lock_path: &Path) -> Result<ProfileLockAudit> {
+    use std::os::fd::AsRawFd as _;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProfileLockAudit::Absent {
+                profile: profile.to_path_buf(),
+                lock_path: lock_path.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut lock = libc::flock {
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+        l_type: libc::F_WRLCK,
+        l_whence: libc::SEEK_SET as i16,
+    };
+    // SAFETY: `file` remains open and `lock` is a valid writable `flock`.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if lock.l_type == libc::F_UNLCK {
+        return Ok(ProfileLockAudit::Unlocked {
+            profile: profile.to_path_buf(),
+            lock_path: lock_path.to_path_buf(),
+        });
+    }
+    // A positive `l_pid` names a POSIX record-lock owner. Zero or negative
+    // means the conflicting lock is not process-associated (`flock(2)` or an
+    // OFD lock); the lock is nonetheless held.
+    let holder_pid = u32::try_from(lock.l_pid).ok().filter(|pid| *pid != 0);
+    Ok(ProfileLockAudit::Held {
+        profile: profile.to_path_buf(),
+        lock_path: lock_path.to_path_buf(),
+        holder_pid,
+    })
+}
+
+/// Live processes that have `lock_path` open, excluding AHRB itself. Used to
+/// identify the holder of a lock whose owner `F_GETLK` cannot report. Each
+/// entry is revalidated by `(pid,start_time)`.
+pub fn lock_file_openers(lock_path: &Path) -> Result<Vec<ProcessInfo>> {
+    let own_pid = std::process::id();
+    let mut pids = open_file_pids(lock_path)?;
+    pids.retain(|pid| *pid != own_pid);
+    let mut openers = Vec::new();
+    for pid in pids {
+        if let Some(mut info) = live_process_info(pid)? {
+            info.ownership = ProcOwnership::LockHolder;
+            openers.push(info);
+        }
+    }
+    openers.sort_by_key(|process| process.identity);
+    openers.dedup_by_key(|process| process.identity);
+    Ok(openers)
+}
+
+/// Current information for a live PID, keyed by its stable identity.
+pub fn live_process_info(pid: u32) -> Result<Option<ProcessInfo>> {
+    let Some((identity, _group)) = process_identity_and_group(pid)? else {
+        return Ok(None);
+    };
+    process_info_for_identity(identity)
+}
+
+#[cfg(target_os = "macos")]
+fn open_file_pids(lock_path: &Path) -> Result<BTreeSet<u32>> {
+    // `lsof -t` prints one PID per line and exits 1 when nothing has the file
+    // open; any other failure is surfaced rather than read as "no holder".
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg("-w")
+        .arg("--")
+        .arg(lock_path)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let nothing_open = output.status.code() == Some(1) && stdout.trim().is_empty();
+    if !output.status.success() && !nothing_open {
+        return Err(AhrbError::Protocol(format!(
+            "lsof could not list openers of {}: {}",
+            lock_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.trim()
+                .parse::<u32>()
+                .map_err(|_| AhrbError::Protocol(format!("lsof printed a non-PID line {line:?}")))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn open_file_pids(lock_path: &Path) -> Result<BTreeSet<u32>> {
+    let target = std::fs::canonicalize(lock_path)?;
+    let mut pids = BTreeSet::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path()).is_ok_and(|link| link == target) {
+                pids.insert(pid);
+                break;
+            }
+        }
+    }
+    Ok(pids)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_file_pids(_lock_path: &Path) -> Result<BTreeSet<u32>> {
+    Err(AhrbError::Unsupported(
+        "lock-holder discovery is implemented only on macOS and Linux".to_owned(),
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn audit_profile_lock(_profile: &Path, _lock_path: &Path) -> Result<ProfileLockAudit> {
+    Err(AhrbError::Unsupported(
+        "profile lock audit requires fcntl(F_GETLK)".to_owned(),
+    ))
+}
+
+/// Bounded number of lock-driven reap rounds after the ownership passes.
+pub const TEARDOWN_LOCK_REAP_ROUNDS: usize = 2;
+
+/// Run-teardown record: owned processes observed before the first signal,
+/// what was reaped, survivors, lock-holder attribution and the final lock audit.
+#[derive(Clone, Debug, Serialize)]
+pub struct RunTeardownEvidence {
+    /// `PASS` or `ERROR`.
+    pub status: &'static str,
+    /// Live owned identities recorded before they were signalled.
+    pub observed_owned_processes: Vec<TeardownProcess>,
+    /// Observed identities no longer alive after teardown.
+    pub reaped_processes: Vec<ProcIdentity>,
+    /// Observed identities still alive after every bounded round.
+    pub surviving_processes: Vec<ProcIdentity>,
+    /// Final lock audit, taken after every bounded reap round.
+    pub profile_locks: Vec<ProfileLockAudit>,
+    /// How each lock found held during teardown was attributed to a holder.
+    pub lock_holders: Vec<LockHolderEvidence>,
+    /// Every teardown failure; non-empty means `ERROR`.
+    pub errors: Vec<String>,
+}
+
+/// Holder attribution for a profile lock that was held during teardown.
+#[derive(Clone, Debug, Serialize)]
+pub struct LockHolderEvidence {
+    /// One-based lock-driven reap round.
+    pub round: usize,
+    /// Disposable profile that declared the lock.
+    pub profile: PathBuf,
+    /// Held lock file.
+    pub lock_path: PathBuf,
+    /// Owner reported by `F_GETLK`; `None` when the kernel cannot attribute it.
+    pub kernel_owner_pid: Option<u32>,
+    /// `fcntl-owner` or `open-file-scan`.
+    pub identified_by: &'static str,
+    /// Every live process identified as holding (or having open) the lock.
+    pub holders: Vec<TeardownProcess>,
+    /// Holders that are neither a declared executable nor profile-owned by argv;
+    /// they are recorded but never signalled.
+    pub unowned_holders: Vec<ProcIdentity>,
+}
+
+fn teardown_process(process: ProcessInfo) -> TeardownProcess {
+    TeardownProcess {
+        identity: process.identity,
+        command: process.command,
+        ppid: process.ppid,
+        ownership: process.ownership,
+    }
+}
+
+/// Record `discovered` as observed before any signal, register it, and run one
+/// bounded TERM-to-KILL cleanup over every registered owned identity.
+fn teardown_reap_pass(
+    discovered: &[ProcessInfo],
+    observed: &mut BTreeMap<ProcIdentity, TeardownProcess>,
+    reaped: &mut BTreeSet<ProcIdentity>,
+    errors: &mut Vec<String>,
+) {
+    for process in discovered {
+        observed
+            .entry(process.identity)
+            .or_insert_with(|| teardown_process(process.clone()));
+    }
+    if let Err(error) = track_profile_owned_processes(discovered) {
+        errors.push(format!(
+            "registering profile-owned processes failed: {error}"
+        ));
+    }
+    match cleanup_owned_processes_with_evidence(Duration::from_millis(500)) {
+        Ok(cleanup) => {
+            for process in cleanup.observed {
+                observed.entry(process.identity).or_insert(process);
+            }
+            reaped.extend(cleanup.reaped);
+        }
+        Err(error) => errors.push(format!("owned-process cleanup failed: {error}")),
+    }
+}
+
+fn teardown_discover(
+    root: &Path,
+    executable_names: &[String],
+    errors: &mut Vec<String>,
+) -> Vec<ProcessInfo> {
+    discover_profile_owned_processes(root, executable_names).unwrap_or_else(|error| {
+        errors.push(format!(
+            "profile-owned process discovery under {} failed: {error}",
+            root.display()
+        ));
+        Vec::new()
+    })
+}
+
+fn audit_declared_profile_locks(
+    locks: &[(PathBuf, PathBuf)],
+) -> (Vec<ProfileLockAudit>, Vec<String>) {
+    let mut audits = Vec::new();
+    let mut errors = Vec::new();
+    for (profile, path) in locks {
+        match audit_profile_lock(profile, path) {
+            Ok(audit) => audits.push(audit),
+            Err(error) => errors.push(format!(
+                "profile lock {} could not be audited: {error}",
+                path.display()
+            )),
+        }
+    }
+    (audits, errors)
+}
+
+/// Record, then reap, every AHRB-owned process left under `run_root`, and
+/// audit the declared `(profile, lock_path)` pairs. Never returns early: every
+/// failure is collected into `errors` so the report always carries the
+/// observed/reaped evidence. A lock found held (including one whose owner the
+/// kernel cannot report) triggers holder attribution and a bounded reap round;
+/// only a lock still held after those rounds, a surviving owned process, or an
+/// operation failure makes the teardown `ERROR`.
+pub fn teardown_owned_processes(
+    run_root: &Path,
+    executable_names: &[String],
+    locks: &[(PathBuf, PathBuf)],
+) -> RunTeardownEvidence {
+    let names = executable_names;
+    let mut errors = Vec::new();
+    let mut observed = BTreeMap::new();
+    let mut reaped = BTreeSet::new();
+
+    let profile_owned = teardown_discover(run_root, names, &mut errors);
+    teardown_reap_pass(&profile_owned, &mut observed, &mut reaped, &mut errors);
+    // Close the narrow race where a launcher creates a detached profile-owned
+    // process during the first cleanup pass. The second pass remains bounded.
+    let late_profile_owned = teardown_discover(run_root, names, &mut errors);
+    if !late_profile_owned.is_empty() {
+        teardown_reap_pass(&late_profile_owned, &mut observed, &mut reaped, &mut errors);
+    }
+
+    let mut lock_holders = Vec::new();
+    let mut round = 0;
+    let (lock_audits, lock_audit_errors) = loop {
+        let (audits, audit_errors) = audit_declared_profile_locks(locks);
+        let held = audits
+            .iter()
+            .filter_map(|audit| match audit {
+                ProfileLockAudit::Held {
+                    profile,
+                    lock_path,
+                    holder_pid,
+                } => Some((profile.clone(), lock_path.clone(), *holder_pid)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if held.is_empty() || round == TEARDOWN_LOCK_REAP_ROUNDS {
+            break (audits, audit_errors);
+        }
+        round += 1;
+        let mut to_reap = Vec::new();
+        for (profile, lock_path, kernel_owner_pid) in held {
+            let (identified_by, candidates) = match kernel_owner_pid {
+                Some(pid) => (
+                    "fcntl-owner",
+                    live_process_info(pid).map(|process| process.into_iter().collect::<Vec<_>>()),
+                ),
+                None => ("open-file-scan", lock_file_openers(&lock_path)),
+            };
+            let candidates = candidates.unwrap_or_else(|error| {
+                errors.push(format!(
+                    "holder of profile lock {} could not be identified ({identified_by}): {error}",
+                    lock_path.display()
+                ));
+                Vec::new()
+            });
+            let owned_by_argv = teardown_discover(&profile, names, &mut errors);
+            let owned_identities = owned_by_argv
+                .iter()
+                .map(|process| process.identity)
+                .collect::<BTreeSet<_>>();
+            let mut holders = Vec::new();
+            let mut unowned_holders = Vec::new();
+            for candidate in &candidates {
+                if names.contains(&candidate.command)
+                    || owned_identities.contains(&candidate.identity)
+                {
+                    to_reap.push(candidate.clone());
+                } else {
+                    unowned_holders.push(candidate.identity);
+                }
+                holders.push(teardown_process(candidate.clone()));
+            }
+            // A holder that cannot be seen by either method is still bounded
+            // by this profile's own processes.
+            to_reap.extend(owned_by_argv);
+            lock_holders.push(LockHolderEvidence {
+                round,
+                profile,
+                lock_path,
+                kernel_owner_pid,
+                identified_by,
+                holders,
+                unowned_holders,
+            });
+        }
+        if to_reap.is_empty() {
+            let (audits, audit_errors) = audit_declared_profile_locks(locks);
+            break (audits, audit_errors);
+        }
+        teardown_reap_pass(&to_reap, &mut observed, &mut reaped, &mut errors);
+    };
+    errors.extend(lock_audit_errors);
+    for audit in &lock_audits {
+        if let ProfileLockAudit::Held {
+            lock_path,
+            holder_pid,
+            ..
+        } = audit
+        {
+            let holders = lock_holders
+                .iter()
+                .filter(|evidence| evidence.lock_path == *lock_path)
+                .flat_map(|evidence| evidence.holders.iter().map(|holder| holder.identity))
+                .collect::<BTreeSet<_>>();
+            errors.push(format!(
+                "profile lock {} remained held after bounded reaping (kernel owner PID {}, identified holders {:?})",
+                lock_path.display(),
+                holder_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+                holders
+            ));
+        }
+    }
+
+    let survivors = observed
+        .keys()
+        .copied()
+        .filter(|identity| identity_is_live(*identity))
+        .collect::<Vec<_>>();
+    reaped.extend(observed.keys().copied());
+    for survivor in &survivors {
+        reaped.remove(survivor);
+    }
+    if !survivors.is_empty() {
+        errors.push(format!(
+            "owned-process teardown left {} process(es) alive: {:?}",
+            survivors.len(),
+            survivors
+        ));
+    }
+    RunTeardownEvidence {
+        status: if errors.is_empty() { "PASS" } else { "ERROR" },
+        observed_owned_processes: observed.into_values().collect(),
+        reaped_processes: reaped.into_iter().collect(),
+        surviving_processes: survivors,
+        profile_locks: lock_audits,
+        lock_holders,
+        errors,
+    }
+}
+
 fn process_identity_and_group(pid: u32) -> Result<Option<(ProcIdentity, u32)>> {
     #[cfg(target_os = "macos")]
     {
@@ -738,6 +1360,21 @@ fn process_identity_and_group(pid: u32) -> Result<Option<(ProcIdentity, u32)>> {
     #[allow(unreachable_code)]
     Err(AhrbError::Unsupported(
         "owned-process identity is implemented only on macOS and Linux".to_owned(),
+    ))
+}
+
+fn process_info_for_identity(identity: ProcIdentity) -> Result<Option<ProcessInfo>> {
+    #[cfg(target_os = "macos")]
+    {
+        return macos::process_info_for_identity(identity);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux::process_info_for_identity(identity);
+    }
+    #[allow(unreachable_code)]
+    Err(AhrbError::Unsupported(
+        "owned-process information is implemented only on macOS and Linux".to_owned(),
     ))
 }
 
@@ -901,7 +1538,7 @@ fn reap_direct_child(pid: u32) {
 
 /// TERM every owned group, wait a bounded grace period, KILL survivors, then
 /// sweep sampler-observed identities that may have reparented or changed group.
-pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
+pub fn cleanup_owned_processes_with_evidence(grace: Duration) -> Result<ProcessTeardownEvidence> {
     let cleanup_lock = CLEANUP_LOCK.get_or_init(|| Mutex::new(()));
     let _exclusive = cleanup_lock
         .lock()
@@ -910,10 +1547,22 @@ pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
     let _phase = CleanupPhase;
     let snapshot = registry_lock()?.clone();
     if snapshot.groups.is_empty() && snapshot.observed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ProcessTeardownEvidence::default());
     }
     #[cfg(unix)]
     {
+        let observed_identities = live_owned(&snapshot)?;
+        let mut observed = Vec::with_capacity(observed_identities.len());
+        for identity in &observed_identities {
+            observed.push(
+                process_info_for_identity(*identity)?.unwrap_or(ProcessInfo {
+                    identity: *identity,
+                    ppid: 0,
+                    command: String::new(),
+                    ownership: ProcOwnership::Reparented,
+                }),
+            );
+        }
         for (process_group, leader) in &snapshot.groups {
             if !verified_group_members(&snapshot, *process_group, *leader)?.is_empty() {
                 signal_group(*process_group, libc::SIGTERM)?;
@@ -990,12 +1639,35 @@ pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
                 record_signal_target(&SIGNAL_PIDS, identity.pid);
             }
         }
-        return Ok(survivors.into_iter().collect());
+        let survivors = survivors.into_iter().collect::<Vec<_>>();
+        let survivor_set = survivors.iter().copied().collect::<BTreeSet<_>>();
+        let reaped = observed_identities
+            .into_iter()
+            .filter(|identity| !survivor_set.contains(identity))
+            .collect();
+        return Ok(ProcessTeardownEvidence {
+            observed: observed
+                .into_iter()
+                .map(|process| TeardownProcess {
+                    identity: process.identity,
+                    command: process.command,
+                    ppid: process.ppid,
+                    ownership: process.ownership,
+                })
+                .collect(),
+            reaped,
+            survivors,
+        });
     }
     #[allow(unreachable_code)]
     Err(AhrbError::Unsupported(
         "owned-process cleanup requires Unix".to_owned(),
     ))
+}
+
+/// Compatibility wrapper for callers that only need the survivor set.
+pub fn cleanup_owned_processes(grace: Duration) -> Result<Vec<ProcIdentity>> {
+    Ok(cleanup_owned_processes_with_evidence(grace)?.survivors)
 }
 
 struct CleanupPhase;

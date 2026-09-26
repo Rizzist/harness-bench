@@ -8,6 +8,7 @@ use crate::{AhrbError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void};
 use std::mem::{size_of, zeroed};
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
 const PROC_PPID_ONLY: u32 = 6;
@@ -1137,6 +1138,133 @@ fn process_info(info: &ProcBsdInfo, ownership: ProcOwnership) -> ProcessInfo {
         },
         ownership,
     }
+}
+
+pub(crate) fn process_info_for_identity(identity: ProcIdentity) -> Result<Option<ProcessInfo>> {
+    let Some(info) = bsd_info(identity.pid)? else {
+        return Ok(None);
+    };
+    Ok((identity_of(&info) == identity).then(|| process_info(&info, ProcOwnership::Reparented)))
+}
+
+fn process_arguments(pid: u32) -> Result<Option<Vec<String>>> {
+    let pid = c_int::try_from(pid)
+        .map_err(|_| AhrbError::Validation("PID exceeds Darwin pid_t range".to_owned()))?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0_usize;
+    // SAFETY: the MIB is valid and a null output asks the kernel for its size.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM) | Some(libc::EACCES)
+        ) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    if size < size_of::<c_int>() {
+        return Ok(None);
+    }
+    let mut bytes = vec![0_u8; size];
+    // SAFETY: `bytes` exposes `size` writable bytes for the requested process.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM) | Some(libc::EACCES)
+        ) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    bytes.truncate(size);
+    let argc = c_int::from_ne_bytes(
+        bytes[..size_of::<c_int>()]
+            .try_into()
+            .map_err(|_| AhrbError::Protocol("Darwin process argv omitted argc".to_owned()))?,
+    );
+    if argc <= 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let mut data = &bytes[size_of::<c_int>()..];
+    let executable_end = data
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(data.len());
+    data = &data[executable_end..];
+    while data.first() == Some(&0) {
+        data = &data[1..];
+    }
+    let mut arguments = Vec::new();
+    for _ in 0..argc {
+        if data.is_empty() {
+            break;
+        }
+        let end = data
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(data.len());
+        arguments.push(String::from_utf8_lossy(&data[..end]).into_owned());
+        data = &data[end..];
+        while data.first() == Some(&0) {
+            data = &data[1..];
+        }
+    }
+    Ok(Some(arguments))
+}
+
+pub(crate) fn profile_owned_processes(
+    profile_roots: &[PathBuf],
+    executable_names: &[String],
+) -> Result<Vec<ProcessInfo>> {
+    let declared = executable_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut matches = Vec::new();
+    for pid in list_pids_for(PROC_ALL_PIDS, 0)? {
+        let Some(before) = bsd_info(pid)? else {
+            continue;
+        };
+        let before_info = process_info(&before, ProcOwnership::ProfilePath);
+        if !declared.contains(before_info.command.as_str()) {
+            continue;
+        }
+        let Some(arguments) = process_arguments(pid)? else {
+            continue;
+        };
+        if !crate::process::argv_names_profile(&arguments, profile_roots) {
+            continue;
+        }
+        let Some(after) = bsd_info(pid)? else {
+            continue;
+        };
+        if identity_of(&after) == before_info.identity {
+            matches.push(process_info(&after, ProcOwnership::ProfilePath));
+        }
+    }
+    Ok(matches)
 }
 
 fn c_chars<const N: usize>(value: &[c_char; N]) -> String {
