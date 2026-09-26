@@ -274,6 +274,15 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L19 `l19-daemon-teardown-reap` (landed 2026-09-26)
+
+- [x] Implement (gpt-5.6-sol impl-1; claude-opus-5-5 impl-2): signal-row residue discovered by profile ownership (both `/tmp` and `/private/tmp` spellings) and recorded before cleanup; teardown reaps surviving AHRB-owned processes by `(pid,start_time)` + profile with bounded escalation on normal/abort/deadline paths; `process.profile_lock_paths` audit with unknown-owner (PID -1) locks treated as held.
+- [x] Verification: orchestrator verify-1 NO-SHIP (test initializers after rebase; PID -1 lock aborted teardown on 0.0.970/0.0.971) → repaired; independent claude-opus-5-5 verify-2 **SHIP** (15 real row-57 runs: leaked SIGINT-twice daemon recorded then reaped on 0.0.970/0.0.971/0.0.972, teardown PASS, no survivors; rows 44/50/53 = master; mocks PASS).
+- [x] Final review: **SHIP by an independent claude-opus-5-5 context** on the tree integrated with L18 (owner-authorized substitute while Codex is capped); lock-holder reaping confined to AHRB's own random profile.
+- [x] Complete: committed `46d7019`, fast-forwarded and pushed.
+
+Known limitation: Linux F_GETLK cannot see flock locks (audit reports unlocked; reaping unaffected) — follow-up `/proc/locks`. Owner note: Haider's post-exit daemon linger is deliberate; a declared-linger row-57 policy is tracked for L11.
+
 ## L18 `l18-rick-base-url-suffix` (landed 2026-09-26)
 
 - [x] Implement (gpt-5.6-sol): generated-config injection renders the manifest-declared template with trial values instead of writing the bare origin (rick, cline, pi and opencode declare `{{base_url}}/v1`).
