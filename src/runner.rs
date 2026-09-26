@@ -9594,9 +9594,59 @@ fn insert_cli_injection(
     Ok(())
 }
 
-fn set_generated_injection_value(
+fn parse_generated_injection_document(text: &str, description: &str) -> Result<(Value, bool)> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(document) => Ok((document, true)),
+        Err(json_error) => {
+            let document = toml::from_str::<toml::Value>(text).map_err(|toml_error| {
+                AhrbError::Validation(format!(
+                    "row-65 generated carrier {description} is neither JSON ({json_error}) nor TOML ({toml_error})"
+                ))
+            })?;
+            Ok((serde_json::to_value(document)?, false))
+        }
+    }
+}
+
+fn render_generated_injection_value(
+    manifest: &Manifest,
     component: &InjectionComponent,
-    value: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<String> {
+    let specification = manifest
+        .isolation
+        .generated_files
+        .iter()
+        .chain(manifest.fake_model.provider_templates.iter())
+        .find(|file| file.path == component.generated_path)
+        .ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "row-65 generated carrier has no declared template for {}",
+                component.generated_path
+            ))
+        })?;
+    let description = format!("template {:?}", specification.path);
+    let (document, _) = parse_generated_injection_document(&specification.content, &description)?;
+    let template = document
+        .pointer(&component.json_pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AhrbError::Validation(format!(
+                "row-65 generated carrier template {:?} lacks string pointer {}",
+                specification.path, component.json_pointer
+            ))
+        })?;
+    crate::manifest::render_template(template, variables).map_err(|error| {
+        AhrbError::Validation(format!(
+            "render row-65 generated carrier template {:?} at {}: {error}",
+            specification.path, component.json_pointer
+        ))
+    })
+}
+
+fn set_generated_injection_value(
+    manifest: &Manifest,
+    component: &InjectionComponent,
     variables: &BTreeMap<String, String>,
     profile_root: &Path,
 ) -> Result<()> {
@@ -9617,18 +9667,9 @@ fn set_generated_injection_value(
             path.display()
         ))
     })?;
-    let (mut document, json_encoding) = match serde_json::from_str::<Value>(&text) {
-        Ok(document) => (document, true),
-        Err(json_error) => {
-            let document = toml::from_str::<toml::Value>(&text).map_err(|toml_error| {
-                AhrbError::Validation(format!(
-                    "row-65 generated carrier {} is neither JSON ({json_error}) nor TOML ({toml_error})",
-                    path.display()
-                ))
-            })?;
-            (serde_json::to_value(document)?, false)
-        }
-    };
+    let (mut document, json_encoding) =
+        parse_generated_injection_document(&text, &path.display().to_string())?;
+    let rendered_value = render_generated_injection_value(manifest, component, variables)?;
     let destination = document
         .pointer_mut(&component.json_pointer)
         .ok_or_else(|| {
@@ -9638,7 +9679,7 @@ fn set_generated_injection_value(
                 component.json_pointer
             ))
         })?;
-    *destination = Value::String(value.to_owned());
+    *destination = Value::String(rendered_value);
     let encoded = if json_encoding {
         serde_json::to_vec_pretty(&document)?
     } else {
@@ -9695,11 +9736,76 @@ fn apply_injection_component(
             insert_cli_injection(command, rendered, component.argv_position)?;
         }
         InjectionMethod::GeneratedConfig => {
-            set_generated_injection_value(component, value, variables, profile_root)?;
+            set_generated_injection_value(manifest, component, variables, profile_root)?;
         }
         InjectionMethod::Impossible => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod generated_injection_tests {
+    use super::*;
+
+    fn rick_base_url_case() -> (Manifest, InjectionComponent, BTreeMap<String, String>) {
+        let manifest = crate::manifest::load(Path::new("adapters/rick/manifest.toml"))
+            .expect("load Rick manifest");
+        let component = manifest
+            .capabilities
+            .injection_surface
+            .as_ref()
+            .expect("Rick injection surface")
+            .base_url
+            .clone();
+        let variables = BTreeMap::from([
+            (
+                "profile".to_owned(),
+                "/tmp/ahrb-generated-injection-test".to_owned(),
+            ),
+            (
+                "base_url".to_owned(),
+                "http://127.0.0.1:43123/fresh-token".to_owned(),
+            ),
+            ("credential".to_owned(), "test-credential".to_owned()),
+            ("model".to_owned(), "ahrb-fake-v1".to_owned()),
+            ("provider".to_owned(), "ahrb-fake-v1".to_owned()),
+        ]);
+        (manifest, component, variables)
+    }
+
+    #[test]
+    fn generated_injection_preserves_declared_template_suffix() {
+        let (manifest, component, variables) = rick_base_url_case();
+        assert_eq!(
+            render_generated_injection_value(&manifest, &component, &variables)
+                .expect("render suffixed base URL"),
+            "http://127.0.0.1:43123/fresh-token/v1"
+        );
+    }
+
+    #[test]
+    fn generated_injection_keeps_bare_template_unchanged() {
+        let (mut manifest, component, variables) = rick_base_url_case();
+        let content = &mut manifest.isolation.generated_files[0].content;
+        *content = content.replace("{{base_url}}/v1", "{{base_url}}");
+        assert_eq!(
+            render_generated_injection_value(&manifest, &component, &variables)
+                .expect("render bare base URL"),
+            "http://127.0.0.1:43123/fresh-token"
+        );
+    }
+
+    #[test]
+    fn generated_injection_rejects_malformed_destination_template_clearly() {
+        let (mut manifest, component, variables) = rick_base_url_case();
+        let content = &mut manifest.isolation.generated_files[0].content;
+        *content = content.replace("{{base_url}}/v1", "{{base_url}/v1");
+        let error = render_generated_injection_value(&manifest, &component, &variables)
+            .expect_err("malformed destination template must fail");
+        let message = error.to_string();
+        assert!(message.contains("render row-65 generated carrier template"));
+        assert!(message.contains("unterminated template token"));
+    }
 }
 
 fn command_contains_credential(manifest: &Manifest, credential: &str) -> bool {
