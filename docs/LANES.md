@@ -274,6 +274,15 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L18 `l18-rick-base-url-suffix` (landed 2026-09-26)
+
+- [x] Implement (gpt-5.6-sol): generated-config injection renders the manifest-declared template with trial values instead of writing the bare origin (rick, cline, pi and opencode declare `{{base_url}}/v1`).
+- [x] Verification (orchestrator, claude-opus-5-5) on master `194e289`: full suite (one `mock_exec_full_matrix` intermittent, exact rerun PASS); rick baseline requests `/chat/completions` on master → `/v1/chat/completions` on the candidate; haider 0.0.972 row 65 PASS 0.833333 on both.
+- [x] Final review: **SHIP by an independent claude-opus-5-5 context** (owner-authorized substitute while Codex is capped).
+- [x] Complete: committed `9b21d44`, fast-forwarded and pushed.
+
+Follow-ups (for L11): row 65 requires exactly one request per invocation, so rick (two requests: non-stream + stream) stays UNSUPPORTED although every trial ran — either credit correctly routed multi-request harnesses or report an informational FAIL; opencode's row-65 baseline made no model requests on this machine.
+
 ## L15 `l15-capability-audit` (landed 2026-09-26)
 
 - [x] Capability audit of UNSUPPORTED/ERROR rows; adapters declare demonstrated capabilities; row 65 typed initialization carrier run as an isolated experiment (fresh catalogue selection, 128-bit URL path token, independent credentials, whole-invocation declared-listener attribution); row 57 credits only source terminals.
