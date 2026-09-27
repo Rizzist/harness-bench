@@ -274,6 +274,15 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L7b `l7b-storage-adapters` (landed 2026-09-27)
+
+- [x] Implement (claude-opus-5-5 impl-1; gpt-5.6-sol impl-2..4): evidence-backed `[storage]` declarations for codex, claude-code, opencode, pi; environment-scoped `session_delete` (spec 4.2); native session ids for S5/S6 verbs; per-boundary hashing of current bytes; S7/S8 `task-incomplete`; codex login-shell flags; haider `resources.journal_paths`; docs.
+- [x] Safety: claude-code (Claude Code 2.1.283) ran `security find-generic-password` against the owner's login keychain even under `--bare`; now launched via an owner-private profile launcher with `CLAUDE_CODE_SIMPLE=1` under macOS `sandbox-exec` denying only `/usr/bin/security`, failing closed without the sandbox. Sampled runs: zero keychain helper processes; no matrix row changes class.
+- [x] Verification: claude-opus-5-5 verify-1 (blocking keychain finding) → gpt-5.6-sol verify-2 (fail-closed finding) → repaired; GPT6-Astra final review 1 NO-SHIP (stat-keyed digest cache stale under MAP_SHARED writes) → cache removed with regression; GPT6-Astra final review 2 **SHIP**.
+- [x] Complete: committed `e49707a`, fast-forwarded and pushed. Real storage: pi S1/S3/S8/S10 measured; codex/opencode/claude-code mixed incl. honest macOS reaped-child ERRORs and S6 FAIL on shared SQLite residue; rick and haider ABSENT.
+
+Follow-ups (L11): pi S1 intermittent counter-identity gap (reproduces on master); haider continuation binding (L11-A); mock regression for native session ids.
+
 ## L19 `l19-daemon-teardown-reap` (landed 2026-09-26)
 
 - [x] Implement (gpt-5.6-sol impl-1; claude-opus-5-5 impl-2): signal-row residue discovered by profile ownership (both `/tmp` and `/private/tmp` spellings) and recorded before cleanup; teardown reaps surviving AHRB-owned processes by `(pid,start_time)` + profile with bounded escalation on normal/abort/deadline paths; `process.profile_lock_paths` audit with unknown-owner (PID -1) locks treated as held.
