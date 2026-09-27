@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::fake_model::ModelFrameObservation;
+use crate::fake_model::{ModelFrameObservation, PacedResponseLedger};
+use crate::process::ProcIdentity;
 
 /// How the row-47 log-path declaration was supplied and verified.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,10 +294,31 @@ pub fn evaluate_disk_io_per_turn(
 
 /// One complete externally sampled row-48 trial.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ModelWaitCpuIdentitySample {
+    pub identity: ProcIdentity,
+    pub cpu_ns: u64,
+    /// This counter was captured after the structured terminal, after the
+    /// process was observed exited, and before its launcher handle was reaped.
+    /// An ordinary live poll must leave this false.
+    #[serde(default)]
+    pub final_retirement: bool,
+}
+
+/// One complete externally sampled row-48 trial.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelWaitCpuSample {
     pub sample_started_ns: u64,
     pub sample_finished_ns: u64,
+    /// Legacy aggregate retained for report compatibility and diagnostics.
     pub cpu_ns: u64,
+    /// Complete discovered membership at this sampling boundary. Keeping this
+    /// separate from successful counter reads prevents a vanished/unreadable
+    /// lifetime from being mistaken for a zero or an absent process.
+    #[serde(default)]
+    pub expected_identities: Vec<ProcIdentity>,
+    /// Cumulative counters keyed by the full process lifetime identity.
+    #[serde(default)]
+    pub cpu_ns_by_identity: Vec<ModelWaitCpuIdentitySample>,
 }
 
 /// One complete externally sampled row-48 trial.
@@ -308,6 +330,7 @@ pub struct ModelWaitCpuTrialEvidence {
     pub cpu_ns: u64,
     pub cpu_samples: Vec<ModelWaitCpuSample>,
     pub frames: Vec<ModelFrameObservation>,
+    pub paced_ledger: PacedResponseLedger,
     pub terminal_count: u32,
     pub success_terminals: u32,
     pub outer_kill_used: bool,
@@ -335,6 +358,7 @@ pub struct SlowStreamStallTrialEvidence {
     pub slow_response_headers_ns: u64,
     pub slow_terminal_ns: Option<u64>,
     pub slow_frames: Vec<ModelFrameObservation>,
+    pub slow_paced_ledger: PacedResponseLedger,
     pub slow_terminal_count: u32,
     pub slow_success_terminals: u32,
     pub slow_idle_timeout_fired: bool,
@@ -364,8 +388,253 @@ pub struct SlowStreamStallEvaluation {
 struct ValidatedFrames {
     bytes: u64,
     last_yield_ns: u64,
-    wall_ns: u64,
     max_inter_frame_ms: f64,
+}
+
+struct ValidatedPacedTrial {
+    frames: Option<ValidatedFrames>,
+    bytes_yielded: u64,
+    max_inter_frame_ms: f64,
+    final_scheduler_ns: u64,
+    early_consumer_close: bool,
+}
+
+fn validate_paced_trial(
+    frames: &[ModelFrameObservation],
+    ledger: &PacedResponseLedger,
+    response_headers_ns: u64,
+    expected_count: u32,
+    consumer_terminal_ns: Option<u64>,
+) -> std::result::Result<ValidatedPacedTrial, String> {
+    if ledger.response_headers_ns != response_headers_ns || ledger.expected_count != expected_count
+    {
+        return Err("paced scheduler ledger header/count binding is invalid".to_owned());
+    }
+    let scheduler_terminal_ns = ledger
+        .scheduler_terminal_ns
+        .ok_or_else(|| "paced scheduler ledger omitted its terminal boundary".to_owned())?;
+    if ledger.frames.len() != expected_count as usize {
+        return Err(format!(
+            "paced scheduler recorded {} ordinals; expected {expected_count}",
+            ledger.frames.len()
+        ));
+    }
+    let mut scheduled = ledger.frames.clone();
+    scheduled.sort_by_key(|frame| frame.ordinal);
+    let mut previous_timer_ns = response_headers_ns;
+    for (index, frame) in scheduled.iter().enumerate() {
+        let ordinal = u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| "paced scheduler ordinal overflow".to_owned())?;
+        let expected_ns = response_headers_ns
+            .checked_add(u64::from(ordinal).saturating_mul(1_000_000_000))
+            .ok_or_else(|| "paced scheduler boundary overflow".to_owned())?;
+        if frame.ordinal != ordinal
+            || frame.scheduled_ns != expected_ns
+            || frame.timer_fired_ns < expected_ns
+        {
+            return Err(format!(
+                "paced scheduler ordinal {ordinal} has an invalid scheduled/timer boundary"
+            ));
+        }
+        let gap = frame
+            .timer_fired_ns
+            .checked_sub(previous_timer_ns)
+            .ok_or_else(|| "paced scheduler timer boundaries regressed".to_owned())?;
+        if gap > 1_250_000_000 {
+            return Err(format!(
+                "AHRB paced scheduler gap {:.3} ms exceeded 1250 ms",
+                gap as f64 / 1_000_000.0
+            ));
+        }
+        if frame
+            .yielded_ns
+            .is_some_and(|yielded_ns| yielded_ns < frame.scheduled_ns)
+        {
+            return Err(format!(
+                "paced scheduler ordinal {ordinal} has an invalid yielded boundary"
+            ));
+        }
+        if frame.body_dropped_ns.is_some_and(|dropped_ns| {
+            dropped_ns < frame.timer_fired_ns || dropped_ns > scheduler_terminal_ns
+        }) {
+            return Err(format!(
+                "paced scheduler ordinal {ordinal} has an invalid body-drop boundary"
+            ));
+        }
+        if frame.yielded_ns.is_some() && frame.body_dropped_ns.is_some() {
+            return Err(format!(
+                "paced scheduler ordinal {ordinal} was both yielded and body-dropped"
+            ));
+        }
+        previous_timer_ns = frame.timer_fired_ns;
+    }
+    if scheduler_terminal_ns < previous_timer_ns {
+        return Err("paced scheduler terminal preceded its final timer boundary".to_owned());
+    }
+    let final_scheduled_ns = scheduled
+        .last()
+        .map(|frame| frame.scheduled_ns)
+        .ok_or_else(|| "paced scheduler final boundary is missing".to_owned())?;
+    if ledger
+        .connection_closed_ns
+        .is_some_and(|boundary| boundary < response_headers_ns)
+        || consumer_terminal_ns.is_some_and(|boundary| boundary < response_headers_ns)
+    {
+        return Err("paced consumer boundary preceded response headers".to_owned());
+    }
+    let early_consumer_close = ledger
+        .connection_closed_ns
+        .is_some_and(|boundary| boundary < final_scheduled_ns)
+        || consumer_terminal_ns.is_some_and(|boundary| boundary < final_scheduled_ns);
+    let all_yielded = scheduled.iter().all(|frame| frame.yielded_ns.is_some());
+    if !all_yielded && !early_consumer_close {
+        return Err(
+            "paced body omitted yielded ordinals without a proven early consumer close/terminal"
+                .to_owned(),
+        );
+    }
+    let ledger_identity = (
+        ledger.scenario.as_str(),
+        ledger.actor.as_str(),
+        ledger.checkpoint.as_str(),
+        ledger.attempt,
+        ledger.frontend.as_str(),
+    );
+    let mut observations_by_ordinal: BTreeMap<u32, &ModelFrameObservation> = BTreeMap::new();
+    for observed in frames {
+        let observed_identity = (
+            observed.scenario.as_str(),
+            observed.actor.as_str(),
+            observed.checkpoint.as_str(),
+            observed.attempt,
+            observed.frontend.as_str(),
+        );
+        if observed_identity != ledger_identity {
+            return Err(format!(
+                "paced ordinal {} belongs to physical response {observed_identity:?}, expected {ledger_identity:?}",
+                observed.ordinal
+            ));
+        }
+        if !scheduled
+            .iter()
+            .any(|scheduled_frame| scheduled_frame.ordinal == observed.ordinal)
+        {
+            return Err(format!(
+                "paced body yielded unscheduled ordinal {}",
+                observed.ordinal
+            ));
+        }
+        if observations_by_ordinal
+            .insert(observed.ordinal, observed)
+            .is_some()
+        {
+            return Err(format!(
+                "paced ordinal {} has duplicate yielded receipts",
+                observed.ordinal
+            ));
+        }
+    }
+    let mut previous_yield_ns = response_headers_ns;
+    let mut max_yield_gap_ns = 0_u64;
+    let mut bytes_yielded = 0_u64;
+    let mut yielded_prefix_ended = false;
+    for scheduled_frame in &scheduled {
+        let observed = observations_by_ordinal
+            .get(&scheduled_frame.ordinal)
+            .copied();
+        match (scheduled_frame.yielded_ns, observed) {
+            (Some(yielded_ns), Some(observed)) => {
+                if yielded_prefix_ended {
+                    return Err(
+                        "paced scheduler yielded a non-contiguous ordinal suffix".to_owned()
+                    );
+                }
+                if observed.scheduled_ns != scheduled_frame.scheduled_ns
+                    || observed.frame_yielded_ns != yielded_ns
+                {
+                    return Err(format!(
+                        "paced ordinal {} disagrees with the independent scheduler ledger",
+                        observed.ordinal
+                    ));
+                }
+                if observed.bytes != 1 {
+                    return Err(format!(
+                        "paced frame {} carried {} bytes instead of one",
+                        observed.ordinal, observed.bytes
+                    ));
+                }
+                let gap_ns = yielded_ns
+                    .checked_sub(previous_yield_ns)
+                    .ok_or_else(|| "paced-frame yield boundaries regressed".to_owned())?;
+                if gap_ns > 1_250_000_000 {
+                    return Err(format!(
+                        "AHRB provider pacing gap {:.3} ms exceeded 1250 ms",
+                        gap_ns as f64 / 1_000_000.0
+                    ));
+                }
+                previous_yield_ns = yielded_ns;
+                max_yield_gap_ns = max_yield_gap_ns.max(gap_ns);
+                bytes_yielded = bytes_yielded
+                    .checked_add(observed.bytes)
+                    .ok_or_else(|| "paced yielded-byte count overflow".to_owned())?;
+            }
+            (Some(_), None) => {
+                return Err(format!(
+                    "paced scheduler ordinal {} yielded without an observation receipt",
+                    scheduled_frame.ordinal
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "paced ordinal {} has an observation without a scheduler yield",
+                    scheduled_frame.ordinal
+                ));
+            }
+            (None, None) => {
+                yielded_prefix_ended = true;
+                if scheduled_frame.body_dropped_ns.is_none() {
+                    return Err(format!(
+                        "paced scheduler ordinal {} lacks yield and body-drop evidence",
+                        scheduled_frame.ordinal
+                    ));
+                }
+            }
+        }
+    }
+    if ledger.connection_closed_ns.is_some_and(|closed_ns| {
+        scheduled.iter().any(|frame| {
+            frame
+                .yielded_ns
+                .is_some_and(|yielded_ns| yielded_ns > closed_ns)
+        })
+    }) || consumer_terminal_ns.is_some_and(|terminal_ns| {
+        scheduled.iter().any(|frame| {
+            frame
+                .yielded_ns
+                .is_some_and(|yielded_ns| yielded_ns > terminal_ns)
+        })
+    }) {
+        return Err("paced consumer boundary preceded an observed frame yield".to_owned());
+    }
+    if all_yielded {
+        let complete = validate_trickle_frames(frames, response_headers_ns, expected_count)?;
+        return Ok(ValidatedPacedTrial {
+            bytes_yielded: complete.bytes,
+            max_inter_frame_ms: complete.max_inter_frame_ms,
+            final_scheduler_ns: previous_timer_ns,
+            frames: Some(complete),
+            early_consumer_close: false,
+        });
+    }
+    Ok(ValidatedPacedTrial {
+        frames: None,
+        bytes_yielded,
+        max_inter_frame_ms: max_yield_gap_ns as f64 / 1_000_000.0,
+        final_scheduler_ns: previous_timer_ns,
+        early_consumer_close,
+    })
 }
 
 fn cpu_sample_point(sample: &ModelWaitCpuSample) -> std::result::Result<u64, String> {
@@ -376,29 +645,21 @@ fn cpu_sample_point(sample: &ModelWaitCpuSample) -> std::result::Result<u64, Str
     Ok(sample.sample_started_ns.saturating_add(width / 2))
 }
 
-fn interpolate_cpu_at(
-    samples: &[ModelWaitCpuSample],
+fn interpolate_identity_counter(
+    points: &[(u64, u64)],
     boundary_ns: u64,
 ) -> std::result::Result<f64, String> {
-    let mut points = samples
-        .iter()
-        .map(|sample| cpu_sample_point(sample).map(|point| (point, sample.cpu_ns)))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    points.sort_by_key(|point| point.0);
-    if points.windows(2).any(|pair| pair[0].1 > pair[1].1) {
-        return Err("model-wait cumulative CPU samples regressed".to_owned());
-    }
     let left = points
         .iter()
         .rev()
         .find(|point| point.0 <= boundary_ns)
         .copied()
-        .ok_or_else(|| format!("no CPU sample precedes boundary {boundary_ns}"))?;
+        .ok_or_else(|| format!("no identity counter precedes boundary {boundary_ns}"))?;
     let right = points
         .iter()
         .find(|point| point.0 >= boundary_ns)
         .copied()
-        .ok_or_else(|| format!("no CPU sample follows boundary {boundary_ns}"))?;
+        .ok_or_else(|| format!("no identity counter follows boundary {boundary_ns}"))?;
     if left.0 == right.0 {
         return Ok(left.1 as f64);
     }
@@ -413,12 +674,162 @@ pub fn interpolated_model_wait_cpu_ns(
     response_headers_ns: u64,
     final_frame_yield_ns: u64,
 ) -> std::result::Result<u64, String> {
-    let start = interpolate_cpu_at(samples, response_headers_ns)?;
-    let end = interpolate_cpu_at(samples, final_frame_yield_ns)?;
-    if end < start {
-        return Err("interpolated model-wait CPU regressed".to_owned());
+    if final_frame_yield_ns < response_headers_ns {
+        return Err("model-wait boundaries regressed".to_owned());
     }
-    Ok((end - start).round() as u64)
+    let mut ordered = samples
+        .iter()
+        .map(|sample| cpu_sample_point(sample).map(|point| (point, sample)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ordered.sort_by_key(|(point, _)| *point);
+    if ordered.len() < 2 {
+        return Err("model-wait CPU needs at least two counter samples".to_owned());
+    }
+    for (_, sample) in &ordered {
+        let expected = sample
+            .expected_identities
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if expected.len() != sample.expected_identities.len() {
+            return Err("model-wait CPU sample contains duplicate expected lifetimes".to_owned());
+        }
+        let identities = sample
+            .cpu_ns_by_identity
+            .iter()
+            .map(|counter| counter.identity)
+            .collect::<BTreeSet<_>>();
+        if identities.len() != sample.cpu_ns_by_identity.len() {
+            return Err("model-wait CPU sample contains a duplicate process lifetime".to_owned());
+        }
+        if let Some(identity) = expected.difference(&identities).next() {
+            return Err(format!(
+                "model-wait CPU expected lifetime ({},{}) has no counter",
+                identity.pid, identity.start_time
+            ));
+        }
+        if let Some(identity) = identities.difference(&expected).next() {
+            return Err(format!(
+                "model-wait CPU counter lifetime ({},{}) lacks discovered membership",
+                identity.pid, identity.start_time
+            ));
+        }
+    }
+    if ordered
+        .first()
+        .is_none_or(|(point, _)| *point > response_headers_ns)
+    {
+        return Err(format!(
+            "no CPU sample precedes response-header boundary {response_headers_ns}"
+        ));
+    }
+    if ordered
+        .last()
+        .is_none_or(|(point, _)| *point < final_frame_yield_ns)
+    {
+        return Err(format!(
+            "no CPU sample follows final-frame boundary {final_frame_yield_ns}"
+        ));
+    }
+    let identities = ordered
+        .iter()
+        .flat_map(|(_, sample)| sample.expected_identities.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if identities.is_empty() {
+        return Err("model-wait CPU samples contain no process lifetimes".to_owned());
+    }
+    let mut total = 0_f64;
+    for identity in identities {
+        let points = ordered
+            .iter()
+            .filter_map(|(point, sample)| {
+                sample
+                    .cpu_ns_by_identity
+                    .iter()
+                    .find(|counter| counter.identity == identity)
+                    .map(|counter| (*point, counter.cpu_ns, counter.final_retirement))
+            })
+            .collect::<Vec<_>>();
+        if points.windows(2).any(|pair| pair[0].1 > pair[1].1) {
+            return Err(format!(
+                "model-wait CPU counter regressed within process lifetime ({},{})",
+                identity.pid, identity.start_time
+            ));
+        }
+        if points
+            .iter()
+            .enumerate()
+            .any(|(index, point)| point.2 && index + 1 != points.len())
+        {
+            return Err(format!(
+                "model-wait CPU lifetime ({},{}) has a non-final retirement receipt",
+                identity.pid, identity.start_time
+            ));
+        }
+        let first = points.first().copied().ok_or_else(|| {
+            format!(
+                "model-wait CPU lifetime ({},{}) has no counter",
+                identity.pid, identity.start_time
+            )
+        })?;
+        let last = points.last().copied().unwrap_or(first);
+        if last.0 < response_headers_ns {
+            if !last.2 {
+                return Err(format!(
+                    "model-wait CPU lifetime ({},{}) was last observed before response headers without a final-retirement counter receipt",
+                    identity.pid, identity.start_time
+                ));
+            }
+            continue;
+        }
+        if first.0 > final_frame_yield_ns {
+            continue;
+        }
+        if points.len() < 2 {
+            return Err(format!(
+                "model-wait CPU lifetime ({},{}) lacks distinct counter samples",
+                identity.pid, identity.start_time
+            ));
+        }
+        let start = if first.0 > response_headers_ns {
+            // The identity joined after the header boundary. A cumulative
+            // per-process counter begins at process birth, so zero is the only
+            // lifetime-safe left boundary; no other PID's counter is involved.
+            0_f64
+        } else {
+            let interpolation_points = points
+                .iter()
+                .map(|point| (point.0, point.1))
+                .collect::<Vec<_>>();
+            interpolate_identity_counter(&interpolation_points, response_headers_ns)?
+        };
+        let end = if last.0 < final_frame_yield_ns {
+            if !last.2 {
+                return Err(format!(
+                    "model-wait CPU lifetime ({},{}) disappeared without a final-retirement counter receipt",
+                    identity.pid, identity.start_time
+                ));
+            }
+            last.1 as f64
+        } else {
+            let interpolation_points = points
+                .iter()
+                .map(|point| (point.0, point.1))
+                .collect::<Vec<_>>();
+            interpolate_identity_counter(&interpolation_points, final_frame_yield_ns)?
+        };
+        if end < start {
+            return Err(format!(
+                "model-wait CPU delta regressed within process lifetime ({},{})",
+                identity.pid, identity.start_time
+            ));
+        }
+        total += end - start;
+    }
+    if !total.is_finite() || total < 0.0 || total > u64::MAX as f64 {
+        return Err("model-wait CPU lifetime sum is not representable".to_owned());
+    }
+    Ok(total.round() as u64)
 }
 
 fn validate_trickle_frames(
@@ -511,7 +922,6 @@ fn validate_trickle_frames(
     Ok(ValidatedFrames {
         bytes,
         last_yield_ns,
-        wall_ns: last_yield_ns.saturating_sub(response_headers_ns),
         max_inter_frame_ms: max_gap_ns as f64 / 1_000_000.0,
     })
 }
@@ -565,14 +975,6 @@ pub fn evaluate_model_wait_cpu(
                 trial.repetition, trial.outer_deadline_ms
             ));
         }
-        let frames =
-            match validate_trickle_frames(&trial.frames, trial.response_headers_ns, expected_count)
-            {
-                Ok(frames) => frames,
-                Err(error) => {
-                    return incomplete(format!("row-48 repetition {}: {error}", trial.repetition));
-                }
-            };
         let terminal_ns = match (trial.terminal_ns, trial.outer_kill_ns) {
             (Some(terminal), _) => terminal,
             (None, Some(outer_kill)) if trial.outer_kill_used => outer_kill,
@@ -583,10 +985,26 @@ pub fn evaluate_model_wait_cpu(
                 ));
             }
         };
+        let paced = match validate_paced_trial(
+            &trial.frames,
+            &trial.paced_ledger,
+            trial.response_headers_ns,
+            expected_count,
+            trial.terminal_ns,
+        ) {
+            Ok(paced) => paced,
+            Err(error) => {
+                return incomplete(format!("row-48 repetition {}: {error}", trial.repetition));
+            }
+        };
+        let cpu_end_ns = paced
+            .frames
+            .as_ref()
+            .map_or(paced.final_scheduler_ns, |frames| frames.last_yield_ns);
         let derived_cpu_ns = match interpolated_model_wait_cpu_ns(
             &trial.cpu_samples,
             trial.response_headers_ns,
-            frames.last_yield_ns,
+            cpu_end_ns,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -604,33 +1022,40 @@ pub fn evaluate_model_wait_cpu(
             .saturating_add(expected_deadline_ms.saturating_mul(1_000_000));
         let terminal_ok = trial.terminal_count == 1
             && trial.success_terminals == 1
-            && terminal_ns >= frames.last_yield_ns
+            && paced
+                .frames
+                .as_ref()
+                .is_some_and(|frames| terminal_ns >= frames.last_yield_ns)
             && terminal_ns < outer_deadline_ns
             && !trial.outer_kill_used
             && trial.outer_kill_ns.is_none();
-        let ratio = if frames.wall_ns == 0 {
+        let wall_ns = cpu_end_ns.saturating_sub(trial.response_headers_ns);
+        let ratio = if wall_ns == 0 {
             f64::INFINITY
         } else {
-            trial.cpu_ns as f64 / frames.wall_ns as f64
+            trial.cpu_ns as f64 / wall_ns as f64
         };
-        let trial_passed = terminal_ok && ratio <= 0.05;
+        let trial_passed = terminal_ok && !paced.early_consumer_close && ratio <= 0.05;
         all_passed &= trial_passed;
-        bytes = bytes.saturating_add(frames.bytes);
-        max_gap_ms = max_gap_ms.max(frames.max_inter_frame_ms);
+        bytes = bytes.saturating_add(paced.bytes_yielded);
+        max_gap_ms = max_gap_ms.max(paced.max_inter_frame_ms);
         cpu_ms.push(trial.cpu_ns as f64 / 1_000_000.0);
-        wall_ms.push(frames.wall_ns as f64 / 1_000_000.0);
+        wall_ms.push(wall_ns as f64 / 1_000_000.0);
         ratios.push(ratio);
         details.push(json!({
             "repetition":trial.repetition,
             "response_headers_ns":trial.response_headers_ns,
-            "final_frame_yield_ns":frames.last_yield_ns,
+            "final_frame_yield_ns":paced.frames.as_ref().map(|frames| frames.last_yield_ns),
+            "final_scheduler_ns":paced.final_scheduler_ns,
             "terminal_ns":terminal_ns,
             "cpu_ns":trial.cpu_ns,
             "cpu_samples":trial.cpu_samples,
-            "wall_ns":frames.wall_ns,
+            "wall_ns":wall_ns,
             "one_core_ratio":ratio,
-            "bytes_yielded":frames.bytes,
-            "max_inter_frame_ms":frames.max_inter_frame_ms,
+            "bytes_yielded":paced.bytes_yielded,
+            "max_inter_frame_ms":paced.max_inter_frame_ms,
+            "early_consumer_close":paced.early_consumer_close,
+            "paced_ledger":trial.paced_ledger,
             "terminal_count":trial.terminal_count,
             "success_terminals":trial.success_terminals,
             "outer_kill_used":trial.outer_kill_used,
@@ -717,25 +1142,27 @@ pub fn evaluate_slow_stream_vs_stall(
                 trial.repetition
             ));
         }
-        let slow = match validate_trickle_frames(
-            &trial.slow_frames,
-            trial.slow_response_headers_ns,
-            expected_count,
-        ) {
-            Ok(frames) => frames,
-            Err(error) => {
-                return incomplete(format!(
-                    "row-59 repetition {} slow case: {error}",
-                    trial.repetition
-                ));
-            }
-        };
         let slow_terminal_ns = match (trial.slow_terminal_ns, trial.slow_outer_kill_ns) {
             (Some(terminal), _) => terminal,
             (None, Some(outer_kill)) if trial.slow_outer_kill_used => outer_kill,
             _ => {
                 return incomplete(format!(
                     "row-59 repetition {} slow case lacks terminal or outer-kill boundary",
+                    trial.repetition
+                ));
+            }
+        };
+        let slow = match validate_paced_trial(
+            &trial.slow_frames,
+            &trial.slow_paced_ledger,
+            trial.slow_response_headers_ns,
+            expected_count,
+            trial.slow_terminal_ns,
+        ) {
+            Ok(paced) => paced,
+            Err(error) => {
+                return incomplete(format!(
+                    "row-59 repetition {} slow case: {error}",
                     trial.repetition
                 ));
             }
@@ -774,7 +1201,11 @@ pub fn evaluate_slow_stream_vs_stall(
             && trial.slow_success_terminals == 1
             && !trial.slow_idle_timeout_fired
             && !trial.slow_outer_kill_used
-            && slow_terminal_ns >= slow.last_yield_ns
+            && slow
+                .frames
+                .as_ref()
+                .is_some_and(|frames| slow_terminal_ns >= frames.last_yield_ns)
+            && !slow.early_consumer_close
             && slow_terminal_ns < slow_outer_ns;
         let stall_passed = trial.stall_bytes_yielded == 0
             && trial.stall_terminal_count == 1
@@ -788,7 +1219,7 @@ pub fn evaluate_slow_stream_vs_stall(
                     .saturating_add(expected_stall_deadline_ms.saturating_mul(1_000_000));
         let pair_passed = slow_passed && stall_passed;
         all_passed &= pair_passed;
-        slow_bytes = slow_bytes.saturating_add(slow.bytes);
+        slow_bytes = slow_bytes.saturating_add(slow.bytes_yielded);
         slow_max_gap_ms = slow_max_gap_ms.max(slow.max_inter_frame_ms);
         slow_success = slow_success.saturating_add(u64::from(trial.slow_success_terminals));
         slow_idle = slow_idle.saturating_add(u64::from(trial.slow_idle_timeout_fired));
@@ -801,8 +1232,11 @@ pub fn evaluate_slow_stream_vs_stall(
             "slow":{
                 "response_headers_ns":trial.slow_response_headers_ns,
                 "terminal_ns":slow_terminal_ns,
-                "bytes_yielded":slow.bytes,
+                "bytes_yielded":slow.bytes_yielded,
                 "max_inter_frame_ms":slow.max_inter_frame_ms,
+                "final_scheduler_ns":slow.final_scheduler_ns,
+                "early_consumer_close":slow.early_consumer_close,
+                "paced_ledger":trial.slow_paced_ledger,
                 "terminal_count":trial.slow_terminal_count,
                 "terminal_success":trial.slow_success_terminals,
                 "idle_timeout_fired":trial.slow_idle_timeout_fired,
@@ -1565,6 +1999,31 @@ mod tests {
             .collect()
     }
 
+    fn paced_ledger(headers_ns: u64, frames: &[ModelFrameObservation]) -> PacedResponseLedger {
+        let identity = frames.first().expect("paced ledger needs a frame");
+        PacedResponseLedger {
+            scenario: identity.scenario.clone(),
+            actor: identity.actor.clone(),
+            checkpoint: identity.checkpoint.clone(),
+            attempt: identity.attempt,
+            frontend: identity.frontend.clone(),
+            response_headers_ns: headers_ns,
+            expected_count: frames.len() as u32,
+            frames: frames
+                .iter()
+                .map(|frame| crate::fake_model::PacedFrameBoundary {
+                    ordinal: frame.ordinal,
+                    scheduled_ns: frame.scheduled_ns,
+                    timer_fired_ns: frame.frame_yielded_ns,
+                    yielded_ns: Some(frame.frame_yielded_ns),
+                    body_dropped_ns: None,
+                })
+                .collect(),
+            scheduler_terminal_ns: frames.last().map(|frame| frame.frame_yielded_ns),
+            connection_closed_ns: None,
+        }
+    }
+
     #[test]
     fn retries_cannot_fabricate_one_complete_paced_response() {
         let headers = 1_000_000_000;
@@ -1585,6 +2044,10 @@ mod tests {
     }
 
     fn cpu_samples(headers_ns: u64, final_ns: u64, cpu_ns: u64) -> Vec<ModelWaitCpuSample> {
+        let identity = ProcIdentity {
+            pid: 42,
+            start_time: 7,
+        };
         [
             (headers_ns - 100_000_000, 0),
             (headers_ns + 100_000_000, 0),
@@ -1596,6 +2059,12 @@ mod tests {
             sample_started_ns: sample_ns,
             sample_finished_ns: sample_ns,
             cpu_ns,
+            expected_identities: vec![identity],
+            cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
+                identity,
+                cpu_ns,
+                final_retirement: false,
+            }],
         })
         .collect()
     }
@@ -1611,6 +2080,7 @@ mod tests {
             terminal_ns: Some(headers_ns + 5_100_000_000),
             cpu_ns: 10_000_000,
             cpu_samples: cpu_samples(headers_ns, final_ns, 10_000_000),
+            paced_ledger: paced_ledger(headers_ns, &frames),
             frames,
             terminal_count: 1,
             success_terminals: 1,
@@ -1637,6 +2107,310 @@ mod tests {
     }
 
     #[test]
+    fn row48_early_consumer_close_is_measured_fail_but_timer_loss_is_error() {
+        let headers_ns = 1_000_000_000;
+        let all_frames = paced_frames(headers_ns, 5);
+        let final_ns = all_frames[4].frame_yielded_ns;
+        let mut ledger = paced_ledger(headers_ns, &all_frames);
+        let close_ns = headers_ns + 2_100_000_000;
+        ledger.connection_closed_ns = Some(close_ns);
+        for frame in ledger.frames.iter_mut().skip(2) {
+            frame.yielded_ns = None;
+            frame.body_dropped_ns = Some(frame.timer_fired_ns);
+        }
+        let early = ModelWaitCpuTrialEvidence {
+            repetition: 1,
+            response_headers_ns: headers_ns,
+            terminal_ns: Some(close_ns),
+            cpu_ns: 10_000_000,
+            cpu_samples: cpu_samples(headers_ns, final_ns, 10_000_000),
+            frames: all_frames[..2].to_vec(),
+            paced_ledger: ledger,
+            terminal_count: 1,
+            success_terminals: 0,
+            outer_kill_used: false,
+            outer_kill_ns: None,
+            outer_deadline_ms: 10_500,
+        };
+        let evaluation = evaluate_model_wait_cpu(std::slice::from_ref(&early), 1, 5, 2_500);
+        assert!(evaluation.measurement_complete);
+        assert!(!evaluation.passed);
+        assert_eq!(
+            evaluation.details["repetitions"][0]["early_consumer_close"],
+            true
+        );
+
+        let assert_error = |trial: ModelWaitCpuTrialEvidence, label: &str| {
+            let evaluation = evaluate_model_wait_cpu(&[trial], 1, 5, 2_500);
+            assert!(
+                !evaluation.measurement_complete && evaluation.measurement_error.is_some(),
+                "{label} must retain infrastructure ERROR precedence: {evaluation:?}"
+            );
+        };
+
+        let mut removed_yield = early.clone();
+        removed_yield.frames.remove(0);
+        assert_error(removed_yield, "removed yielded receipt");
+
+        let mut duplicate_yield = early.clone();
+        duplicate_yield
+            .frames
+            .push(duplicate_yield.frames[0].clone());
+        assert_error(duplicate_yield, "duplicate yielded receipt");
+
+        let mut wrong_physical_identity = early.clone();
+        wrong_physical_identity.frames[0].attempt = 99;
+        assert_error(wrong_physical_identity, "wrong physical response identity");
+
+        let mut timer_loss = early.clone();
+        timer_loss.paced_ledger.frames.pop();
+        assert_error(timer_loss, "missing scheduler ordinal");
+
+        let mut delayed_yield = early.clone();
+        let delayed_ns = headers_ns + 1_500_000_000;
+        delayed_yield.frames[0].frame_yielded_ns = delayed_ns;
+        delayed_yield.paced_ledger.frames[0].yielded_ns = Some(delayed_ns);
+        assert_error(delayed_yield, "yield delayed by 1500 ms");
+
+        let mut invalid_scheduler_terminal = early;
+        invalid_scheduler_terminal
+            .paced_ledger
+            .scheduler_terminal_ns = Some(1);
+        assert_error(
+            invalid_scheduler_terminal,
+            "scheduler terminal before headers and timers",
+        );
+    }
+
+    #[test]
+    fn row48_cpu_brackets_are_identity_safe_across_join_exit_and_pid_reuse() {
+        let old = ProcIdentity {
+            pid: 42,
+            start_time: 100,
+        };
+        let reused = ProcIdentity {
+            pid: 42,
+            start_time: 200,
+        };
+        let samples = vec![
+            ModelWaitCpuSample {
+                sample_started_ns: 900,
+                sample_finished_ns: 900,
+                cpu_ns: 10,
+                expected_identities: vec![old],
+                cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
+                    identity: old,
+                    cpu_ns: 10,
+                    final_retirement: false,
+                }],
+            },
+            ModelWaitCpuSample {
+                sample_started_ns: 1_100,
+                sample_finished_ns: 1_100,
+                cpu_ns: 20,
+                expected_identities: vec![old],
+                cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
+                    identity: old,
+                    cpu_ns: 20,
+                    final_retirement: true,
+                }],
+            },
+            ModelWaitCpuSample {
+                sample_started_ns: 1_500,
+                sample_finished_ns: 1_500,
+                cpu_ns: 25,
+                expected_identities: vec![reused],
+                cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
+                    identity: reused,
+                    cpu_ns: 5,
+                    final_retirement: false,
+                }],
+            },
+            ModelWaitCpuSample {
+                sample_started_ns: 1_700,
+                sample_finished_ns: 1_700,
+                cpu_ns: 35,
+                expected_identities: vec![reused],
+                cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
+                    identity: reused,
+                    cpu_ns: 15,
+                    final_retirement: true,
+                }],
+            },
+            ModelWaitCpuSample {
+                sample_started_ns: 2_100,
+                sample_finished_ns: 2_100,
+                cpu_ns: 35,
+                expected_identities: Vec::new(),
+                cpu_ns_by_identity: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            interpolated_model_wait_cpu_ns(&samples, 1_000, 2_000),
+            Ok(20)
+        );
+
+        let mut disappeared_without_final = samples.clone();
+        disappeared_without_final[1].cpu_ns_by_identity[0].final_retirement = false;
+        assert!(
+            interpolated_model_wait_cpu_ns(&disappeared_without_final, 1_000, 2_000)
+                .unwrap_err()
+                .contains("disappeared without a final-retirement counter receipt")
+        );
+
+        let mut expected_without_counter = samples.clone();
+        expected_without_counter[0].cpu_ns_by_identity.clear();
+        assert!(
+            interpolated_model_wait_cpu_ns(&expected_without_counter, 1_000, 2_000)
+                .unwrap_err()
+                .contains("expected lifetime")
+        );
+
+        let mut regressed = samples.clone();
+        regressed[3].cpu_ns_by_identity[0].cpu_ns = 4;
+        assert!(
+            interpolated_model_wait_cpu_ns(&regressed, 1_000, 2_000)
+                .unwrap_err()
+                .contains("within process lifetime")
+        );
+
+        let mut missing_lifetime = samples;
+        missing_lifetime[3].cpu_ns_by_identity.clear();
+        assert!(
+            interpolated_model_wait_cpu_ns(&missing_lifetime, 1_000, 2_000)
+                .unwrap_err()
+                .contains("expected lifetime")
+        );
+    }
+
+    #[test]
+    fn row48_preheader_lifetime_requires_positive_retirement_evidence() {
+        let anchor = ProcIdentity {
+            pid: 41,
+            start_time: 10,
+        };
+        let transient = ProcIdentity {
+            pid: 42,
+            start_time: 20,
+        };
+        let sample = |sample_ns, transient_counter: Option<(u64, bool)>| {
+            let mut expected_identities = vec![anchor];
+            let mut cpu_ns_by_identity = vec![ModelWaitCpuIdentitySample {
+                identity: anchor,
+                cpu_ns: 0,
+                final_retirement: false,
+            }];
+            if let Some((cpu_ns, final_retirement)) = transient_counter {
+                expected_identities.push(transient);
+                cpu_ns_by_identity.push(ModelWaitCpuIdentitySample {
+                    identity: transient,
+                    cpu_ns,
+                    final_retirement,
+                });
+            }
+            ModelWaitCpuSample {
+                sample_started_ns: sample_ns,
+                sample_finished_ns: sample_ns,
+                cpu_ns: cpu_ns_by_identity
+                    .iter()
+                    .map(|counter| counter.cpu_ns)
+                    .sum(),
+                expected_identities,
+                cpu_ns_by_identity,
+            }
+        };
+
+        let missing_final = vec![
+            sample(800, Some((10, false))),
+            sample(900, Some((20, false))),
+            sample(1_100, None),
+            sample(2_100, None),
+        ];
+        let error = interpolated_model_wait_cpu_ns(&missing_final, 1_000, 2_000).unwrap_err();
+        assert!(error.contains("last observed before response headers"));
+        assert!(error.contains("without a final-retirement counter receipt"));
+
+        let one_live_sample = vec![
+            sample(800, None),
+            sample(900, Some((20, false))),
+            sample(1_100, None),
+            sample(2_100, None),
+        ];
+        assert!(
+            interpolated_model_wait_cpu_ns(&one_live_sample, 1_000, 2_000)
+                .unwrap_err()
+                .contains("last observed before response headers")
+        );
+
+        let final_after_headers = vec![
+            sample(800, Some((10, false))),
+            sample(900, Some((20, false))),
+            sample(1_100, None),
+            sample(1_500, Some((120, true))),
+            sample(2_100, None),
+        ];
+        assert_eq!(
+            interpolated_model_wait_cpu_ns(&final_after_headers, 1_000, 2_000),
+            Ok(83)
+        );
+
+        let retired_before_headers = vec![
+            sample(800, Some((10, false))),
+            sample(900, Some((20, true))),
+            sample(1_100, None),
+            sample(2_100, None),
+        ];
+        assert_eq!(
+            interpolated_model_wait_cpu_ns(&retired_before_headers, 1_000, 2_000),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn row48_incomplete_preheader_lifetime_cannot_become_a_complete_pass() {
+        let headers_ns = 1_000_000_000;
+        let frames = paced_frames(headers_ns, 5);
+        let final_ns = frames[4].frame_yielded_ns;
+        let mut samples = cpu_samples(headers_ns, final_ns, 10_000_000);
+        let lost = ProcIdentity {
+            pid: 99,
+            start_time: 123,
+        };
+        samples[0].expected_identities.push(lost);
+        samples[0]
+            .cpu_ns_by_identity
+            .push(ModelWaitCpuIdentitySample {
+                identity: lost,
+                cpu_ns: 5_000_000,
+                final_retirement: false,
+            });
+        let trial = ModelWaitCpuTrialEvidence {
+            repetition: 1,
+            response_headers_ns: headers_ns,
+            terminal_ns: Some(headers_ns + 5_100_000_000),
+            cpu_ns: 10_000_000,
+            cpu_samples: samples,
+            paced_ledger: paced_ledger(headers_ns, &frames),
+            frames,
+            terminal_count: 1,
+            success_terminals: 1,
+            outer_kill_used: false,
+            outer_kill_ns: None,
+            outer_deadline_ms: 10_500,
+        };
+
+        let evaluation = evaluate_model_wait_cpu(&[trial], 1, 5, 2_500);
+        assert!(!evaluation.measurement_complete);
+        assert!(!evaluation.passed);
+        assert!(
+            evaluation
+                .measurement_error
+                .as_deref()
+                .is_some_and(|error| error.contains("last observed before response headers"))
+        );
+    }
+
+    #[test]
     fn row59_requires_reset_on_byte_success_and_bounded_true_stall() {
         let headers_ns = 10_000_000_000;
         let trial = SlowStreamStallTrialEvidence {
@@ -1644,6 +2418,7 @@ mod tests {
             slow_response_headers_ns: headers_ns,
             slow_terminal_ns: Some(headers_ns + 5_100_000_000),
             slow_frames: paced_frames(headers_ns, 5),
+            slow_paced_ledger: paced_ledger(headers_ns, &paced_frames(headers_ns, 5)),
             slow_terminal_count: 1,
             slow_success_terminals: 1,
             slow_idle_timeout_fired: false,
@@ -1667,17 +2442,78 @@ mod tests {
             2_500.0
         );
 
-        let mut early = trial;
+        let mut early = trial.clone();
         early.stall_terminal_ns = Some(headers_ns + 1_000_000_000);
         let early = evaluate_slow_stream_vs_stall(&[early], 1, 5, 2_500);
         assert!(early.measurement_complete);
         assert!(!early.passed);
+
+        let mut closed_trial = trial;
+        let close_ns = headers_ns + 2_100_000_000;
+        closed_trial.slow_terminal_ns = Some(close_ns);
+        closed_trial.slow_success_terminals = 0;
+        closed_trial.slow_frames.truncate(2);
+        closed_trial.slow_paced_ledger.connection_closed_ns = Some(close_ns);
+        for frame in closed_trial.slow_paced_ledger.frames.iter_mut().skip(2) {
+            frame.yielded_ns = None;
+            frame.body_dropped_ns = Some(frame.timer_fired_ns);
+        }
+        let closed =
+            evaluate_slow_stream_vs_stall(std::slice::from_ref(&closed_trial), 1, 5, 2_500);
+        assert!(closed.measurement_complete);
+        assert!(!closed.passed);
+        assert_eq!(
+            closed.details["repetitions"][0]["slow"]["early_consumer_close"],
+            true
+        );
+
+        let assert_error = |trial: SlowStreamStallTrialEvidence, label: &str| {
+            let evaluation = evaluate_slow_stream_vs_stall(&[trial], 1, 5, 2_500);
+            assert!(
+                !evaluation.measurement_complete && evaluation.measurement_error.is_some(),
+                "row 59 {label} must retain infrastructure ERROR precedence: {evaluation:?}"
+            );
+        };
+
+        let mut removed_yield = closed_trial.clone();
+        removed_yield.slow_frames.remove(0);
+        assert_error(removed_yield, "removed yielded receipt");
+
+        let mut duplicate_yield = closed_trial.clone();
+        duplicate_yield
+            .slow_frames
+            .push(duplicate_yield.slow_frames[0].clone());
+        assert_error(duplicate_yield, "duplicate yielded receipt");
+
+        let mut wrong_physical_identity = closed_trial.clone();
+        wrong_physical_identity.slow_frames[0].attempt = 99;
+        assert_error(wrong_physical_identity, "wrong physical response identity");
+
+        let mut timer_loss = closed_trial.clone();
+        timer_loss.slow_paced_ledger.frames.pop();
+        assert_error(timer_loss, "missing scheduler ordinal");
+
+        let mut delayed_yield = closed_trial.clone();
+        let delayed_ns = headers_ns + 1_500_000_000;
+        delayed_yield.slow_frames[0].frame_yielded_ns = delayed_ns;
+        delayed_yield.slow_paced_ledger.frames[0].yielded_ns = Some(delayed_ns);
+        assert_error(delayed_yield, "yield delayed by 1500 ms");
+
+        let mut invalid_scheduler_terminal = closed_trial;
+        invalid_scheduler_terminal
+            .slow_paced_ledger
+            .scheduler_terminal_ns = Some(1);
+        assert_error(
+            invalid_scheduler_terminal,
+            "scheduler terminal before headers and timers",
+        );
 
         let mut killed = SlowStreamStallTrialEvidence {
             repetition: 1,
             slow_response_headers_ns: headers_ns,
             slow_terminal_ns: Some(headers_ns + 5_100_000_000),
             slow_frames: paced_frames(headers_ns, 5),
+            slow_paced_ledger: paced_ledger(headers_ns, &paced_frames(headers_ns, 5)),
             slow_terminal_count: 1,
             slow_success_terminals: 1,
             slow_idle_timeout_fired: false,

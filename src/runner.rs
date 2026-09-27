@@ -21,8 +21,8 @@ use crate::evaluate::{
 use crate::events::{EventVocab, NormalizedEvent, rule_matches};
 use crate::fake_model::{
     FakeModelEngine, FakeModelMailboxServer, FakeModelPreconnectedServer, FakeModelServer,
-    FakeModelUnixServer, ProviderMailboxRequest, ProviderMailboxResponse, is_transient_bind_error,
-    monotonic_timestamp_ns,
+    FakeModelUnixServer, PacedResponseLedger, ProviderMailboxRequest, ProviderMailboxResponse,
+    is_transient_bind_error, monotonic_timestamp_ns,
 };
 use crate::manifest::{
     ArgvPosition, InjectionArgvTarget, InjectionComponent, InjectionMethod, Manifest, TransportKind,
@@ -54,11 +54,11 @@ use crate::resource_certification::{
 use crate::sampler::{MemoryMetric, SampleSeries};
 use crate::wave2::{
     DiskIoEvaluation, DiskTurnEvidence, LargeOutputEvaluation, LargeOutputTrial, LogEvidenceKind,
-    ModelWaitCpuEvaluation, ModelWaitCpuSample, ModelWaitCpuTrialEvidence,
-    SlowStreamStallEvaluation, SlowStreamStallTrialEvidence, WorkspaceFaultEvaluation,
-    WorkspaceFaultTrial, evaluate_disk_io_per_turn, evaluate_large_tool_output,
-    evaluate_model_wait_cpu, evaluate_slow_stream_vs_stall, evaluate_workspace_fault,
-    interpolated_model_wait_cpu_ns,
+    ModelWaitCpuEvaluation, ModelWaitCpuIdentitySample, ModelWaitCpuSample,
+    ModelWaitCpuTrialEvidence, SlowStreamStallEvaluation, SlowStreamStallTrialEvidence,
+    WorkspaceFaultEvaluation, WorkspaceFaultTrial, evaluate_disk_io_per_turn,
+    evaluate_large_tool_output, evaluate_model_wait_cpu, evaluate_slow_stream_vs_stall,
+    evaluate_workspace_fault, interpolated_model_wait_cpu_ns,
 };
 use crate::wave2_automation::{
     ChildFailureCase, ChildFailureEvaluation, ChildFailureTrial, OfflineAttempt,
@@ -19015,10 +19015,10 @@ async fn collect_disk_io_trials(
             .await?;
         let mut path_variables = variables.clone();
         path_variables.insert("session_id".to_owned(), session.0.clone());
-        let pre_reap_event_path = if per_invocation {
-            if manifest.events.source != "journal-file" || manifest.events.path.trim().is_empty() {
+        let pre_reap_event_path = if per_invocation && manifest.events.source == "journal-file" {
+            if manifest.events.path.trim().is_empty() {
                 return Err(AhrbError::Protocol(
-                    "row-47 per-invocation disk accounting requires a file-backed structured terminal boundary before reap"
+                    "row-47 journal-file terminal accounting requires a declared event path"
                         .to_owned(),
                 ));
             }
@@ -19027,13 +19027,20 @@ async fn collect_disk_io_trials(
                 &path_variables,
                 &profile_root,
             )?;
-            paths.pop().map(|(path, _)| path).ok_or_else(|| {
+            Some(paths.pop().map(|(path, _)| path).ok_or_else(|| {
                 AhrbError::Protocol(
                     "row-47 per-invocation event journal path rendered empty".to_owned(),
                 )
-            })?
+            })?)
+        } else if per_invocation && manifest.events.source == "stdout" {
+            None
+        } else if per_invocation {
+            return Err(AhrbError::Protocol(format!(
+                "row-47 per-invocation disk accounting cannot observe events.source {:?} before reap",
+                manifest.events.source
+            )));
         } else {
-            PathBuf::new()
+            None
         };
         let mut journal_templates = Vec::new();
         if !manifest.events.path.trim().is_empty() {
@@ -19094,7 +19101,11 @@ async fn collect_disk_io_trials(
             };
             let previous_boundary_count = driver.completed_turn_boundaries().len();
             let previous_terminal_count = if per_invocation {
-                row47_terminal_record_count(&pre_reap_event_path, manifest)?
+                pre_reap_event_path
+                    .as_deref()
+                    .map(|path| row47_terminal_record_count(path, manifest))
+                    .transpose()?
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -19105,6 +19116,19 @@ async fn collect_disk_io_trials(
                     &format!("row-47-r{repetition}-turn-{turn:03}"),
                 )
                 .await?;
+            let active_pre_reap_event_path = if per_invocation {
+                match pre_reap_event_path.as_ref() {
+                    Some(path) => Some(path.clone()),
+                    None => Some(client_pre_reap_event_path(
+                        &driver,
+                        manifest,
+                        &profile_root,
+                        &session,
+                    )?),
+                }
+            } else {
+                None
+            };
             let invocation_roots = if per_invocation {
                 let roots = driver.session_pids(&session);
                 if roots.is_empty() {
@@ -19121,7 +19145,11 @@ async fn collect_disk_io_trials(
             };
             if per_invocation {
                 row47_wait_for_pre_reap_terminal(
-                    &pre_reap_event_path,
+                    active_pre_reap_event_path.as_deref().ok_or_else(|| {
+                        AhrbError::Protocol(
+                            "row-47 lost its structured terminal source before reap".to_owned(),
+                        )
+                    })?,
                     manifest,
                     previous_terminal_count,
                     outer_turn_timeout(manifest),
@@ -19720,6 +19748,8 @@ struct StreamingCaseResult {
     cpu_ns: u64,
     cpu_samples: Vec<ModelWaitCpuSample>,
     frames: Vec<crate::fake_model::ModelFrameObservation>,
+    paced_ledger: Option<PacedResponseLedger>,
+    paced_ledgers: Vec<PacedResponseLedger>,
     events: Vec<NormalizedEvent>,
     requests: Vec<crate::fake_model::ModelRequestRecord>,
 }
@@ -19805,6 +19835,7 @@ struct PacedFrameWait<'a> {
     cpu_samples: &'a mut Vec<ModelWaitCpuSample>,
 }
 
+#[cfg(test)]
 fn complete_paced_response(
     records: &[crate::fake_model::ModelRequestRecord],
     frames: &[crate::fake_model::ModelFrameObservation],
@@ -19873,6 +19904,7 @@ async fn wait_for_paced_frames(
     mut wait: PacedFrameWait<'_>,
 ) -> Result<(
     Vec<crate::fake_model::ModelFrameObservation>,
+    PacedResponseLedger,
     crate::fake_model::ModelRequestRecord,
 )> {
     let mut next_cpu_sample = Instant::now();
@@ -19884,14 +19916,72 @@ async fn wait_for_paced_frames(
             .into_iter()
             .filter(|frame| frame.actor == wait.actor)
             .collect::<Vec<_>>();
-        // Completion and every timing boundary belong to one physical
-        // response, never to an earlier retry that happened to publish headers.
-        if let Some(record) = complete_paced_response(&records, &frames, wait.expected_count)? {
+        let completed_ledgers = wait
+            .engine
+            .paced_response_ledgers()?
+            .into_iter()
+            .filter(|ledger| {
+                ledger.actor == wait.actor
+                    && ledger.expected_count == wait.expected_count
+                    && ledger.scheduler_terminal_ns.is_some()
+            })
+            .collect::<Vec<_>>();
+        let consumer_ledgers = completed_ledgers
+            .iter()
+            .filter(|ledger| ledger.frames.iter().any(|frame| frame.yielded_ns.is_some()))
+            .collect::<Vec<_>>();
+        if consumer_ledgers.len() > 1 {
+            return Err(AhrbError::Protocol(format!(
+                "paced trial yielded bytes from {} physical responses; expected one",
+                consumer_ledgers.len()
+            )));
+        }
+        let selected_ledger = consumer_ledgers
+            .first()
+            .copied()
+            .or_else(|| (completed_ledgers.len() == 1).then(|| &completed_ledgers[0]));
+        if completed_ledgers.len() > 1 && selected_ledger.is_none() {
+            return Err(AhrbError::Protocol(format!(
+                "paced trial completed {} scheduler ledgers without identifying a consumer-polled response",
+                completed_ledgers.len()
+            )));
+        }
+        // Scheduler completion is independent of consumer polling. The row
+        // oracle receives missing/duplicate yielded ordinals unchanged. Some
+        // adapters race protocol frontends; only a unique response with an
+        // observed body yield identifies the physical response the consumer
+        // selected. Every physical ledger is retained for publication later.
+        if let Some(ledger) = selected_ledger {
+            let record = records
+                .iter()
+                .find(|record| {
+                    record.request.scenario == ledger.scenario
+                        && record.request.actor == ledger.actor
+                        && record.request.checkpoint == ledger.checkpoint
+                        && record.attempt == ledger.attempt
+                        && record.response_headers_ns == Some(ledger.response_headers_ns)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "paced scheduler ledger has no matching response-header record".to_owned(),
+                    )
+                })?;
             if let Some(sampler) = wait.sampler.as_deref_mut() {
                 wait.cpu_samples
                     .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
             }
-            return Ok((frames, record));
+            let selected_frames = frames
+                .into_iter()
+                .filter(|frame| {
+                    frame.scenario == ledger.scenario
+                        && frame.actor == ledger.actor
+                        && frame.checkpoint == ledger.checkpoint
+                        && frame.attempt == ledger.attempt
+                        && frame.frontend == ledger.frontend
+                })
+                .collect();
+            return Ok((selected_frames, ledger.clone(), record));
         }
         let latest_header = records
             .iter()
@@ -19909,8 +19999,6 @@ async fn wait_for_paced_frames(
                 wait.cpu_samples
                     .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
             }
-            // Incomplete evidence must survive the outer deadline so the oracle
-            // can issue ERROR with the actual attempt/frame identities.
             let record = latest_header
                 .map(|(_, record)| record.clone())
                 .ok_or_else(|| {
@@ -19918,7 +20006,11 @@ async fn wait_for_paced_frames(
                         "paced response deadline elapsed without a header record".to_owned(),
                     )
                 })?;
-            return Ok((frames, record));
+            return Err(AhrbError::Protocol(format!(
+                "paced response deadline elapsed before scheduler terminal for attempt {}; yielded frames retained={}",
+                record.attempt,
+                frames.len()
+            )));
         }
         if let Some(sampler) = wait.sampler.as_deref_mut()
             && Instant::now() >= next_cpu_sample
@@ -19926,6 +20018,61 @@ async fn wait_for_paced_frames(
             wait.cpu_samples
                 .push(sample_streaming_cpu(sampler.as_mut(), wait.roots)?);
             next_cpu_sample = Instant::now() + Duration::from_millis(100);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_paced_scheduler_settlement(
+    engine: &FakeModelEngine,
+    actor: &str,
+    expected_count: u32,
+    outer_deadline_ms: u64,
+) -> Result<Vec<PacedResponseLedger>> {
+    loop {
+        let ledgers = engine
+            .paced_response_ledgers()?
+            .into_iter()
+            .filter(|ledger| ledger.actor == actor && ledger.expected_count == expected_count)
+            .collect::<Vec<_>>();
+        if !ledgers.is_empty()
+            && ledgers
+                .iter()
+                .all(|ledger| ledger.scheduler_terminal_ns.is_some())
+        {
+            for ledger in &ledgers {
+                let mut ordinals = ledger
+                    .frames
+                    .iter()
+                    .map(|frame| frame.ordinal)
+                    .collect::<Vec<_>>();
+                ordinals.sort_unstable();
+                if ordinals != (1..=expected_count).collect::<Vec<_>>() {
+                    return Err(AhrbError::Protocol(format!(
+                        "paced scheduler attempt {} retained ordinals {:?}; expected 1..={expected_count}",
+                        ledger.attempt, ordinals
+                    )));
+                }
+            }
+            return Ok(ledgers);
+        }
+        let deadline_ns = ledgers
+            .iter()
+            .map(|ledger| {
+                ledger
+                    .response_headers_ns
+                    .saturating_add(outer_deadline_ms.saturating_mul(1_000_000))
+            })
+            .max();
+        if deadline_ns.is_some_and(|deadline| monotonic_timestamp_ns() >= deadline) {
+            let incomplete = ledgers
+                .iter()
+                .filter(|ledger| ledger.scheduler_terminal_ns.is_none())
+                .map(|ledger| ledger.attempt)
+                .collect::<Vec<_>>();
+            return Err(AhrbError::Protocol(format!(
+                "paced scheduler settlement deadline elapsed with incomplete attempts {incomplete:?}"
+            )));
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -19993,6 +20140,14 @@ mod paced_response_tests {
 }
 
 fn sample_streaming_cpu(sampler: &mut dyn Sampler, roots: &[u32]) -> Result<ModelWaitCpuSample> {
+    sample_streaming_cpu_with_final_retirements(sampler, roots, &BTreeSet::new())
+}
+
+fn sample_streaming_cpu_with_final_retirements(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    final_retirement_pids: &BTreeSet<u32>,
+) -> Result<ModelWaitCpuSample> {
     if roots.is_empty() {
         return Err(AhrbError::Protocol(
             "streaming row exposed no owned process root".to_owned(),
@@ -20000,12 +20155,23 @@ fn sample_streaming_cpu(sampler: &mut dyn Sampler, roots: &[u32]) -> Result<Mode
     }
     let sample_started_ns = monotonic_timestamp_ns();
     let tree = sampler.discover(roots)?;
-    let cpu_ns = sampler.sample(&tree, "model-wait")?.cpu_ns;
+    let sample = sampler.sample(&tree, "model-wait")?;
     let sample_finished_ns = monotonic_timestamp_ns();
+    let expected_identities = tree.members.keys().copied().collect::<Vec<_>>();
     Ok(ModelWaitCpuSample {
         sample_started_ns,
         sample_finished_ns,
-        cpu_ns,
+        cpu_ns: sample.cpu_ns,
+        expected_identities,
+        cpu_ns_by_identity: sample
+            .process_samples
+            .into_iter()
+            .map(|process| ModelWaitCpuIdentitySample {
+                identity: process.process.identity,
+                cpu_ns: process.cpu_ns,
+                final_retirement: final_retirement_pids.contains(&process.process.identity.pid),
+            })
+            .collect(),
     })
 }
 
@@ -22263,10 +22429,10 @@ async fn collect_streaming_case(
     if let Some(sampler) = sampler.as_deref_mut() {
         cpu_samples.push(sample_streaming_cpu(sampler, &roots)?);
     }
-    let frames = if case == "stall" {
-        Vec::new()
+    let (mut frames, mut paced_ledger) = if case == "stall" {
+        (Vec::new(), None)
     } else {
-        let (frames, paced_record) = wait_for_paced_frames(PacedFrameWait {
+        let (frames, paced_ledger, paced_record) = wait_for_paced_frames(PacedFrameWait {
             engine: &engine,
             actor: &actor_name,
             expected_count: count,
@@ -22279,17 +22445,7 @@ async fn collect_streaming_case(
         response_headers_ns = paced_record.response_headers_ns.ok_or_else(|| {
             AhrbError::Protocol("paced response header boundary disappeared".to_owned())
         })?;
-        frames
-    };
-    let cpu_ns = if measure_cpu {
-        let final_frame_yield_ns = frames
-            .last()
-            .map(|frame| frame.frame_yielded_ns)
-            .ok_or_else(|| AhrbError::Protocol("model-wait final frame disappeared".to_owned()))?;
-        interpolated_model_wait_cpu_ns(&cpu_samples, response_headers_ns, final_frame_yield_ns)
-            .map_err(AhrbError::Protocol)?
-    } else {
-        0
+        (frames, Some(paced_ledger))
     };
     let terminal_result = match remaining_row_deadline(response_headers_ns, outer_deadline_ms) {
         Ok(remaining) => {
@@ -22307,6 +22463,22 @@ async fn collect_streaming_case(
     let (events, terminal_ns, outer_kill_used, outer_kill_ns) = match terminal_result {
         Ok(events) => {
             let terminal_ns = monotonic_timestamp_ns();
+            if let Some(sampler) = sampler.as_deref_mut() {
+                if per_invocation {
+                    // The driver observes the direct child exit without
+                    // reaping it. Only this ordered terminal -> exit -> sample
+                    // boundary is an explicit final-retirement receipt; an
+                    // earlier live cadence poll is never promoted to final.
+                    driver.observe_exits_before_reap().await?;
+                    cpu_samples.push(sample_streaming_cpu_with_final_retirements(
+                        sampler,
+                        &roots,
+                        &roots.iter().copied().collect(),
+                    )?);
+                } else {
+                    cpu_samples.push(sample_streaming_cpu(sampler, &roots)?);
+                }
+            }
             if manifest.transport.kind == TransportKind::Exec
                 || !manifest.sessions.close_delete.is_empty()
             {
@@ -22317,6 +22489,9 @@ async fn collect_streaming_case(
         }
         Err(AhrbError::Timeout(_)) => {
             let outer_kill_ns = monotonic_timestamp_ns();
+            if let Some(sampler) = sampler.as_deref_mut() {
+                cpu_samples.push(sample_streaming_cpu(sampler, &roots)?);
+            }
             cleanup_streaming_outer_kill(
                 &mut driver,
                 &roots,
@@ -22327,7 +22502,80 @@ async fn collect_streaming_case(
         }
         Err(error) => return Err(error),
     };
+    let paced_ledgers = if let Some(ledger_identity) = paced_ledger.as_ref().map(|ledger| {
+        (
+            ledger.scenario.clone(),
+            ledger.actor.clone(),
+            ledger.checkpoint.clone(),
+            ledger.attempt,
+            ledger.frontend.clone(),
+        )
+    }) {
+        // Driver shutdown prevents new attempts. Let every physical response
+        // already accepted by the fake provider finish its independent
+        // scheduler before taking the publication snapshot.
+        let all_ledgers =
+            wait_for_paced_scheduler_settlement(&engine, &actor_name, count, outer_deadline_ms)
+                .await?;
+        let matching_ledgers = all_ledgers
+            .iter()
+            .filter(|ledger| {
+                ledger.scenario == ledger_identity.0
+                    && ledger.actor == ledger_identity.1
+                    && ledger.checkpoint == ledger_identity.2
+                    && ledger.attempt == ledger_identity.3
+                    && ledger.frontend == ledger_identity.4
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching_ledgers.len() != 1 {
+            return Err(AhrbError::Protocol(format!(
+                "paced response retained {} matching ledgers after teardown; expected one",
+                matching_ledgers.len()
+            )));
+        }
+        paced_ledger = matching_ledgers.into_iter().next();
+        frames = engine
+            .frame_observations()?
+            .into_iter()
+            .filter(|frame| {
+                frame.scenario == ledger_identity.0
+                    && frame.actor == ledger_identity.1
+                    && frame.checkpoint == ledger_identity.2
+                    && frame.attempt == ledger_identity.3
+                    && frame.frontend == ledger_identity.4
+            })
+            .collect();
+        all_ledgers
+            .into_iter()
+            .filter(|ledger| ledger.actor == actor_name && ledger.expected_count == count)
+            .collect()
+    } else {
+        Vec::new()
+    };
     server.shutdown().await?;
+    let cpu_ns = if measure_cpu {
+        let cpu_end_ns = paced_ledger
+            .as_ref()
+            .and_then(|ledger| {
+                if ledger.frames.iter().all(|frame| frame.yielded_ns.is_some()) {
+                    ledger
+                        .frames
+                        .iter()
+                        .filter_map(|frame| frame.yielded_ns)
+                        .max()
+                } else {
+                    ledger.frames.iter().map(|frame| frame.timer_fired_ns).max()
+                }
+            })
+            .ok_or_else(|| {
+                AhrbError::Protocol("model-wait final scheduler boundary disappeared".to_owned())
+            })?;
+        interpolated_model_wait_cpu_ns(&cpu_samples, response_headers_ns, cpu_end_ns)
+            .map_err(AhrbError::Protocol)?
+    } else {
+        0
+    };
     let requests = engine.request_records().await;
     Ok(StreamingCaseResult {
         actor: actor_name,
@@ -22338,6 +22586,8 @@ async fn collect_streaming_case(
         cpu_ns,
         cpu_samples,
         frames,
+        paced_ledger,
+        paced_ledgers,
         events,
         requests,
     })
@@ -22347,22 +22597,29 @@ fn streaming_chunks(
     repetition: u32,
     case: &str,
     actor: &str,
-    frames: &[crate::fake_model::ModelFrameObservation],
+    ledger: &PacedResponseLedger,
+    terminal_ns: Option<u64>,
 ) -> Vec<StreamChunkObservation> {
-    frames
+    ledger
+        .frames
         .iter()
         .map(|frame| StreamChunkObservation {
             repetition,
             actor: actor.to_owned(),
             case: case.to_owned(),
-            scenario: frame.scenario.clone(),
-            checkpoint: frame.checkpoint.clone(),
-            attempt: frame.attempt,
-            frontend: frame.frontend.clone(),
+            scenario: ledger.scenario.clone(),
+            checkpoint: ledger.checkpoint.clone(),
+            attempt: ledger.attempt,
+            frontend: ledger.frontend.clone(),
             ordinal: frame.ordinal,
             scheduled_ns: frame.scheduled_ns,
-            frame_yielded_ns: frame.frame_yielded_ns,
-            bytes: frame.bytes,
+            timer_fired_ns: frame.timer_fired_ns,
+            frame_yielded_ns: frame.yielded_ns,
+            body_dropped_ns: frame.body_dropped_ns,
+            scheduler_terminal_ns: ledger.scheduler_terminal_ns,
+            consumer_terminal_ns: terminal_ns,
+            connection_closed_ns: ledger.connection_closed_ns,
+            bytes: u64::from(frame.yielded_ns.is_some()),
         })
         .collect()
 }
@@ -22411,12 +22668,15 @@ async fn collect_model_wait_cpu_trials(
             .iter()
             .filter(|event| is_terminal(&event.event))
             .count() as u32;
-        trials.stream_chunks.extend(streaming_chunks(
-            repetition,
-            "model-wait",
-            &trial.actor,
-            &trial.frames,
-        ));
+        for ledger in &trial.paced_ledgers {
+            trials.stream_chunks.extend(streaming_chunks(
+                repetition,
+                "model-wait",
+                &trial.actor,
+                ledger,
+                trial.terminal_ns,
+            ));
+        }
         trials.evidence.push(ModelWaitCpuTrialEvidence {
             repetition,
             response_headers_ns: trial.response_headers_ns,
@@ -22424,6 +22684,9 @@ async fn collect_model_wait_cpu_trials(
             cpu_ns: trial.cpu_ns,
             cpu_samples: trial.cpu_samples,
             frames: trial.frames,
+            paced_ledger: trial.paced_ledger.ok_or_else(|| {
+                AhrbError::Protocol("row-48 paced scheduler ledger disappeared".to_owned())
+            })?,
             terminal_count,
             success_terminals,
             outer_kill_used: trial.outer_kill_used,
@@ -22519,17 +22782,23 @@ async fn collect_slow_stream_stall_trials(
                             == Some("idle-timeout")
             })
             .count() as u32;
-        trials.stream_chunks.extend(streaming_chunks(
-            repetition,
-            "slow",
-            &slow.actor,
-            &slow.frames,
-        ));
+        for ledger in &slow.paced_ledgers {
+            trials.stream_chunks.extend(streaming_chunks(
+                repetition,
+                "slow",
+                &slow.actor,
+                ledger,
+                slow.terminal_ns,
+            ));
+        }
         trials.evidence.push(SlowStreamStallTrialEvidence {
             repetition,
             slow_response_headers_ns: slow.response_headers_ns,
             slow_terminal_ns: slow.terminal_ns,
             slow_frames: slow.frames,
+            slow_paced_ledger: slow.paced_ledger.ok_or_else(|| {
+                AhrbError::Protocol("row-59 paced scheduler ledger disappeared".to_owned())
+            })?,
             slow_terminal_count,
             slow_success_terminals,
             slow_idle_timeout_fired,
@@ -25223,9 +25492,12 @@ fn platform_sampler() -> Box<dyn Sampler> {
     }
 }
 
+type ResourceSamplerFactory = Arc<dyn Fn() -> Box<dyn Sampler> + Send + Sync>;
+
 struct ResourceCollector {
     sampler: Option<Box<dyn Sampler>>,
     membership_sampler: Option<Box<dyn Sampler>>,
+    sampler_factory: ResourceSamplerFactory,
     series: SampleSeries,
     membership_samples_by_phase: BTreeMap<String, Vec<u64>>,
     membership_refreshes_by_phase: BTreeMap<String, Vec<MembershipRefreshEvidence>>,
@@ -25237,6 +25509,8 @@ struct ResourceCollector {
     membership_cadence: Duration,
     counter_sample_interval: Duration,
     counter_cadence: Duration,
+    #[cfg(test)]
+    phase_collection_counts: BTreeMap<String, u32>,
 }
 
 struct PhaseSampling {
@@ -25532,6 +25806,13 @@ fn collect_resource_phase(
 
 impl ResourceCollector {
     fn new(timing: &ResourceTimingPlan) -> Self {
+        Self::with_sampler_factory(timing, Arc::new(platform_sampler))
+    }
+
+    fn with_sampler_factory(
+        timing: &ResourceTimingPlan,
+        sampler_factory: ResourceSamplerFactory,
+    ) -> Self {
         #[cfg(target_os = "macos")]
         let counter_ms = timing.macos_rusage_cadence_ms;
         #[cfg(target_os = "linux")]
@@ -25544,8 +25825,9 @@ impl ResourceCollector {
             .filter(|interval| !interval.is_zero())
             .unwrap_or(counter_cadence);
         Self {
-            sampler: Some(platform_sampler()),
-            membership_sampler: Some(platform_sampler()),
+            sampler: Some(sampler_factory()),
+            membership_sampler: Some(sampler_factory()),
+            sampler_factory,
             series: SampleSeries::default(),
             membership_samples_by_phase: BTreeMap::new(),
             membership_refreshes_by_phase: BTreeMap::new(),
@@ -25554,10 +25836,17 @@ impl ResourceCollector {
             membership_cadence,
             counter_sample_interval,
             counter_cadence,
+            #[cfg(test)]
+            phase_collection_counts: BTreeMap::new(),
         }
     }
 
     async fn sample_phase(&mut self, roots: &[u32], phase: &str, duration: Duration) -> Result<()> {
+        #[cfg(test)]
+        self.phase_collection_counts
+            .entry(phase.to_owned())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
         self.sample_until(roots, phase, async move {
             tokio::time::sleep(duration).await;
             Ok(())
@@ -25632,7 +25921,7 @@ impl ResourceCollector {
             let backup = std::thread::Builder::new()
                 .name(format!("ahrb-membership-sampler-{index}"))
                 .spawn({
-                    let backup_sampler = platform_sampler();
+                    let backup_sampler = (self.sampler_factory)();
                     let roots = Arc::clone(&roots);
                     let stop = Arc::clone(&sampler_stop);
                     let membership_cadence = self.membership_cadence;
@@ -25767,10 +26056,19 @@ impl ResourceCollector {
         for sample in phase_sampling.samples {
             self.series.push(sample)?;
         }
-        self.membership_samples_by_phase
-            .insert(phase.to_owned(), membership_times);
-        self.membership_refreshes_by_phase
-            .insert(phase.to_owned(), membership_sampling.refreshes);
+        let times = self
+            .membership_samples_by_phase
+            .entry(phase.to_owned())
+            .or_default();
+        times.extend(membership_times);
+        times.sort_unstable();
+        times.dedup();
+        let refreshes = self
+            .membership_refreshes_by_phase
+            .entry(phase.to_owned())
+            .or_default();
+        refreshes.extend(membership_sampling.refreshes);
+        refreshes.sort_by_key(|refresh| (refresh.elapsed_ns, refresh.lane));
         operation_result
     }
 
@@ -25799,6 +26097,121 @@ struct GroupEvidence {
     ordinary_return: ReturnToIdleObservation,
     single_agent: Option<SingleAgentObservation>,
     cleanup: CleanupObservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PostTurnWindowReceipt {
+    requested_ms: u64,
+    actual_ms: u64,
+    extension_used_ms: u64,
+    first_sample_ns: u64,
+    last_sample_ns: u64,
+    sample_span_ns: u64,
+    overrun_tolerance_ns: u64,
+    overrun_ns: u64,
+    overrun_beyond_tolerance_ns: u64,
+}
+
+fn post_turn_window_needs_extension(
+    collector: &ResourceCollector,
+    phase: &str,
+    requested_ns: u64,
+    steady_ns: u64,
+) -> bool {
+    let counter_complete = collector
+        .series
+        .phase_coverage(phase, duration_ns(collector.counter_cadence), requested_ns)
+        .is_ok_and(|coverage| coverage.trustworthy);
+    let membership_times = collector
+        .membership_samples_by_phase
+        .get(phase)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let membership_complete = membership_times.len() >= 2
+        && membership_times
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(membership_times.first().copied().unwrap_or(0))
+            .saturating_add(duration_ns(collector.membership_cadence))
+            >= requested_ns;
+    let plateau_trustworthy = collector
+        .series
+        .trailing_plateau(phase, MemoryMetric::Effective, 1, steady_ns)
+        .is_ok_and(|plateau| {
+            plateau.trustworthy
+                && plateau.relative_spread <= ResourceEnvelope::default().maximum_plateau_spread
+        });
+    !counter_complete || !membership_complete || !plateau_trustworthy
+}
+
+fn post_turn_window_receipt(
+    collector: &ResourceCollector,
+    phase: &str,
+    requested_ms: u64,
+    extension_used_ms: u64,
+) -> Result<PostTurnWindowReceipt> {
+    let mut samples = collector
+        .series
+        .samples
+        .iter()
+        .filter(|sample| sample.phase == phase);
+    let first_sample_ns = samples
+        .next()
+        .map(|sample| sample.elapsed_ns)
+        .ok_or_else(|| AhrbError::Protocol("resource post-turn sample is absent".to_owned()))?;
+    let last_sample_ns = samples.fold(first_sample_ns, |_, sample| sample.elapsed_ns);
+    let sample_span_ns = last_sample_ns.saturating_sub(first_sample_ns);
+    let actual_ms = sample_span_ns.div_ceil(1_000_000);
+    let requested_bound_ns = requested_ms
+        .saturating_add(extension_used_ms)
+        .saturating_mul(1_000_000);
+    let overrun_tolerance_ns = duration_ns(collector.counter_cadence)
+        .saturating_add(duration_ns(collector.membership_cadence));
+    let overrun_ns = sample_span_ns.saturating_sub(requested_bound_ns);
+    Ok(PostTurnWindowReceipt {
+        requested_ms,
+        actual_ms,
+        extension_used_ms,
+        first_sample_ns,
+        last_sample_ns,
+        sample_span_ns,
+        overrun_tolerance_ns,
+        overrun_ns,
+        overrun_beyond_tolerance_ns: overrun_ns.saturating_sub(overrun_tolerance_ns),
+    })
+}
+
+async fn collect_post_turn_window(
+    collector: &mut ResourceCollector,
+    roots: &[u32],
+    phase: &str,
+    agents: u32,
+    timing: &ResourceTimingPlan,
+) -> Result<PostTurnWindowReceipt> {
+    let requested_ms = timing
+        .barrier_discard_ms
+        .saturating_add(timing.barrier_steady_ms);
+    collector
+        .sample_phase(roots, phase, Duration::from_millis(requested_ms))
+        .await?;
+    let requested_ns = requested_ms.saturating_mul(1_000_000);
+    let steady_ns = timing.barrier_steady_ms.saturating_mul(1_000_000);
+    let extension_used_ms = if agents == 1
+        && post_turn_window_needs_extension(collector, phase, requested_ns, steady_ns)
+    {
+        collector
+            .sample_phase(
+                roots,
+                phase,
+                Duration::from_millis(timing.single_agent_extension_ms),
+            )
+            .await?;
+        timing.single_agent_extension_ms
+    } else {
+        0
+    };
+    post_turn_window_receipt(collector, phase, requested_ms, extension_used_ms)
 }
 
 /// Measure client-process fan-out as transient process trees. There is no
@@ -26705,17 +27118,8 @@ async fn run_resource_group(
     if agents == 1 {
         collector.sample_once(roots, &turn_cpu_phase)?;
     }
-    collector
-        .sample_phase(
-            roots,
-            &post_turn_phase,
-            Duration::from_millis(
-                timing
-                    .barrier_discard_ms
-                    .saturating_add(timing.barrier_steady_ms),
-            ),
-        )
-        .await?;
+    let post_turn_window =
+        collect_post_turn_window(collector, roots, &post_turn_phase, agents, timing).await?;
     let close_started = Instant::now();
     let mut closed_actor_sessions = BTreeMap::new();
     for (actor, _, session) in &sessions {
@@ -26758,6 +27162,15 @@ async fn run_resource_group(
             workload_phase: workload_phase.clone(),
             cold_phase,
             steady_phase: steady_phase.clone(),
+            post_turn_requested_ms: post_turn_window.requested_ms,
+            post_turn_actual_ms: post_turn_window.actual_ms,
+            post_turn_extension_used_ms: post_turn_window.extension_used_ms,
+            post_turn_first_sample_ns: post_turn_window.first_sample_ns,
+            post_turn_last_sample_ns: post_turn_window.last_sample_ns,
+            post_turn_sample_span_ns: post_turn_window.sample_span_ns,
+            post_turn_overrun_tolerance_ns: post_turn_window.overrun_tolerance_ns,
+            post_turn_overrun_ns: post_turn_window.overrun_ns,
+            post_turn_overrun_beyond_tolerance_ns: post_turn_window.overrun_beyond_tolerance_ns,
             post_turn_phase,
             post_close_phase: post_close_phase.clone(),
             minimum_steady_processes: 1,
@@ -27742,6 +28155,142 @@ mod resource_sampler_tests {
             .expect("explicit low cert width must classify without measurement");
             assert!(matches!(low_result.outcome, TestOutcome::Unsupported(_)));
         }
+    }
+
+    struct UnstablePostTurnSampler {
+        started: Instant,
+        samples: Arc<AtomicU64>,
+    }
+
+    impl Sampler for UnstablePostTurnSampler {
+        fn discover(&mut self, _roots: &[u32]) -> Result<ProcessTree> {
+            let root = crate::process::ProcIdentity {
+                pid: 200,
+                start_time: 1,
+            };
+            Ok(ProcessTree {
+                roots: BTreeSet::from([root]),
+                members: BTreeMap::from([(
+                    root,
+                    crate::process::ProcessInfo {
+                        identity: root,
+                        ppid: 0,
+                        command: "unstable-post-turn".to_owned(),
+                        ownership: crate::process::ProcOwnership::DeclaredRoot,
+                    },
+                )]),
+            })
+        }
+
+        fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
+            let elapsed_ns = duration_ns(self.started.elapsed());
+            let wall_time = std::time::SystemTime::now();
+            let sample_index = self.samples.fetch_add(1, Ordering::AcqRel);
+            let bytes = if sample_index.is_multiple_of(2) {
+                100 * 1_048_576
+            } else {
+                120 * 1_048_576
+            };
+            Ok(Sample {
+                elapsed_ns,
+                wall_time,
+                phase: phase.to_owned(),
+                rss_bytes: bytes,
+                pss_bytes: Some(bytes),
+                private_bytes: Some(bytes),
+                footprint_bytes: None,
+                rss_crosscheck_bytes: None,
+                cgroup_memory_bytes: None,
+                cgroup_peak_bytes: None,
+                cpu_ns: 0,
+                open_fds: Some(1),
+                thread_count: Some(1),
+                collection_ns: 1,
+                collection_wall_ns: 1,
+                processes: tree.members.values().cloned().collect(),
+                process_samples: Vec::new(),
+                cpu_accounting_warnings: Vec::new(),
+            })
+        }
+    }
+
+    async fn collect_unstable_post_turn_fixture(
+        phase: &str,
+    ) -> (ResourceCollector, PostTurnWindowReceipt, ResourceTimingPlan) {
+        let mut timing = ResourceTimingPlan::for_profile(ResourceProfile::Quick);
+        timing.barrier_discard_ms = 20;
+        timing.barrier_steady_ms = 20;
+        timing.single_agent_extension_ms = 40;
+        timing.membership_cadence_ms = 4;
+        timing.macos_rusage_cadence_ms = 4;
+        timing.linux_smaps_cadence_ms = 4;
+        let started = Instant::now();
+        let samples = Arc::new(AtomicU64::new(0));
+        let sampler_factory: ResourceSamplerFactory = Arc::new(move || {
+            Box::new(UnstablePostTurnSampler {
+                started,
+                samples: Arc::clone(&samples),
+            })
+        });
+        let mut collector = ResourceCollector::with_sampler_factory(&timing, sampler_factory);
+        let receipt = collect_post_turn_window(&mut collector, &[200], phase, 1, &timing)
+            .await
+            .expect("collect post-turn window through the production collector");
+        (collector, receipt, timing)
+    }
+
+    #[tokio::test]
+    async fn post_turn_collector_forces_one_extension_and_publishes_measured_window() {
+        let phase = "forced-post-turn-extension";
+        let (collector, receipt, timing) = collect_unstable_post_turn_fixture(phase).await;
+        assert_eq!(receipt.requested_ms, 40);
+        assert_eq!(receipt.extension_used_ms, 40);
+        assert_eq!(
+            receipt.actual_ms,
+            receipt.sample_span_ns.div_ceil(1_000_000)
+        );
+        assert_eq!(
+            receipt.sample_span_ns,
+            receipt
+                .last_sample_ns
+                .saturating_sub(receipt.first_sample_ns)
+        );
+        assert_eq!(
+            receipt.overrun_tolerance_ns,
+            duration_ns(collector.counter_cadence)
+                .saturating_add(duration_ns(collector.membership_cadence))
+        );
+        assert_eq!(collector.phase_collection_counts.get(phase), Some(&2));
+        let final_plateau = collector
+            .series
+            .trailing_plateau(
+                phase,
+                MemoryMetric::Effective,
+                1,
+                timing.barrier_steady_ms.saturating_mul(1_000_000),
+            )
+            .expect("extended post-turn plateau remains analyzable");
+        assert!(
+            !final_plateau.trustworthy,
+            "the forced extension must not manufacture trust"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_turn_collector_never_takes_a_second_extension() {
+        let phase = "single-bounded-post-turn-extension";
+        let (collector, receipt, timing) = collect_unstable_post_turn_fixture(phase).await;
+        assert!(post_turn_window_needs_extension(
+            &collector,
+            phase,
+            receipt
+                .requested_ms
+                .saturating_add(receipt.extension_used_ms)
+                .saturating_mul(1_000_000),
+            timing.barrier_steady_ms.saturating_mul(1_000_000),
+        ));
+        assert_eq!(receipt.extension_used_ms, timing.single_agent_extension_ms);
+        assert_eq!(collector.phase_collection_counts.get(phase), Some(&2));
     }
 
     struct LateChurnSampler {

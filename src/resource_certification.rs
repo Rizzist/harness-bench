@@ -46,6 +46,9 @@ pub struct ResourceTimingPlan {
     pub barrier_discard_ms: u64,
     /// Trailing barrier duration analyzed as the steady window.
     pub barrier_steady_ms: u64,
+    /// One predeclared extension of the N=1 post-turn phase when its first
+    /// complete trailing window is unstable or lacks distinct samples.
+    pub single_agent_extension_ms: u64,
     /// Maximum wait for return-to-idle and post-close reclaim.
     pub reclaim_deadline_ms: u64,
     /// Whole-tree membership cadence.
@@ -79,6 +82,7 @@ impl ResourceTimingPlan {
                 barrier_hold_ms: 500,
                 barrier_discard_ms: 100,
                 barrier_steady_ms: 400,
+                single_agent_extension_ms: 500,
                 reclaim_deadline_ms: 10_000,
                 membership_cadence_ms: 10,
                 macos_rusage_cadence_ms: 20,
@@ -100,6 +104,7 @@ impl ResourceTimingPlan {
                 barrier_hold_ms: 3_000,
                 barrier_discard_ms: 1_000,
                 barrier_steady_ms: 2_000,
+                single_agent_extension_ms: 3_000,
                 reclaim_deadline_ms: 10_000,
                 membership_cadence_ms: 10,
                 macos_rusage_cadence_ms: 20,
@@ -417,6 +422,33 @@ pub struct SweepObservation {
     pub cold_phase: String,
     /// Three-second barrier hold phase, whose final two seconds define S_n.
     pub steady_phase: String,
+    /// Initially requested N=1 post-turn collection window.
+    #[serde(default)]
+    pub post_turn_requested_ms: u64,
+    /// Ceiling milliseconds of the first-to-last retained counter-sample span.
+    #[serde(default)]
+    pub post_turn_actual_ms: u64,
+    /// The one bounded extension actually used; zero means none.
+    #[serde(default)]
+    pub post_turn_extension_used_ms: u64,
+    /// Monotonic timestamp of the first retained post-turn counter sample.
+    #[serde(default)]
+    pub post_turn_first_sample_ns: u64,
+    /// Monotonic timestamp of the last retained post-turn counter sample.
+    #[serde(default)]
+    pub post_turn_last_sample_ns: u64,
+    /// Exact first-to-last retained post-turn counter-sample span.
+    #[serde(default)]
+    pub post_turn_sample_span_ns: u64,
+    /// Expected scheduling slack: one counter cadence plus one membership cadence.
+    #[serde(default)]
+    pub post_turn_overrun_tolerance_ns: u64,
+    /// Measured sample-span excess above requested window plus extension.
+    #[serde(default)]
+    pub post_turn_overrun_ns: u64,
+    /// Portion of the measured overrun beyond the published scheduling tolerance.
+    #[serde(default)]
+    pub post_turn_overrun_beyond_tolerance_ns: u64,
     /// Post-turn retention phase I_n.
     pub post_turn_phase: String,
     /// Post-close plateau phase R_n.
@@ -1431,6 +1463,51 @@ impl<'a> Analysis<'a> {
         let expected_repetitions: BTreeSet<u32> = (0..self.timing.repetitions).collect();
         let mut grouped: BTreeMap<u32, BTreeMap<u32, SweepPoint>> = BTreeMap::new();
         for observation in &self.evidence.sweep {
+            // Window receipts remain published even when the extended phase is
+            // still untrustworthy and the corresponding row correctly becomes ERROR.
+            for (name, value) in [
+                ("post_turn_requested_ms", observation.post_turn_requested_ms),
+                ("post_turn_actual_ms", observation.post_turn_actual_ms),
+                (
+                    "post_turn_extension_used_ms",
+                    observation.post_turn_extension_used_ms,
+                ),
+                (
+                    "post_turn_requested_bound_ms",
+                    observation
+                        .post_turn_requested_ms
+                        .saturating_add(observation.post_turn_extension_used_ms),
+                ),
+                (
+                    "post_turn_first_sample_ns",
+                    observation.post_turn_first_sample_ns,
+                ),
+                (
+                    "post_turn_last_sample_ns",
+                    observation.post_turn_last_sample_ns,
+                ),
+                (
+                    "post_turn_sample_span_ns",
+                    observation.post_turn_sample_span_ns,
+                ),
+                (
+                    "post_turn_overrun_tolerance_ns",
+                    observation.post_turn_overrun_tolerance_ns,
+                ),
+                ("post_turn_overrun_ns", observation.post_turn_overrun_ns),
+                (
+                    "post_turn_overrun_beyond_tolerance_ns",
+                    observation.post_turn_overrun_beyond_tolerance_ns,
+                ),
+            ] {
+                self.metrics.insert(
+                    format!(
+                        "parallel_n{}_rep{}_{}",
+                        observation.agents, observation.identity.repetition, name
+                    ),
+                    value as f64,
+                );
+            }
             match derive_sweep_point(
                 &self.evidence.series,
                 observation,
@@ -3198,10 +3275,71 @@ fn derive_sweep_point(
             observation.observed_barrier_actors
         )));
     }
+    let requested_post_turn_ms = timing
+        .barrier_discard_ms
+        .saturating_add(timing.barrier_steady_ms);
+    let requested_bound_ms =
+        requested_post_turn_ms.saturating_add(observation.post_turn_extension_used_ms);
+    let post_turn_coverage = series.phase_coverage(
+        &observation.post_turn_phase,
+        cadence.counter_cadence_ns,
+        requested_bound_ms.saturating_mul(1_000_000),
+    )?;
+    let expected_actual_ms = post_turn_coverage.observed_duration_ns.div_ceil(1_000_000);
+    let expected_tolerance_ns = cadence
+        .counter_cadence_ns
+        .saturating_add(cadence.membership_cadence_ns);
+    let expected_overrun_ns = post_turn_coverage
+        .observed_duration_ns
+        .saturating_sub(requested_bound_ms.saturating_mul(1_000_000));
+    let legacy_window_receipt = observation.post_turn_requested_ms == 0
+        && observation.post_turn_actual_ms == 0
+        && observation.post_turn_extension_used_ms == 0
+        && observation.post_turn_first_sample_ns == 0
+        && observation.post_turn_last_sample_ns == 0
+        && observation.post_turn_sample_span_ns == 0
+        && observation.post_turn_overrun_tolerance_ns == 0
+        && observation.post_turn_overrun_ns == 0
+        && observation.post_turn_overrun_beyond_tolerance_ns == 0;
+    if !legacy_window_receipt
+        && (observation.post_turn_requested_ms != requested_post_turn_ms
+            || observation.post_turn_actual_ms != expected_actual_ms
+            || observation.post_turn_first_sample_ns != post_turn_coverage.start_ns
+            || observation.post_turn_last_sample_ns != post_turn_coverage.end_ns
+            || observation.post_turn_sample_span_ns != post_turn_coverage.observed_duration_ns
+            || observation.post_turn_overrun_tolerance_ns != expected_tolerance_ns
+            || observation.post_turn_overrun_ns != expected_overrun_ns
+            || observation.post_turn_overrun_beyond_tolerance_ns
+                != expected_overrun_ns.saturating_sub(expected_tolerance_ns))
+        || observation.post_turn_extension_used_ms > timing.single_agent_extension_ms
+        || observation.post_turn_extension_used_ms > 0 && observation.agents != 1
+    {
+        return Err(AhrbError::Validation(format!(
+            "N={} repetition {} has invalid post-turn-window receipt: requested={} actual={} extension={} first={} last={} span={} overrun={} tolerance={} beyond-tolerance={} expected-requested={} expected-actual={} expected-first={} expected-last={} expected-span={} expected-overrun={} expected-tolerance={} predeclared-extension={}",
+            observation.agents,
+            observation.identity.repetition,
+            observation.post_turn_requested_ms,
+            observation.post_turn_actual_ms,
+            observation.post_turn_extension_used_ms,
+            observation.post_turn_first_sample_ns,
+            observation.post_turn_last_sample_ns,
+            observation.post_turn_sample_span_ns,
+            observation.post_turn_overrun_ns,
+            observation.post_turn_overrun_tolerance_ns,
+            observation.post_turn_overrun_beyond_tolerance_ns,
+            requested_post_turn_ms,
+            expected_actual_ms,
+            post_turn_coverage.start_ns,
+            post_turn_coverage.end_ns,
+            post_turn_coverage.observed_duration_ns,
+            expected_overrun_ns,
+            expected_tolerance_ns,
+            timing.single_agent_extension_ms
+        )));
+    }
     for (phase, duration_ms) in [
         (&observation.baseline_phase, timing.idle_baseline_ms),
         (&observation.steady_phase, timing.barrier_hold_ms),
-        (&observation.post_turn_phase, timing.barrier_steady_ms),
         (&observation.post_close_phase, timing.barrier_steady_ms),
     ] {
         let coverage = series.phase_coverage(
@@ -3227,6 +3365,28 @@ fn derive_sweep_point(
                 observation.agents, observation.identity.repetition
             )));
         }
+    }
+    if !post_turn_coverage.trustworthy {
+        return Err(AhrbError::Validation(format!(
+            "N={} repetition {} phase {:?} is truncated or gapped: observed={} ns required={} ns maximum-gap={} ns",
+            observation.agents,
+            observation.identity.repetition,
+            observation.post_turn_phase,
+            post_turn_coverage.observed_duration_ns,
+            post_turn_coverage.required_duration_ns,
+            post_turn_coverage.maximum_gap_ns
+        )));
+    }
+    let post_turn_membership = membership_phase_coverage(
+        cadence,
+        &observation.post_turn_phase,
+        requested_bound_ms.saturating_mul(1_000_000),
+    )?;
+    if !post_turn_membership.trustworthy {
+        return Err(AhrbError::Validation(format!(
+            "N={} repetition {} membership phase {:?} is truncated or gapped",
+            observation.agents, observation.identity.repetition, observation.post_turn_phase
+        )));
     }
     for phase in [&observation.workload_phase, &observation.cold_phase] {
         let coverage = series.phase_coverage(
@@ -3846,6 +4006,7 @@ mod tests {
 
         let mut sweep = Vec::new();
         let width_rotation_seed = 17_u64;
+        let membership_cadence_ns = 10_000_000;
         for repetition in 0..timing.repetitions {
             let mut rotated_widths = timing.sweep_widths.clone();
             let rotation = (usize::try_from(width_rotation_seed).unwrap_or(usize::MAX)
@@ -3907,7 +4068,9 @@ mod tests {
                     active,
                     1,
                     1,
-                    timing.barrier_steady_ms,
+                    timing
+                        .barrier_discard_ms
+                        .saturating_add(timing.barrier_steady_ms),
                     cadence_ns,
                 )?;
                 add_phase(
@@ -3920,6 +4083,26 @@ mod tests {
                     timing.barrier_steady_ms,
                     cadence_ns,
                 )?;
+                let mut post_turn_times = series
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.phase == post_turn)
+                    .map(|sample| sample.elapsed_ns);
+                let post_turn_first_sample_ns = post_turn_times.next().ok_or_else(|| {
+                    AhrbError::Validation("fixture post-turn phase is absent".to_owned())
+                })?;
+                let post_turn_last_sample_ns = post_turn_times
+                    .next_back()
+                    .unwrap_or(post_turn_first_sample_ns);
+                let post_turn_sample_span_ns =
+                    post_turn_last_sample_ns.saturating_sub(post_turn_first_sample_ns);
+                let post_turn_requested_ms = timing
+                    .barrier_discard_ms
+                    .saturating_add(timing.barrier_steady_ms);
+                let post_turn_overrun_tolerance_ns =
+                    cadence_ns.saturating_add(membership_cadence_ns);
+                let post_turn_overrun_ns = post_turn_sample_span_ns
+                    .saturating_sub(post_turn_requested_ms.saturating_mul(1_000_000));
                 let actors: BTreeSet<String> =
                     (0..agents).map(|actor| format!("actor-{actor}")).collect();
                 sweep.push(SweepObservation {
@@ -3932,6 +4115,16 @@ mod tests {
                     workload_phase: workload,
                     cold_phase: cold,
                     steady_phase: steady,
+                    post_turn_requested_ms,
+                    post_turn_actual_ms: post_turn_sample_span_ns.div_ceil(1_000_000),
+                    post_turn_extension_used_ms: 0,
+                    post_turn_first_sample_ns,
+                    post_turn_last_sample_ns,
+                    post_turn_sample_span_ns,
+                    post_turn_overrun_tolerance_ns,
+                    post_turn_overrun_ns,
+                    post_turn_overrun_beyond_tolerance_ns: post_turn_overrun_ns
+                        .saturating_sub(post_turn_overrun_tolerance_ns),
                     post_turn_phase: post_turn,
                     post_close_phase: post_close,
                     minimum_steady_processes: 1,
@@ -3944,7 +4137,6 @@ mod tests {
                 });
             }
         }
-        let membership_cadence_ns = 10_000_000;
         let membership_samples_by_phase = membership_samples(&series, membership_cadence_ns);
         let membership_refreshes_by_phase = membership_samples_by_phase
             .iter()
@@ -4936,6 +5128,282 @@ mod tests {
         );
         let row26 = certification.rows.iter().find(|row| row.row == 26);
         assert!(row26.is_some_and(|row| !matches!(row.outcome, TestOutcome::Pass)));
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_window_receipts_are_published_and_bounded_to_n1() -> Result<()> {
+        let evidence = passing_evidence(ResourceProfile::Quick)?;
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_requested_ms"],
+            500.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_actual_ms"],
+            500.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_extension_used_ms"],
+            0.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_requested_bound_ms"],
+            500.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_sample_span_ns"],
+            500_000_000.0
+        );
+
+        let mut invalid = passing_evidence(ResourceProfile::Quick)?;
+        let n2 = invalid
+            .sweep
+            .iter_mut()
+            .find(|point| point.agents == 2 && point.identity.repetition == 0)
+            .ok_or_else(|| AhrbError::Validation("N=2 fixture is absent".to_owned()))?;
+        n2.post_turn_actual_ms = 1_000;
+        n2.post_turn_extension_used_ms = 500;
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &invalid,
+            &ResourceEnvelope::default(),
+        );
+        let row28 = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .ok_or_else(|| AhrbError::Validation("row 28 is absent".to_owned()))?;
+        assert!(matches!(&row28.outcome, TestOutcome::Error(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn measured_post_turn_overrun_is_published_without_nominal_equality() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let target = evidence
+            .sweep
+            .iter()
+            .find(|point| point.agents == 1 && point.identity.repetition == 0)
+            .ok_or_else(|| AhrbError::Validation("N=1 fixture is absent".to_owned()))?;
+        let target_phase = target.post_turn_phase.clone();
+        let target_end_ns = target.post_turn_last_sample_ns;
+        let overrun_ns = 15_000_000;
+        let target_last = evidence
+            .series
+            .samples
+            .iter()
+            .rposition(|sample| sample.phase == target_phase)
+            .ok_or_else(|| AhrbError::Validation("N=1 post-turn samples are absent".to_owned()))?;
+        for (index, sample) in evidence.series.samples.iter_mut().enumerate() {
+            if index >= target_last {
+                sample.elapsed_ns = sample.elapsed_ns.saturating_add(overrun_ns);
+            }
+        }
+        for observation in &mut evidence.sweep {
+            if observation.post_turn_phase == target_phase {
+                observation.post_turn_last_sample_ns = observation
+                    .post_turn_last_sample_ns
+                    .saturating_add(overrun_ns);
+                observation.post_turn_sample_span_ns = observation
+                    .post_turn_sample_span_ns
+                    .saturating_add(overrun_ns);
+                observation.post_turn_actual_ms =
+                    observation.post_turn_sample_span_ns.div_ceil(1_000_000);
+                observation.post_turn_overrun_ns = overrun_ns;
+                observation.post_turn_overrun_beyond_tolerance_ns =
+                    overrun_ns.saturating_sub(observation.post_turn_overrun_tolerance_ns);
+            } else if observation.post_turn_first_sample_ns > target_end_ns {
+                observation.post_turn_first_sample_ns = observation
+                    .post_turn_first_sample_ns
+                    .saturating_add(overrun_ns);
+                observation.post_turn_last_sample_ns = observation
+                    .post_turn_last_sample_ns
+                    .saturating_add(overrun_ns);
+            }
+        }
+        let cadence = evidence
+            .phases
+            .cadence
+            .as_mut()
+            .ok_or_else(|| AhrbError::Validation("fixture cadence is absent".to_owned()))?;
+        cadence.membership_samples_by_phase =
+            membership_samples(&evidence.series, cadence.membership_cadence_ns);
+        cadence.membership_refreshes_by_phase = cadence
+            .membership_samples_by_phase
+            .iter()
+            .map(|(phase, times)| {
+                (
+                    phase.clone(),
+                    times
+                        .iter()
+                        .map(|elapsed_ns| MembershipRefreshEvidence {
+                            elapsed_ns: *elapsed_ns,
+                            discovery_wall_ns: 1_000,
+                            discovery_cpu_ns: 1_000,
+                            lane: 0,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_requested_bound_ms"],
+            500.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_actual_ms"],
+            515.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_overrun_ns"],
+            15_000_000.0
+        );
+        let row28 = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .ok_or_else(|| AhrbError::Validation("row 28 is absent".to_owned()))?;
+        assert!(
+            !matches!(&row28.outcome, TestOutcome::Error(_)),
+            "measured scheduler overrun within trustworthy evidence must not be ERROR: {:?}",
+            row28.outcome
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extended_untrustworthy_post_turn_window_stays_error_with_receipts() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let target = evidence
+            .sweep
+            .iter()
+            .find(|point| point.agents == 1 && point.identity.repetition == 0)
+            .ok_or_else(|| AhrbError::Validation("N=1 fixture is absent".to_owned()))?;
+        let target_phase = target.post_turn_phase.clone();
+        let target_end_ns = target.post_turn_last_sample_ns;
+        let extension_ns = 500_000_000;
+        let first_index = evidence
+            .series
+            .samples
+            .iter()
+            .position(|sample| sample.phase == target_phase)
+            .ok_or_else(|| AhrbError::Validation("N=1 post-turn samples are absent".to_owned()))?;
+        let last_index = evidence
+            .series
+            .samples
+            .iter()
+            .rposition(|sample| sample.phase == target_phase)
+            .ok_or_else(|| AhrbError::Validation("N=1 post-turn samples are absent".to_owned()))?;
+        let extension_samples = evidence.series.samples[first_index + 1..=last_index]
+            .iter()
+            .cloned()
+            .map(|mut sample| {
+                sample.elapsed_ns = sample.elapsed_ns.saturating_add(extension_ns);
+                sample
+            })
+            .collect::<Vec<_>>();
+        for sample in evidence.series.samples.iter_mut().skip(last_index + 1) {
+            sample.elapsed_ns = sample.elapsed_ns.saturating_add(extension_ns);
+        }
+        evidence
+            .series
+            .samples
+            .splice(last_index + 1..last_index + 1, extension_samples);
+        for (index, sample) in evidence
+            .series
+            .samples
+            .iter_mut()
+            .filter(|sample| sample.phase == target_phase)
+            .enumerate()
+        {
+            let bytes = if index.is_multiple_of(2) {
+                100 * MIB
+            } else {
+                120 * MIB
+            };
+            sample.rss_bytes = bytes;
+            sample.pss_bytes = Some(bytes);
+            sample.private_bytes = Some(bytes);
+        }
+        for observation in &mut evidence.sweep {
+            if observation.post_turn_phase == target_phase {
+                observation.post_turn_extension_used_ms = 500;
+                observation.post_turn_actual_ms = 1_000;
+                observation.post_turn_last_sample_ns = observation
+                    .post_turn_last_sample_ns
+                    .saturating_add(extension_ns);
+                observation.post_turn_sample_span_ns = observation
+                    .post_turn_sample_span_ns
+                    .saturating_add(extension_ns);
+            } else if observation.post_turn_first_sample_ns > target_end_ns {
+                observation.post_turn_first_sample_ns = observation
+                    .post_turn_first_sample_ns
+                    .saturating_add(extension_ns);
+                observation.post_turn_last_sample_ns = observation
+                    .post_turn_last_sample_ns
+                    .saturating_add(extension_ns);
+            }
+        }
+        let cadence = evidence
+            .phases
+            .cadence
+            .as_mut()
+            .ok_or_else(|| AhrbError::Validation("fixture cadence is absent".to_owned()))?;
+        cadence.membership_samples_by_phase =
+            membership_samples(&evidence.series, cadence.membership_cadence_ns);
+        cadence.membership_refreshes_by_phase = cadence
+            .membership_samples_by_phase
+            .iter()
+            .map(|(phase, times)| {
+                (
+                    phase.clone(),
+                    times
+                        .iter()
+                        .map(|elapsed_ns| MembershipRefreshEvidence {
+                            elapsed_ns: *elapsed_ns,
+                            discovery_wall_ns: 1_000,
+                            discovery_cpu_ns: 1_000,
+                            lane: 0,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_extension_used_ms"],
+            500.0
+        );
+        assert_eq!(
+            certification.metrics["parallel_n1_rep0_post_turn_actual_ms"],
+            1_000.0
+        );
+        let row28 = certification
+            .rows
+            .iter()
+            .find(|row| row.row == 28)
+            .ok_or_else(|| AhrbError::Validation("row 28 is absent".to_owned()))?;
+        assert!(
+            matches!(&row28.outcome, TestOutcome::Error(_)),
+            "extended unstable evidence must remain ERROR: {:?}",
+            row28.outcome
+        );
         Ok(())
     }
 

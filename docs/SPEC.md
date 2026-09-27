@@ -86,6 +86,19 @@ AND final window P95–P5 ≤5% of median (else repeat / classify unstable).
 An adapter-declared cohort `wait-ready` command is advisory settle evidence only and never
 replaces the terminal/idle + client-exit PASS fence.
 
+For N=1 post-turn collection, the requested window is the discard duration plus the
+steady duration. If that first window lacks trustworthy coverage, distinct samples, or a
+trustworthy trailing plateau, AHRB may take exactly one predeclared extension of the same
+phase; it never reruns until favorable. `post_turn_extension_used_ms` is the extension
+requested (zero or the predeclared value). `post_turn_actual_ms` is measured, not planned:
+it is the ceiling in milliseconds of the exact monotonic span from the first to the last
+retained counter-sample timestamp for the complete phase. The receipt also publishes both
+timestamps, the exact nanosecond span, and overrun above requested-plus-extension. One
+counter cadence plus one membership cadence is published as scheduling tolerance, and any
+excess beyond it remains visible. Scheduling overrun alone does not change the outcome;
+missing/truncated/gapped coverage or a final trailing plateau above the unchanged 5%
+spread limit is untrustworthy and therefore ERROR.
+
 **Whole-tree ownership** includes client(s), persistent daemon/controller, session
 workers, agent subprocesses, harness-launched tool/hook procs, reparented children;
 excludes the AHRB runner + fake-model + deny-egress servers. Dedup by `(PID, start-time)`,

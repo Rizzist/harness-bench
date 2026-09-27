@@ -255,6 +255,37 @@ pub struct ModelFrameObservation {
     pub bytes: u64,
 }
 
+/// One independent paced-body scheduler boundary. Unlike
+/// [`ModelFrameObservation`], these receipts exist even when the consumer never
+/// polls or has already closed the response body.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PacedFrameBoundary {
+    pub ordinal: u32,
+    pub scheduled_ns: u64,
+    pub timer_fired_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_dropped_ns: Option<u64>,
+}
+
+/// Complete scheduler/body lifecycle for one physical paced response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PacedResponseLedger {
+    pub scenario: String,
+    pub actor: String,
+    pub checkpoint: String,
+    pub attempt: u64,
+    pub frontend: String,
+    pub response_headers_ns: u64,
+    pub expected_count: u32,
+    pub frames: Vec<PacedFrameBoundary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_terminal_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_closed_ns: Option<u64>,
+}
+
 /// Complete row-42 aggregation and reference-envelope decision.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelRequestEfficiencyEvaluation {
@@ -677,6 +708,7 @@ pub struct FakeModelEngine {
     requests: Mutex<BTreeMap<RequestRecordKey, Vec<ModelRequestRecord>>>,
     frame_observations: Arc<StdMutex<Vec<ModelFrameObservation>>>,
     frame_boundaries: Arc<StdMutex<FrameBoundaryMap>>,
+    paced_response_ledgers: Arc<StdMutex<Vec<PacedResponseLedger>>>,
     attempt_sequences: Mutex<BTreeMap<SemanticRequestKey, u64>>,
     request_role_rules: Vec<RequestRoleRule>,
     semantic_ordinals: BTreeMap<(String, String, String), u64>,
@@ -745,6 +777,7 @@ impl FakeModelEngine {
             storage_responses: StdMutex::new(Vec::new()),
             storage_body_capture: StdMutex::new(None),
             frame_boundaries: Arc::new(StdMutex::new(BTreeMap::new())),
+            paced_response_ledgers: Arc::new(StdMutex::new(Vec::new())),
             attempt_sequences: Mutex::new(BTreeMap::new()),
             request_role_rules,
             semantic_ordinals,
@@ -1208,10 +1241,36 @@ impl FakeModelEngine {
         Ok(output)
     }
 
+    /// Return the independent paced-body scheduler and connection ledgers.
+    pub fn paced_response_ledgers(&self) -> Result<Vec<PacedResponseLedger>> {
+        let ledgers = self.paced_response_ledgers.lock().map_err(|_| {
+            AhrbError::Protocol("fake-model paced-response ledger lock was poisoned".to_owned())
+        })?;
+        let mut output = ledgers.clone();
+        output.sort_by(|left, right| {
+            (
+                &left.scenario,
+                &left.actor,
+                &left.checkpoint,
+                left.attempt,
+                &left.frontend,
+            )
+                .cmp(&(
+                    &right.scenario,
+                    &right.actor,
+                    &right.checkpoint,
+                    right.attempt,
+                    &right.frontend,
+                ))
+        });
+        Ok(output)
+    }
+
     fn frame_observation_sink(&self, response: &ModelResponse) -> FrameObservationSink {
         FrameObservationSink {
             observations: Arc::clone(&self.frame_observations),
             boundaries: Arc::clone(&self.frame_boundaries),
+            paced_response_ledgers: Arc::clone(&self.paced_response_ledgers),
             scenario: response.scenario.clone(),
             actor: response.actor.clone(),
             checkpoint: response.checkpoint.clone(),
@@ -4032,14 +4091,62 @@ impl DeterministicBody {
                 let observation_sink = observation_sink.ok_or_else(|| {
                     AhrbError::Protocol("trickle body lacks frame observation sink".to_owned())
                 })?;
+                let response_headers_ns = response_headers_ns.ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "trickle body lacks its response-header schedule origin".to_owned(),
+                    )
+                })?;
+                observation_sink.begin_paced(response_headers_ns, *count)?;
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                let scheduler_sink = observation_sink.clone();
+                let payload = Bytes::from(bytes);
+                let cadence_ms = *cadence_ms;
+                let count = *count;
+                tokio::spawn(async move {
+                    for ordinal in 1..=count {
+                        let scheduled_ns = response_headers_ns.saturating_add(
+                            cadence_ms
+                                .saturating_mul(u64::from(ordinal))
+                                .saturating_mul(1_000_000),
+                        );
+                        loop {
+                            let now = monotonic_timestamp_ns();
+                            if now >= scheduled_ns {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_nanos(scheduled_ns - now)).await;
+                        }
+                        let timer_fired_ns = monotonic_timestamp_ns();
+                        if scheduler_sink
+                            .record_scheduled(ordinal, scheduled_ns, timer_fired_ns)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let index =
+                            usize::try_from(ordinal.saturating_sub(1)).unwrap_or(usize::MAX);
+                        let Some(byte) = payload.get(index).copied() else {
+                            return;
+                        };
+                        if sender
+                            .send(ScheduledFrame {
+                                ordinal,
+                                scheduled_ns,
+                                byte,
+                            })
+                            .is_err()
+                        {
+                            let _ = scheduler_sink
+                                .record_body_drop(Some(ordinal), monotonic_timestamp_ns());
+                        }
+                    }
+                    let _ = scheduler_sink.record_scheduler_terminal(monotonic_timestamp_ns());
+                });
                 Ok(Self {
                     state: BodyState::Trickle(TrickleBodyState {
-                        payload: Bytes::from(bytes),
-                        cadence_ms: *cadence_ms,
-                        count: *count,
+                        count,
                         next_ordinal: 1,
-                        origin_ns: response_headers_ns,
-                        sleep: None,
+                        receiver,
                         observation_sink,
                     }),
                 })
@@ -4178,6 +4285,7 @@ impl Body for DeterministicBody {
 struct FrameObservationSink {
     observations: Arc<StdMutex<Vec<ModelFrameObservation>>>,
     boundaries: Arc<StdMutex<FrameBoundaryMap>>,
+    paced_response_ledgers: Arc<StdMutex<Vec<PacedResponseLedger>>>,
     scenario: String,
     actor: String,
     checkpoint: String,
@@ -4186,6 +4294,109 @@ struct FrameObservationSink {
 }
 
 impl FrameObservationSink {
+    fn begin_paced(&self, response_headers_ns: u64, expected_count: u32) -> std::io::Result<()> {
+        let mut ledgers = self.paced_response_ledgers.lock().map_err(|_| {
+            std::io::Error::other("fake-model paced-response ledger lock was poisoned")
+        })?;
+        if ledgers.iter().any(|ledger| self.matches_ledger(ledger)) {
+            return Err(std::io::Error::other(
+                "duplicate fake-model paced-response ledger",
+            ));
+        }
+        ledgers.push(PacedResponseLedger {
+            scenario: self.scenario.clone(),
+            actor: self.actor.clone(),
+            checkpoint: self.checkpoint.clone(),
+            attempt: self.attempt,
+            frontend: self.frontend.clone(),
+            response_headers_ns,
+            expected_count,
+            frames: Vec::new(),
+            scheduler_terminal_ns: None,
+            connection_closed_ns: None,
+        });
+        Ok(())
+    }
+
+    fn matches_ledger(&self, ledger: &PacedResponseLedger) -> bool {
+        ledger.scenario == self.scenario
+            && ledger.actor == self.actor
+            && ledger.checkpoint == self.checkpoint
+            && ledger.attempt == self.attempt
+            && ledger.frontend == self.frontend
+    }
+
+    fn update_paced(
+        &self,
+        update: impl FnOnce(&mut PacedResponseLedger) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut ledgers = self.paced_response_ledgers.lock().map_err(|_| {
+            std::io::Error::other("fake-model paced-response ledger lock was poisoned")
+        })?;
+        let ledger = ledgers
+            .iter_mut()
+            .find(|ledger| self.matches_ledger(ledger))
+            .ok_or_else(|| std::io::Error::other("paced-response ledger disappeared"))?;
+        update(ledger)
+    }
+
+    fn record_scheduled(
+        &self,
+        ordinal: u32,
+        scheduled_ns: u64,
+        timer_fired_ns: u64,
+    ) -> std::io::Result<()> {
+        self.update_paced(|ledger| {
+            if ledger.frames.iter().any(|frame| frame.ordinal == ordinal) {
+                return Err(std::io::Error::other("duplicate paced scheduler ordinal"));
+            }
+            ledger.frames.push(PacedFrameBoundary {
+                ordinal,
+                scheduled_ns,
+                timer_fired_ns,
+                yielded_ns: None,
+                body_dropped_ns: None,
+            });
+            Ok(())
+        })
+    }
+
+    fn record_body_drop(&self, ordinal: Option<u32>, boundary_ns: u64) -> std::io::Result<()> {
+        self.update_paced(|ledger| {
+            ledger.connection_closed_ns.get_or_insert(boundary_ns);
+            if let Some(ordinal) = ordinal {
+                let frame = ledger
+                    .frames
+                    .iter_mut()
+                    .find(|frame| frame.ordinal == ordinal)
+                    .ok_or_else(|| std::io::Error::other("body-drop ordinal was not scheduled"))?;
+                frame.body_dropped_ns.get_or_insert(boundary_ns);
+            } else {
+                // Dropping the receiver discards every frame already queued by
+                // the independent scheduler but not yet yielded by Body. New
+                // scheduled frames are accounted when their channel send
+                // subsequently fails.
+                for frame in &mut ledger.frames {
+                    if frame.yielded_ns.is_none() {
+                        frame.body_dropped_ns.get_or_insert(boundary_ns);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn record_scheduler_terminal(&self, boundary_ns: u64) -> std::io::Result<()> {
+        self.update_paced(|ledger| {
+            if ledger.scheduler_terminal_ns.replace(boundary_ns).is_some() {
+                return Err(std::io::Error::other(
+                    "paced scheduler terminal was recorded twice",
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn record(
         &self,
         ordinal: u32,
@@ -4209,6 +4420,23 @@ impl FrameObservationSink {
             bytes,
         });
         drop(observations);
+        let mut paced_ledgers = self.paced_response_ledgers.lock().map_err(|_| {
+            std::io::Error::other("fake-model paced-response ledger lock was poisoned")
+        })?;
+        if let Some(ledger) = paced_ledgers
+            .iter_mut()
+            .find(|ledger| self.matches_ledger(ledger))
+        {
+            let frame = ledger
+                .frames
+                .iter_mut()
+                .find(|frame| frame.ordinal == ordinal)
+                .ok_or_else(|| std::io::Error::other("yielded ordinal was not scheduled"))?;
+            if frame.yielded_ns.replace(frame_yielded_ns).is_some() {
+                return Err(std::io::Error::other("paced ordinal was yielded twice"));
+            }
+        }
+        drop(paced_ledgers);
         let key = (
             self.scenario.clone(),
             self.actor.clone(),
@@ -4229,13 +4457,17 @@ impl FrameObservationSink {
 
 #[derive(Debug)]
 struct TrickleBodyState {
-    payload: Bytes,
-    cadence_ms: u64,
     count: u32,
-    next_ordinal: u64,
-    origin_ns: Option<u64>,
-    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    next_ordinal: u32,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<ScheduledFrame>,
     observation_sink: FrameObservationSink,
+}
+
+#[derive(Debug)]
+struct ScheduledFrame {
+    ordinal: u32,
+    scheduled_ns: u64,
+    byte: u8,
 }
 
 impl TrickleBodyState {
@@ -4243,90 +4475,49 @@ impl TrickleBodyState {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, std::io::Error>>> {
-        if self.next_ordinal > u64::from(self.count) {
-            return Poll::Ready(None);
-        }
-        if self.origin_ns.is_none() {
-            self.origin_ns = Some(monotonic_timestamp_ns());
-        }
-
-        let ordinal_u64 = self.next_ordinal;
-        let ordinal = match u32::try_from(ordinal_u64) {
-            Ok(ordinal) => ordinal,
-            Err(_) => {
-                return Poll::Ready(Some(Err(std::io::Error::other(
-                    "trickle ordinal does not fit u32",
-                ))));
-            }
-        };
-        let scheduled_ns = match self.scheduled_ns(ordinal_u64) {
-            Ok(scheduled_ns) => scheduled_ns,
-            Err(error) => return Poll::Ready(Some(Err(error))),
-        };
-        loop {
-            if let Some(sleep) = self.sleep.as_mut() {
-                if sleep.as_mut().poll(context).is_pending() {
-                    return Poll::Pending;
+        match Pin::new(&mut self.receiver).poll_recv(context) {
+            Poll::Ready(Some(frame)) => {
+                if frame.ordinal != self.next_ordinal {
+                    return Poll::Ready(Some(Err(std::io::Error::other(
+                        "paced scheduler delivered an out-of-order ordinal",
+                    ))));
                 }
-                self.sleep = None;
+                let yielded_ns = monotonic_timestamp_ns();
+                if let Err(error) =
+                    self.observation_sink
+                        .record(frame.ordinal, frame.scheduled_ns, yielded_ns, 1)
+                {
+                    return Poll::Ready(Some(Err(error)));
+                }
+                self.next_ordinal = self.next_ordinal.saturating_add(1);
+                Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(&[frame.byte])))))
             }
-            let observed_ns = monotonic_timestamp_ns();
-            if observed_ns >= scheduled_ns {
-                break;
-            }
-            self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_nanos(
-                scheduled_ns - observed_ns,
-            ))));
+            Poll::Ready(None) if self.next_ordinal > self.count => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(Some(Err(std::io::Error::other(
+                "paced scheduler ended before its declared final frame",
+            )))),
+            Poll::Pending => Poll::Pending,
         }
-        let index = match usize::try_from(ordinal_u64.saturating_sub(1)) {
-            Ok(index) => index,
-            Err(_) => {
-                return Poll::Ready(Some(Err(std::io::Error::other(
-                    "trickle ordinal does not fit usize",
-                ))));
-            }
-        };
-        let Some(byte) = self.payload.get(index).copied() else {
-            return Poll::Ready(Some(Err(std::io::Error::other(
-                "trickle payload ended before its declared count",
-            ))));
-        };
-        // Tokio supplies wakeups, but CLOCK_MONOTONIC gates and timestamps the
-        // frame. An early wake therefore cannot predate its serialized schedule.
-        let frame_yielded_ns = monotonic_timestamp_ns();
-        if let Err(error) = self
-            .observation_sink
-            .record(ordinal, scheduled_ns, frame_yielded_ns, 1)
-        {
-            return Poll::Ready(Some(Err(error)));
-        }
-        self.next_ordinal = self.next_ordinal.saturating_add(1);
-        self.sleep = None;
-        Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(&[byte])))))
-    }
-
-    fn scheduled_ns(&self, ordinal: u64) -> std::io::Result<u64> {
-        let origin_ns = self
-            .origin_ns
-            .ok_or_else(|| std::io::Error::other("trickle evidence lacks its monotonic origin"))?;
-        let offset_ns = self
-            .cadence_ms
-            .checked_mul(ordinal)
-            .and_then(|millis| millis.checked_mul(1_000_000))
-            .ok_or_else(|| std::io::Error::other("trickle evidence offset overflow"))?;
-        origin_ns
-            .checked_add(offset_ns)
-            .ok_or_else(|| std::io::Error::other("trickle scheduled boundary overflow"))
     }
 
     fn remaining_bytes(&self) -> u64 {
-        u64::from(self.count)
-            .saturating_add(1)
-            .saturating_sub(self.next_ordinal)
+        u64::from(
+            self.count
+                .saturating_add(1)
+                .saturating_sub(self.next_ordinal),
+        )
     }
 
     fn is_end_stream(&self) -> bool {
-        self.next_ordinal > u64::from(self.count)
+        self.next_ordinal > self.count
+    }
+}
+
+impl Drop for TrickleBodyState {
+    fn drop(&mut self) {
+        let _ = self
+            .observation_sink
+            .record_body_drop(None, monotonic_timestamp_ns());
     }
 }
 
@@ -4629,17 +4820,16 @@ mod tests {
         let request = frontend.parse(frontend.path(), &BTreeMap::new(), &request_body())?;
         let response = engine.handle(request).await?;
         let origin_ns = monotonic_timestamp_ns().saturating_add(250_000_000);
-        let mut body = DeterministicBody {
-            state: BodyState::Trickle(TrickleBodyState {
-                payload: Bytes::from_static(b"x"),
-                cadence_ms: 1,
-                count: 1,
-                next_ordinal: 1,
-                origin_ns: Some(origin_ns),
-                sleep: Some(Box::pin(tokio::time::sleep(Duration::ZERO))),
-                observation_sink: engine.frame_observation_sink(&response),
-            }),
+        let fault = Fault::Trickle {
+            cadence_ms: 1,
+            count: 1,
         };
+        let mut body = DeterministicBody::from_fault(
+            b"x".to_vec(),
+            Some(&fault),
+            Some(engine.frame_observation_sink(&response)),
+            Some(origin_ns),
+        )?;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(10), body.frame())
@@ -4656,6 +4846,50 @@ mod tests {
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].scheduled_ns, origin_ns + 1_000_000);
         assert!(observations[0].frame_yielded_ns >= observations[0].scheduled_ns);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_trickle_body_marks_queued_unyielded_frames_as_dropped() -> Result<()> {
+        use http_body_util::BodyExt as _;
+
+        let mut workflow = simple_workflow();
+        workflow.responses[0].fault = Some(Fault::Trickle {
+            cadence_ms: 10,
+            count: 3,
+        });
+        let engine = FakeModelEngine::new(&workflow)?;
+        let frontend = OpenAiChatFrontend;
+        let request = frontend.parse(frontend.path(), &BTreeMap::new(), &request_body())?;
+        let response = engine.handle(request).await?;
+        let response_headers_ns = monotonic_timestamp_ns();
+        let mut body = DeterministicBody::from_fault(
+            b"abc".to_vec(),
+            response.fault.as_ref(),
+            Some(engine.frame_observation_sink(&response)),
+            Some(response_headers_ns),
+        )?;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let first = body
+            .frame()
+            .await
+            .ok_or_else(|| AhrbError::Protocol("queued trickle body ended early".to_owned()))??;
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"a"));
+        drop(body);
+
+        let ledgers = engine.paced_response_ledgers()?;
+        assert_eq!(ledgers.len(), 1);
+        let ledger = &ledgers[0];
+        assert!(ledger.scheduler_terminal_ns.is_some());
+        assert!(ledger.connection_closed_ns.is_some());
+        assert!(ledger.frames[0].yielded_ns.is_some());
+        assert!(ledger.frames[0].body_dropped_ns.is_none());
+        assert!(
+            ledger.frames[1..]
+                .iter()
+                .all(|frame| { frame.yielded_ns.is_none() && frame.body_dropped_ns.is_some() })
+        );
         Ok(())
     }
 

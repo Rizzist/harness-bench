@@ -788,6 +788,7 @@ impl Counters {
                     errors.push(format!("{direction}: {error}"));
                 }
             }
+            self.first.entry(*identity).or_insert(0);
         }
         if errors.is_empty() {
             Ok(())
@@ -802,7 +803,7 @@ impl Counters {
         identity: crate::process::ProcIdentity,
         sample: impl FnOnce() -> Result<Option<u64>>,
     ) -> Result<()> {
-        tracker.note_structured_terminal(identity)?;
+        tracker.note_or_admit_structured_terminal(identity)?;
         let bytes = sample()?.ok_or_else(|| {
             AhrbError::Protocol(format!(
                 "storage missing client terminal-before-reap receipt ({},{})",

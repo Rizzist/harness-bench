@@ -852,8 +852,24 @@ pub struct StreamChunkObservation {
     pub ordinal: u32,
     /// AHRB-owned scheduled monotonic boundary.
     pub scheduled_ns: u64,
+    /// Independent scheduler wake boundary.
+    #[serde(default)]
+    pub timer_fired_ns: u64,
     /// Fake-provider `Body::poll_frame` yield boundary.
-    pub frame_yielded_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_yielded_ns: Option<u64>,
+    /// Scheduler send failed because the response body had been dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_dropped_ns: Option<u64>,
+    /// Independent scheduler completion boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_terminal_ns: Option<u64>,
+    /// Harness structured terminal receipt, when one was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_terminal_ns: Option<u64>,
+    /// Provider response-body drop/connection-close boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_closed_ns: Option<u64>,
     /// Payload bytes in this frame.
     pub bytes: u64,
 }

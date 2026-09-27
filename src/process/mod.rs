@@ -326,6 +326,23 @@ impl TreeDiskTracker {
         Ok(())
     }
 
+    /// Record a structured terminal while admitting an identity first seen at
+    /// that exact boundary. This is only complete if a later pre-reap counter
+    /// sample is recorded; otherwise the snapshot remains explicitly
+    /// `TerminalAwaitingFinalSample`.
+    pub fn note_or_admit_structured_terminal(&mut self, identity: ProcIdentity) -> Result<()> {
+        let state = self.identities.entry(identity).or_default();
+        if state.retirement.is_some() {
+            return Err(AhrbError::Protocol(format!(
+                "structured terminal references retired disk identity ({},{})",
+                identity.pid, identity.start_time
+            )));
+        }
+        state.terminal_observed = true;
+        state.final_sample_observed = false;
+        Ok(())
+    }
+
     /// Record the cumulative process counter sampled after its structured
     /// terminal and before the process was reaped.
     pub fn record_final_sample_before_reap(
@@ -375,6 +392,22 @@ impl TreeDiskTracker {
         state.expected = false;
         state.retirement = Some(DiskRetirement::TerminalFinalSample);
         Ok(())
+    }
+
+    /// Atomically admit and retire a short-lived identity first discovered at
+    /// the structured-terminal boundary.
+    ///
+    /// The supplied cumulative counter is a complete same-lifetime value from
+    /// process birth through the pre-reap terminal sample. Failure to read that
+    /// value remains an error at the caller; this method never invents a zero.
+    pub fn retire_from_terminal_sample(
+        &mut self,
+        identity: ProcIdentity,
+        write_bytes: u64,
+    ) -> Result<()> {
+        self.note_or_admit_structured_terminal(identity)?;
+        self.record_final_sample_before_reap(identity, write_bytes)?;
+        self.retire_after_final_sample(identity)
     }
 
     /// Retire missing identities using a cumulative cgroup `io.stat` value
@@ -2437,6 +2470,28 @@ mod tests {
         assert_eq!(
             retired.identities[0].status,
             DiskIdentityStatus::RetiredAfterFinalSample
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_disk_accepts_counter_backed_terminal_only_lifetime() -> Result<()> {
+        let short_lived = identity(33);
+        let mut tracker = TreeDiskTracker::default();
+        tracker.retire_from_terminal_sample(short_lived, 8_192)?;
+        let snapshot = tracker.snapshot();
+        assert!(snapshot.counter_complete);
+        assert_eq!(snapshot.cumulative_write_bytes, Some(8_192));
+        assert_eq!(
+            snapshot.identities[0].status,
+            DiskIdentityStatus::RetiredAfterFinalSample
+        );
+        assert!(
+            tracker
+                .retire_from_terminal_sample(short_lived, 8_192)
+                .unwrap_err()
+                .to_string()
+                .contains("retired")
         );
         Ok(())
     }
