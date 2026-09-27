@@ -14561,6 +14561,7 @@ fn stable_json_stream_hash(events: &[NormalizedEvent]) -> Result<String> {
             // the semantic stream whose prefix row 53 compares.
             object.remove("_ahrb_receipt");
             object.remove("_ahrb_source_raw");
+            object.remove("_ahrb_mapping_raw");
         }
         // Driver-local replay IDs/cursors are transport bookkeeping. Hash the
         // exact ordered normalized semantic stream so daemon and official
@@ -27457,6 +27458,7 @@ fn validate_recovered_suffix(
                 // additive change that must NOT abort the run, per the
                 // no-silent-degradation / unmapped-is-additive contract.
                 payload.remove("_ahrb_source_raw");
+                payload.remove("_ahrb_mapping_raw");
             }
             if matches!(
                 event.event,

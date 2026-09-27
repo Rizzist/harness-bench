@@ -1973,6 +1973,12 @@ struct ExecEventCache {
     turn: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ExecNormalization<'a> {
+    mapping: &'a EventMapping,
+    session_id_pointer: &'a str,
+}
+
 #[derive(Clone, Debug)]
 struct AbstractFixtureCall {
     call_id: String,
@@ -2723,6 +2729,7 @@ impl PerInvocationDriver {
 
     fn normalize_records(
         mapping: &EventMapping,
+        session_id_pointer: &str,
         session: &mut PersistedExecSession,
         records: &[Value],
         existing: &BTreeMap<String, NormalizedEvent>,
@@ -2730,7 +2737,10 @@ impl PerInvocationDriver {
         allow_terminal: bool,
     ) -> Result<Vec<NormalizedEvent>> {
         Self::normalize_records_at(
-            mapping,
+            ExecNormalization {
+                mapping,
+                session_id_pointer,
+            },
             session,
             records,
             existing,
@@ -2741,7 +2751,7 @@ impl PerInvocationDriver {
     }
 
     fn normalize_records_at(
-        mapping: &EventMapping,
+        normalization: ExecNormalization<'_>,
         session: &mut PersistedExecSession,
         records: &[Value],
         existing: &BTreeMap<String, NormalizedEvent>,
@@ -2749,6 +2759,15 @@ impl PerInvocationDriver {
         allow_terminal: bool,
         record_base: usize,
     ) -> Result<Vec<NormalizedEvent>> {
+        let ExecNormalization {
+            mapping,
+            session_id_pointer,
+        } = normalization;
+        // Every route into normalization, including finite native replay, must
+        // authenticate the harness-native identity before AHRB replaces the
+        // public normalized session handle below. Otherwise a replay from a
+        // different native session can be silently relabelled as this one.
+        Self::validate_harness_session_identity(session_id_pointer, session, records)?;
         let mut output = Vec::new();
         let mut normalizer = EventNormalizer::default();
         let mut fixture_calls = existing
@@ -2914,15 +2933,31 @@ impl PerInvocationDriver {
                     })?;
                     object.insert("_ahrb_id".to_owned(), Value::String(id));
                     object.insert("_ahrb_cursor".to_owned(), Value::from(session.next_cursor));
-                    object
-                        .entry("session_id".to_owned())
-                        .or_insert_with(|| Value::String(session.local_id.clone()));
+                    // Normalized events always belong to AHRB's local session
+                    // handle. Harness-native session identifiers remain in the
+                    // source payload and are tracked separately for continuation.
+                    object.insert(
+                        "session_id".to_owned(),
+                        Value::String(session.local_id.clone()),
+                    );
                     object
                         .entry("actor".to_owned())
                         .or_insert_with(|| Value::String(session.marker.clone()));
                     effective.rules.clear();
                     effective.rules.push(rule.clone());
                     if let Some(mut event) = normalizer.normalize(&prepared, &effective)? {
+                        if let Some(payload) = event.payload.as_object_mut() {
+                            let prepared_raw =
+                                payload.insert("_ahrb_source_raw".to_owned(), raw.clone());
+                            if let Some(prepared_raw) = prepared_raw
+                                && prepared_raw != *raw
+                            {
+                                // Array expansion and AHRB cursor/identity fields
+                                // remain available for existing mapping pointers,
+                                // but are not misrepresented as verbatim evidence.
+                                payload.insert("_ahrb_mapping_raw".to_owned(), prepared_raw);
+                            }
+                        }
                         if let Some((native_call_id, call)) =
                             canonicalize_native_fixture_event(&mut event, &fixture_calls)
                         {
@@ -2937,18 +2972,38 @@ impl PerInvocationDriver {
         Ok(output)
     }
 
-    fn learn_harness_identifiers(&self, session: &mut PersistedExecSession, records: &[Value]) {
-        if !self.config.session_id_pointer.is_empty() && session.harness_id.is_empty() {
-            if let Some(id) = records.iter().find_map(|record| {
-                record
-                    .pointer(&self.config.session_id_pointer)
-                    .and_then(Value::as_str)
-            }) {
+    fn validate_harness_session_identity(
+        session_id_pointer: &str,
+        session: &mut PersistedExecSession,
+        records: &[Value],
+    ) -> Result<()> {
+        if session_id_pointer.is_empty() {
+            return Ok(());
+        }
+        for id in records
+            .iter()
+            .filter_map(|record| record.pointer(session_id_pointer).and_then(Value::as_str))
+        {
+            if session.harness_id.is_empty() {
                 session.harness_id = id.to_owned();
+            } else if session.harness_id != id {
+                return Err(AhrbError::Protocol(format!(
+                    "exec replay/continuation changed native session identity: expected {:?}, observed {:?}",
+                    session.harness_id, id
+                )));
             }
         }
-        if !self.config.run_id_pointer.is_empty() && session.run_id.is_empty() {
-            if let Some(id) = records.iter().find_map(|record| {
+        Ok(())
+    }
+
+    fn learn_harness_identifiers(
+        &self,
+        session: &mut PersistedExecSession,
+        records: &[Value],
+    ) -> Result<()> {
+        Self::validate_harness_session_identity(&self.config.session_id_pointer, session, records)?;
+        if !self.config.run_id_pointer.is_empty() {
+            if let Some(id) = records.iter().rev().find_map(|record| {
                 record
                     .pointer(&self.config.run_id_pointer)
                     .and_then(Value::as_str)
@@ -2956,6 +3011,7 @@ impl PerInvocationDriver {
                 session.run_id = id.to_owned();
             }
         }
+        Ok(())
     }
 
     fn terminal_contract(
@@ -2979,7 +3035,7 @@ impl PerInvocationDriver {
         let receipt_ns = crate::fake_model::monotonic_timestamp_ns();
         let normalization_started_ns = receipt_ns;
         self.record_event_contract(&records)?;
-        self.learn_harness_identifiers(session, &records);
+        self.learn_harness_identifiers(session, &records)?;
         let namespace = if self.config.events.source == "stdout" {
             format!("turn-{}", active.turn)
         } else {
@@ -3014,7 +3070,10 @@ impl PerInvocationDriver {
                 .unwrap_or(records.len())
         };
         let mut additions = Self::normalize_records_at(
-            &self.config.events,
+            ExecNormalization {
+                mapping: &self.config.events,
+                session_id_pointer: &self.config.session_id_pointer,
+            },
             session,
             &records[..consumed],
             &cache.current,
@@ -3118,9 +3177,12 @@ impl PerInvocationDriver {
         let cache = self.take_event_cache(session)?;
         let (records, record_base) = self.source_records(session, None, true)?;
         self.record_event_contract(&records)?;
-        self.learn_harness_identifiers(session, &records);
+        self.learn_harness_identifiers(session, &records)?;
         let additions = Self::normalize_records_at(
-            &self.config.events,
+            ExecNormalization {
+                mapping: &self.config.events,
+                session_id_pointer: &self.config.session_id_pointer,
+            },
             session,
             &records,
             &cache.current,
@@ -3849,6 +3911,7 @@ impl Driver for PerInvocationDriver {
                 replayed.next_cursor = self.config.events.replay_cursor_start.unwrap_or(1);
                 let mut normalized = Self::normalize_records(
                     &self.config.events,
+                    &self.config.session_id_pointer,
                     &mut replayed,
                     &records,
                     &BTreeMap::new(),
@@ -3878,6 +3941,7 @@ impl Driver for PerInvocationDriver {
                 replayed.next_cursor = after.map_or(1, |cursor| cursor.0.saturating_add(1));
                 Self::normalize_records(
                     &self.config.events,
+                    &self.config.session_id_pointer,
                     &mut replayed,
                     &records,
                     &BTreeMap::new(),
@@ -5681,6 +5745,7 @@ mod tests {
         ];
         let first = PerInvocationDriver::normalize_records(
             &manifest.events,
+            &manifest.sessions.id_pointer,
             &mut session,
             &initial,
             &BTreeMap::new(),
@@ -5702,6 +5767,7 @@ mod tests {
         ];
         let corrections = PerInvocationDriver::normalize_records(
             &manifest.events,
+            &manifest.sessions.id_pointer,
             &mut session,
             &completed,
             &existing,
@@ -5721,6 +5787,7 @@ mod tests {
         assert!(
             PerInvocationDriver::normalize_records(
                 &manifest.events,
+                &manifest.sessions.id_pointer,
                 &mut session,
                 &completed,
                 &existing,
@@ -5812,6 +5879,7 @@ mod tests {
         })];
         let events = PerInvocationDriver::normalize_records(
             &mapping,
+            "",
             &mut session,
             &records,
             &BTreeMap::new(),
@@ -5893,6 +5961,7 @@ mod tests {
         };
         let events = PerInvocationDriver::normalize_records(
             &manifest.events,
+            &manifest.sessions.id_pointer,
             &mut session,
             &records,
             &BTreeMap::new(),
@@ -6188,6 +6257,7 @@ mod tests {
             };
             let events = PerInvocationDriver::normalize_records(
                 &manifest.events,
+                &manifest.sessions.id_pointer,
                 &mut session,
                 &records,
                 &BTreeMap::new(),
@@ -6195,6 +6265,12 @@ mod tests {
                 true,
             )
             .expect("normalize native exec events");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.session_id == session.local_id),
+                "{adapter} normalized events must use the AHRB session handle"
+            );
             let call = events
                 .iter()
                 .find(|event| event.event == EventVocab::ToolCall)
@@ -6233,6 +6309,74 @@ mod tests {
                 "{adapter}"
             );
         }
+    }
+
+    #[test]
+    fn exec_identity_keeps_native_session_stable_and_refreshes_run_id() {
+        let manifest =
+            crate::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
+        let driver = PerInvocationDriver::new(PerInvocationConfig {
+            daemon: None,
+            command: Vec::new(),
+            resume_command: Vec::new(),
+            resume_control_command: Vec::new(),
+            recover_probe_command: Vec::new(),
+            close_delete_command: Vec::new(),
+            release_command: Vec::new(),
+            cancel_command: Vec::new(),
+            replay_command: Vec::new(),
+            wait_ready_command: Vec::new(),
+            environment: BTreeMap::new(),
+            base_variables: BTreeMap::new(),
+            profile_root: PathBuf::new(),
+            events: manifest.events,
+            exit: manifest.exit,
+            session_id_pointer: manifest.sessions.id_pointer,
+            run_id_pointer: manifest.sessions.run_id_pointer,
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4_096,
+            gate_launch: false,
+        });
+        let mut session = PersistedExecSession {
+            local_id: "local-session".into(),
+            marker: "actor".into(),
+            harness_id: String::new(),
+            run_id: String::new(),
+            turns: 0,
+            invocations: 1,
+            next_cursor: 1,
+            closed: false,
+        };
+
+        driver
+            .learn_harness_identifiers(
+                &mut session,
+                &[json!({"session_id":"native-session","run_id":"run-1"})],
+            )
+            .unwrap();
+        assert_eq!(session.harness_id, "native-session");
+        assert_eq!(session.run_id, "run-1");
+
+        driver
+            .learn_harness_identifiers(
+                &mut session,
+                &[json!({"session_id":"native-session","run_id":"run-2"})],
+            )
+            .unwrap();
+        assert_eq!(session.harness_id, "native-session");
+        assert_eq!(session.run_id, "run-2");
+
+        let error = driver
+            .learn_harness_identifiers(
+                &mut session,
+                &[json!({"session_id":"other-session","run_id":"run-3"})],
+            )
+            .expect_err("native session identity change must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("changed native session identity")
+        );
     }
 
     #[test]
@@ -6385,6 +6529,7 @@ mod tests {
         })];
         let events = PerInvocationDriver::normalize_records(
             &manifest.events,
+            &manifest.sessions.id_pointer,
             &mut session,
             &records,
             &BTreeMap::new(),
@@ -6421,6 +6566,7 @@ mod tests {
         })];
         let events = PerInvocationDriver::normalize_records(
             &manifest.events,
+            &manifest.sessions.id_pointer,
             &mut session,
             &records,
             &BTreeMap::new(),
@@ -6682,7 +6828,10 @@ mod tests {
             assert_eq!(base, 0);
             let cache = driver.take_event_cache(&session).unwrap();
             let changes = PerInvocationDriver::normalize_records_at(
-                &driver.config.events,
+                ExecNormalization {
+                    mapping: &driver.config.events,
+                    session_id_pointer: &driver.config.session_id_pointer,
+                },
                 &mut session,
                 &records,
                 &cache.current,
@@ -7412,6 +7561,7 @@ mod tests {
         };
         let normalized = PerInvocationDriver::normalize_records(
             &manifest.events,
+            &manifest.sessions.id_pointer,
             &mut session,
             &records,
             &BTreeMap::new(),
@@ -7420,6 +7570,21 @@ mod tests {
         )
         .expect("normalize replayed Haider envelopes");
         assert_eq!(normalized.len(), 4);
+        assert!(normalized.iter().all(|event| event.session_id == "local-1"));
+        assert_eq!(
+            normalized[0]
+                .payload
+                .pointer("/_ahrb_source_raw/session_id")
+                .and_then(Value::as_str),
+            Some("session-1")
+        );
+        assert!(
+            normalized[0]
+                .payload
+                .pointer("/_ahrb_source_raw/_ahrb_id")
+                .is_none(),
+            "verbatim source evidence must not contain AHRB normalization fields"
+        );
         assert_eq!(normalized[0].cursor, 2);
         assert_eq!(normalized[0].event, EventVocab::ModelRequest);
         assert_eq!(normalized[1].event, EventVocab::ToolCall);
@@ -7434,6 +7599,46 @@ mod tests {
         );
         assert_eq!(normalized[3].cursor, 5);
         assert_eq!(normalized[3].event, EventVocab::TerminalSuccess);
+
+        let wrong_records = records
+            .iter()
+            .cloned()
+            .map(|mut record| {
+                record
+                    .as_object_mut()
+                    .expect("replay record object")
+                    .insert(
+                        "session_id".to_owned(),
+                        Value::String("wrong-native-session".to_owned()),
+                    );
+                record
+            })
+            .collect::<Vec<_>>();
+        let mut replay_session = PersistedExecSession {
+            local_id: "local-1".to_owned(),
+            marker: "r30".to_owned(),
+            harness_id: "session-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            turns: 1,
+            invocations: 1,
+            next_cursor: manifest.events.replay_cursor_start.unwrap_or(1),
+            closed: false,
+        };
+        let error = PerInvocationDriver::normalize_records(
+            &manifest.events,
+            &manifest.sessions.id_pointer,
+            &mut replay_session,
+            &wrong_records,
+            &BTreeMap::new(),
+            "turn-1",
+            true,
+        )
+        .expect_err("native replay from another session must fail before rewrite");
+        assert!(
+            error
+                .to_string()
+                .contains("changed native session identity")
+        );
     }
 
     #[test]

@@ -212,6 +212,9 @@ failures = { provider = 1 }
 executable_names = ["claude", "node"]
 
 [resources]
+# Exhaustive isolated-root audits after real 2.1.283 turns found session JSONL,
+# settings/backups, and AHRB evidence only; no non-journal log artifact.
+log_paths = []
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576

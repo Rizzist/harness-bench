@@ -2,7 +2,7 @@
 schema = 1
 id = "opencode"
 name = "OpenCode"
-revision = "1.17-run-format-json-native-tools-v4"
+revision = "1.17-run-format-json-native-tools-v5"
 
 [availability]
 exec_paths = ["opencode"]
@@ -33,7 +33,10 @@ content = '''{
         "apiKey": "{{credential}}"
       },
       "models": {
-        "{{model}}": { "name": "AHRB Fake Model" }
+        "ahrb-fake-v1": {
+          "id": "{{model}}",
+          "name": "AHRB Fake Model"
+        }
       }
     }
   },
@@ -223,6 +226,10 @@ failures = { provider = 1 }
 executable_names = ["opencode", "node"]
 
 [resources]
+# OpenCode 1.17.20 writes the active application log at this stable path. The
+# disposable-profile audit found no rotated sibling; any future rotation must
+# be declared as another exact path rather than hidden from row 47.
+log_paths = ["{{profile}}/data/opencode/log/opencode.log"]
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
@@ -237,9 +244,9 @@ max_bytes = 1048576
 credential_carrier_paths = ["{{profile}}/config/opencode/opencode.json"]
 
 [capabilities.injection_surface.provider]
-method = "cli"
-argv = ["--model", "ahrb/{{provider}}"]
-argv_position = "suffix"
+method = "generated-config"
+generated_path = "{{profile}}/config/opencode/opencode.json"
+json_pointer = "/provider/ahrb/models/ahrb-fake-v1/id"
 
 [capabilities.injection_surface.base_url]
 method = "generated-config"

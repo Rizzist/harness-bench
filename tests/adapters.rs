@@ -23,6 +23,8 @@ fn external_reference_manifests_parse_and_validate() -> Result<()> {
         let manifest = ahrb::manifest::load(Path::new(&path))?;
         assert_eq!(manifest.identity.id, adapter);
     }
+    let legacy = ahrb::manifest::load(Path::new("adapters/haider-agent-legacy/manifest.toml"))?;
+    assert_eq!(legacy.identity.id, "haider-agent");
     Ok(())
 }
 
@@ -243,6 +245,22 @@ fn named_harness_adapters_declare_honest_architectures_and_exec_contracts() -> R
             .windows(2)
             .any(|arguments| { arguments == ["--output", "jsonl"] })
     );
+    assert!(
+        haider
+            .sessions
+            .continue_turn
+            .windows(2)
+            .any(|arguments| arguments == ["--session", "{{session_id}}"])
+    );
+    assert!(
+        haider
+            .sessions
+            .continue_turn
+            .windows(2)
+            .any(|arguments| arguments == ["--output", "jsonl"])
+    );
+    assert_eq!(haider.sessions.id_pointer, "/session_id");
+    assert_eq!(haider.sessions.run_id_pointer, "/run_id");
     // The bench account must carry a stored credential (a credential-less custom
     // provider is auto-hermetic by contract: lockdown fs scope, no process_exec),
     // and that credential must never travel on argv.
@@ -880,6 +898,158 @@ fn claude_launcher_fails_closed_and_wraps_on_macos() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_launcher_denies_owner_config_and_fails_closed_on_macos() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let codex = ahrb::manifest::load(Path::new("adapters/codex/manifest.toml"))?;
+    assert_eq!(codex.availability.version_probe, ["codex", "--version"]);
+    let launcher = codex
+        .isolation
+        .generated_files
+        .iter()
+        .find(|file| file.path == "{{profile}}/bin/codex-ahrb-isolated")
+        .expect("profile-local Codex isolation launcher");
+    assert_eq!(launcher.mode, "0700");
+    for command in [&codex.transport.command, &codex.sessions.resume] {
+        assert_eq!(
+            command.first().map(String::as_str),
+            Some("{{profile}}/bin/codex-ahrb-isolated")
+        );
+        assert_eq!(
+            &command[1..5],
+            [
+                "/usr/bin/uname",
+                "/usr/bin/sandbox-exec",
+                "/usr/bin/id",
+                "/usr/bin/dscl",
+            ]
+        );
+        assert_eq!(command.get(5).map(String::as_str), Some("codex"));
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-codex-launcher-test-{}-{nonce}",
+        std::process::id()
+    ));
+    let real_home = root.join("real-home");
+    let codex_dir = real_home.join(".codex/packages/bin");
+    std::fs::create_dir_all(&codex_dir)?;
+
+    let write_executable = |path: &Path, content: &str| -> std::io::Result<()> {
+        std::fs::write(path, content)?;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)
+    };
+    let launcher_path = root.join("codex-ahrb-isolated");
+    let platform_probe = root.join("platform-probe");
+    let sandbox_exec = root.join("sandbox-exec");
+    let account_probe = root.join("account-probe");
+    let directory_service = root.join("directory-service");
+    let missing_sandbox = root.join("missing-sandbox-exec");
+    let missing_directory_service = root.join("missing-directory-service");
+    let fake_codex = codex_dir.join("codex");
+    let codex_marker = root.join("codex-ran");
+    let environment_log = root.join("codex-environment");
+    let sandbox_log = root.join("sandbox-argv");
+    write_executable(&launcher_path, &launcher.content)?;
+    write_executable(
+        &platform_probe,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$AHRB_TEST_PLATFORM\"\n",
+    )?;
+    write_executable(
+        &sandbox_exec,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$AHRB_TEST_SANDBOX_LOG\"\n[ \"$1\" = -p ]\nshift 2\nexec \"$@\"\n",
+    )?;
+    write_executable(
+        &account_probe,
+        "#!/bin/sh\nset -eu\n[ \"$1\" = -un ]\nprintf '%s\\n' ahrb-test-account\n",
+    )?;
+    write_executable(
+        &directory_service,
+        "#!/bin/sh\nset -eu\nprintf 'NFSHomeDirectory: %s\\n' \"$AHRB_TEST_REAL_HOME\"\n",
+    )?;
+    write_executable(
+        &fake_codex,
+        "#!/bin/sh\nset -eu\n: > \"$AHRB_TEST_CODEX_MARKER\"\nprintf '%s|%s|%s|%s\\n' \"${CODEX_ACCESS_TOKEN-unset}\" \"${OPENAI_IDENTITY_TOKEN_FILE-unset}\" \"${OPENAI_FEDERATION_RULE_ID-unset}\" \"${OPENAI_WORKLOAD_IDENTITY_CONTEXT-unset}\" > \"$AHRB_TEST_ENVIRONMENT_LOG\"\nprintf '%s\\n' wrapped-codex\n",
+    )?;
+
+    let run_launcher = |platform: &str, sandbox: &Path, directory: &Path| {
+        Command::new("/bin/sh")
+            .arg(&launcher_path)
+            .arg(&platform_probe)
+            .arg(sandbox)
+            .arg(&account_probe)
+            .arg(directory)
+            .arg(&fake_codex)
+            .env("AHRB_TEST_PLATFORM", platform)
+            .env("AHRB_TEST_REAL_HOME", &real_home)
+            .env("AHRB_TEST_CODEX_MARKER", &codex_marker)
+            .env("AHRB_TEST_ENVIRONMENT_LOG", &environment_log)
+            .env("AHRB_TEST_SANDBOX_LOG", &sandbox_log)
+            .env("CODEX_ACCESS_TOKEN", "owner-token-must-not-propagate")
+            .env("OPENAI_IDENTITY_TOKEN_FILE", "/owner/identity-token")
+            .env("OPENAI_FEDERATION_RULE_ID", "owner-rule")
+            .env("OPENAI_WORKLOAD_IDENTITY_CONTEXT", "owner-context")
+            .output()
+    };
+
+    let missing = run_launcher("Darwin", &missing_sandbox, &directory_service)?;
+    assert_eq!(missing.status.code(), Some(126));
+    assert!(!codex_marker.exists());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("sandbox-exec unavailable"));
+
+    let missing_home = run_launcher("Darwin", &sandbox_exec, &missing_directory_service)?;
+    assert_eq!(missing_home.status.code(), Some(126));
+    assert!(!codex_marker.exists());
+    assert!(String::from_utf8_lossy(&missing_home.stderr).contains("account database omitted"));
+
+    let wrapped = run_launcher("Darwin", &sandbox_exec, &directory_service)?;
+    assert!(wrapped.status.success());
+    assert_eq!(String::from_utf8_lossy(&wrapped.stdout), "wrapped-codex\n");
+    assert!(codex_marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(&environment_log)?,
+        "unset|unset|unset|unset\n"
+    );
+    let sandbox_arguments = std::fs::read_to_string(&sandbox_log)?;
+    let mut sandbox_arguments = sandbox_arguments.lines();
+    assert_eq!(sandbox_arguments.next(), Some("-p"));
+    let policy = sandbox_arguments.next().expect("sandbox policy");
+    assert!(policy.contains(&format!(
+        "(literal \"{}/.codex/config.toml\")",
+        real_home.display()
+    )));
+    assert!(policy.contains(&format!(
+        "(literal \"{}/.codex/auth.json\")",
+        real_home.display()
+    )));
+    assert!(!policy.contains("(subpath"));
+    assert_eq!(sandbox_arguments.next(), fake_codex.to_str());
+
+    std::fs::remove_file(&codex_marker)?;
+    std::fs::remove_file(&environment_log)?;
+    std::fs::remove_file(&sandbox_log)?;
+    let non_macos = run_launcher("Linux", &missing_sandbox, &missing_directory_service)?;
+    assert!(non_macos.status.success());
+    assert!(codex_marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(&environment_log)?,
+        "owner-token-must-not-propagate|/owner/identity-token|owner-rule|owner-context\n"
+    );
+    assert!(!sandbox_log.exists());
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 #[test]
 fn remaining_adapter_provider_files_render_as_scoped_valid_json() -> Result<()> {
     let profile =
@@ -910,26 +1080,22 @@ fn remaining_adapter_provider_files_render_as_scoped_valid_json() -> Result<()> 
 fn codex_manifest_overrides_context_and_ignores_nonfatal_metadata_items() -> Result<()> {
     let manifest = ahrb::manifest::load(Path::new("adapters/codex/manifest.toml"))?;
     for command in [&manifest.transport.command, &manifest.sessions.resume] {
-        let positions: Vec<_> = command
-            .iter()
-            .enumerate()
-            .filter_map(|(index, argument)| {
-                (argument == "model_context_window=128000").then_some(index)
-            })
-            .collect();
-        assert_eq!(positions.len(), 1);
-        let position = positions[0];
-        assert_eq!(
-            command.get(position.wrapping_sub(1)).map(String::as_str),
-            Some("-c")
+        assert!(
+            command
+                .windows(2)
+                .any(|arguments| arguments == ["--profile", "ahrb"])
         );
         let prompt = command
             .iter()
             .position(|argument| argument == "{{prompt}}")
             .expect("Codex command has prompt argument");
-        assert!(position < prompt);
+        let profile = command
+            .iter()
+            .position(|argument| argument == "--profile")
+            .expect("Codex command has generated profile argument");
+        assert!(profile < prompt);
         if let Some(resume) = command.iter().position(|argument| argument == "resume") {
-            assert!(position < resume);
+            assert!(profile < resume);
         }
         assert!(
             command
@@ -937,6 +1103,18 @@ fn codex_manifest_overrides_context_and_ignores_nonfatal_metadata_items() -> Res
                 .all(|argument| !argument.contains("max_output"))
         );
     }
+    let profile = manifest
+        .isolation
+        .generated_files
+        .iter()
+        .find(|file| file.path == "{{profile}}/codex/ahrb.config.toml")
+        .expect("Codex generated provider profile");
+    let parsed: toml::Value = toml::from_str(&profile.content)?;
+    assert_eq!(parsed["model_context_window"].as_integer(), Some(128_000));
+    assert_eq!(
+        parsed["model_providers"]["ahrb"]["base_url"].as_str(),
+        Some("{{base_url}}/v1")
+    );
     assert_eq!(
         manifest.exit.success_stdout,
         ["\"type\":\"turn.completed\""]
@@ -949,11 +1127,11 @@ fn codex_manifest_overrides_context_and_ignores_nonfatal_metadata_items() -> Res
 }
 
 #[test]
-fn haider_970_measurement_declarations_do_not_invent_lifecycle_or_truncation() {
+fn versioned_haider_manifests_separate_continuation_from_legacy_controls() {
     let manifest = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
     assert_eq!(
         manifest.identity.revision,
-        "0.0.970-measurement-capability-audit-v3"
+        "0.0.972-stable-session-continuation-v1"
     );
     assert_eq!(
         manifest.resources.log_paths.as_ref().unwrap(),
@@ -968,7 +1146,7 @@ fn haider_970_measurement_declarations_do_not_invent_lifecycle_or_truncation() {
             .iter()
             .all(|path| path.contains("{{profile}}/home/.haider/dev-profile/"))
     );
-    assert!(manifest.sessions.continue_turn.is_empty());
+    assert!(!manifest.sessions.continue_turn.is_empty());
     assert!(manifest.sessions.close_delete.is_empty());
     assert!(manifest.capture.truncation_marker.is_none());
     // Row-47 session-journal attribution uses the typed journal locator, not logs.
@@ -979,6 +1157,96 @@ fn haider_970_measurement_declarations_do_not_invent_lifecycle_or_truncation() {
             "{{profile}}/home/.haider/dev-profile/store.sqlite-wal",
         ]
     );
+
+    let legacy =
+        ahrb::manifest::load(Path::new("adapters/haider-agent-legacy/manifest.toml")).unwrap();
+    assert_eq!(
+        legacy.identity.revision,
+        "0.0.970-0.0.971-measurement-capability-audit-legacy-v1"
+    );
+    assert!(legacy.sessions.continue_turn.is_empty());
+    assert_eq!(
+        legacy.sessions.resume_control,
+        manifest.sessions.resume_control
+    );
+    assert_eq!(
+        legacy.sessions.recover_probe,
+        manifest.sessions.recover_probe
+    );
+    assert!(legacy.capture.truncation_marker.is_none());
+}
+
+#[test]
+fn six_harnesses_declare_row47_log_evidence() -> Result<()> {
+    let expected = [
+        (
+            "codex",
+            vec![
+                "{{profile}}/codex/logs_1.sqlite",
+                "{{profile}}/codex/logs_1.sqlite-shm",
+                "{{profile}}/codex/logs_1.sqlite-wal",
+                "{{profile}}/codex/logs_2.sqlite",
+                "{{profile}}/codex/logs_2.sqlite-shm",
+                "{{profile}}/codex/logs_2.sqlite-wal",
+            ],
+        ),
+        ("claude-code", vec![]),
+        (
+            "opencode",
+            vec!["{{profile}}/data/opencode/log/opencode.log"],
+        ),
+        ("pi", vec![]),
+        ("rick", vec![]),
+        (
+            "haider-agent",
+            vec!["{{profile}}/home/.haider/dev-profile/daemon.log"],
+        ),
+    ];
+    for (adapter, paths) in expected {
+        let manifest =
+            ahrb::manifest::load(Path::new(&format!("adapters/{adapter}/manifest.toml")))?;
+        let paths = paths.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            manifest.resources.log_paths.as_deref(),
+            Some(paths.as_slice())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_and_opencode_row65_carriers_run_before_positional_prompts() -> Result<()> {
+    let codex = ahrb::manifest::load(Path::new("adapters/codex/manifest.toml"))?;
+    let surface = codex.capabilities.injection_surface.as_ref().unwrap();
+    assert_eq!(
+        surface.provider.argv_position,
+        ahrb::manifest::ArgvPosition::ReplaceOption
+    );
+    assert_eq!(
+        surface.base_url.method,
+        ahrb::manifest::InjectionMethod::GeneratedConfig
+    );
+    assert_eq!(
+        surface.base_url.json_pointer,
+        "/model_providers/ahrb/base_url"
+    );
+
+    let opencode = ahrb::manifest::load(Path::new("adapters/opencode/manifest.toml"))?;
+    let provider = &opencode
+        .capabilities
+        .injection_surface
+        .as_ref()
+        .unwrap()
+        .provider;
+    assert_eq!(
+        provider.method,
+        ahrb::manifest::InjectionMethod::GeneratedConfig
+    );
+    assert_eq!(
+        provider.json_pointer,
+        "/provider/ahrb/models/ahrb-fake-v1/id"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1043,8 +1311,9 @@ fn six_harness_storage_declarations_are_evidence_scoped() -> Result<()> {
         let storage = manifest.storage.as_ref().expect("[storage] areas");
         assert!(!storage.areas.as_ref().expect("areas")["store"].is_empty());
     }
-    // Rick has no headless continuation and Haider's shared manifest binds none,
-    // so storage stays ABSENT for both; no declarations are guessed.
+    // Rick has no headless continuation. Haider 0.0.972 has continuation but
+    // storage declarations stay absent while daemon.log aliases a rotated file
+    // by hard link; the capture must report that repeated identity honestly.
     for adapter in ["rick", "haider-agent"] {
         assert!(load(adapter)?.storage.is_none(), "{adapter}");
     }

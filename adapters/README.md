@@ -12,6 +12,22 @@ and are not part of the nine-harness reference. Cline's directory and identity a
 `cline`, matching its executable and shorthand; `hbench cline-cli` remains an alias.
 Direct `--manifest` users must use `adapters/cline/manifest.toml`.
 
+Codex benchmark invocations use a generated mode-0700 launcher inside each disposable
+profile. On macOS it resolves the account's real home through the account database and
+applies exact `sandbox-exec` read denials for the documented user config
+(`.codex/config.toml`) and file credential store (`.codex/auth.json`); it also removes
+workload-identity credential variables before launch. The exact-file policy deliberately
+does not deny the rest of the owner's `.codex` tree because the installed Codex executable
+may live there. If the sandbox or account lookup is unavailable, the launcher fails closed.
+The manifest's availability probe remains the resolved `codex --version`: doctor runs it
+before any disposable profile exists, it makes no model request, and it is not treated as
+isolated-execution evidence. All benchmark rows, including row 65, use the launcher.
+
+The primary `haider-agent` manifest targets Haider 0.0.972 and later, including its
+stable-session `haider run --session <id>` continuation. Use
+`adapters/haider-agent-legacy/manifest.toml` explicitly for 0.0.970 or 0.0.971 comparisons;
+it freezes the pre-L11-A contract and intentionally has no ordinary continuation binding.
+
 ## Extra adapters (schema 2)
 
 These manifests target Aider **0.86.2**, Goose **1.49.0**, and Cline CLI **3.0.61**.
@@ -143,7 +159,8 @@ cline carry no storage declarations (owner scope decision).
 | opencode (1.17.20) | `run --session` | `store` `opencode.db*`; `logs` `data/opencode/log/**`; `native_libs` `tmp/.*.dylib` | `session_delete` = `opencode session delete <id>` |
 | pi (0.84.4) | `--session` in `--session-dir` | `store` `home/.pi/agent/sessions/**` | none |
 | rick (v0.1.18) | none headless (`rick --resume` is the TUI) | none | none |
-| haider-agent (0.0.970–0.0.972) | none bound (`run --session` exists from 0.0.971) | none | none |
+| haider-agent (0.0.972+) | `run --session <id>` | none (hard-link capture blocker below) | none |
+| haider-agent legacy (0.0.970/0.0.971) | none bound | none | none |
 
 No adapter documents a close-without-delete verb, a retention or auxiliary cap, or a
 sweep interval, so S5 and S7's cap assessment stay `UNSUPPORTED`. No adapter has a
@@ -204,13 +221,14 @@ implicit customization can still alter request bytes, helper processes, timing a
 observations, so candidate-versus-baseline runs must report any resulting class changes
 rather than assuming equivalence.
 
-Rick and Haider stay `ABSENT` in storage. Rick's `exec` has no headless resume. Haider's
-shared manifest binds no continuation: `haider run --session ID` is documented from 0.0.971,
-0.0.970's `run --help` does not list it, and binding it changes every multi-turn matrix row. Even with that
-binding, Haider hard-links `daemon.log` to its active `daemon-logs/haiderd-*.log`
-generation, and a repeated hard-link identity is a storage capture `ERROR` (SPEC-v4 §2).
-Haider's `resources.journal_paths` declares `store.sqlite` and `store.sqlite-wal` for
-row-47 journal attribution.
+Rick stays `ABSENT` in storage because `rick exec` has no headless resume. The 0.0.972+
+Haider manifest binds ordinary continuation, but storage remains blocked rather than
+misreported: Haider hard-links `daemon.log` to its active
+`daemon-logs/haiderd-*.log` generation, and the exhaustive storage capture rejects the
+repeated device/inode identity as `ERROR` (SPEC-v4 §2). The adapter does not exclude either
+name or substitute a favorable snapshot. Haider's `resources.journal_paths` separately
+declares `store.sqlite` and `store.sqlite-wal` for row-47 journal attribution. The legacy
+manifest remains storage `ABSENT` because it intentionally binds no continuation.
 
 ## Evidence and limits
 
@@ -222,11 +240,11 @@ and [isolated paths](https://github.com/aaif-goose/goose/blob/v1.49.0/crates/goo
 Installed CLI help, Aider's installed Python source, and Cline's generated disposable
 provider file are the local configuration references for this lane.
 
-Haider's `0.0.970-measurement-capability-audit-v3` declaration was checked against the pinned
-0.0.970 executable (SHA-256 `dd40b86e7334ed87dae04d14b032dc5912f83f050980e0fbb97594e6b76c503b`,
-dev/debug preflight build). `run --help` lists JSONL, timeout, start/status/stop/replay
-and describes allow-writes/allow-exec as compatibility aliases. It does not document
-ordinary session continuation. No continuation or close binding is inferred.
+The legacy declaration is checked against pinned 0.0.970 and 0.0.971 executables.
+0.0.970 `run --help` lists JSONL, timeout, start/status/stop/replay and compatibility
+aliases but no ordinary continuation. The primary declaration is checked against pinned
+0.0.972; its help additionally documents `--session ID`, and the manifest binds that
+stable-session surface independently from `resume` and `recover` controls.
 Disposable-profile observations establish `home/.haider/dev-profile/daemon.log`
 and `daemon-logs/haiderd-<pid>-<timestamp>-0.log`. The active generation and
 `daemon.log` share device/inode, so the manifest declares the stable alias once.

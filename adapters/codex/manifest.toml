@@ -2,10 +2,14 @@
 schema = 1
 id = "codex"
 name = "OpenAI Codex CLI"
-revision = "exec-jsonl-native-tools-v2"
+revision = "exec-jsonl-native-tools-v4"
 
 [availability]
 exec_paths = ["codex"]
+# Availability runs before AHRB creates a disposable profile, so this remains a
+# version-only probe of the resolved executable. It performs no model request
+# and is not evidence for an isolated Codex execution; every benchmark launch
+# below goes through the generated macOS owner-config deny launcher.
 version_probe = ["codex", "--version"]
 version_pattern = "codex-cli"
 
@@ -30,8 +34,70 @@ TMPDIR = "{{profile}}/tmp"
 CODEX_HOME = "{{profile}}/codex"
 
 [isolation]
-generated_files = []
 forbidden_roots = ["~/.codex"]
+
+# Keep the provider route in one profile layer so row 65 can perturb the
+# base-URL field without appending config flags after Codex's positional prompt.
+[[isolation.generated_files]]
+path = "{{profile}}/codex/ahrb.config.toml"
+mode = "0600"
+content = '''model_provider = "ahrb"
+model_context_window = 128000
+
+[model_providers.ahrb]
+name = "AHRB Fake Model"
+base_url = "{{base_url}}/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+'''
+
+# On macOS, keep disposable HOME/CODEX_HOME as the selected profile while also
+# denying reads of the owner's documented Codex config and file credential
+# store. Resolve the real home from the account database: $HOME is deliberately
+# disposable here. Exact-file rules leave an owner-installed Codex executable
+# beneath another .codex subtree readable. Official Codex docs name config.toml
+# and CODEX_HOME/auth.json; workload-identity variables are removed so an
+# externally named identity-token file cannot become an undeclared carrier.
+[[isolation.generated_files]]
+path = "{{profile}}/bin/codex-ahrb-isolated"
+mode = "0700"
+content = '''#!/bin/sh
+set -eu
+platform_probe=$1
+sandbox_exec=$2
+account_probe=$3
+directory_service=$4
+shift 4
+platform=$("$platform_probe" -s 2>/dev/null)
+if [ "$platform" = Darwin ]; then
+  if [ ! -x "$sandbox_exec" ]; then
+    echo 'ahrb codex launcher: sandbox-exec unavailable on macOS; refusing to run codex without the owner-config read guard' >&2
+    exit 126
+  fi
+  account=$("$account_probe" -un 2>/dev/null) || {
+    echo 'ahrb codex launcher: account lookup failed; refusing to infer the real home from disposable HOME' >&2
+    exit 126
+  }
+  record=$("$directory_service" . -read "/Users/$account" NFSHomeDirectory 2>/dev/null) || {
+    echo 'ahrb codex launcher: account database omitted the real home; refusing to run codex' >&2
+    exit 126
+  }
+  real_home=${record#NFSHomeDirectory: }
+  case "$real_home" in
+    /*) ;;
+    *) echo 'ahrb codex launcher: account database returned an invalid real home; refusing to run codex' >&2; exit 126 ;;
+  esac
+  case "$real_home" in
+    *[!A-Za-z0-9_./-]*) echo 'ahrb codex launcher: real home cannot be represented safely in a sandbox profile; refusing to run codex' >&2; exit 126 ;;
+  esac
+  policy="(version 1) (allow default) (deny file-read* (literal \"$real_home/.codex/config.toml\") (literal \"$real_home/.codex/auth.json\"))"
+  unset CODEX_ACCESS_TOKEN OPENAI_IDENTITY_TOKEN_FILE OPENAI_FEDERATION_RULE_ID OPENAI_WORKLOAD_IDENTITY_CONTEXT
+  exec "$sandbox_exec" -p "$policy" "$@"
+fi
+exec "$@"
+'''
 
 [daemon]
 persistent = false
@@ -44,17 +110,12 @@ persistent = false
 [transport]
 kind = "exec"
 command = [
+  "{{profile}}/bin/codex-ahrb-isolated",
+  "/usr/bin/uname", "/usr/bin/sandbox-exec", "/usr/bin/id", "/usr/bin/dscl",
   "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check", "--disable", "plugins",
   "--disable", "shell_snapshot", "-c", "allow_login_shell=false",
-  "--ignore-user-config", "--ignore-rules",
-  "-c", 'model_provider="ahrb"',
-  "-c", "model_context_window=128000",
-  "-c", 'model_providers.ahrb.name="AHRB Fake Model"',
-  "-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"',
-  "-c", 'model_providers.ahrb.env_key="OPENAI_API_KEY"',
-  "-c", 'model_providers.ahrb.wire_api="responses"',
-  "-c", "model_providers.ahrb.request_max_retries=0",
-  "-c", "model_providers.ahrb.stream_max_retries=0",
+  "--ignore-rules",
+  "--profile", "ahrb",
   "--model", "{{model}}", "--sandbox", "workspace-write", "-C", "{{workspace}}",
   "{{prompt}}"
 ]
@@ -62,17 +123,12 @@ timeout_ms = 30000
 
 [sessions]
 resume = [
+  "{{profile}}/bin/codex-ahrb-isolated",
+  "/usr/bin/uname", "/usr/bin/sandbox-exec", "/usr/bin/id", "/usr/bin/dscl",
   "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check", "--disable", "plugins",
   "--disable", "shell_snapshot", "-c", "allow_login_shell=false",
-  "--ignore-user-config", "--ignore-rules",
-  "-c", 'model_provider="ahrb"',
-  "-c", "model_context_window=128000",
-  "-c", 'model_providers.ahrb.name="AHRB Fake Model"',
-  "-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"',
-  "-c", 'model_providers.ahrb.env_key="OPENAI_API_KEY"',
-  "-c", 'model_providers.ahrb.wire_api="responses"',
-  "-c", "model_providers.ahrb.request_max_retries=0",
-  "-c", "model_providers.ahrb.stream_max_retries=0",
+  "--ignore-rules",
+  "--profile", "ahrb",
   "--model", "{{model}}", "--sandbox", "workspace-write", "-C", "{{workspace}}",
   "resume", "{{session_id}}", "{{prompt}}"
 ]
@@ -249,6 +305,17 @@ failures = { provider = 1 }
 executable_names = ["codex", "node"]
 
 [resources]
+# Codex creates one versioned SQLite log family in a fresh CODEX_HOME. Keep the
+# complete 0.156.1 generation and the current 0.157.1 generation, including
+# SQLite auxiliaries; absent compatibility paths contribute no growth.
+log_paths = [
+  "{{profile}}/codex/logs_1.sqlite",
+  "{{profile}}/codex/logs_1.sqlite-shm",
+  "{{profile}}/codex/logs_1.sqlite-wal",
+  "{{profile}}/codex/logs_2.sqlite",
+  "{{profile}}/codex/logs_2.sqlite-shm",
+  "{{profile}}/codex/logs_2.sqlite-wal",
+]
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
@@ -264,12 +331,12 @@ max_bytes = 1048576
 [capabilities.injection_surface.provider]
 method = "cli"
 argv = ["--model", "{{provider}}"]
-argv_position = "suffix"
+argv_position = "replace-option"
 
 [capabilities.injection_surface.base_url]
-method = "cli"
-argv = ["-c", 'model_providers.ahrb.base_url="{{base_url}}/v1"']
-argv_position = "suffix"
+method = "generated-config"
+generated_path = "{{profile}}/codex/ahrb.config.toml"
+json_pointer = "/model_providers/ahrb/base_url"
 
 [capabilities.injection_surface.credential]
 method = "environment"
@@ -283,10 +350,9 @@ tool_result_role_fidelity = "Responses function_call_output items preserve the n
 
 [capabilities.optional]
 
-# TODO(orchestrator): verify whether `codex exec` accepts the row-65 `--model`
-# and `-c model_providers.ahrb.base_url=...` suffix perturbations after the
-# prompt; otherwise the prefix/suffix carrier schema cannot express their
-# verified pre-prompt positions.
+# Row 65 replaces the existing public --model value and rewrites the generated
+# mode-0600 profile's base_url before launch. No option is appended after the
+# positional prompt.
 # TODO(orchestrator): pin complete public create/list/fork/delete argv and the
 # lifecycle JSON pointers before declaring session_ops_cli; `exec resume` alone
 # is insufficient.

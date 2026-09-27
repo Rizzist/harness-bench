@@ -45,7 +45,8 @@ fn usage_fields(value: &Value, metadata: &EventMetadata) -> Option<[u64; 5]> {
 fn raw_event(event: &NormalizedEvent) -> Value {
     event
         .payload
-        .get("_ahrb_source_raw")
+        .get("_ahrb_mapping_raw")
+        .or_else(|| event.payload.get("_ahrb_source_raw"))
         .cloned()
         .unwrap_or_else(|| serde_json::to_value(event).unwrap_or(Value::Null))
 }

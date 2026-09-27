@@ -204,6 +204,9 @@ failures = { provider = 1 }
 executable_names = ["pi", "node"]
 
 [resources]
+# Exhaustive isolated-root audits after real 0.84.4 turns found persisted
+# session JSONL and generated model/auth configuration, but no separate log.
+log_paths = []
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
