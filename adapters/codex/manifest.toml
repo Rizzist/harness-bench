@@ -36,10 +36,16 @@ forbidden_roots = ["~/.codex"]
 [daemon]
 persistent = false
 
+# `--disable shell_snapshot` and `allow_login_shell=false` (documented in 0.156.1:
+# `codex features list`, config key `allow_login_shell`) keep codex from sourcing
+# host login-shell files (/etc/zprofile -> path_helper, snapshot helpers). Those
+# host-dependent descendants are reaped by codex before its terminal, so no
+# owned final disk counter can exist for them on macOS (storage S1/S10 ERROR).
 [transport]
 kind = "exec"
 command = [
   "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check", "--disable", "plugins",
+  "--disable", "shell_snapshot", "-c", "allow_login_shell=false",
   "--ignore-user-config", "--ignore-rules",
   "-c", 'model_provider="ahrb"',
   "-c", "model_context_window=128000",
@@ -57,6 +63,7 @@ timeout_ms = 30000
 [sessions]
 resume = [
   "codex", "exec", "--json", "--color", "never", "--skip-git-repo-check", "--disable", "plugins",
+  "--disable", "shell_snapshot", "-c", "allow_login_shell=false",
   "--ignore-user-config", "--ignore-rules",
   "-c", 'model_provider="ahrb"',
   "-c", "model_context_window=128000",
@@ -70,6 +77,15 @@ resume = [
   "resume", "{{session_id}}", "{{prompt}}"
 ]
 id_pointer = "/thread_id"
+# 0.156.1 session store: rollout JSONL plus the SQLite thread state and
+# paginated thread-history databases (with WALs) that index/copy it.
+store_paths = [
+  "{{profile}}/codex/sessions",
+  "{{profile}}/codex/state_5.sqlite",
+  "{{profile}}/codex/state_5.sqlite-wal",
+  "{{profile}}/codex/thread_history_1.sqlite",
+  "{{profile}}/codex/thread_history_1.sqlite-wal",
+]
 
 [next_input]
 [agents]
@@ -280,7 +296,23 @@ tool_result_role_fidelity = "Responses function_call_output items preserve the n
 # TODO(orchestrator): pin exact budget, tariff, usage carrier/scope/pointers, and
 # network-denial behavior before declaring rows 66, 67, or the complete row 70.
 
+# Storage declarations from the disposable 0.156.1 profile (L7b evidence):
+# rollout JSONL under codex/sessions plus the SQLite thread state/history
+# stores; logs_N.sqlite is the log database. Skills, queue, goals, memories and
+# the installation id remain in the computed `other` family. No caps, close verb
+# or sweep are documented, so S5/S7 stay honestly UNSUPPORTED.
+# `codex delete --force <UUID>` (0.156.1 help: "Permanently delete a saved
+# session", `--force` = no prompt, UUID required) ran headless on a disposable
+# CODEX_HOME: exit 0, rollout removed, `threads` table empty. Codex has no
+# disposable-profile uninstall command (`logout` only removes credentials).
+[storage]
+session_delete = [
+  "{{harness}}", "delete", "--force", "--disable", "plugins", "{{session_id}}"
+]
+
 # Plugin clone staging remains part of exhaustive allocated-byte accounting.
 # SPEC-v4 revision 4.1 permits bounded re-inventory, never exclusion.
 [storage.areas]
+store = ["codex/sessions/**", "codex/state_*.sqlite*", "codex/thread_history_*.sqlite*"]
+logs = ["codex/logs_*.sqlite*"]
 transient = ["codex/.tmp/**"]

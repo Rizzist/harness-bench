@@ -128,6 +128,90 @@ a generated-config field with the raw fake origin, without a value-template tran
 That probe limitation does not establish that Cline lacks custom-endpoint support;
 the ordinary generated profile and native routing probes exercise that support.
 
+## Storage declarations
+
+The storage pillar ([SPEC-v4](../docs/SPEC-v4-storage.md)) measures the whole disposable
+profile with or without a `[storage]` table. Declarations only label files into named
+areas and name public verbs; they never exclude bytes. The six storage adapters were
+declared from disposable-profile storage runs of the installed binaries; aider, goose and
+cline carry no storage declarations (owner scope decision).
+
+| Adapter (version) | Session continuation | Areas | Verbs |
+|---|---|---|---|
+| codex (0.156.1) | `exec … resume` | `store` rollouts + `state_*`/`thread_history_*` SQLite; `logs` `logs_*.sqlite*`; `transient` `codex/.tmp/**` | `session_delete` = `codex delete --force <UUID>` |
+| claude-code (2.1.283) | `--resume` | `store` `claude/projects/**` | none |
+| opencode (1.17.20) | `run --session` | `store` `opencode.db*`; `logs` `data/opencode/log/**`; `native_libs` `tmp/.*.dylib` | `session_delete` = `opencode session delete <id>` |
+| pi (0.84.4) | `--session` in `--session-dir` | `store` `home/.pi/agent/sessions/**` | none |
+| rick (v0.1.18) | none headless (`rick --resume` is the TUI) | none | none |
+| haider-agent (0.0.970–0.0.972) | none bound (`run --session` exists from 0.0.971) | none | none |
+
+No adapter documents a close-without-delete verb, a retention or auxiliary cap, or a
+sweep interval, so S5 and S7's cap assessment stay `UNSUPPORTED`. No adapter has a
+disposable-profile uninstall: `opencode uninstall` removes the real binary on package or
+script installations, `rick uninstall` removes Rick itself, `pi uninstall` removes an
+extension source, and codex, claude-code and haider have none. `claude rm` only deletes
+background (`--bg`) sessions by short id, and `claude project purge` removes a whole
+project's state.
+
+The codex and opencode delete commands take their store only from the environment, not
+from an argument. SPEC-v4 §3 allows that scope when the isolated environment is honoured:
+AHRB runs every verb with a cleared environment containing only the profile-contained
+isolation roots, records `scope_basis="isolated-environment"` in the S6 command receipt,
+and turns the operation into `ERROR` unless the verb visibly changed a file in the
+declared `sessions.store_paths`. Uninstall and close verbs still need a `{{profile}}` or
+`{{workspace}}` argument. For both adapters the declared store includes the SQLite files
+that hold session data, so a delete that leaves those files behind is S6 residue. Both
+commands receive the harness-native session id learned from the adapter's `id_pointer`, the
+same value continuation commands receive, not AHRB's internal session handle.
+
+Codex runs with `--disable shell_snapshot -c allow_login_shell=false` (both documented in
+0.156.1). Otherwise codex starts host login shells (`/etc/zprofile`, `path_helper`,
+snapshot helpers) and reaps them before its terminal; macOS keeps no disk counters for a
+descendant reaped by the harness, so S1/S10 could only report `ERROR`. Without the
+protected bare launcher, Claude Code also spawns and reaps helpers every turn (`git`,
+`security`, shells). The documented bare mode is intended to remove the forbidden
+`security` lookup; the launcher below enforces that promise for 2.1.283. Any remaining
+reaped helpers can still make S1/S10 physical counters `ERROR` on macOS by the same rule.
+
+Claude Code 2.1.283 must run with its documented `--bare` option on every AHRB launch,
+including the version probe, initial transport and resume command. A disposable `HOME`
+does not isolate the macOS login keychain; without `--bare`, Claude Code probes the
+owner's keychain before using AHRB's fake `ANTHROPIC_API_KEY`. The installed help states
+that bare mode never reads OAuth or keychain authentication and accepts Anthropic auth
+only from `ANTHROPIC_API_KEY` or an explicit `apiKeyHelper` supplied by `--settings`.
+The initial and resume environments also pre-set the documented bare-mode variable
+`CLAUDE_CODE_SIMPLE=1`: in 2.1.283, relying on the flag to set it after process startup
+still allowed an early keychain prefetch before argument handling. Keeping both the flag
+and its documented environment effect active from process creation closes that startup
+window in versions that honor the documented behavior. Version 2.1.283 did not: a sampled
+run still observed the legacy prefetch. AHRB therefore generates an owner-private launcher
+inside each disposable profile. On macOS it applies a narrow `sandbox-exec` rule that
+allows all normal behavior but denies execution of `/usr/bin/security`; on other platforms
+it directly launches the documented bare command. The macOS branch fails closed with a
+nonzero exit and a clear diagnostic if `/usr/bin/sandbox-exec` is unavailable or not
+executable; it never falls through to an unsandboxed Claude launch. This blocks the
+defective macOS prefetch before a child exists or any keychain request can occur without
+making the adapter macOS-only; sampler evidence remains the authority.
+
+Bare mode also skips settings/plugin hooks, LSP, plugin sync, attribution, auto-memory,
+background prefetches and automatic `CLAUDE.md` discovery. Of the 73 matrix rows, only
+row 39 directly measures one of those features (hooks); Claude Code's manifest declares
+no hook, so it remains `UNSUPPORTED`. The matrix has no direct plugin, LSP, attribution,
+auto-memory, prefetch, `CLAUDE.md`, or MCP-discovery row. Skills are not disabled by bare
+mode, and explicit context remains available through flags such as `--mcp-config`,
+`--settings`, `--agents` and `--plugin-dir`; this manifest supplies none of them. Removing
+implicit customization can still alter request bytes, helper processes, timing and disk
+observations, so candidate-versus-baseline runs must report any resulting class changes
+rather than assuming equivalence.
+
+Rick and Haider stay `ABSENT` in storage. Rick's `exec` has no headless resume. Haider's
+shared manifest binds no continuation: `haider run --session ID` is documented from 0.0.971,
+0.0.970's `run --help` does not list it, and binding it changes every multi-turn matrix row. Even with that
+binding, Haider hard-links `daemon.log` to its active `daemon-logs/haiderd-*.log`
+generation, and a repeated hard-link identity is a storage capture `ERROR` (SPEC-v4 §2).
+Haider's `resources.journal_paths` declares `store.sqlite` and `store.sqlite-wal` for
+row-47 journal attribution.
+
 ## Evidence and limits
 
 Implementation and separate Astra verification evidence live outside Git in the lane's

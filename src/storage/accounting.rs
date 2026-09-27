@@ -482,7 +482,17 @@ pub async fn settle(
     if !status.success() {
         return Err(AhrbError::Protocol("storage sync failed".into()));
     }
-    let inventory = settle_capture(limit, || capture_attempt(root, config)).await?;
+    // Paths that differed in the most recent unstable probe pair; reported if
+    // the boundary never settles so the unstable writer is identifiable.
+    let unstable = std::sync::Mutex::new(Vec::new());
+    let inventory = settle_capture(limit, || capture_attempt(root, config, &unstable))
+        .await
+        .map_err(|error| {
+            annotate_unsettled(
+                error,
+                &unstable.lock().map(|p| p.clone()).unwrap_or_default(),
+            )
+        })?;
     Ok(SettledInventory {
         inventory,
         settle_ms: crate::fake_model::monotonic_timestamp_ns().saturating_sub(boundary_ns) as f64
@@ -492,11 +502,31 @@ pub async fn settle(
     })
 }
 
-async fn capture_attempt(root: &Path, config: &StorageConfig) -> Result<Option<Inventory>> {
+/// Name the paths that differed in the last unstable probe pair when a
+/// boundary never settles; other errors pass through unchanged.
+fn annotate_unsettled(error: AhrbError, paths: &[String]) -> AhrbError {
+    match error {
+        AhrbError::Protocol(reason)
+            if reason.starts_with("storage failed to settle") && !paths.is_empty() =>
+        {
+            AhrbError::Protocol(format!("{reason}; last unstable paths={paths:?}"))
+        }
+        other => other,
+    }
+}
+
+async fn capture_attempt(
+    root: &Path,
+    config: &StorageConfig,
+    unstable: &std::sync::Mutex<Vec<String>>,
+) -> Result<Option<Inventory>> {
     let before = inventory(root, config, false)?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let after = inventory(root, config, false)?;
     if before != after {
+        if let Ok(mut paths) = unstable.lock() {
+            *paths = changed_paths(&before, &after).into_iter().collect();
+        }
         return Ok(None);
     }
     let captured = inventory(root, config, true)?;
@@ -791,4 +821,104 @@ pub fn read_verified(_root: &Path, _entry: &FileEntry) -> Result<Vec<u8>> {
     Err(AhrbError::Unsupported(
         "S8 no-follow content audit unavailable".into(),
     ))
+}
+
+#[cfg(all(test, unix))]
+mod unstable_boundary_tests {
+    use super::*;
+
+    /// The probe pair records exactly the differing paths, and an unsettled
+    /// boundary error names them (diagnostic for real adapters).
+    #[test]
+    fn unsettled_boundary_reports_the_last_unstable_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-unstable-boundary-{}-{}",
+            std::process::id(),
+            crate::fake_model::monotonic_timestamp_ns()
+        ));
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("state/stable"), b"fixed").unwrap();
+        std::fs::write(root.join("state/busy"), b"one").unwrap();
+        let config = StorageConfig::default();
+        let before = inventory(&root, &config, false).unwrap();
+        std::fs::write(root.join("state/busy"), b"two-longer").unwrap();
+        let after = inventory(&root, &config, false).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let paths = changed_paths(&before, &after)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"state/busy".to_owned()), "{paths:?}");
+        assert!(!paths.contains(&"state/stable".to_owned()), "{paths:?}");
+        let timeout = AhrbError::Protocol(
+            "storage failed to settle within 10000 ms; transient capture attempts=[]".into(),
+        );
+        let text = annotate_unsettled(timeout, &paths).to_string();
+        assert!(
+            text.contains("last unstable paths=[") && text.contains("state/busy"),
+            "{text}"
+        );
+        let other = AhrbError::Protocol("storage sync failed".into());
+        assert_eq!(
+            annotate_unsettled(other, &paths).to_string(),
+            "protocol: storage sync failed"
+        );
+        let bare = AhrbError::Protocol("storage failed to settle within 10000 ms".into());
+        assert!(
+            !annotate_unsettled(bare, &[])
+                .to_string()
+                .contains("unstable")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod digest_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    fn digest_of(root: &Path, path: &str) -> String {
+        inventory(root, &StorageConfig::default(), true)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.path == path)
+            .and_then(|e| e.sha256)
+            .unwrap()
+    }
+
+    /// An in-place, same-size rewrite with its mtime restored is still re-read.
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_is_rehashed() {
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-digest-cache-{}-{}",
+            std::process::id(),
+            crate::fake_model::monotonic_timestamp_ns()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("journal");
+        std::fs::write(&file, b"AAAAAAAA").unwrap();
+        let first = digest_of(&root, "journal");
+        assert_eq!(first, format!("{:x}", Sha256::digest(b"AAAAAAAA")));
+        assert_eq!(
+            digest_of(&root, "journal"),
+            first,
+            "unchanged bytes hash identically"
+        );
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .write_at(b"BBBB", 2)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let second = digest_of(&root, "journal");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(second, format!("{:x}", Sha256::digest(b"AABBBBAA")));
+    }
 }

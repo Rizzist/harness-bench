@@ -476,6 +476,24 @@ fn fixture_templates_execute_write_read_and_fail_effects_for_native_adapters() -
 fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Result<()> {
     let claude = ahrb::manifest::load(Path::new("adapters/claude-code/manifest.toml"))?;
     assert_eq!(claude.fake_model.allowed_paths, ["/v1/messages"]);
+    assert_eq!(
+        claude.availability.version_probe,
+        ["claude", "--bare", "--version"]
+    );
+    let launcher = claude
+        .isolation
+        .generated_files
+        .iter()
+        .find(|file| file.path == "{{profile}}/bin/claude-ahrb-bare")
+        .expect("profile-local Claude bare launcher");
+    assert_eq!(launcher.mode, "0700");
+    assert!(launcher.content.contains("sandbox_exec=$2"));
+    assert!(
+        launcher
+            .content
+            .contains("sandbox-exec unavailable on macOS")
+    );
+    assert!(launcher.content.contains("/usr/bin/security"));
     for command in [&claude.transport.command, &claude.sessions.resume] {
         assert_eq!(command.first().map(String::as_str), Some("/usr/bin/env"));
         assert!(
@@ -483,7 +501,23 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
                 .iter()
                 .any(|argument| argument == "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
         );
+        assert!(
+            command
+                .iter()
+                .any(|argument| argument == "CLAUDE_CODE_SIMPLE=1")
+        );
+        assert!(
+            command
+                .iter()
+                .any(|argument| argument == "{{profile}}/bin/claude-ahrb-bare")
+        );
+        assert!(
+            command
+                .windows(2)
+                .any(|arguments| { arguments == ["/usr/bin/uname", "/usr/bin/sandbox-exec"] })
+        );
         assert!(command.iter().any(|argument| argument == "claude"));
+        assert!(command.iter().any(|argument| argument == "--bare"));
     }
     assert_eq!(claude.tools.aliases["write"].primary(), Some("Bash"));
     assert_eq!(
@@ -738,6 +772,114 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn claude_launcher_fails_closed_and_wraps_on_macos() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let claude = ahrb::manifest::load(Path::new("adapters/claude-code/manifest.toml"))?;
+    let launcher = claude
+        .isolation
+        .generated_files
+        .iter()
+        .find(|file| file.path == "{{profile}}/bin/claude-ahrb-bare")
+        .expect("profile-local Claude bare launcher");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-claude-launcher-test-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root)?;
+
+    let write_executable = |path: &Path, content: &str| -> std::io::Result<()> {
+        std::fs::write(path, content)?;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)
+    };
+    let launcher_path = root.join("claude-ahrb-bare");
+    let platform_probe = root.join("platform-probe");
+    let sandbox_exec = root.join("sandbox-exec");
+    let fake_claude = root.join("claude");
+    let missing_sandbox = root.join("missing-sandbox-exec");
+    let claude_marker = root.join("claude-ran");
+    let sandbox_log = root.join("sandbox-argv");
+    write_executable(&launcher_path, &launcher.content)?;
+    write_executable(
+        &platform_probe,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$AHRB_TEST_PLATFORM\"\n",
+    )?;
+    write_executable(
+        &sandbox_exec,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$AHRB_TEST_SANDBOX_LOG\"\n[ \"$1\" = -p ]\nshift 2\nexec \"$@\"\n",
+    )?;
+    write_executable(
+        &fake_claude,
+        "#!/bin/sh\nset -eu\n: > \"$AHRB_TEST_CLAUDE_MARKER\"\nprintf '%s\\n' wrapped-claude\n",
+    )?;
+
+    let run_launcher = |platform: &str, sandbox: &Path| {
+        Command::new("/bin/sh")
+            .arg(&launcher_path)
+            .arg(&platform_probe)
+            .arg(sandbox)
+            .arg(&fake_claude)
+            .env("AHRB_TEST_PLATFORM", platform)
+            .env("AHRB_TEST_CLAUDE_MARKER", &claude_marker)
+            .env("AHRB_TEST_SANDBOX_LOG", &sandbox_log)
+            .output()
+    };
+
+    let missing = run_launcher("Darwin", &missing_sandbox)?;
+    assert!(!missing.status.success());
+    assert_eq!(missing.status.code(), Some(126));
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr).trim(),
+        "ahrb claude-code launcher: sandbox-exec unavailable on macOS; refusing to run claude without the keychain-lookup guard"
+    );
+    assert!(
+        !claude_marker.exists(),
+        "missing sandbox-exec must not launch Claude"
+    );
+
+    let wrapped = run_launcher("Darwin", &sandbox_exec)?;
+    assert!(wrapped.status.success());
+    assert_eq!(String::from_utf8_lossy(&wrapped.stdout), "wrapped-claude\n");
+    assert!(claude_marker.exists(), "sandbox wrapper must launch Claude");
+    let sandbox_arguments = std::fs::read_to_string(&sandbox_log)?;
+    let mut sandbox_arguments = sandbox_arguments.lines();
+    assert_eq!(sandbox_arguments.next(), Some("-p"));
+    assert_eq!(
+        sandbox_arguments.next(),
+        Some("(version 1) (allow default) (deny process-exec (literal \"/usr/bin/security\"))")
+    );
+    assert_eq!(sandbox_arguments.next(), fake_claude.to_str());
+
+    std::fs::remove_file(&claude_marker)?;
+    std::fs::remove_file(&sandbox_log)?;
+    let non_macos = run_launcher("Linux", &missing_sandbox)?;
+    assert!(non_macos.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&non_macos.stdout),
+        "wrapped-claude\n"
+    );
+    assert!(
+        claude_marker.exists(),
+        "non-macOS launcher must execute Claude directly"
+    );
+    assert!(
+        !sandbox_log.exists(),
+        "non-macOS launcher must not invoke sandbox-exec"
+    );
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 #[test]
 fn remaining_adapter_provider_files_render_as_scoped_valid_json() -> Result<()> {
     let profile =
@@ -829,4 +971,102 @@ fn haider_970_measurement_declarations_do_not_invent_lifecycle_or_truncation() {
     assert!(manifest.sessions.continue_turn.is_empty());
     assert!(manifest.sessions.close_delete.is_empty());
     assert!(manifest.capture.truncation_marker.is_none());
+    // Row-47 session-journal attribution uses the typed journal locator, not logs.
+    assert_eq!(
+        manifest.resources.journal_paths.as_ref().unwrap(),
+        &[
+            "{{profile}}/home/.haider/dev-profile/store.sqlite",
+            "{{profile}}/home/.haider/dev-profile/store.sqlite-wal",
+        ]
+    );
+}
+
+#[test]
+fn six_harness_storage_declarations_are_evidence_scoped() -> Result<()> {
+    let load = |adapter: &str| {
+        ahrb::manifest::load(Path::new(&format!("adapters/{adapter}/manifest.toml")))
+    };
+    let strings = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+
+    // Verbs only where a public, disposable-profile-scoped surface was proven;
+    // neither CLI takes a store-root argument, so scope is the isolated profile.
+    let codex = load("codex")?;
+    let storage = codex.storage.as_ref().expect("codex [storage]");
+    let delete = storage.session_delete.as_ref().expect("codex delete");
+    assert_eq!(
+        delete,
+        &strings(&[
+            "{{harness}}",
+            "delete",
+            "--force",
+            "--disable",
+            "plugins",
+            "{{session_id}}"
+        ])
+    );
+    assert!(ahrb::storage::scoped_by_environment(
+        "session_delete",
+        delete
+    ));
+    assert!(
+        codex
+            .sessions
+            .store_paths
+            .contains(&"{{profile}}/codex/sessions".to_owned())
+    );
+    for command in [&codex.transport.command, &codex.sessions.resume] {
+        assert!(
+            command
+                .windows(2)
+                .any(|a| a == ["--disable", "shell_snapshot"])
+        );
+        assert!(
+            command
+                .windows(2)
+                .any(|a| a == ["-c", "allow_login_shell=false"])
+        );
+    }
+    let areas = storage.areas.as_ref().expect("codex areas");
+    assert_eq!(areas["transient"], ["codex/.tmp/**"]);
+    assert!(areas["store"].contains(&"codex/sessions/**".to_owned()));
+
+    let opencode = load("opencode")?;
+    let storage = opencode.storage.as_ref().expect("opencode [storage]");
+    assert_eq!(
+        storage.session_delete.as_ref().expect("opencode delete"),
+        &strings(&["{{harness}}", "session", "delete", "{{session_id}}"])
+    );
+    assert!(!opencode.sessions.store_paths.is_empty());
+
+    for adapter in ["claude-code", "pi"] {
+        let manifest = load(adapter)?;
+        let storage = manifest.storage.as_ref().expect("[storage] areas");
+        assert!(!storage.areas.as_ref().expect("areas")["store"].is_empty());
+    }
+    // Rick has no headless continuation and Haider's shared manifest binds none,
+    // so storage stays ABSENT for both; no declarations are guessed.
+    for adapter in ["rick", "haider-agent"] {
+        assert!(load(adapter)?.storage.is_none(), "{adapter}");
+    }
+    for adapter in [
+        "codex",
+        "claude-code",
+        "opencode",
+        "pi",
+        "rick",
+        "haider-agent",
+    ] {
+        let manifest = load(adapter)?;
+        let Some(storage) = manifest.storage.as_ref() else {
+            continue;
+        };
+        storage.validate()?;
+        // No uninstall, close, caps or sweep are documented for any of the six.
+        assert!(storage.uninstall_cleanup.is_none(), "{adapter}");
+        assert!(storage.session_close.is_none(), "{adapter}");
+        assert!(storage.retention_cap_bytes.is_none(), "{adapter}");
+        assert!(storage.auxiliary_cap_bytes.is_none(), "{adapter}");
+        assert!(storage.sweep_interval_s.is_none(), "{adapter}");
+    }
+    Ok(())
 }

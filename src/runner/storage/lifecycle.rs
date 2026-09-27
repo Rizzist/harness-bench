@@ -18,15 +18,6 @@ pub(crate) struct CompactionCapture {
     pub events: Vec<Value>,
 }
 
-fn file_ref(output: &Path, name: &str) -> Result<EvidenceRef> {
-    Ok(EvidenceRef {
-        file: name.into(),
-        sha256: format!("{:x}", Sha256::digest(std::fs::read(output.join(name))?)),
-        first_record: None,
-        last_record: None,
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn boundary(
     report: &mut Report,
@@ -443,15 +434,25 @@ async fn compact(
     )
     .await?;
     let receipt_name = format!("s4-r{repetition}-context.json");
-    std::fs::write(
-        progress.output.join(&receipt_name),
-        serde_json::to_vec_pretty(
-            &json!({"row51_trials":observation.trials,"compaction_trials":observation.compaction_trials.iter().map(|t| json!({"repetition":t.repetition,"compaction_observed":t.compaction_observed,"omitted_markers":t.omitted_markers})).collect::<Vec<_>>()}),
-        )?,
+    let compaction_trials = observation
+        .compaction_trials
+        .iter()
+        .map(|t| {
+            json!({
+                "repetition": t.repetition,
+                "compaction_observed": t.compaction_observed,
+                "omitted_markers": t.omitted_markers,
+            })
+        })
+        .collect::<Vec<_>>();
+    let receipt = serde_json::to_vec_pretty(
+        &json!({"row51_trials": observation.trials, "compaction_trials": compaction_trials}),
     )?;
-    trial
-        .evidence_refs
-        .push(file_ref(&progress.output, &receipt_name)?);
+    trial.evidence_refs.push(EvidenceRef::write(
+        &progress.output,
+        receipt_name,
+        &receipt,
+    )?);
     trial.diagnostics.before_boundary = capture
         .before
         .as_ref()
@@ -679,14 +680,19 @@ async fn close_sessions(
             "workspace".into(),
             task_workspace.to_string_lossy().into_owned(),
         );
-        variables.insert("session_id".into(), session.0.clone());
+        // Public verbs address the harness-native session, not AHRB's handle.
+        let native_id = driver
+            .harness_session_id(&session)
+            .unwrap_or_else(|| session.0.clone());
+        variables.insert("session_id".into(), native_id);
         let observation = public_close(manifest, config, profile, &variables).await?;
         let name = format!("s5-r{repetition}-c{ordinal:04}-close.json");
         let bytes = serde_json::to_vec_pretty(
             &json!({"argv":observation.argv,"exit_code":observation.exit_code,"stdout":String::from_utf8_lossy(&observation.stdout),"stderr":String::from_utf8_lossy(&observation.stderr),"operation_start_ns":observation.operation_start_ns,"terminal_receipt_ns":observation.terminal_receipt_ns,"outer_kill":observation.outer_kill}),
         )?;
-        std::fs::write(progress.output.join(&name), &bytes)?;
-        trial.evidence_refs.push(file_ref(&progress.output, &name)?);
+        trial
+            .evidence_refs
+            .push(EvidenceRef::write(&progress.output, name, &bytes)?);
         if observation.exit_code != Some(0)
             || observation.outer_kill
             || observation.terminal_receipt_ns.is_none()

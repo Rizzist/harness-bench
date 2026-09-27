@@ -1,6 +1,86 @@
 use ahrb::storage::{accounting::*, *};
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn shared_mapping_write_changes_digest_across_settle_boundaries() {
+    use std::os::fd::AsRawFd;
+
+    struct SharedMapping {
+        address: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl Drop for SharedMapping {
+        fn drop(&mut self) {
+            // SAFETY: address and len are the still-owned values returned by mmap.
+            assert_eq!(unsafe { libc::munmap(self.address, self.len) }, 0);
+        }
+    }
+
+    fn digest(inventory: &Inventory, path: &str) -> String {
+        inventory
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| entry.sha256.clone())
+            .expect("regular file digest")
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-storage-mmap-digest-{}-{}",
+        std::process::id(),
+        ahrb::fake_model::monotonic_timestamp_ns()
+    ));
+    std::fs::create_dir(&root).expect("root");
+    let path = root.join("journal");
+    std::fs::write(&path, vec![b'A'; 4096]).expect("initial contents");
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("mapped file");
+    // SAFETY: the file is open read/write for the mapping lifetime and has len bytes.
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(
+        address,
+        libc::MAP_FAILED,
+        "mmap: {}",
+        std::io::Error::last_os_error()
+    );
+    let mapping = SharedMapping { address, len: 4096 };
+    let config = StorageConfig::default();
+
+    let first = settle(&root, &config, ahrb::fake_model::monotonic_timestamp_ns())
+        .await
+        .expect("first settle boundary");
+    // SAFETY: the live mapping is writable and spans at least one byte.
+    unsafe { (mapping.address as *mut u8).write_volatile(b'B') };
+    let second = settle(&root, &config, ahrb::fake_model::monotonic_timestamp_ns())
+        .await
+        .expect("second settle boundary");
+
+    assert_eq!(std::fs::read(&path).expect("changed contents")[0], b'B');
+    assert_ne!(
+        digest(&first.inventory, "journal"),
+        digest(&second.inventory, "journal"),
+        "each settle boundary must hash the current mapped bytes"
+    );
+
+    drop(mapping);
+    drop(file);
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
 #[test]
 fn glob_grammar_and_family_intersection() {
     for glob in [

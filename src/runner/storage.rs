@@ -355,7 +355,9 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             finalize(&mut progress, &config)?;
         }
         if !interrupted && collection_failed {
-            for id in [5, 8, 9] {
+            // S7/S8 share the failed task too: never leave their "collection has
+            // not started" placeholder after an attempted collection.
+            for id in [5, 6, 7, 8, 9] {
                 if !matches!(progress.report.results[id].outcome, TestOutcome::Absent(_)) {
                     let reason = format!(
                         "task-incomplete: shared storage task prerequisite: {}",
@@ -416,7 +418,14 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             .iter()
             .all(|r| matches!(r.outcome, TestOutcome::Absent(_)))
     {
-        preserve_partial_trial(&mut progress, &config);
+        // A still-active repetition here means the shared task failed mid-way.
+        let partial_reason = if collection_failed {
+            outcome_reason(&progress.report.results[6].outcome)
+                .unwrap_or_else(|| "task-incomplete".into())
+        } else {
+            "deadline".into()
+        };
+        preserve_partial_trial(&mut progress, &config, &partial_reason);
         progress.active_engine = None;
         let lifecycle_result = lifecycle::collect(
             &manifest,
@@ -530,7 +539,7 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
     }
     capture_provider(&mut progress).await?;
     durability::preserve_partial(&mut progress)?;
-    preserve_partial_trial(&mut progress, &config);
+    preserve_partial_trial(&mut progress, &config, "deadline");
     // Keep completed trial evidence even when later repetitions or collectors failed.
     if !progress.write_trials.is_empty() {
         let reason = outcome_reason(&progress.report.results[0].outcome);
@@ -1717,23 +1726,10 @@ fn bind_evidence(
             serde_json::to_writer(&mut bytes, value)?;
             bytes.push(b'\n');
         }
-        Ok(EvidenceRef {
-            file: file.into(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
-            first_record: None,
-            last_record: None,
-        })
+        Ok(EvidenceRef::whole_file(file, &bytes))
     }
     let refs = vec![
-        EvidenceRef {
-            file: "storage-log-audit.jsonl".into(),
-            sha256: format!(
-                "{:x}",
-                Sha256::digest(std::fs::read(output.join("storage-log-audit.jsonl"))?)
-            ),
-            first_record: None,
-            last_record: None,
-        },
+        EvidenceRef::read(output, "storage-log-audit.jsonl")?,
         receipt("storage-samples.jsonl", &report.storage_samples)?,
         receipt("storage-files.jsonl", &report.storage_files)?,
         receipt("processes.jsonl", &report.processes)?,
@@ -1741,12 +1737,7 @@ fn bind_evidence(
         receipt("model-requests.jsonl", &report.model_requests)?,
         receipt("events.jsonl", &report.events)?,
         receipt("request-body-matches.jsonl", &report.request_body_matches)?,
-        EvidenceRef {
-            file: "storage-request-bodies.jsonl".into(),
-            sha256: retention::digest(&std::fs::read(output.join("storage-request-bodies.jsonl"))?),
-            first_record: None,
-            last_record: None,
-        },
+        EvidenceRef::read(output, "storage-request-bodies.jsonl")?,
     ];
     for id in [
         ROWS[0], ROWS[2], ROWS[5], ROWS[6], ROWS[7], ROWS[8], ROWS[9],
@@ -1757,8 +1748,8 @@ fn bind_evidence(
             .and_then(Value::as_array_mut)
         {
             for trial in trials {
-                // L13 rebuilds shared-task references, including its handling of
-                // missing S8 blobs. Only L6 carries additional command receipts.
+                // Shared-task references are rebuilt here, including missing S8
+                // blobs; only S6/S9/S10 carry additional per-trial command receipts.
                 let existing = if [ROWS[5], ROWS[8], ROWS[9]].contains(&id) {
                     trial["evidence_refs"]
                         .as_array()
@@ -1779,12 +1770,7 @@ fn bind_evidence(
                                 Err(_) if trial["measurement_complete"] == false => continue,
                                 Err(error) => return Err(error.into()),
                             };
-                            trial_refs.push(EvidenceRef {
-                                file: path.into(),
-                                sha256: retention::digest(&bytes),
-                                first_record: None,
-                                last_record: None,
-                            });
+                            trial_refs.push(EvidenceRef::whole_file(path, &bytes));
                         }
                     }
                 }
@@ -1820,18 +1806,14 @@ fn bind_evidence(
                     if metadata.is_dir() {
                         raw_refs(&path, output, refs)?;
                     } else if metadata.is_file() {
-                        refs.push(EvidenceRef {
-                            file: path
-                                .strip_prefix(output)
-                                .map_err(|_| {
-                                    AhrbError::Protocol("collector evidence escaped bundle".into())
-                                })?
-                                .to_string_lossy()
-                                .into_owned(),
-                            sha256: crate::storage::durability::digest(&path)?,
-                            first_record: None,
-                            last_record: None,
-                        });
+                        let file = path
+                            .strip_prefix(output)
+                            .map_err(|_| {
+                                AhrbError::Protocol("collector evidence escaped bundle".into())
+                            })?
+                            .to_string_lossy()
+                            .into_owned();
+                        refs.push(EvidenceRef::whole_file(file, &std::fs::read(&path)?));
                     } else {
                         return Err(AhrbError::Protocol(
                             "collector evidence is not a regular file".into(),
@@ -2138,7 +2120,9 @@ fn finalize_retention_capture(
 
 /// Retain the last settled checkpoints when a repetition cannot complete. No
 /// aggregate or counter total is inferred from incomplete turn coverage.
-fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) {
+/// Keep the active repetition's partial S1/S3/S7/S8 evidence, labelled with why
+/// it stopped: a deadline or a failed shared task.
+fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig, reason: &str) {
     let Some((repetition, _, _, _)) = &progress.active_engine else {
         return;
     };
@@ -2180,9 +2164,9 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) {
             .collect::<Vec<_>>();
         progress.auxiliary_trials.push(Trial {
             repetition,
-            outcome: TestOutcome::Error("deadline".into()),
+            outcome: TestOutcome::Error(reason.into()),
             measurement_complete: false,
-            reason: Some("deadline".into()),
+            reason: Some(reason.into()),
             summary: AuxiliarySummary::default(),
             diagnostics: auxiliaries::checkpoint_diagnostics(&snapshots, config),
             evidence_refs: Vec::new(),
@@ -2221,9 +2205,9 @@ fn preserve_partial_trial(progress: &mut Progress, config: &StorageConfig) {
             .collect();
         progress.retention_trials.push(Trial {
             repetition,
-            outcome: TestOutcome::Error("deadline".into()),
+            outcome: TestOutcome::Error(reason.into()),
             measurement_complete: false,
-            reason: Some("deadline".into()),
+            reason: Some(reason.into()),
             summary: RetentionSummary::default(),
             diagnostics: RetentionDiagnostics {
                 coverage: Coverage::CaptureError,
@@ -3067,7 +3051,7 @@ mod retirement_error_tests {
         finalize(&mut progress, &config)?;
         let before = serde_json::to_value(&progress.report)?;
         mark_interrupted_rows(&mut progress, &config, 3);
-        preserve_partial_trial(&mut progress, &config);
+        preserve_partial_trial(&mut progress, &config, "deadline");
         let after = serde_json::to_value(&progress.report)?;
         for id in [0, 2, 6, 7] {
             assert_eq!(before["results"][id], after["results"][id]);

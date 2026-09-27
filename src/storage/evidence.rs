@@ -226,6 +226,29 @@ pub struct EvidenceRef {
     pub first_record: Option<u64>,
     pub last_record: Option<u64>,
 }
+impl EvidenceRef {
+    /// Whole-file receipt (no record bounds) binding `file` to these exact bytes.
+    pub fn whole_file(file: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            file: file.into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            first_record: None,
+            last_record: None,
+        }
+    }
+
+    /// Whole-file receipt for an existing bundle-relative file.
+    pub fn read(output: &std::path::Path, file: &str) -> Result<Self> {
+        Ok(Self::whole_file(file, &std::fs::read(output.join(file))?))
+    }
+
+    /// Writes `bytes` to the bundle-relative `file` and returns its receipt.
+    pub fn write(output: &std::path::Path, file: impl Into<String>, bytes: &[u8]) -> Result<Self> {
+        let file = file.into();
+        std::fs::write(output.join(&file), bytes)?;
+        Ok(Self::whole_file(file, bytes))
+    }
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageSample {

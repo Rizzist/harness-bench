@@ -63,7 +63,56 @@ retention, and typed end/workspace evidence. These are serialized-request observ
 not claims about model understanding or task success. The complete contract is in
 [`docs/SPEC-v3-fidelity.md`](docs/SPEC-v3-fidelity.md).
 
-The planned independent storage pillar is defined in [`docs/SPEC-v4-storage.md`](docs/SPEC-v4-storage.md).
+## Storage pillar (v4)
+
+The storage pillar measures what a harness writes and keeps on disk while one session
+grows turn by turn. It is independent of the matrix, economy and fidelity:
+
+```console
+hbench storage mock --profile quick --output "$PWD/results/storage-$(date -u +%Y%m%dT%H%M%SZ)"
+ahrb run --pillar storage --manifest adapters/mock/manifest.toml --profile quick \
+  --output /absolute/fresh/bundle
+```
+
+Both forms accept `--profile quick|cert`, `--deadline SECS`, `--no-save` and `--output`;
+`--tests` is rejected because all ten rows always run. Quick is 100 turns x 3 repetitions,
+cert 1,000 turns x 7. The default deadline is derived from that serialized workload
+(10,509 s + 3 x `sweep_interval_s` quick; 174,979 s + 7 x `sweep_interval_s` cert).
+On expiry AHRB still writes the full report, marks unfinished rows `ERROR: deadline`
+and exits 2. The rows are:
+
+| Row | Measures |
+|---|---|
+| S1 `write-volume` | OS-accounted physical bytes written per turn by the whole owned process tree, allocated-footprint growth, write amplification and the D class |
+| S2 `durability-cost` | `fsync`/`fdatasync`/`F_FULLFSYNC` calls per turn in an instrumented copy of the task, plus an *estimated* wall cost at a fixed 4 ms/call |
+| S3 `footprint-curve` | Allocated bytes at checkpoints 0/1/10/50/100 (cert adds 500/1,000) and the G class `bounded/linear/superlinear`; superlinear growth FAILs |
+| S4 `compaction-vs-disk` | Allocated bytes before and after a context-limit compaction |
+| S5 `close-retention` | Bytes retained after a declared close-without-delete, against a declared cap and sweep |
+| S6 `delete-uninstall-residue` | Files left after a declared `session_delete` or `uninstall_cleanup` verb; residue FAILs |
+| S7 `bounded-auxiliaries` | Per-family growth of declared areas (logs, caches, ...) against declared caps |
+| S8 `request-body-retention` | Whether captured request bytes are stored verbatim (`none/deduplicated/full`) |
+| S9 `crash-residue` | Files left by a SIGKILL during a held turn, and whether resume preserves the committed prefix |
+| S10 `resume-read-cost` | Physical bytes read and latency to resume a grown session |
+
+Honesty rails: physical I/O (OS counters) and allocated footprint (`st_blocks x 512`) are
+separate measurements and never substitute for each other. The whole disposable profile
+is audited without following links; a symlink, a repeated hard-link identity or a file
+that keeps changing is an `ERROR`, never a smaller number. A declared `transient` area
+only permits a bounded re-inventory; its bytes stay in every total. S2's wall time is an
+estimate, not measured latency. S8 classes describe exact byte matches, not privacy
+safety. A missing declaration yields `ABSENT` or `UNSUPPORTED`, never zero. The only
+behavioural FAILs are S3 superlinear growth and residue after a declared S6 verb; the
+other classes are informational.
+
+A completed run with no ERROR, a D class, S3 PASS and every declared S6 verb clean earns
+the separate badge `Storage v4 · <os> · <topology> · D<class> · G<class> · <facets>`.
+Values compare only within one OS, topology, profile and declaration set
+(`comparison_scope="within-topology-only"`). Saved storage runs appear in `hbench results`
+with their pillar, D/G classes, outcome counts and badge. `hbench diff` compares two
+storage runs of the same scope, reports `not-comparable-storage-scope` otherwise, and
+refuses to compare storage with another pillar. Adapters opt in through an optional
+`[storage]` table; see [adapter storage declarations](adapters/README.md#storage-declarations)
+and the normative [`docs/SPEC-v4-storage.md`](docs/SPEC-v4-storage.md).
 
 ## Deadlines and saved results
 
@@ -85,12 +134,16 @@ The directory contains the full report and JSONL evidence bundle (plus
 `--output DIR` writes the primary bundle there and also mirrors it into
 `results/`. Use `--no-save` or `AHRB_NO_SAVE=1` to opt out of that durable copy.
 
-`results/index.jsonl` receives one append-only JSON object per saved run. Its
-schema is `harness_id`, `harness_version`, `manifest_hash`, `ahrb_revision`,
-`platform`, `profile`, `rows_run`, `timestamp`, `counts` (`PASS`, `FAIL`,
-`UNSUPPORTED`, `ERROR`; `ABSENT` is counted as `ERROR`), `badge`,
-`resource_summary` (`peak_rss_mib`, `cpu_per_turn_p50_ms`, `cpu_per_turn_p95_ms`, `wall_per_turn_ms`,
-`sampler_overhead_pct`), `results_dir`, and `load_avg_1m`.
+`results/index.jsonl` receives one append-only JSON object per saved run. Line
+schema 3 records `schema`, `pillar`, `run_key`, `completed_at`, `harness`,
+`harness_version`, `report_path`, `report_schema`, `spec_version`, `profile`, `os`,
+`topology`, `outcome_counts` (`PASS`, `FAIL`, `UNSUPPORTED`, `ERROR`; `ABSENT` is
+counted as `ERROR`), `badge_label`, `resource_summary` (`peak_rss_mib`,
+`cpu_per_turn_p50_ms`, `cpu_per_turn_p95_ms`, `wall_per_turn_ms`,
+`sampler_overhead_pct`, row-47/48/60 disk and model-wait fields when measured),
+`metrics`, `manifest_sha256`, `workflow_sha256`, `ahrb_revision`, and
+`storage_summary` (the complete typed storage object for storage runs, otherwise null).
+Legacy schema-1/2 lines remain readable; storage data is never reconstructed for them.
 
 Legacy `resource_summary.cpu_total_s` and `cpu_per_turn_ms` are retired: samples from
 different collectors have independent cumulative counters and workload windows. CPU

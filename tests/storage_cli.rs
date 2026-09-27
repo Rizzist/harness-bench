@@ -108,8 +108,11 @@ fn storage_manifests_are_additive_and_strict() {
         "retention_cap_bytes=-1",
         "workspace_path='/tmp/outside'",
         "workspace_path='{{profile}}/../outside'",
-        "session_delete=['harness','delete','{{session_id}}']",
         "session_delete=['sh','-c','{{profile}}','{{session_id}}']",
+        "session_delete=['harness','delete','/tmp/store','{{session_id}}']",
+        // Only a session delete may rely on the isolated environment for scope.
+        "session_close=['harness','close','{{session_id}}']",
+        "uninstall_cleanup=['harness','uninstall','--force']",
         "session_close=['harness','close','{{profile}}','{{credential}}','{{session_id}}']",
     ] {
         let parsed = toml::from_str::<manifest::Manifest>(&format!("{text}\n[storage]\n{bad}\n"));
@@ -118,6 +121,12 @@ fn storage_manifests_are_additive_and_strict() {
             "accepted {bad}"
         );
     }
+    // SPEC-v4 §3: a session delete may be scoped by the isolated environment.
+    let environment_scoped = format!(
+        "{text}\n[storage]\nsession_delete=['{{{{harness}}}}','delete','--force','{{{{session_id}}}}']\n"
+    );
+    let parsed: manifest::Manifest = toml::from_str(&environment_scoped).expect("parsed");
+    manifest::validate(&parsed).expect("environment-scoped session delete");
 }
 
 fn fresh(label: &str) -> PathBuf {
@@ -424,6 +433,20 @@ fn attempted_plaintext_collection_with_a_false_structured_declaration_stays_erro
         !report.storage_samples.is_empty(),
         "collection was attempted"
     );
+    // S7/S8 share the failed task: an attempted collection is task-incomplete,
+    // never the "collection has not started" placeholder or a deadline.
+    let details = serde_json::to_value(&report.details).expect("details");
+    for (i, slug) in [(6, "bounded-auxiliaries"), (7, "request-body-retention")] {
+        assert!(
+            matches!(&report.results[i].outcome, ahrb::evaluate::TestOutcome::Error(reason)
+            if reason.contains("task-incomplete") && !reason.contains("collector-pending")),
+            "{:?}",
+            report.results[i].outcome
+        );
+        for trial in details[slug]["trials"].as_array().into_iter().flatten() {
+            assert_ne!(trial["reason"], "deadline", "{trial}");
+        }
+    }
     assert!(
         report
             .storage_summary

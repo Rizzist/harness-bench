@@ -1187,6 +1187,12 @@ pub trait Driver: Send {
     fn session_workspace(&self, _session: &SessionId) -> Option<PathBuf> {
         None
     }
+    /// The harness-native session identifier learned from its own output (the
+    /// value continuation argv receive as `{{session_id}}`), when it differs
+    /// from AHRB's handle. Public storage verbs must address this identifier.
+    fn harness_session_id(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
     /// Submit a prompt with an idempotency key.
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()>;
     /// Path receiving the active invocation's live structured event stream,
@@ -3427,6 +3433,13 @@ impl Driver for PerInvocationDriver {
 
     fn session_workspace(&self, session: &SessionId) -> Option<PathBuf> {
         Some(self.workspace_directory(&session.0))
+    }
+
+    fn harness_session_id(&self, session: &SessionId) -> Option<String> {
+        self.sessions
+            .get(&session.0)
+            .map(|item| item.persisted.harness_id.clone())
+            .filter(|id| !id.is_empty())
     }
 
     fn submit(&mut self, session: &SessionId, prompt: &str, key: &str) -> DriverFuture<'_, ()> {

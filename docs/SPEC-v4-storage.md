@@ -1,6 +1,6 @@
 # AHRB v4 — storage pillar
 
-Status: normative implementation specification, revision 4.1 (2026-09-07: declared transient capture retries). This document defines requirements for implementing storage; it does not claim that the current binary supports them.
+Status: normative implementation specification, revision 4.2 (4.1 2026-09-07: declared transient capture retries; 4.2 2026-09-26: environment-scoped session delete must change its store; verbs address the harness-native session id). This document defines requirements for implementing storage; it does not claim that the current binary supports them.
 MUST, MUST NOT, and REQUIRED are normative. [SPEC-v2](SPEC-v2.md) §§3–7 supply the outcome, identity, evidence, and comparison conventions except for explicit overrides below.
 The [proposal](PROPOSAL-v4-storage.md) supplies motivation, not additional oracles.
 
@@ -200,6 +200,17 @@ variables. Allowed variables are `profile`, `workspace`, `session_id`, and resol
 Reject secrets and credential templates in argv even if legacy `allow_credential_argv` is true.
 Close/delete/uninstall use only the benchmark-created profile and fake account. A command
 that acts on a real installation, global package, real account, or unscoped HOME is invalid; omission is the correct declaration when no safely scoped public command exists.
+
+Revision 4.2 clarification: only `session_delete` may prove scope through the isolated
+environment instead of a `{{profile}}`/`{{workspace}}` argument; close and uninstall verbs
+still need one. AHRB runs every verb with a cleared environment holding only the
+manifest's profile-contained isolation roots and records `scope_basis` (`argument` or
+`isolated-environment`) and those roots in the S6 command receipt. "Actually honoured" is
+demonstrated per operation: an environment-scoped delete that exits 0 but changes no
+regular file inside `sessions.store_paths` (no removal, replacement, content change or
+addition) is ERROR, never a clean PASS. In every storage verb `{{session_id}}` renders the
+harness-native session identifier learned through `sessions.id_pointer` (the value the
+continuation argv receives), falling back to AHRB's handle only when none was learned.
 
 Existing `sessions.store_paths` remains the profile-contained S5/S6 store locator;
 `resources.journal_paths` and `events.path` identify journals, and `resources.log_paths`

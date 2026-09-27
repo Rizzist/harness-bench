@@ -38,6 +38,27 @@ pub fn residue<'a>(
         .collect()
 }
 
+/// True when any regular file inside `scope` was added, removed, replaced or
+/// changed between the two inventories.
+pub fn scope_changed(before: &Inventory, after: &Inventory, scope: &[String]) -> bool {
+    let in_scope = |path: &str| {
+        scope
+            .iter()
+            .any(|p| p.is_empty() || path == p || path.starts_with(&format!("{p}/")))
+    };
+    let removed = before
+        .entries
+        .iter()
+        .filter(|e| e.kind == "regular" && in_scope(&e.path))
+        .any(|e| {
+            !after
+                .entries
+                .iter()
+                .any(|a| a.kind == "regular" && a.path == e.path)
+        });
+    removed || !residue(before, after, scope).is_empty()
+}
+
 pub fn declared_outcome<'a>(outcomes: impl Iterator<Item = &'a TestOutcome>) -> TestOutcome {
     outcomes
         .max_by_key(|o| match o {
@@ -202,6 +223,41 @@ mod tests {
         after.entries[0].path = "elsewhere/a".into();
         assert!(residue(&before, &after, &["store".into()]).is_empty());
         assert_eq!(residue(&before, &after, &[String::new()]).len(), 1);
+    }
+    #[test]
+    fn scope_change_sees_removal_replacement_and_addition_only_inside_scope() {
+        let file = |path: &str, sha: &str| FileEntry {
+            path: path.into(),
+            kind: "regular".into(),
+            device_id: 1,
+            inode_or_file_id: 1,
+            allocated_bytes: 4096,
+            apparent_bytes: 10,
+            sha256: Some(sha.into()),
+            family: "store".into(),
+        };
+        let scope = ["store".to_string()];
+        let mut before = Inventory::default();
+        before.entries.push(file("store/session.jsonl", "a"));
+        before.entries.push(file("logs/run.log", "a"));
+        let mut after = before.clone();
+        assert!(!scope_changed(&before, &after, &scope));
+        after.entries[1].sha256 = Some("b".into());
+        assert!(
+            !scope_changed(&before, &after, &scope),
+            "out-of-scope change"
+        );
+        after.entries.remove(0);
+        assert!(
+            scope_changed(&before, &after, &scope),
+            "removed session file"
+        );
+        let mut after = before.clone();
+        after.entries[0].sha256 = Some("b".into());
+        assert!(scope_changed(&before, &after, &scope), "rewritten store");
+        let mut after = before.clone();
+        after.entries.push(file("store/new", "c"));
+        assert!(scope_changed(&before, &after, &scope), "new store file");
     }
     #[test]
     fn resume_branches_are_exclusive_and_topology_driven() {

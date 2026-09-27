@@ -6,7 +6,7 @@ revision = "print-stream-json-native-tools-v3"
 
 [availability]
 exec_paths = ["claude"]
-version_probe = ["claude", "--version"]
+version_probe = ["claude", "--bare", "--version"]
 version_pattern = "Claude Code"
 
 [fake_model]
@@ -30,8 +30,26 @@ TMPDIR = "{{profile}}/tmp"
 CLAUDE_CONFIG_DIR = "{{profile}}/claude"
 
 [isolation]
-generated_files = []
 forbidden_roots = ["~/.claude"]
+
+[[isolation.generated_files]]
+path = "{{profile}}/bin/claude-ahrb-bare"
+mode = "0700"
+content = '''#!/bin/sh
+set -eu
+platform_probe=$1
+sandbox_exec=$2
+shift 2
+platform=$("$platform_probe" -s 2>/dev/null)
+if [ "$platform" = Darwin ]; then
+  if [ ! -x "$sandbox_exec" ]; then
+    echo 'ahrb claude-code launcher: sandbox-exec unavailable on macOS; refusing to run claude without the keychain-lookup guard' >&2
+    exit 126
+  fi
+  exec "$sandbox_exec" -p '(version 1) (allow default) (deny process-exec (literal "/usr/bin/security"))' "$@"
+fi
+exec "$@"
+'''
 
 [daemon]
 persistent = false
@@ -40,7 +58,10 @@ persistent = false
 kind = "exec"
 command = [
   "/usr/bin/env", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-  "claude", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
+  "CLAUDE_CODE_SIMPLE=1",
+  "{{profile}}/bin/claude-ahrb-bare",
+  "/usr/bin/uname", "/usr/bin/sandbox-exec",
+  "claude", "--bare", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
   "--model", "{{model}}", "--add-dir", "{{workspace}}",
   "--dangerously-skip-permissions", "--allowedTools", "Bash",
   "--session-id", "{{session_id}}"
@@ -50,7 +71,10 @@ timeout_ms = 30000
 [sessions]
 resume = [
   "/usr/bin/env", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-  "claude", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
+  "CLAUDE_CODE_SIMPLE=1",
+  "{{profile}}/bin/claude-ahrb-bare",
+  "/usr/bin/uname", "/usr/bin/sandbox-exec",
+  "claude", "--bare", "-p", "{{prompt}}", "--verbose", "--output-format", "stream-json",
   "--model", "{{model}}", "--add-dir", "{{workspace}}",
   "--dangerously-skip-permissions", "--allowedTools", "Bash",
   "--resume", "{{session_id}}"
@@ -230,3 +254,12 @@ tool_result_role_fidelity = "Anthropic tool_result blocks preserve the native re
 # TODO(orchestrator): pin all three budget controls, the harness-side tariff,
 # usage event/scope/five pointers, and closed-stdin filesystem/network denial
 # commands before declaring rows 66, 67, or 70.
+
+# Storage declarations from the disposable 2.1.283 profile (L7b evidence): the
+# session transcript JSONL under CLAUDE_CONFIG_DIR/projects; .claude.json and
+# its backups stay in `other`. No verbs: `claude rm <id>` deletes only
+# background (--bg) sessions by short id, and `claude project purge` deletes a
+# whole project's state, which is neither a per-session delete nor an uninstall.
+# No caps, close verb or sweep are documented.
+[storage.areas]
+store = ["claude/projects/**"]

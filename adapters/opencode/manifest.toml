@@ -83,6 +83,11 @@ resume = [
   "--session", "{{session_id}}", "{{prompt}}"
 ]
 id_pointer = "/sessionID"
+# OpenCode 1.17 keeps every session in one SQLite store (+ WAL).
+store_paths = [
+  "{{profile}}/data/opencode/opencode.db",
+  "{{profile}}/data/opencode/opencode.db-wal",
+]
 
 [next_input]
 [agents]
@@ -262,3 +267,20 @@ tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native
 # pointers, and permission denial commands before declaring rows 66, 67, or 70.
 # TODO(orchestrator): capture timestamp and schema-version fields from installed
 # 1.17.x JSON events before declaring those row-69 metadata components.
+
+# Storage declarations from the disposable 1.17.20 profile (L7b evidence).
+# `opencode session delete <sessionID>` ran headless on a disposable profile:
+# exit 0 and the session left `session list`; a repeated delete exits 1
+# (`Session not found`). `opencode uninstall` is not declared: its dry run
+# lists only the profile XDG roots here because the install method is
+# "unknown", but on a package/script installation it removes the real binary,
+# so it is not a disposable-profile-scoped verb. Each `opencode run` also
+# extracts a ~4.8 MB native library into TMPDIR and never removes it; that
+# family is declared so S7 shows its growth. No caps, close verb or sweep.
+[storage]
+session_delete = ["{{harness}}", "session", "delete", "{{session_id}}"]
+
+[storage.areas]
+store = ["data/opencode/opencode.db", "data/opencode/opencode.db-*"]
+logs = ["data/opencode/log/**"]
+native_libs = ["tmp/.*.dylib"]

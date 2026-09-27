@@ -220,10 +220,14 @@ fn validate_verb(name: &str, argv: &[String], session: bool) -> Result<()> {
     {
         return Err(error());
     }
-    if !argv
-        .iter()
-        .skip(1)
-        .any(|s| s.contains("{{profile}}") || s.contains("{{workspace}}"))
+    // SPEC-v4 §3: scope is proven by a profile/workspace argument or by the
+    // isolated environment the public command honours. Only a session delete
+    // may use the environment; its store change is demonstrated at run time.
+    if !scoped_by_environment(name, argv)
+        && !argv
+            .iter()
+            .skip(1)
+            .any(|s| s.contains("{{profile}}") || s.contains("{{workspace}}"))
     {
         return Err(error());
     }
@@ -262,6 +266,18 @@ fn validate_verb(name: &str, argv: &[String], session: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A `session_delete` with no profile/workspace argument is scoped only by the
+/// isolated environment (manifest validation keeps HOME, XDG and every declared
+/// isolation root under the disposable profile, and verbs run with a cleared
+/// environment). Such a verb must visibly change its declared store at run time.
+pub fn scoped_by_environment(name: &str, argv: &[String]) -> bool {
+    name == "session_delete"
+        && !argv
+            .iter()
+            .skip(1)
+            .any(|s| s.contains("{{profile}}") || s.contains("{{workspace}}"))
 }
 
 pub fn validate_glob(pattern: &str) -> Result<()> {

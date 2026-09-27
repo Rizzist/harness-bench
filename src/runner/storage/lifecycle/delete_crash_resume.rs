@@ -254,6 +254,10 @@ async fn execute_verb(
     output: &Path,
 ) -> Result<(i32, String)> {
     let mut variables = vars(&run.profile, &run.workspace, &run.session);
+    // Public verbs address the harness-native session learned from its output.
+    if let Some(native) = run.runtime.driver.harness_session_id(&run.session) {
+        variables.insert("session_id".into(), native);
+    }
     let mut executable = None;
     for candidate in &manifest.availability.exec_paths {
         let resolved = resolve_local_program(std::slice::from_ref(candidate))?;
@@ -266,6 +270,11 @@ async fn execute_verb(
         AhrbError::Validation("storage verb has no discovered harness executable".into())
     })?;
     variables.insert("harness".into(), executable.to_string_lossy().into_owned());
+    let scope_basis = if crate::storage::scoped_by_environment(name, argv) {
+        "isolated-environment"
+    } else {
+        "argument"
+    };
     let argv = resolve_local_program(&render_verb(name, argv, &variables, &run.profile)?)?;
     // Public verbs can derive store paths from a profile-only argument. Check
     // the complete profile immediately before execution, not only rendered argv.
@@ -285,6 +294,12 @@ async fn execute_verb(
             env.insert(name.into(), v);
         }
     }
+    let isolation_roots = manifest
+        .isolation
+        .roots
+        .keys()
+        .filter_map(|key| env.get(key).map(|value| (key.clone(), value.clone())))
+        .collect::<BTreeMap<_, _>>();
     let mut command = tokio::process::Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -308,7 +323,17 @@ async fn execute_verb(
         .map_err(|_| AhrbError::Timeout("storage verb deadline".into()))??;
     crate::process::retire_process(pid)?;
     let code = result.status.code().unwrap_or(-1);
-    let receipt = json!({"argv":argv,"pid":pid,"start_ns":started,"exit_ns":monotonic_timestamp_ns(),"exit_code":code,"stdout":String::from_utf8_lossy(&result.stdout),"stderr":String::from_utf8_lossy(&result.stderr)});
+    let receipt = json!({
+        "argv": argv,
+        "scope_basis": scope_basis,
+        "isolation_roots": isolation_roots,
+        "pid": pid,
+        "start_ns": started,
+        "exit_ns": monotonic_timestamp_ns(),
+        "exit_code": code,
+        "stdout": String::from_utf8_lossy(&result.stdout),
+        "stderr": String::from_utf8_lossy(&result.stderr),
+    });
     let bytes = serde_json::to_vec(&receipt)?;
     std::fs::write(output, &bytes)?;
     Ok((code, format!("{:x}", Sha256::digest(bytes))))
@@ -402,6 +427,14 @@ async fn delete_operation(
         } else {
             "uninstall_cleanup"
         };
+        // An environment-scoped delete (no profile argument) must visibly act on
+        // the disposable store; compare the declared scope around the verb.
+        let environment_scoped = crate::storage::scoped_by_environment(name, argv);
+        let pre_verb = if environment_scoped {
+            Some(accounting::settle(&run.profile, config, monotonic_timestamp_ns()).await?)
+        } else {
+            None
+        };
         let receipt_file = progress
             .output
             .join(format!("s6-{label}-r{rep}-command.json"));
@@ -418,6 +451,17 @@ async fn delete_operation(
         let after_name = format!("s6-{label}-r{rep}-after");
         boundary(progress, config, 5, rep, n, &after_name, &after);
         op.after_boundary = Some(after_name);
+        if let Some(pre_verb) = &pre_verb
+            && !crate::storage::lifecycle::scope_changed(
+                &pre_verb.inventory,
+                &after.inventory,
+                &op.scope,
+            )
+        {
+            return Err(AhrbError::Protocol(format!(
+                "declared {label} is scoped only by the isolated environment but changed no file in the declared store"
+            )));
+        }
         let leftovers = residue(&before.inventory, &after.inventory, &op.scope);
         let bytes = leftovers.iter().map(|f| f.allocated_bytes).sum::<u64>();
         let files = leftovers.len() as u64;
@@ -783,9 +827,9 @@ async fn resume_trial(
         crate::storage::lifecycle::validate_resume_bracket(&d)?;
         let bytes=d.last_read_bytes.and_then(|last|last.checked_sub(d.first_read_bytes?)).ok_or_else(||AhrbError::Protocol("resume reads regressed or absent".into()))?;
         if !controls.is_empty() {
-            let path=progress.output.join(format!("s10-r{rep}-control.json"));
-            let bytes=serde_json::to_vec(&controls)?;std::fs::write(&path,&bytes)?;
-            trial.evidence_refs.push(EvidenceRef {file:path.file_name().unwrap().to_string_lossy().into_owned(),sha256:format!("{:x}",Sha256::digest(bytes)),first_record:None,last_record:None});
+            let bytes = serde_json::to_vec(&controls)?;
+            let file = format!("s10-r{rep}-control.json");
+            trial.evidence_refs.push(EvidenceRef::write(&progress.output, file, &bytes)?);
         }
         // Nothing above this gate settles/scans the filesystem or releases the
         // provider. Terminal and post-response reads are outside the interval.
@@ -799,9 +843,14 @@ async fn resume_trial(
         if manifest.transport.kind==TransportKind::Exec {
             let boundary=await_completed_turn_boundary(&mut run.runtime.driver,&run.session,Some(detached),previous,outer_turn_timeout(manifest)).await?;
             if Some(boundary.launch_ns)!=d.continuation_start_ns {return Err(AhrbError::Protocol("continuation launch receipt changed".into()));}
-            let v=json!({"launch_ns":boundary.launch_ns,"exit_ns":boundary.exit_ns,"identities":d.identities});let raw=serde_json::to_vec(&v)?;
-            let file=format!("s10-r{rep}-continuation.json");std::fs::write(progress.output.join(&file),&raw)?;
-            trial.evidence_refs.push(EvidenceRef {file,sha256:format!("{:x}",Sha256::digest(raw)),first_record:None,last_record:None});
+            let receipt = json!({
+                "launch_ns": boundary.launch_ns,
+                "exit_ns": boundary.exit_ns,
+                "identities": d.identities,
+            });
+            let file = format!("s10-r{rep}-continuation.json");
+            let raw = serde_json::to_vec(&receipt)?;
+            trial.evidence_refs.push(EvidenceRef::write(&progress.output, file, &raw)?);
         }
         let after_resume=accounting::settle(&run.profile,&manifest.storage.clone().unwrap_or_default(),monotonic_timestamp_ns()).await?;
         boundary(progress,&manifest.storage.clone().unwrap_or_default(),9,rep,n+1,&format!("s10-r{rep}-post-resume"),&after_resume);
@@ -948,9 +997,10 @@ async fn crash_trial(
         d.committed_cursor=before_events.iter().map(|e|e.cursor).max();
         let cursor=d.committed_cursor.ok_or_else(||AhrbError::Protocol("kill has no durable activity".into()))?;
         if cursor<=run.after.map_or(0,|c|c.0) {return Err(AhrbError::Protocol("held turn has no new durable activity".into()));}
-        d.committed_prefix_sha256=Some(format!("{:x}",Sha256::digest(&committed)));
-        let prefix_file=format!("s9-r{rep}-committed-journal.bin");std::fs::write(progress.output.join(&prefix_file),&committed)?;
-        trial.evidence_refs.push(EvidenceRef {file:prefix_file,sha256:d.committed_prefix_sha256.clone().unwrap(),first_record:None,last_record:None});
+        let prefix_file = format!("s9-r{rep}-committed-journal.bin");
+        let prefix_ref = EvidenceRef::write(&progress.output, prefix_file, &committed)?;
+        d.committed_prefix_sha256 = Some(prefix_ref.sha256.clone());
+        trial.evidence_refs.push(prefix_ref);
         d.expected_session_id_hash=Some(stable_evidence_hash(&run.session.0));d.expected_cursor=cursor.checked_add(1);
         let mut sampler=platform_sampler();
         let roots=verified_process_roots(manifest,sampler.as_mut(),run.runtime.driver.owned_pids(),run.runtime.driver.daemon_pid())?;
@@ -969,8 +1019,9 @@ async fn crash_trial(
         run.runtime.driver.reap_after_external_kill().await?;
         d.exit_ns=Some(monotonic_timestamp_ns());
         let kill_receipt=json!({"signal":"SIGKILL","target":target,"owned_identities":tree.members.keys().collect::<Vec<_>>(),"delivery_succeeded":true,"hold_ns":d.hold_ns,"kill_ns":d.kill_ns,"exit_ns":d.exit_ns,"tree_exited":true});
-        let file=format!("s9-r{rep}-kill.json");let bytes=serde_json::to_vec(&kill_receipt)?;std::fs::write(progress.output.join(&file),&bytes)?;
-        trial.evidence_refs.push(EvidenceRef {file,sha256:format!("{:x}",Sha256::digest(bytes)),first_record:None,last_record:None});
+        let file = format!("s9-r{rep}-kill.json");
+        let bytes = serde_json::to_vec(&kill_receipt)?;
+        trial.evidence_refs.push(EvidenceRef::write(&progress.output, file, &bytes)?);
         let post=accounting::settle(&run.profile,&config,monotonic_timestamp_ns()).await?;
         boundary(progress,&config,8,rep,n,&format!("s9-r{rep}-post-kill"),&post);
         let candidates=residue(&pre.inventory,&post.inventory,&[String::new()]);

@@ -253,3 +253,10 @@ tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native
 # TODO(orchestrator): pin budget controls, tariff, usage event/scope/five
 # pointers, permission denial commands, timestamps, and schema version before
 # declaring rows 66, 67, 69 metadata, or 70.
+
+# Storage declarations from the disposable 0.84.4 profile (L7b evidence): one
+# JSONL file per session under the declared --session-dir; models/auth files
+# stay in `other`. Pi exposes no session delete, close or uninstall command
+# (`pi uninstall` removes an extension source), and no caps or sweep.
+[storage.areas]
+store = ["home/.pi/agent/sessions/**"]

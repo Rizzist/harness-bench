@@ -44,3 +44,9 @@ path = "src/bin/hbench.rs"
 [profile.dev]
 debug = 0
 incremental = false
+
+# Storage boundaries digest every changed profile byte inside a 10 s settle
+# bound (SPEC-v4 §2); unoptimized SHA-256 (~30 MB/s) cannot keep up with
+# multi-hundred-MB profiles. Optimizing only the hash crate keeps debug builds.
+[profile.dev.package.sha2]
+opt-level = 3

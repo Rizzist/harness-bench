@@ -260,6 +260,14 @@ profile_lock_paths = ["{{profile}}/home/.haider/dev-profile/lock"]
 # Declare its stable alias once; row 47 accepts file paths, not glob patterns.
 # Archived generations were observed too; no bounded-retention claim is made.
 log_paths = ["{{profile}}/home/.haider/dev-profile/daemon.log"]
+# Session journal for row-47 attribution (layout observed in AHRB run roots on
+# 0.0.970-0.0.972): the daemon's SQLite store and its WAL. The WAL is rewritten
+# in place after each checkpoint, so its same-identity growth is 0; store.sqlite
+# grows at checkpoint turns. Row 47 publishes the per-turn median.
+journal_paths = [
+  "{{profile}}/home/.haider/dev-profile/store.sqlite",
+  "{{profile}}/home/.haider/dev-profile/store.sqlite-wal",
+]
 turn_timeout_ms = 30000
 idle_timeout_ms = 2000
 max_output_bytes = 1048576
