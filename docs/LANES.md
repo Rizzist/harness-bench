@@ -274,6 +274,16 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L11-A `l11a-adapter-truth` (landed 2026-09-27)
+
+- [x] Plan: `state/lanes/l11-error-rows/plan-1/plan.md` (gpt-5.6-sol) splits L11 into A–E; orchestrator adopted recommended decisions D1–D8.
+- [x] Implement (gpt-5.6-sol, 2 passes): truthful log declarations (5 adapters); haider-agent → 0.0.972+ with stable-session continuation, `haider-agent-legacy` for 0.0.970/0.0.971; replay-safe native identity in driver normalization; codex/opencode row-65 carriers; codex owner-config sandbox launcher.
+- [x] Verification (gpt-5.6-sol verify-1/1b): haider 0.0.972 row 52 ERROR→PASS; codex/opencode row 65 UNSUPPORTED→PASS; legacy manifest matches master on 0.0.970/0.0.971; codex isolation proven.
+- [x] Final review: GPT6-Astra 1 NO-SHIP (wrong-session replay passed row 30) → repaired; GPT6-Astra 2 **SHIP**.
+- [x] Complete: committed `693280e`, fast-forwarded and pushed.
+
+Finding for the Haider team: with a real growing continuation session, haider 0.0.972 row 49 FAILs (slope ≈100 ms/100 turns) and row 43 FAILs (jitter); row 44 now PASSes. Row 47 on per-invocation adapters moves to L11-B.
+
 ## L7b `l7b-storage-adapters` (landed 2026-09-27)
 
 - [x] Implement (claude-opus-5-5 impl-1; gpt-5.6-sol impl-2..4): evidence-backed `[storage]` declarations for codex, claude-code, opencode, pi; environment-scoped `session_delete` (spec 4.2); native session ids for S5/S6 verbs; per-boundary hashing of current bytes; S7/S8 `task-incomplete`; codex login-shell flags; haider `resources.journal_paths`; docs.
