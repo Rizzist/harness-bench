@@ -274,6 +274,13 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L11-B `l11b-collection` (landed 2026-09-28)
+
+- [x] Implement (gpt-5.6-sol, 4 passes incl. two provider-interrupted continuations): row-28 single predeclared N=1 extension with measured windows; row-48 lifetime-complete CPU (bracket or final-retirement receipt; pre-header exclusion only with receipt); rows 48/59 independent scheduler ledger validated one-to-one before D4 early-close FAIL; row-47 stdout terminal pre-reap boundary.
+- [x] Verification: gpt-5.6-sol verify-1 NO-SHIP (row-28 `actual` was nominal) → repaired.
+- [x] Final review: GPT6-Astra 1 NO-SHIP (lost final counter accepted; early close masked ledger defects) → repaired; GPT6-Astra 2 NO-SHIP (pre-header lifetime bypass) → repaired; GPT6-Astra 3 **SHIP**.
+- [x] Complete: committed `f8b9e09`, fast-forwarded and pushed. Haider 0.0.972 rows 28/48/59 now measured (FAIL: reclaim ratio; early paced-body close ~2 s into a 5 s stream); row 47 measured on the five per-invocation adapters.
+
 ## L11-A `l11a-adapter-truth` (landed 2026-09-27)
 
 - [x] Plan: `state/lanes/l11-error-rows/plan-1/plan.md` (gpt-5.6-sol) splits L11 into A–E; orchestrator adopted recommended decisions D1–D8.
