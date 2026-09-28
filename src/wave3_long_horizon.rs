@@ -856,12 +856,36 @@ pub fn evaluate_resume_latency_vs_length(
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct JournalTornTailTrial {
     pub trial: u32,
+    pub declared_source_path: String,
+    pub source_path: String,
+    pub copy_root: String,
+    pub source_device_id: u64,
+    pub source_file_id: u64,
+    pub source_link_count: u64,
+    pub observed_device_id: u64,
+    pub observed_file_id: u64,
+    pub observed_link_count: u64,
+    pub source_is_regular: bool,
     pub pre_size: u64,
+    pub trigger_operation: String,
+    pub trigger_submit_result: String,
+    pub observed_sizes: Vec<u64>,
     pub observed_size: u64,
+    pub full_record_length: u64,
+    pub full_record_sha256: String,
     pub cut_offset: u64,
+    pub target_size: u64,
     pub truncated_size: u64,
+    pub copied_path: String,
+    pub copied_device_id: u64,
+    pub copied_file_id: u64,
+    pub copied_link_count: u64,
+    pub copied_is_regular: bool,
+    pub live_source_size_after_copy: u64,
+    pub live_source_link_count_after_copy: u64,
     pub growth_observed_ns: u64,
     pub kill_ns: u64,
+    pub kill_boundary: String,
     pub record_digest_matches: bool,
     pub recovery_ms: f64,
     pub clean_recovery: bool,
@@ -934,14 +958,48 @@ pub fn evaluate_journal_torn_tail_sweep(
         let offset = TORN_CUT_OFFSETS[((trial.trial - 1) as usize) % TORN_CUT_OFFSETS.len()];
         let expected_observed = trial.pre_size.checked_add(TORN_RECORD_BYTES);
         let expected_truncated = trial.pre_size.checked_add(offset);
-        if trial.cut_offset != offset
+        let same_source_identity = trial.source_device_id == trial.observed_device_id
+            && trial.source_file_id == trial.observed_file_id;
+        let distinct_copy_identity = (trial.source_device_id, trial.source_file_id)
+            != (trial.copied_device_id, trial.copied_file_id);
+        let observations_exact = expected_observed.is_some_and(|expected| {
+            trial.observed_sizes.first() == Some(&trial.pre_size)
+                && trial.observed_sizes.last() == Some(&expected)
+                && trial.observed_sizes.iter().all(|size| *size <= expected)
+        });
+        if trial.declared_source_path != trial.source_path
+            || trial.source_path.is_empty()
+            || trial.copy_root.is_empty()
+            || trial.copied_path.is_empty()
+            || trial.source_path == trial.copied_path
+            || !trial.source_is_regular
+            || !trial.copied_is_regular
+            || trial.source_link_count != 1
+            || trial.observed_link_count != 1
+            || trial.copied_link_count != 1
+            || trial.live_source_link_count_after_copy != 1
+            || !same_source_identity
+            || !distinct_copy_identity
+            || trial.trigger_operation != "submit"
+            || trial.trigger_submit_result != "ok"
+            || !observations_exact
+            || trial.full_record_length != TORN_RECORD_BYTES
+            || trial.full_record_sha256.len() != 64
+            || !trial
+                .full_record_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || trial.cut_offset != offset
             || Some(trial.observed_size) != expected_observed
+            || Some(trial.target_size) != expected_truncated
             || Some(trial.truncated_size) != expected_truncated
+            || trial.live_source_size_after_copy != trial.observed_size
             || trial.growth_observed_ns == 0
             || trial.kill_ns < trial.growth_observed_ns
+            || trial.kill_boundary != "after-exact-full-record-growth"
         {
             return incomplete(
-                "row-53 did not observe full growth or truncate to pre_size+cut_offset".to_owned(),
+                "row-53 path/identity/trigger/growth/copy/cut receipts are inconsistent".to_owned(),
             );
         }
         growth_observed_trials = growth_observed_trials.saturating_add(1);
@@ -1146,12 +1204,36 @@ mod tests {
         let cut_offset = TORN_CUT_OFFSETS[((trial - 1) as usize) % TORN_CUT_OFFSETS.len()];
         JournalTornTailTrial {
             trial,
+            declared_source_path: "source/session/journal.jsonl".to_owned(),
+            source_path: "source/session/journal.jsonl".to_owned(),
+            copy_root: "source/session".to_owned(),
+            source_device_id: 1,
+            source_file_id: 2,
+            source_link_count: 1,
+            observed_device_id: 1,
+            observed_file_id: 2,
+            observed_link_count: 1,
+            source_is_regular: true,
             pre_size,
+            trigger_operation: "submit".to_owned(),
+            trigger_submit_result: "ok".to_owned(),
+            observed_sizes: vec![pre_size, pre_size + TORN_RECORD_BYTES],
             observed_size: pre_size + TORN_RECORD_BYTES,
+            full_record_length: TORN_RECORD_BYTES,
+            full_record_sha256: "b".repeat(64),
             cut_offset,
+            target_size: pre_size + cut_offset,
             truncated_size: pre_size + cut_offset,
+            copied_path: "copy/session/journal.jsonl".to_owned(),
+            copied_device_id: 1,
+            copied_file_id: 3,
+            copied_link_count: 1,
+            copied_is_regular: true,
+            live_source_size_after_copy: pre_size + TORN_RECORD_BYTES,
+            live_source_link_count_after_copy: 1,
             growth_observed_ns: 100 + u64::from(trial).saturating_mul(2),
             kill_ns: 101 + u64::from(trial).saturating_mul(2),
+            kill_boundary: "after-exact-full-record-growth".to_owned(),
             record_digest_matches: true,
             recovery_ms: 10.0,
             clean_recovery: true,
@@ -1185,6 +1267,39 @@ mod tests {
         reused_kill[1].growth_observed_ns = reused_kill[0].growth_observed_ns;
         reused_kill[1].kill_ns = reused_kill[0].kill_ns;
         assert!(!evaluate_journal_torn_tail_sweep(&reused_kill, 5).measurement_complete);
+
+        let mut symlink = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        symlink[0].source_is_regular = false;
+        assert!(!evaluate_journal_torn_tail_sweep(&symlink, 5).measurement_complete);
+
+        let mut live_truncated = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        live_truncated[0].live_source_size_after_copy = live_truncated[0].target_size;
+        assert!(!evaluate_journal_torn_tail_sweep(&live_truncated, 5).measurement_complete);
+
+        let mut missing_trigger = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        missing_trigger[0].trigger_submit_result.clear();
+        assert!(!evaluate_journal_torn_tail_sweep(&missing_trigger, 5).measurement_complete);
+
+        let mut wrong_path = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        wrong_path[0].source_path = "source/session/other.jsonl".to_owned();
+        assert!(!evaluate_journal_torn_tail_sweep(&wrong_path, 5).measurement_complete);
+
+        let mut wrong_identity = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        wrong_identity[0].observed_file_id = 9;
+        assert!(!evaluate_journal_torn_tail_sweep(&wrong_identity, 5).measurement_complete);
+
+        let mut multiply_linked = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        multiply_linked[0].source_link_count = 2;
+        assert!(!evaluate_journal_torn_tail_sweep(&multiply_linked, 5).measurement_complete);
+
+        let mut overshoot = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        let overshoot_size = overshoot[0].observed_size.saturating_add(1);
+        overshoot[0].observed_sizes.push(overshoot_size);
+        assert!(!evaluate_journal_torn_tail_sweep(&overshoot, 5).measurement_complete);
+
+        let mut wrong_target = (1..=5).map(torn_trial).collect::<Vec<_>>();
+        wrong_target[0].target_size = wrong_target[0].target_size.saturating_add(1);
+        assert!(!evaluate_journal_torn_tail_sweep(&wrong_target, 5).measurement_complete);
     }
 
     #[test]

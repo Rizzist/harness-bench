@@ -487,6 +487,8 @@ async fn observe_registered_command_tree(
     command_timeout: Duration,
     phase: String,
 ) -> Result<(Vec<Sample>, Option<Sample>)> {
+    const PUBLIC_CLOSE_DELETE_LIVE_COUNTER_ATTEMPTS: u32 = 32;
+
     let mut sampler = driver_platform_sampler();
     let started = std::time::Instant::now();
     let audit_timeout = command_timeout.saturating_add(Duration::from_secs(2));
@@ -496,7 +498,7 @@ async fn observe_registered_command_tree(
             sampler.as_mut(),
             &[pid],
             &phase,
-            3,
+            PUBLIC_CLOSE_DELETE_LIVE_COUNTER_ATTEMPTS,
             "public close-delete process observation",
         )?;
         crate::process::track_process_tree(&tree)?;
@@ -5859,6 +5861,7 @@ mod tests {
             metadata: None,
             narrative: None,
             compaction: None,
+            torn_tail: None,
         };
         let mut session = PersistedExecSession {
             local_id: "00000000-0000-4000-8000-000000000000".to_owned(),

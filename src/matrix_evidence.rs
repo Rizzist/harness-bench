@@ -380,6 +380,12 @@ pub fn capability_for_row(manifest: &Manifest, row: u8) -> CapabilityStatus {
             };
         }
         if !operation_surface_present(manifest, row) {
+            if row == 53 && manifest.events.torn_tail.is_none() {
+                return CapabilityStatus::Unsupported(
+                    "durable replay is declared, but no profile-contained copy-safe physical torn-tail journal operation is declared"
+                        .to_owned(),
+                );
+            }
             return CapabilityStatus::Unsupported(format!(
                 "capability {key} is declared but its operation surface is absent"
             ));
@@ -602,13 +608,23 @@ fn operation_surface_present(manifest: &Manifest, row: u8) -> bool {
                     || !manifest.sessions.attach.is_empty())
         }
         39 => !manifest.hooks.acceptance.is_empty() && !manifest.hooks.completion.is_empty(),
-        40 | 53 => {
+        40 => {
             manifest.events.framing == "jsonl"
                 && !manifest.events.cursor_pointer.is_empty()
                 && if manifest.transport.kind == TransportKind::Exec {
                     !manifest.events.replay_command.is_empty()
                 } else {
                     manifest.events.source == "journal" && !manifest.events.path.is_empty()
+                }
+        }
+        53 => {
+            manifest.events.torn_tail.is_some()
+                && manifest.events.framing == "jsonl"
+                && !manifest.events.cursor_pointer.is_empty()
+                && if manifest.transport.kind == TransportKind::Exec {
+                    !manifest.events.replay_command.is_empty()
+                } else {
+                    !manifest.sessions.attach.is_empty()
                 }
         }
         51 => manifest.resources.context_window.is_some(),
@@ -1272,6 +1288,28 @@ mod wave4_tests {
         assert!(matches!(
             capability_for_row(&manifest, 60),
             CapabilityStatus::Absent(reason) if reason.contains("truncation_marker")
+        ));
+    }
+
+    #[test]
+    fn torn_tail_capability_is_distinct_from_durable_replay() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let haider = crate::manifest::load(&root.join("adapters/haider-agent/manifest.toml"))
+            .expect("load Haider manifest");
+        assert!(matches!(
+            capability_for_row(&haider, 40),
+            CapabilityStatus::Supported
+        ));
+        assert!(matches!(
+            capability_for_row(&haider, 53),
+            CapabilityStatus::Unsupported(reason) if reason.contains("copy-safe physical torn-tail journal")
+        ));
+
+        let mock = crate::manifest::load(&root.join("adapters/mock/manifest.toml"))
+            .expect("load mock manifest");
+        assert!(matches!(
+            capability_for_row(&mock, 53),
+            CapabilityStatus::Supported
         ));
     }
 

@@ -27,8 +27,12 @@ pub fn fresh_dependency_value() -> Result<String> {
 pub fn extract_dependency_value(text: &str) -> Option<String> {
     for (offset, _) in text.match_indices(DEPENDENCY_PREFIX) {
         let start = offset + DEPENDENCY_PREFIX.len();
-        let end = start.checked_add(DECIMAL_OCTETS_LEN)?;
-        let decimal_octets = text.get(start..end)?;
+        let Some(end) = start.checked_add(DECIMAL_OCTETS_LEN) else {
+            continue;
+        };
+        let Some(decimal_octets) = text.get(start..end) else {
+            continue;
+        };
         let mut count = 0_usize;
         let valid = decimal_octets.split(' ').all(|octet| {
             count += 1;
@@ -95,6 +99,14 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn malformed_earlier_prefix_does_not_hide_a_later_complete_value() {
+        let value =
+            "AHRB row 3 non-credential nonce 000 001 002 003 004 005 006 007 008 009 010 255";
+        let decorated = format!("AHRB row 3 non-credential nonce broken\n{value}");
+        assert_eq!(extract_dependency_value(&decorated).as_deref(), Some(value));
     }
 
     #[test]

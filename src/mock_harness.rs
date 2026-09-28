@@ -1025,7 +1025,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
                  ahrb-mock-harness close-delete-session --state-dir PATH --session-id ID\n\
                  ahrb-mock-harness budget-trial --state-dir PATH \
                  (--max-tokens N|--max-cost USD|--max-time-ms N)\n\
-                 ahrb-mock-harness session-create --state-dir PATH --marker MARKER\n\
+                 ahrb-mock-harness session-create --state-dir PATH --marker MARKER [--session-id ID]\n\
                  ahrb-mock-harness session-close --state-dir PATH --session-id ID\n\
                  ahrb-mock-harness session-list --state-dir PATH\n\
                  ahrb-mock-harness storage-cleanup --profile DISPOSABLE --operation delete|uninstall [--session-id ID]\n\
@@ -1499,10 +1499,13 @@ fn cost_budget_terminal(limit: u64) -> Result<Value> {
 }
 
 fn session_create_command(args: &[String]) -> Result<i32> {
-    let options = parse_cli_options(args, &["--state-dir", "--marker"])?;
+    let options = parse_cli_options(args, &["--state-dir", "--marker", "--session-id"])?;
     let marker = required_cli_option(&options, "--marker")?;
     let mut harness = open_session_cli_harness(&options)?;
-    let session_id = harness.create_session(marker)?;
+    let session_id = match options.get("--session-id") {
+        Some(session_id) => harness.create_session_with_id(marker, session_id)?,
+        None => harness.create_session(marker)?,
+    };
     println!(
         "{}",
         json!({"schema_version":1,"operation":"create","terminal_type":"success","session_id":session_id})
@@ -3123,7 +3126,9 @@ async fn accept_turn(
         if let Some(evidence) = exec_template_evidence {
             payload["exec_template"] = serde_json::to_value(evidence)?;
         }
-        guard.append(id, EventVocab::TurnAccepted, payload)?;
+        if !turn.prompt.contains("AHRB-ROW53-LARGE-JOURNAL") {
+            guard.append(id, EventVocab::TurnAccepted, payload)?;
+        }
         guard.config.acceptance_hook.clone()
     };
     run_hook_and_record(harness, id, "acceptance", &turn.key, &hook).await?;
@@ -3224,17 +3229,10 @@ async fn execute_turn(
             if session_should_stop(guard.session_mut(id)?)? {
                 return Ok(());
             }
-            // The daemon stays alive independently of the worker, so a
-            // committed terminal record is useful prefix evidence there. A
-            // per-invocation client exits as soon as it observes a terminal;
-            // keep that client alive until the collector kills it instead.
-            if !config.declare_native_shell {
-                guard.append_terminal(
-                    id,
-                    EventVocab::TerminalSuccess,
-                    json!({"status":"success","fixture":"row53-prefix-committed"}),
-                )?;
-            }
+            // The one-MiB fixture must be the trigger's only append so the
+            // collector's pre-submit size is the exact record-relative base.
+            // Keep both daemon and per-invocation workers alive until AHRB
+            // observes the complete record and kills the owned tree.
             let session = guard.session_mut(id)?;
             session.journal.append_row53_large_record()?;
         }
@@ -4677,6 +4675,7 @@ fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) 
                             }))
                         }
                         Err(error) => Ok(json!({
+                            "schema":"ahrb.fixture.write.v1",
                             "ok": false,
                             "error": error.to_string(),
                             "write_errno": error.raw_os_error(),
@@ -4686,6 +4685,7 @@ fn fixture_result(config: &MockConfig, session: &str, name: &str, args: &Value) 
                 }
             }
             let mut result = json!({
+                "schema":"ahrb.fixture.write.v1",
                 "ok": true,
                 "bytes": content.len(),
                 "path": required_str(args, "path")?

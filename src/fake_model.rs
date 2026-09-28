@@ -1676,14 +1676,6 @@ fn render_native_arguments(
         };
         let mut arguments = Map::new();
         arguments.insert(field.clone(), command);
-        copy_allowed_semantic_arguments(
-            &mut arguments,
-            semantic_arguments,
-            &tool.name,
-            bindings,
-            &tool.schema,
-            Some(&field),
-        )?;
         return Ok(Value::Object(arguments));
     }
 
@@ -1694,7 +1686,6 @@ fn render_native_arguments(
         &tool.name,
         bindings,
         &tool.schema,
-        None,
     )?;
     if arguments.is_empty() && !semantic_arguments.is_empty() {
         return Err(AhrbError::Protocol(format!(
@@ -1730,11 +1721,10 @@ fn copy_allowed_semantic_arguments(
     native_name: &str,
     bindings: &Map<String, Value>,
     schema: &Value,
-    command_field: Option<&str>,
 ) -> Result<()> {
     for (field, value) in semantic_arguments {
         let target = binding_for(bindings, native_name, field)?.unwrap_or_else(|| field.clone());
-        if command_field == Some(target.as_str()) || !schema_allows_property(schema, &target) {
+        if !schema_allows_property(schema, &target) {
             continue;
         }
         output.insert(target, value.clone());
@@ -5276,8 +5266,7 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                    "additionalProperties": false
+                    "required": ["command"]
                 }
             }]
         });

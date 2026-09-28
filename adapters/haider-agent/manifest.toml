@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.972-stable-session-continuation-v1"
+revision = "0.0.972-torn-tail-capability-v1"
 
 [availability]
 exec_paths = ["haider"]
@@ -317,6 +317,10 @@ tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native
 sessions = "durable daemon sessions are listable with haider sessions --json --no-spawn"
 resume = "haider run --session <session-id> submits an ordinary headless continuation; resume/recover remain separate controls"
 durable_journal = "haider run --replay <run-id> replays the daemon-owned durable journal"
+
+# Row 53 is intentionally UNSUPPORTED under D5. Public replay is a logical
+# document and the only observed physical store is SQLite/WAL; neither is a
+# declared copy-safe append journal for exact record-relative truncation.
 
 # TODO(orchestrator): confirm the exact recovery-control JSON schemas
 # before replacing AHRB's conservative error/negative-field checks with

@@ -2022,6 +2022,8 @@ pub(crate) fn sample_live_with_counter_retries(
     max_attempts: u32,
     context: &str,
 ) -> Result<(ProcessTree, Sample)> {
+    const LIVE_COUNTER_RETRY_SETTLE: Duration = Duration::from_millis(5);
+
     if max_attempts == 0 {
         return Err(AhrbError::Validation(format!(
             "{context} live-counter retry count must be positive"
@@ -2072,10 +2074,12 @@ pub(crate) fn sample_live_with_counter_retries(
                 "{context} could not collect complete live thread/FD counters after {max_attempts} identity-safe attempts"
             )));
         }
-        // Give a live-to-exit transition time to settle before rediscovery.
-        // Back-to-back libproc reads can otherwise observe the same transient
-        // omission on every bounded attempt.
-        std::thread::sleep(Duration::from_millis(1));
+        // Give a live-to-exit or exec transition time to settle before
+        // rediscovery. Back-to-back libproc reads can otherwise exhaust the
+        // bounded attempts inside one scheduler slice and repeatedly observe
+        // the same transient omission. Every accepted sample still requires
+        // complete counters for the freshly discovered identities.
+        std::thread::sleep(LIVE_COUNTER_RETRY_SETTLE);
     }
     unreachable!("positive bounded retry loop always returns")
 }

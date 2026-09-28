@@ -141,6 +141,11 @@ framing = "jsonl"
 id_pointer = "/id"
 cursor_pointer = "/cursor"
 
+[events.torn_tail]
+operation = "submit"
+path = "{{profile}}/state/sessions/{{session_id}}/journal.jsonl"
+copy_root = "{{profile}}/state/sessions/{{session_id}}"
+
 [events.metadata]
 timestamp_pointer = "/payload/timestamp_ns"
 timestamp_format = "monotonic-ns"

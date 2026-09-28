@@ -645,10 +645,37 @@ pub struct EventMapping {
     /// Adapter-declared context-compaction signal and scope locations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionCapture>,
+    /// Destructive copied-journal torn-tail surface used only by row 53.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torn_tail: Option<TornTailJournal>,
 }
 
 fn default_replay_mode() -> String {
     "lines".to_owned()
+}
+
+/// A profile-contained physical append journal safe to copy and truncate away
+/// from the live profile. Durable replay alone does not imply this surface.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TornTailJournal {
+    /// Optional public preparation argv used to create the exact physical
+    /// journal before its pre-submit identity and size are captured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepare: Vec<String>,
+    /// Public operation that appends the exact row-53 record.
+    pub operation: TornTailOperation,
+    /// Exact physical journal file receiving the append.
+    pub path: String,
+    /// Smallest declared profile-contained tree needed for recovery.
+    pub copy_root: String,
+}
+
+/// Public operation used to trigger the destructive copied-journal trial.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TornTailOperation {
+    /// Submit the row-53 workflow through the ordinary session driver.
+    Submit,
 }
 
 /// Raw-event metadata used for event completeness and usage reporting.
@@ -1590,6 +1617,36 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         return Err(AhrbError::Validation(
             "events.path must be lexically contained under {{profile}}".to_owned(),
         ));
+    }
+    if let Some(torn_tail) = &manifest.events.torn_tail {
+        if torn_tail
+            .prepare
+            .iter()
+            .any(|argument| argument.trim().is_empty())
+        {
+            return Err(AhrbError::Validation(
+                "events.torn_tail.prepare cannot contain empty argv fragments".to_owned(),
+            ));
+        }
+        for (label, template) in [
+            ("events.torn_tail.path", torn_tail.path.as_str()),
+            ("events.torn_tail.copy_root", torn_tail.copy_root.as_str()),
+        ] {
+            if !profile_scoped_template(template) {
+                return Err(AhrbError::Validation(format!(
+                    "{label} must be lexically contained under {{{{profile}}}}"
+                )));
+            }
+        }
+        let normalized_path = normalized_profile_template(&torn_tail.path);
+        let normalized_root = normalized_profile_template(&torn_tail.copy_root);
+        if !Path::new(&normalized_path).starts_with(Path::new(&normalized_root))
+            || normalized_path == normalized_root
+        {
+            return Err(AhrbError::Validation(
+                "events.torn_tail.path must be a file below events.torn_tail.copy_root".to_owned(),
+            ));
+        }
     }
     for (label, paths) in [
         ("sessions.store_paths", Some(&manifest.sessions.store_paths)),

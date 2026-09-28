@@ -91,6 +91,12 @@ id_pointer = "/id"
 cursor_pointer = "/cursor"
 replay_command = ["target/debug/ahrb-mock-harness", "inspect-journal", "--state-dir", "{{profile}}/state", "--session", "{{session_id}}", "--after", "{{cursor}}"]
 
+[events.torn_tail]
+prepare = ["target/debug/ahrb-mock-harness", "session-create", "--state-dir", "{{profile}}/state", "--marker", "{{actor}}", "--session-id", "{{session_id}}"]
+operation = "submit"
+path = "{{profile}}/state/sessions/{{session_id}}/journal.jsonl"
+copy_root = "{{profile}}/state/sessions/{{session_id}}"
+
 [events.metadata]
 timestamp_pointer = "/payload/timestamp_ns"
 timestamp_format = "monotonic-ns"

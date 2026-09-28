@@ -19,14 +19,43 @@ fn main() {
 fn run(args: &[String]) -> Result<i32> {
     match args.first().map(String::as_str) {
         Some("write") => {
-            let path = fixture_path(required(args, "--path")?)?;
+            let declared_path = required(args, "--path")?;
+            let path = fixture_path(declared_path)?;
             let content = required(args, "--content")?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+            let result = (|| -> std::io::Result<()> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, content.as_bytes())
+            })();
+            match result {
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema":"ahrb.fixture.write.v1",
+                            "ok":true,
+                            "path":declared_path,
+                            "write_errno":serde_json::Value::Null,
+                            "bytes":content.len(),
+                        })
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema":"ahrb.fixture.write.v1",
+                            "ok":false,
+                            "path":declared_path,
+                            "write_errno":error.raw_os_error(),
+                            "error":error.to_string(),
+                        })
+                    );
+                    Ok(1)
+                }
             }
-            std::fs::write(&path, content.as_bytes())?;
-            println!("wrote {} bytes to {}", content.len(), path.display());
-            Ok(0)
         }
         Some("write-row3-dependency") => {
             let path = fixture_path(required(args, "--path")?)?;

@@ -1131,7 +1131,7 @@ fn versioned_haider_manifests_separate_continuation_from_legacy_controls() {
     let manifest = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
     assert_eq!(
         manifest.identity.revision,
-        "0.0.972-stable-session-continuation-v1"
+        "0.0.972-torn-tail-capability-v1"
     );
     assert_eq!(
         manifest.resources.log_paths.as_ref().unwrap(),

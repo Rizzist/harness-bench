@@ -1629,6 +1629,11 @@ pub fn evaluate_large_tool_output(
 pub struct WorkspaceFaultTrial {
     pub repetition: u32,
     pub kind: String,
+    pub call_id: String,
+    pub target_path: String,
+    pub result_path: Option<String>,
+    pub structured_result: Option<Value>,
+    pub native_result_carrier: Option<Value>,
     pub write_errno: Option<i32>,
     pub control_write_errno: Option<i32>,
     pub structured_failure: bool,
@@ -1713,10 +1718,34 @@ pub fn evaluate_workspace_fault(
             );
         }
         if !trial.crashed && !trial.hung {
-            let Some(write_errno) = trial.write_errno else {
+            if trial.call_id.is_empty()
+                || trial.target_path.is_empty()
+                || trial
+                    .structured_result
+                    .as_ref()
+                    .and_then(|result| result.get("schema").and_then(Value::as_str))
+                    != Some("ahrb.fixture.write.v1")
+                || trial.native_result_carrier.is_none()
+                || trial.result_path.is_none()
+            {
                 return incomplete(
-                    "ordinary fixture structured result omitted write_errno".to_owned(),
+                    "ordinary fixture result lacks exact call/path/native-carrier mapping"
+                        .to_owned(),
                 );
+            }
+            let Some(write_errno) = trial.write_errno else {
+                let readable_success = trial
+                    .structured_result
+                    .as_ref()
+                    .and_then(|result| result.get("ok"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if !readable_success {
+                    return incomplete(
+                        "ordinary fixture structured failure omitted write_errno".to_owned(),
+                    );
+                }
+                continue;
             };
             if !allowed_errno(write_errno) {
                 return incomplete(
@@ -1733,6 +1762,7 @@ pub fn evaluate_workspace_fault(
             && trial.outside_writes == 0
             && trial.residue_processes == 0
             && !trial.target_written
+            && trial.result_path.as_deref() == Some(trial.target_path.as_str())
             && !trial.success_contradiction
             && !trial.crashed
             && !trial.hung
@@ -1778,6 +1808,11 @@ pub fn evaluate_workspace_fault(
             "trials":trials.iter().map(|trial|json!({
                 "repetition":trial.repetition,
                 "kind":trial.kind,
+                "call_id":trial.call_id,
+                "target_path":trial.target_path,
+                "result_path":trial.result_path,
+                "structured_result":trial.structured_result,
+                "native_result_carrier":trial.native_result_carrier,
                 "write_errno":trial.write_errno,
                 "control_write_errno":trial.control_write_errno,
                 "target_existed_before":trial.target_existed_before,
@@ -1927,6 +1962,15 @@ mod tests {
         let trial = WorkspaceFaultTrial {
             repetition: 1,
             kind: "read-only-directory".to_owned(),
+            call_id: "call-workspace-fault-r1".to_owned(),
+            target_path: "row-61-denied.txt".to_owned(),
+            result_path: Some("row-61-denied.txt".to_owned()),
+            structured_result: Some(
+                json!({"schema":"ahrb.fixture.write.v1","ok":false,"path":"row-61-denied.txt","write_errno":libc::EACCES}),
+            ),
+            native_result_carrier: Some(
+                json!({"stdout":"{\"schema\":\"ahrb.fixture.write.v1\",\"ok\":false,\"path\":\"row-61-denied.txt\",\"write_errno\":13}"}),
+            ),
             write_errno: Some(libc::EACCES),
             control_write_errno: None,
             structured_failure: true,
@@ -1957,6 +2001,15 @@ mod tests {
         let trial = WorkspaceFaultTrial {
             repetition: 1,
             kind: "read-only-directory".to_owned(),
+            call_id: "call-workspace-fault-r1".to_owned(),
+            target_path: "row-61-denied.txt".to_owned(),
+            result_path: Some("row-61-denied.txt".to_owned()),
+            structured_result: Some(
+                json!({"schema":"ahrb.fixture.write.v1","ok":false,"path":"row-61-denied.txt","write_errno":libc::EACCES}),
+            ),
+            native_result_carrier: Some(
+                json!({"stdout":"{\"schema\":\"ahrb.fixture.write.v1\",\"ok\":false,\"path\":\"row-61-denied.txt\",\"write_errno\":13}"}),
+            ),
             write_errno: Some(libc::EACCES),
             control_write_errno: Some(libc::EACCES),
             structured_failure: false,

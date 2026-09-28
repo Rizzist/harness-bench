@@ -84,13 +84,13 @@ fn reference_mock_pins_all_six_economy_columns() {
     // The six MVP columns: turns; total reference tokens; calls/batching;
     // peak/last context; scripted completion; reference cost.
     assert_eq!(summary.model_turns, 8);
-    assert_eq!(summary.total_reference_tokens, 96_426);
+    assert_eq!(summary.total_reference_tokens, 97_791);
     assert_eq!(summary.tool_calls, 17);
     assert_eq!(summary.tool_batching_factor, 17.0 / 7.0);
-    assert_eq!(summary.last_context_size_tokens, 17_132);
+    assert_eq!(summary.last_context_size_tokens, 17_342);
     assert_eq!(summary.completion, EconomyCompletion::Completed);
-    assert_eq!(summary.reference_cost_usd, 0.964_26);
-    assert_eq!(summary.tokens_per_completed_task, Some(96_426));
+    assert_eq!(summary.reference_cost_usd, 0.977_91);
+    assert_eq!(summary.tokens_per_completed_task, Some(97_791));
     assert_eq!(summary.cost_outcome_label, COST_OUTCOME_LABEL);
     assert!(summary.effects_verified.all_verified);
     assert_eq!(summary.effects_verified.label, EFFECTS_VERIFIED_LABEL);
@@ -176,13 +176,13 @@ fn reference_mock_pins_all_five_v3_full_economy_columns() {
     let summary = report.economy_summary.expect("v3-full economy summary");
 
     assert_eq!(summary.schema, 4);
-    assert_eq!(summary.cache_eligible_fraction, 0.817_066_502_631_399_1);
-    assert_eq!(summary.redundant_tokens, 71_626);
+    assert_eq!(summary.cache_eligible_fraction, 0.817_511_861_897_230_6);
+    assert_eq!(summary.redundant_tokens, 72_781);
     assert_eq!(
         summary.context_token_curve,
-        vec![1_249, 6_422, 11_360, 14_331, 14_712, 15_108, 16_112, 17_132]
+        vec![1_249, 6_597, 11_535, 14_506, 14_922, 15_318, 16_322, 17_342]
     );
-    assert_eq!(summary.context_token_curve_slope, 1_730.5);
+    assert_eq!(summary.context_token_curve_slope, 1_742.166_666_666_666_3);
     assert!(summary.context_token_curve_last_matches_last_context_size);
     assert_eq!(summary.per_turn_fixed_overhead_tokens, 1_049);
     assert_eq!(summary.wasted_tool_call_count, 0);
@@ -244,8 +244,8 @@ fn reference_mock_pins_schema_four_cache_economics() {
         summary.cache_input_discount_label,
         CACHE_INPUT_DISCOUNT_LABEL
     );
-    assert_eq!(summary.effective_reference_tokens, 25_518.190_875_538_24);
-    assert_eq!(summary.effective_cost_usd, 0.255_181_908_755_382_4);
+    assert_eq!(summary.effective_reference_tokens, 25_840.227_761_887_127);
+    assert_eq!(summary.effective_cost_usd, 0.258_402_277_618_871_3);
     assert_eq!(summary.effective_cost_label, EFFECTIVE_COST_LABEL);
     assert_eq!(summary.stable_prefix_preserved_fraction, 1.0);
     assert_eq!(summary.cache_bust_count, 0);

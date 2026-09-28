@@ -97,6 +97,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static CREATED_PROFILES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+const ROW61_TARGET_PATH: &str = "read-only/row-61-denied.txt";
 
 type RunTeardownAudit = crate::process::RunTeardownEvidence;
 
@@ -269,6 +270,11 @@ struct ResumeLatencyTrials {
     events: Vec<NormalizedEvent>,
     requests: Vec<crate::fake_model::ModelRequestRecord>,
     points: Vec<ResumeLatencyPoint>,
+}
+
+struct JournalTornTailTrials {
+    events: Vec<NormalizedEvent>,
+    evidence: Vec<JournalTornTailTrial>,
 }
 
 struct SlowStreamStallTrials {
@@ -6922,7 +6928,10 @@ async fn run_inner_timed(
         )
         .await
         {
-            Ok(trials) => Some(trials),
+            Ok(trials) => {
+                events.insert(53_u8, trials.events.clone());
+                Some(trials)
+            }
             Err(error) => {
                 let detail = format!("journal-torn-tail-sweep evidence collection: {error}");
                 row_errors.insert(53, detail.clone());
@@ -7801,7 +7810,9 @@ async fn run_inner_timed(
         Profile::Cert => 25_u32,
     };
     let row53_evaluation = evaluate_journal_torn_tail_sweep(
-        row53_trials.as_deref().unwrap_or(&[]),
+        row53_trials
+            .as_ref()
+            .map_or(&[][..], |trials| trials.evidence.as_slice()),
         row53_expected_trials,
     );
     let child_failure_repetitions = match options.profile {
@@ -14120,6 +14131,7 @@ fn copy_row53_tree(source: &Path, destination: &Path) -> Result<()> {
             copy_row53_tree(&entry.path(), &destination.join(entry.file_name()))?;
         }
     } else if metadata.is_file() {
+        row53_regular_file_identity(source, "recovery-copy source")?;
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -14131,6 +14143,273 @@ fn copy_row53_tree(source: &Path, destination: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Row53FileIdentity {
+    device_id: u64,
+    file_id: u64,
+    size: u64,
+    link_count: u64,
+}
+
+fn row53_regular_file_identity(path: &Path, label: &str) -> Result<Row53FileIdentity> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "row-53 {label} {} is unavailable: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(AhrbError::Protocol(format!(
+            "row-53 {label} {} is not a regular non-symlink file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let link_count = metadata.nlink();
+        if link_count > 1 {
+            return Err(AhrbError::Protocol(format!(
+                "row-53 {label} {} has {link_count} hard links; exactly one is required",
+                path.display()
+            )));
+        }
+        Ok(Row53FileIdentity {
+            device_id: metadata.dev(),
+            file_id: metadata.ino(),
+            size: metadata.len(),
+            link_count,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let canonical = std::fs::canonicalize(path)?;
+        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+        Ok(Row53FileIdentity {
+            device_id: 0,
+            file_id: u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8])),
+            size: metadata.len(),
+            link_count: 1,
+        })
+    }
+}
+
+fn row53_validate_declared_path(path: &Path, root: &Path, label: &str) -> Result<PathBuf> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        AhrbError::Protocol(format!(
+            "row-53 declared {label} {} is outside disposable profile {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AhrbError::Protocol(format!(
+            "row-53 declared {label} is not a strict profile-relative path"
+        )));
+    }
+
+    let root_metadata = std::fs::symlink_metadata(root).map_err(|error| {
+        AhrbError::Protocol(format!(
+            "row-53 disposable profile {} is unavailable: {error}",
+            root.display()
+        ))
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(AhrbError::Protocol(format!(
+            "row-53 disposable profile {} is not a regular directory",
+            root.display()
+        )));
+    }
+    let canonical_root = std::fs::canonicalize(root)?;
+    let mut cursor = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        cursor.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&cursor).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "row-53 declared {label} component {} is unavailable: {error}",
+                cursor.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(AhrbError::Protocol(format!(
+                "row-53 declared {label} component {} is a symlink",
+                cursor.display()
+            )));
+        }
+        if components.peek().is_some() && !metadata.is_dir() {
+            return Err(AhrbError::Protocol(format!(
+                "row-53 declared {label} ancestor {} is not a directory",
+                cursor.display()
+            )));
+        }
+    }
+    let canonical_path = std::fs::canonicalize(path)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(AhrbError::Protocol(format!(
+            "row-53 declared {label} {} resolves outside disposable profile {}",
+            path.display(),
+            root.display()
+        )));
+    }
+    Ok(relative.to_path_buf())
+}
+
+#[cfg(test)]
+mod row53_path_tests {
+    use super::*;
+
+    fn fresh_fixture(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ahrb-row53-path-{label}-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn row53_declared_regular_paths_are_profile_contained() {
+        let fixture = fresh_fixture("regular");
+        let profile = fixture.join("profile");
+        let copy_root = profile.join("state/sessions/session-1");
+        let journal = copy_root.join("journal.jsonl");
+        std::fs::create_dir_all(&copy_root).expect("create row-53 copy root");
+        std::fs::write(&journal, b"{}\n").expect("write row-53 journal");
+
+        assert_eq!(
+            row53_validate_declared_path(&copy_root, &profile, "copy root")
+                .expect("accept regular copy root"),
+            PathBuf::from("state/sessions/session-1")
+        );
+        assert_eq!(
+            row53_validate_declared_path(&journal, &profile, "journal path")
+                .expect("accept regular journal path"),
+            PathBuf::from("state/sessions/session-1/journal.jsonl")
+        );
+        std::fs::remove_dir_all(fixture).expect("remove row-53 regular fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn row53_rejects_multiply_linked_files_without_modifying_the_outside_link() {
+        let fixture = fresh_fixture("hard-link");
+        let profile = fixture.join("profile");
+        let copy_root = profile.join("state/sessions/session-1");
+        let journal = copy_root.join("journal.jsonl");
+        let outside = fixture.join("outside-journal.jsonl");
+        let destination = fixture.join("recovery-copy");
+        let expected = b"{\"cursor\":1}\n";
+        std::fs::create_dir_all(&copy_root).expect("create row-53 copy root");
+        std::fs::write(&journal, expected).expect("write row-53 journal");
+        std::fs::hard_link(&journal, &outside).expect("create outside hard link");
+
+        let identity_error = row53_regular_file_identity(&journal, "declared journal")
+            .expect_err("reject multiply linked source journal");
+        assert!(identity_error.to_string().contains("2 hard links"));
+        let copy_error = copy_row53_tree(&copy_root, &destination)
+            .expect_err("reject multiply linked recovery-copy source");
+        assert!(copy_error.to_string().contains("2 hard links"));
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside hard link after rejection"),
+            expected
+        );
+
+        std::fs::remove_file(&outside).expect("remove outside hard link");
+        let identity = row53_regular_file_identity(&journal, "declared journal")
+            .expect("accept single-link source journal");
+        assert_eq!(identity.link_count, 1);
+        copy_row53_tree(&copy_root, &destination).expect("copy single-link recovery tree");
+        assert_eq!(
+            std::fs::read(destination.join("journal.jsonl"))
+                .expect("read copied single-link journal"),
+            expected
+        );
+        assert_eq!(
+            row53_regular_file_identity(&destination.join("journal.jsonl"), "copied journal")
+                .expect("inspect copied single-link journal")
+                .link_count,
+            1
+        );
+
+        std::fs::remove_dir_all(fixture).expect("remove row-53 hard-link fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn row53_declared_journal_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fresh_fixture("journal-symlink");
+        let profile = fixture.join("profile");
+        let outside = fixture.join("outside");
+        std::fs::create_dir_all(&profile).expect("create row-53 profile");
+        std::fs::create_dir_all(&outside).expect("create row-53 outside directory");
+        std::fs::write(outside.join("journal.jsonl"), b"{}\n").expect("write outside journal");
+        symlink(&outside, profile.join("sessions")).expect("create journal ancestor symlink");
+
+        let error = row53_validate_declared_path(
+            &profile.join("sessions/journal.jsonl"),
+            &profile,
+            "journal path",
+        )
+        .expect_err("reject journal beneath symlinked ancestor");
+        assert!(error.to_string().contains("component") && error.to_string().contains("symlink"));
+        std::fs::remove_dir_all(fixture).expect("remove row-53 journal symlink fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn row53_declared_copy_root_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fresh_fixture("copy-root-symlink");
+        let profile = fixture.join("profile");
+        let outside = fixture.join("outside/sessions/session-1");
+        std::fs::create_dir_all(&profile).expect("create row-53 profile");
+        std::fs::create_dir_all(&outside).expect("create outside copy root");
+        symlink(fixture.join("outside"), profile.join("state"))
+            .expect("create copy-root ancestor symlink");
+
+        let error = row53_validate_declared_path(
+            &profile.join("state/sessions/session-1"),
+            &profile,
+            "copy root",
+        )
+        .expect_err("reject copy root beneath symlinked ancestor");
+        assert!(error.to_string().contains("component") && error.to_string().contains("symlink"));
+        std::fs::remove_dir_all(fixture).expect("remove row-53 copy-root symlink fixture");
+    }
+}
+
+fn persist_row53_receipt(run_profile_root: &Path, trial: u32, receipt: &Value) -> Result<PathBuf> {
+    let directory = run_profile_root.join("row53-receipts");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("trial-{trial:02}.json"));
+    let temporary = directory.join(format!("trial-{trial:02}.json.tmp"));
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    use std::io::Write as _;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &path)?;
+    std::fs::File::open(&directory)?.sync_all()?;
+    Ok(path)
 }
 
 fn row53_record_digest() -> String {
@@ -14219,15 +14498,23 @@ async fn collect_journal_torn_tail_trials(
     profile: Profile,
     run_profile_root: &Path,
     manifest_hash: &str,
-) -> Result<Vec<JournalTornTailTrial>> {
+) -> Result<JournalTornTailTrials> {
     const RECORD_BYTES: u64 = 1_048_576;
     const CUTS: [u64; 5] = [0, 262_144, 524_288, 786_432, 1_048_575];
     let expected_trials = match profile {
         Profile::Quick => 5_u32,
         Profile::Cert => 25_u32,
     };
+    let torn_tail = manifest.events.torn_tail.as_ref().ok_or_else(|| {
+        AhrbError::Unsupported(
+            "row-53 requires a declared copy-safe physical torn-tail journal".to_owned(),
+        )
+    })?;
     let expected_digest = row53_record_digest();
-    let mut trials = Vec::with_capacity(expected_trials as usize);
+    let mut collected = JournalTornTailTrials {
+        events: Vec::new(),
+        evidence: Vec::with_capacity(expected_trials as usize),
+    };
     for trial_number in 1..=expected_trials {
         let group = trial_number;
         let stage = std::cell::Cell::new("prepare source profile");
@@ -14309,34 +14596,133 @@ async fn collect_journal_torn_tail_trials(
             let session = source_driver.create_session(&actor_name).await?;
             let mut journal_variables = source_variables.clone();
             journal_variables.insert("session_id".to_owned(), session.0.clone());
+            journal_variables.insert("actor".to_owned(), actor_name.clone());
+            stage.set("prepare declared source journal");
+            let prepare_result = if torn_tail.prepare.is_empty() {
+                json!({"operation":"already-created","exit_code":0})
+            } else {
+                let prepare_argv = render_argv(&torn_tail.prepare, &journal_variables)?;
+                let observation = run_wave4_command(
+                    &prepare_argv,
+                    &source_environment,
+                    Duration::from_secs(10),
+                    manifest.capture.max_bytes,
+                )
+                .await?;
+                if observation.exit_code != Some(0) {
+                    return Err(AhrbError::Protocol(format!(
+                        "row-53 declared journal preparation failed with {:?}: {}",
+                        observation.exit_code,
+                        String::from_utf8_lossy(&observation.stderr).trim()
+                    )));
+                }
+                json!({
+                    "operation":"argv",
+                    "argv":observation.argv,
+                    "exit_code":observation.exit_code,
+                    "stdout":String::from_utf8_lossy(&observation.stdout),
+                    "stderr":String::from_utf8_lossy(&observation.stderr),
+                    "terminal":observation.terminal,
+                })
+            };
             let source_journal = PathBuf::from(crate::manifest::render_template(
-                &manifest.events.path,
+                &torn_tail.path,
                 &journal_variables,
             )?);
-            stage.set("read source journal baseline");
-            let initial_size = match std::fs::metadata(&source_journal) {
-                Ok(metadata) => metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(error) => return Err(error.into()),
-            };
+            let source_copy_root = PathBuf::from(crate::manifest::render_template(
+                &torn_tail.copy_root,
+                &journal_variables,
+            )?);
+            let source_relative =
+                row53_validate_declared_path(&source_journal, &source_root, "journal path")?;
+            let copy_root_relative =
+                row53_validate_declared_path(&source_copy_root, &source_root, "copy root")?;
+            if !source_relative.starts_with(&copy_root_relative) {
+                return Err(AhrbError::Protocol(format!(
+                    "row-53 declared journal {} is outside copy root {}",
+                    source_journal.display(),
+                    source_copy_root.display()
+                )));
+            }
+            let copy_root_metadata = std::fs::symlink_metadata(&source_copy_root)?;
+            if copy_root_metadata.file_type().is_symlink() || !copy_root_metadata.is_dir() {
+                return Err(AhrbError::Protocol(format!(
+                    "row-53 copy root {} is not a regular directory",
+                    source_copy_root.display()
+                )));
+            }
+            stage.set("persist source journal baseline");
+            let source_identity = row53_regular_file_identity(&source_journal, "declared journal")?;
+            let pre_size = source_identity.size;
+            let mut observed_sizes = vec![pre_size];
+            let mut receipt = json!({
+                "trial":trial_number,
+                "declared_source_path":source_journal,
+                "source_path":source_journal,
+                "copy_root":source_copy_root,
+                "source_identity":{
+                    "device_id":source_identity.device_id,
+                    "file_id":source_identity.file_id,
+                    "link_count":source_identity.link_count,
+                },
+                "pre_size":pre_size,
+                "prepare_result":prepare_result,
+                "trigger_operation":"submit",
+                "trigger_submit_result":Value::Null,
+                "observed_sizes":observed_sizes,
+                "full_record_length":Value::Null,
+                "full_record_sha256":Value::Null,
+                "kill_boundary":Value::Null,
+                "copied_path":Value::Null,
+                "target_size":Value::Null,
+            });
+            persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
             stage.set("submit source torn-tail turn");
-            source_driver
+            let submit_result = source_driver
                 .submit(&session, &actor.prompt, &format!("row-53-source-{group}"))
-                .await?;
+                .await;
+            receipt["trigger_submit_result"] = Value::String(
+                submit_result
+                    .as_ref()
+                    .map(|()| "ok".to_owned())
+                    .unwrap_or_else(|error| format!("error: {error}")),
+            );
+            persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
+            submit_result?;
             stage.set("observe source journal growth");
             let watch_started = Instant::now();
             let mut growth_observed_ns = 0_u64;
-            let observed_size = loop {
-                let size = match std::fs::metadata(&source_journal) {
-                    Ok(metadata) => metadata.len(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                    Err(error) => return Err(error.into()),
-                };
-                if size > initial_size && growth_observed_ns == 0 {
+            let (observed_size, observed_link_count) = loop {
+                let observed_identity =
+                    row53_regular_file_identity(&source_journal, "declared journal")?;
+                if (observed_identity.device_id, observed_identity.file_id)
+                    != (source_identity.device_id, source_identity.file_id)
+                {
+                    return Err(AhrbError::Protocol(
+                        "row-53 source journal changed identity while being watched".to_owned(),
+                    ));
+                }
+                let size = observed_identity.size;
+                if observed_sizes.last() != Some(&size) {
+                    observed_sizes.push(size);
+                    receipt["observed_sizes"] = serde_json::to_value(&observed_sizes)?;
+                    persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
+                }
+                if size > pre_size && growth_observed_ns == 0 {
                     growth_observed_ns = monotonic_timestamp_ns();
                 }
-                if size >= initial_size.saturating_add(RECORD_BYTES) {
-                    break size;
+                let expected_size = pre_size.checked_add(RECORD_BYTES).ok_or_else(|| {
+                    AhrbError::Protocol("row-53 expected size overflow".to_owned())
+                })?;
+                if size > expected_size {
+                    return Err(AhrbError::Protocol(format!(
+                        "row-53 journal overshot exact target {expected_size} with size {size}"
+                    )));
+                }
+                if size == expected_size {
+                    receipt["observed_link_count"] = Value::from(observed_identity.link_count);
+                    persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
+                    break (size, observed_identity.link_count);
                 }
                 if watch_started.elapsed() >= Duration::from_secs(10) {
                     return Err(AhrbError::Timeout(
@@ -14345,20 +14731,18 @@ async fn collect_journal_torn_tail_trials(
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             };
-            let pre_size = observed_size.checked_sub(RECORD_BYTES).ok_or_else(|| {
-                AhrbError::Protocol(
-                    "row-53 observed journal is shorter than its fixture".to_owned(),
-                )
-            })?;
             if observed_size != pre_size.saturating_add(RECORD_BYTES) {
                 return Err(AhrbError::Protocol(
                     "row-53 journal grew beyond the exact fixture boundary".to_owned(),
                 ));
             }
-            let record_digest_matches =
-                row53_tail_digest(&source_journal, pre_size)? == expected_digest;
+            let full_record_sha256 = row53_tail_digest(&source_journal, pre_size)?;
+            let record_digest_matches = full_record_sha256 == expected_digest;
             let committed = row53_committed_prefix(&source_journal, pre_size)?;
             let committed_hash = stable_json_stream_hash(&committed)?;
+            receipt["full_record_length"] = Value::from(RECORD_BYTES);
+            receipt["full_record_sha256"] = Value::String(full_record_sha256.clone());
+            persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
             stage.set("discover and kill source process tree");
             let mut sampler = platform_sampler();
             let roots = verified_process_roots(
@@ -14369,6 +14753,10 @@ async fn collect_journal_torn_tail_trials(
             )?;
             let tree = sampler.discover(&roots)?;
             let kill_ns = signal_row53_kill(&tree)?;
+            receipt["growth_observed_ns"] = Value::from(growth_observed_ns);
+            receipt["kill_ns"] = Value::from(kill_ns);
+            receipt["kill_boundary"] = Value::String("after-exact-full-record-growth".to_owned());
+            persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
             source_driver.reap_after_external_kill().await?;
             if !await_owned_tree_empty(sampler.as_mut(), &roots, Duration::from_secs(10)).await? {
                 return Err(AhrbError::Protocol(
@@ -14377,9 +14765,6 @@ async fn collect_journal_torn_tail_trials(
             }
             drop(source_driver);
             stage.set("validate source store placement");
-            let source_session_dir = source_journal.parent().ok_or_else(|| {
-                AhrbError::Protocol("row-53 source journal has no session directory".to_owned())
-            })?;
             let source_store_roots = crate::manifest::render_session_store_paths(
                 manifest,
                 &source_variables,
@@ -14387,38 +14772,85 @@ async fn collect_journal_torn_tail_trials(
             )?;
             if !source_store_roots
                 .iter()
-                .any(|root| source_session_dir.starts_with(root))
+                .any(|root| source_copy_root.starts_with(root))
             {
                 return Err(AhrbError::Protocol(format!(
-                    "row-53 source journal {} is outside declared session stores",
-                    source_journal.display()
+                    "row-53 copy root {} is outside declared session stores",
+                    source_copy_root.display()
                 )));
             }
-            let journal_relative = source_journal.strip_prefix(&source_root).map_err(|_| {
-                AhrbError::Protocol(format!(
-                    "row-53 source journal {} is outside profile {}",
-                    source_journal.display(),
-                    source_root.display()
-                ))
-            })?;
             let cut_offset = CUTS[usize::try_from(trial_number.saturating_sub(1))
                 .unwrap_or(usize::MAX)
                 % CUTS.len()];
             stage.set("prepare recovery profile");
             let trial_root = run_profile_root.join(format!("dr53-trial-{trial_number}"));
             prepare_profile(manifest, &trial_root)?;
-            let target_journal = trial_root.join(journal_relative);
-            let target_session_dir = target_journal.parent().ok_or_else(|| {
-                AhrbError::Protocol("row-53 target journal has no session directory".to_owned())
-            })?;
+            let target_journal = trial_root.join(&source_relative);
+            let target_copy_root = trial_root.join(&copy_root_relative);
+            if target_journal == source_journal || target_copy_root == source_copy_root {
+                return Err(AhrbError::Protocol(
+                    "row-53 copy resolved back into the live source profile".to_owned(),
+                ));
+            }
             stage.set("copy and truncate recovery journal");
-            copy_row53_tree(source_session_dir, target_session_dir)?;
+            copy_row53_tree(&source_copy_root, &target_copy_root)?;
+            row53_validate_declared_path(&target_copy_root, &trial_root, "copied root")?;
+            row53_validate_declared_path(&target_journal, &trial_root, "copied journal")?;
+            let copied_identity = row53_regular_file_identity(&target_journal, "copied journal")?;
+            if (copied_identity.device_id, copied_identity.file_id)
+                == (source_identity.device_id, source_identity.file_id)
+            {
+                return Err(AhrbError::Protocol(
+                    "row-53 copied journal retained the live source file identity".to_owned(),
+                ));
+            }
             let truncated_size = pre_size.saturating_add(cut_offset);
+            receipt["copied_path"] = serde_json::to_value(&target_journal)?;
+            receipt["copied_identity"] = json!({
+                "device_id":copied_identity.device_id,
+                "file_id":copied_identity.file_id,
+                "link_count":copied_identity.link_count,
+            });
+            receipt["cut_offset"] = Value::from(cut_offset);
+            receipt["target_size"] = Value::from(truncated_size);
+            persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
             let target_file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&target_journal)?;
             target_file.set_len(truncated_size)?;
             target_file.sync_all()?;
+            let truncated_identity =
+                row53_regular_file_identity(&target_journal, "copied journal")?;
+            if (truncated_identity.device_id, truncated_identity.file_id)
+                != (copied_identity.device_id, copied_identity.file_id)
+                || truncated_identity.size != truncated_size
+            {
+                return Err(AhrbError::Protocol(
+                    "row-53 copied journal identity or exact target size changed during truncation"
+                        .to_owned(),
+                ));
+            }
+            let live_identity_after_copy =
+                row53_regular_file_identity(&source_journal, "declared journal")?;
+            if live_identity_after_copy
+                != (Row53FileIdentity {
+                    device_id: source_identity.device_id,
+                    file_id: source_identity.file_id,
+                    size: observed_size,
+                    link_count: source_identity.link_count,
+                })
+            {
+                return Err(AhrbError::Protocol(
+                    "row-53 live source journal changed or was truncated while preparing its copy"
+                        .to_owned(),
+                ));
+            }
+            receipt["truncated_size"] = Value::from(truncated_identity.size);
+            receipt["truncated_link_count"] = Value::from(truncated_identity.link_count);
+            receipt["live_source_size_after_copy"] = Value::from(live_identity_after_copy.size);
+            receipt["live_source_link_count_after_copy"] =
+                Value::from(live_identity_after_copy.link_count);
+            persist_row53_receipt(run_profile_root, trial_number, &receipt)?;
 
             stage.set("render recovery environment");
             let mut variables = BTreeMap::from([
@@ -14512,14 +14944,40 @@ async fn collect_journal_torn_tail_trials(
             stage.set("close recovered session");
             recovered_driver.close(&session).await?;
             recovered_driver.shutdown().await?;
-            trials.push(JournalTornTailTrial {
+            collected.events.extend(recovered.clone());
+            collected.events.extend(post_committed_suffix.clone());
+            collected.evidence.push(JournalTornTailTrial {
                 trial: trial_number,
+                declared_source_path: source_journal.to_string_lossy().into_owned(),
+                source_path: source_journal.to_string_lossy().into_owned(),
+                copy_root: source_copy_root.to_string_lossy().into_owned(),
+                source_device_id: source_identity.device_id,
+                source_file_id: source_identity.file_id,
+                source_link_count: source_identity.link_count,
+                observed_device_id: source_identity.device_id,
+                observed_file_id: source_identity.file_id,
+                observed_link_count,
+                source_is_regular: true,
                 pre_size,
+                trigger_operation: "submit".to_owned(),
+                trigger_submit_result: "ok".to_owned(),
+                observed_sizes,
                 observed_size,
+                full_record_length: RECORD_BYTES,
+                full_record_sha256,
                 cut_offset,
+                target_size: truncated_size,
                 truncated_size,
+                copied_path: target_journal.to_string_lossy().into_owned(),
+                copied_device_id: copied_identity.device_id,
+                copied_file_id: copied_identity.file_id,
+                copied_link_count: copied_identity.link_count,
+                copied_is_regular: true,
+                live_source_size_after_copy: live_identity_after_copy.size,
+                live_source_link_count_after_copy: live_identity_after_copy.link_count,
                 growth_observed_ns,
                 kill_ns,
+                kill_boundary: "after-exact-full-record-growth".to_owned(),
                 record_digest_matches,
                 recovery_ms,
                 clean_recovery: committed_prefix_suffix_exact,
@@ -14548,7 +15006,7 @@ async fn collect_journal_torn_tail_trials(
             ))
         })?;
     }
-    Ok(trials)
+    Ok(collected)
 }
 
 fn stable_json_stream_hash(events: &[NormalizedEvent]) -> Result<String> {
@@ -20230,7 +20688,7 @@ fn workspace_fault_workflow(
         "write",
         format!("call-workspace-fault-r{repetition}"),
         json!({
-            "path":"row-61-denied.txt",
+            "path":ROW61_TARGET_PATH,
             "content":format!("must-not-be-written{terminal}")
         }),
     )?;
@@ -20247,7 +20705,7 @@ fn workspace_fault_workflow(
                     route_marker(&scenario, &actor_name, "start")
                 ),
                 workspace: profile_root
-                    .join("workspace")
+                    .join("workspace-fault-root")
                     .to_string_lossy()
                     .into_owned(),
             },
@@ -20292,11 +20750,61 @@ fn set_directory_mode(_path: &Path, _mode: u32) -> Result<()> {
     ))
 }
 
-fn workspace_result_errno(
+#[derive(Clone, Debug)]
+struct WorkspaceResultObservation {
+    write_errno: Option<i32>,
+    structured_result: Value,
+    native_carrier: Value,
+    result_path: String,
+    result_ok: bool,
+}
+
+fn collect_workspace_fixture_results(value: &Value, found: &mut BTreeMap<String, Value>) {
+    match value {
+        Value::Object(object) => {
+            if object.get("schema").and_then(Value::as_str) == Some("ahrb.fixture.write.v1") {
+                if let Ok(encoded) = serde_json::to_string(value) {
+                    found.entry(encoded).or_insert_with(|| value.clone());
+                }
+                return;
+            }
+            for child in object.values() {
+                collect_workspace_fixture_results(child, found);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_workspace_fixture_results(child, found);
+            }
+        }
+        Value::String(text) => {
+            let mut candidates = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            candidates.extend(text.match_indices('{').map(|(offset, _)| &text[offset..]));
+            for candidate in candidates {
+                let Some(Ok(parsed)) = serde_json::Deserializer::from_str(candidate)
+                    .into_iter::<Value>()
+                    .next()
+                else {
+                    continue;
+                };
+                if !parsed.is_string() {
+                    collect_workspace_fixture_results(&parsed, found);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn workspace_result_observation(
     events: &[NormalizedEvent],
     expected_call_id: &str,
     expected_path: &str,
-) -> Result<i32> {
+) -> Result<WorkspaceResultObservation> {
     let calls = events
         .iter()
         .filter(|event| event.event == EventVocab::ToolCall)
@@ -20327,54 +20835,59 @@ fn workspace_result_errno(
             ));
         }
     }
-    let result = results[0];
-    let ordinary = result.payload.get("result").ok_or_else(|| {
+    let result_event = results[0];
+    let native_carrier = result_event
+        .payload
+        .get("native_result")
+        .or_else(|| result_event.payload.get("result"))
+        .cloned()
+        .ok_or_else(|| {
+            AhrbError::Protocol(
+                "row-61 correlated result omitted its protocol-native result carrier".to_owned(),
+            )
+        })?;
+    let mut structured = BTreeMap::new();
+    collect_workspace_fixture_results(&native_carrier, &mut structured);
+    if structured.len() != 1 {
+        return Err(AhrbError::Protocol(format!(
+            "row-61 protocol-native result carrier yielded {} distinct AHRB write results; expected one",
+            structured.len()
+        )));
+    }
+    let ordinary = structured.into_values().next().ok_or_else(|| {
         AhrbError::Protocol(
-            "row-61 correlated result omitted its ordinary result object".to_owned(),
+            "row-61 protocol-native result omitted the AHRB structured write result".to_owned(),
         )
     })?;
-    if ordinary.get("path").and_then(Value::as_str) != Some(expected_path)
-        || ordinary.get("ok").and_then(Value::as_bool) != Some(false)
-    {
-        return Err(AhrbError::Protocol(
-            "row-61 ordinary result path/status contradicted the denied write".to_owned(),
-        ));
-    }
-    let errno = ordinary
+    let result_path = ordinary
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AhrbError::Protocol("row-61 structured result omitted its path".to_owned()))?
+        .to_owned();
+    let result_ok = ordinary.get("ok").and_then(Value::as_bool).ok_or_else(|| {
+        AhrbError::Protocol("row-61 structured result omitted boolean ok".to_owned())
+    })?;
+    let write_errno = ordinary
         .get("write_errno")
         .and_then(Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| {
-            AhrbError::Protocol("row-61 ordinary result omitted write_errno".to_owned())
+        .and_then(|value| i32::try_from(value).ok());
+    if !result_ok {
+        let errno = write_errno.ok_or_else(|| {
+            AhrbError::Protocol("row-61 failed structured result omitted write_errno".to_owned())
         })?;
-    if let Some(native) = result.payload.get("native_result") {
-        let native_errno = native
-            .get("write_errno")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok());
-        if native.get("path").and_then(Value::as_str) != Some(expected_path)
-            || native_errno != Some(errno)
-        {
-            return Err(AhrbError::Protocol(
-                "row-61 normalized and native structured results disagreed".to_owned(),
-            ));
+        if !matches!(errno, libc::EACCES | libc::EROFS | libc::ENOSPC) {
+            return Err(AhrbError::Protocol(format!(
+                "row-61 structured result returned unrelated write_errno {errno}"
+            )));
         }
     }
-    Ok(errno)
-}
-
-fn workspace_result_claimed_success(events: &[NormalizedEvent]) -> bool {
-    events
-        .iter()
-        .filter(|event| event.event == EventVocab::ToolResult)
-        .any(|event| {
-            event.payload.pointer("/result/ok").and_then(Value::as_bool) == Some(true)
-                || event
-                    .payload
-                    .pointer("/native_result/ok")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-        })
+    Ok(WorkspaceResultObservation {
+        write_errno,
+        structured_result: ordinary,
+        native_carrier,
+        result_path,
+        result_ok,
+    })
 }
 
 async fn collect_large_output_trials(
@@ -21264,11 +21777,12 @@ fn row61_unexpected_profile_changes(
 }
 
 fn row61_allowed_profile_write_roots(
+    manifest: &Manifest,
     environment: &BTreeMap<String, String>,
     profile_root: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    for name in ["XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR"] {
+    let mut roots = vec![PathBuf::from("ahrb-exec-sessions")];
+    for name in manifest.isolation.roots.keys() {
         if let Some(value) = environment.get(name) {
             let path = Path::new(value);
             let relative = path.strip_prefix(profile_root).map_err(|_| {
@@ -21283,49 +21797,20 @@ fn row61_allowed_profile_write_roots(
     }
     // These are AHRB-owned transport evidence roots, not actor workspaces.
     roots.push(PathBuf::from("logs"));
+    roots.push(PathBuf::from("daemon-logs"));
     roots.push(PathBuf::from("ahrb-exec-sessions"));
     roots.sort();
     roots.dedup();
     Ok(roots)
 }
 
-fn row61_forbidden_roots(manifest: &Manifest) -> Result<Vec<PathBuf>> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        AhrbError::Validation("row-61 cannot resolve forbidden roots without HOME".to_owned())
-    })?;
-    manifest
-        .isolation
-        .forbidden_roots
-        .iter()
-        .map(|declared| {
-            if declared == "~" {
-                Ok(home.clone())
-            } else if let Some(relative) = declared.strip_prefix("~/") {
-                Ok(home.join(relative))
-            } else {
-                let path = PathBuf::from(declared);
-                if path.is_absolute() {
-                    Ok(path)
-                } else {
-                    Err(AhrbError::Validation(format!(
-                        "row-61 forbidden root must be absolute or home-relative: {declared}"
-                    )))
-                }
-            }
-        })
-        .collect()
-}
-
-fn row61_snapshot_set(roots: &[PathBuf]) -> Result<(String, Value)> {
-    let snapshots = roots
-        .iter()
-        .map(|root| row61_tree_snapshot(root))
-        .collect::<Result<Vec<_>>>()?;
-    let encoded = serde_json::to_vec(&snapshots)?;
-    Ok((
-        format!("{:x}", Sha256::digest(&encoded)),
-        serde_json::to_value(snapshots)?,
-    ))
+fn row61_forbidden_boundary_receipt(manifest: &Manifest) -> Result<(String, Value)> {
+    let receipt = json!({
+        "mode":"declared-boundaries-not-opened",
+        "roots":manifest.isolation.forbidden_roots,
+    });
+    let encoded = serde_json::to_vec(&receipt)?;
+    Ok((format!("{:x}", Sha256::digest(&encoded)), receipt))
 }
 
 fn row61_write_snapshot_ledger(
@@ -21390,17 +21875,16 @@ mod row61_collector_tests {
                 "call_id":call_id,
                 "name":"write_fixture",
                 "arguments":{"path":"row-61-denied.txt"},
-                "result":{"ok":false,"path":"row-61-denied.txt","write_errno":libc::EACCES}
+                "result":{"schema":"ahrb.fixture.write.v1","ok":false,"path":"row-61-denied.txt","write_errno":libc::EACCES}
             }),
         );
-        assert_eq!(
-            workspace_result_errno(
-                &[call.clone(), result.clone()],
-                call_id,
-                "row-61-denied.txt"
-            )?,
-            libc::EACCES
-        );
+        let observation = workspace_result_observation(
+            &[call.clone(), result.clone()],
+            call_id,
+            "row-61-denied.txt",
+        )?;
+        assert_eq!(observation.write_errno, Some(libc::EACCES));
+        assert_eq!(observation.result_path, "row-61-denied.txt");
         let unrelated = event(
             3,
             EventVocab::ToolResult,
@@ -21408,13 +21892,62 @@ mod row61_collector_tests {
                 "call_id":"other",
                 "name":"write_fixture",
                 "arguments":{"path":"other"},
-                "result":{"ok":false,"path":"other","write_errno":libc::EACCES}
+                "result":{"schema":"ahrb.fixture.write.v1","ok":false,"path":"other","write_errno":libc::EACCES}
             }),
         );
         assert!(
-            workspace_result_errno(&[call, result, unrelated], call_id, "row-61-denied.txt")
+            workspace_result_observation(&[call, result, unrelated], call_id, "row-61-denied.txt")
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_result_accepts_decorated_native_json_but_not_argument_echo() -> Result<()> {
+        let call_id = "call-workspace-fault-r1";
+        let call = event(
+            1,
+            EventVocab::ToolCall,
+            json!({
+                "call_id":call_id,
+                "name":"write_fixture",
+                "arguments":{"path":"row-61-denied.txt"}
+            }),
+        );
+        let structured = json!({
+            "schema":"ahrb.fixture.write.v1",
+            "ok":false,
+            "path":"row-61-denied.txt",
+            "write_errno":libc::EACCES
+        });
+        let result = event(
+            2,
+            EventVocab::ToolResult,
+            json!({
+                "call_id":call_id,
+                "name":"write_fixture",
+                "arguments":{"path":"row-61-denied.txt"},
+                "result":{"ok":false},
+                "native_result":{"content":format!("wrapper\n{}\nfooter", structured)}
+            }),
+        );
+        assert_eq!(
+            workspace_result_observation(&[call.clone(), result], call_id, "row-61-denied.txt")?
+                .write_errno,
+            Some(libc::EACCES)
+        );
+
+        let echo = event(
+            2,
+            EventVocab::ToolResult,
+            json!({
+                "call_id":call_id,
+                "name":"write_fixture",
+                "arguments":structured,
+                "native_result":{"content":"permission denied"}
+            }),
+        );
+        assert!(workspace_result_observation(&[call, echo], call_id, "row-61-denied.txt").is_err());
         Ok(())
     }
 
@@ -21544,11 +22077,13 @@ async fn collect_workspace_fault_trials(
         // per-invocation mocks receive this exact actor workspace.
         let workspace = profile_root.join("workspace-fault-root");
         std::fs::create_dir_all(&workspace)?;
-        set_directory_mode(&workspace, 0o555)?;
-        let target = workspace.join("row-61-denied.txt");
+        let fault_directory = workspace.join("read-only");
+        std::fs::create_dir_all(&fault_directory)?;
+        set_directory_mode(&fault_directory, 0o555)?;
+        let target = workspace.join(ROW61_TARGET_PATH);
         let target_existed_before = std::fs::symlink_metadata(&target).is_ok();
         if target_existed_before {
-            set_directory_mode(&workspace, 0o700)?;
+            set_directory_mode(&fault_directory, 0o700)?;
             return Err(AhrbError::Protocol(format!(
                 "row-61 repetition {repetition} target existed before the control boundary"
             )));
@@ -21561,7 +22096,7 @@ async fn collect_workspace_fault_trials(
             Ok(file) => {
                 drop(file);
                 let _ = std::fs::remove_file(&target);
-                set_directory_mode(&workspace, 0o700)?;
+                set_directory_mode(&fault_directory, 0o700)?;
                 return Err(AhrbError::Protocol(format!(
                     "row-61 repetition {repetition} read-only chmod control was ineffective"
                 )));
@@ -21570,19 +22105,20 @@ async fn collect_workspace_fault_trials(
         };
         if !matches!(control_errno, Some(errno) if matches!(errno, libc::EACCES | libc::EROFS | libc::ENOSPC))
         {
-            set_directory_mode(&workspace, 0o700)?;
+            set_directory_mode(&fault_directory, 0o700)?;
             return Err(AhrbError::Protocol(format!(
                 "row-61 repetition {repetition} control returned unrelated errno {control_errno:?}"
             )));
         }
         let workspace_before = row61_tree_snapshot(&workspace)?;
-        let profile_before = row61_tree_snapshot(&profile_root)?;
-        let forbidden_roots = row61_forbidden_roots(manifest)?;
-        let (forbidden_before_sha256, forbidden_before) = row61_snapshot_set(&forbidden_roots)?;
         let allowed_profile_write_roots =
-            row61_allowed_profile_write_roots(&environment, &profile_root)?;
+            row61_allowed_profile_write_roots(manifest, &environment, &profile_root)?;
         environment.insert(
             "AHRB_MOCK_WORKSPACE_OVERRIDE".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        );
+        variables.insert(
+            "storage_workspace".to_owned(),
             workspace.to_string_lossy().into_owned(),
         );
         let command = if manifest.transport.kind == TransportKind::Exec {
@@ -21625,6 +22161,9 @@ async fn collect_workspace_fault_trials(
             "workspace-fault-state",
             &mut filesystem_snapshots,
         )?;
+        let profile_before = row61_tree_snapshot(&profile_root)?;
+        let (forbidden_before_sha256, forbidden_before) =
+            row61_forbidden_boundary_receipt(manifest)?;
         let operation_start_ns = monotonic_timestamp_ns();
         driver
             .submit(&session, &actor.prompt, &format!("row-61-r{repetition}"))
@@ -21632,7 +22171,7 @@ async fn collect_workspace_fault_trials(
         let roots = if per_invocation {
             let roots = driver.session_pids(&session);
             if roots.is_empty() {
-                set_directory_mode(&workspace, 0o700)?;
+                set_directory_mode(&fault_directory, 0o700)?;
                 return Err(AhrbError::Protocol(format!(
                     "row-61 repetition {repetition} exposed no owned invocation root"
                 )));
@@ -21670,28 +22209,31 @@ async fn collect_workspace_fault_trials(
         };
         let target_written = std::fs::symlink_metadata(&target).is_ok();
         let workspace_after = row61_tree_snapshot(&workspace)?;
-        set_directory_mode(&workspace, 0o700)?;
+        set_directory_mode(&fault_directory, 0o700)?;
         let expected_call_id = format!("call-workspace-fault-r{repetition}");
-        let write_errno = if crashed || hung {
+        let result_observation = if crashed || hung {
             None
         } else {
-            Some(workspace_result_errno(
+            Some(workspace_result_observation(
                 &events,
                 &expected_call_id,
-                "row-61-denied.txt",
+                ROW61_TARGET_PATH,
             )?)
         };
-        let success_contradiction = workspace_result_claimed_success(&events)
-            || events
-                .iter()
-                .any(|event| event.event == EventVocab::TerminalSuccess);
+        let write_errno = result_observation
+            .as_ref()
+            .and_then(|observation| observation.write_errno);
+        let result_path = result_observation
+            .as_ref()
+            .map(|observation| observation.result_path.clone());
+        let readable_result_contradiction =
+            result_observation.as_ref().is_some_and(|observation| {
+                observation.result_ok || observation.result_path != ROW61_TARGET_PATH
+            });
+        let success_contradiction = readable_result_contradiction;
         let terminal_count = events
             .iter()
             .filter(|event| is_terminal(&event.event))
-            .count();
-        let failure_count = events
-            .iter()
-            .filter(|event| event.event == EventVocab::TerminalFailure)
             .count();
         let _ = row47_snapshot_file(
             &state_evidence_path,
@@ -21730,7 +22272,7 @@ async fn collect_workspace_fault_trials(
         };
         server.shutdown().await?;
         let profile_after = row61_tree_snapshot(&profile_root)?;
-        let (forbidden_after_sha256, forbidden_after) = row61_snapshot_set(&forbidden_roots)?;
+        let (forbidden_after_sha256, forbidden_after) = row61_forbidden_boundary_receipt(manifest)?;
         let outside_writes = row61_unexpected_profile_changes(
             &profile_before,
             &profile_after,
@@ -21775,9 +22317,22 @@ async fn collect_workspace_fault_trials(
         evidence.push(WorkspaceFaultTrial {
             repetition,
             kind: "read-only-directory".to_owned(),
+            call_id: expected_call_id,
+            target_path: ROW61_TARGET_PATH.to_owned(),
+            result_path,
+            structured_result: result_observation
+                .as_ref()
+                .map(|observation| observation.structured_result.clone()),
+            native_result_carrier: result_observation
+                .as_ref()
+                .map(|observation| observation.native_carrier.clone()),
             write_errno,
             control_write_errno: control_errno,
-            structured_failure: failure_count == 1 && !success_contradiction,
+            structured_failure: result_observation
+                .as_ref()
+                .is_some_and(|observation| !observation.result_ok)
+                && terminal_count == 1
+                && !success_contradiction,
             terminal_count: u32::try_from(terminal_count).map_err(|_| {
                 AhrbError::Protocol("row-61 terminal count does not fit u32".to_owned())
             })?,

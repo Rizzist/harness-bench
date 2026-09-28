@@ -2,7 +2,7 @@
 schema = 1
 id = "codex"
 name = "OpenAI Codex CLI"
-revision = "exec-jsonl-native-tools-v4"
+revision = "exec-jsonl-native-tools-v5"
 
 [availability]
 exec_paths = ["codex"]
@@ -102,7 +102,10 @@ exec "$@"
 [daemon]
 persistent = false
 
-# `--disable shell_snapshot` and `allow_login_shell=false` (documented in 0.156.1:
+# The generated launcher above is the external sandbox. Do not ask Codex to
+# apply a nested macOS seatbelt profile for tool commands: sandbox_apply rejects
+# that nesting before the fixture can run. `--disable shell_snapshot` and
+# `allow_login_shell=false` (documented in 0.156.1:
 # `codex features list`, config key `allow_login_shell`) keep codex from sourcing
 # host login-shell files (/etc/zprofile -> path_helper, snapshot helpers). Those
 # host-dependent descendants are reaped by codex before its terminal, so no
@@ -116,7 +119,7 @@ command = [
   "--disable", "shell_snapshot", "-c", "allow_login_shell=false",
   "--ignore-rules",
   "--profile", "ahrb",
-  "--model", "{{model}}", "--sandbox", "workspace-write", "-C", "{{workspace}}",
+  "--model", "{{model}}", "--dangerously-bypass-approvals-and-sandbox", "-C", "{{workspace}}",
   "{{prompt}}"
 ]
 timeout_ms = 30000
@@ -129,7 +132,7 @@ resume = [
   "--disable", "shell_snapshot", "-c", "allow_login_shell=false",
   "--ignore-rules",
   "--profile", "ahrb",
-  "--model", "{{model}}", "--sandbox", "workspace-write", "-C", "{{workspace}}",
+  "--model", "{{model}}", "--dangerously-bypass-approvals-and-sandbox", "-C", "{{workspace}}",
   "resume", "{{session_id}}", "{{prompt}}"
 ]
 id_pointer = "/thread_id"
