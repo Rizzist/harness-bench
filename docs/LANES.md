@@ -274,6 +274,14 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L11-D `l11d-policy` (landed 2026-09-30)
+
+- [x] Implement (gpt-5.6-sol impl-1..5; claude-opus-5-5 impl-6..7 as owner-authorized stand-in during the Codex usage limit): row 49 every-repetition PASS with median headlines; row 57 typed `daemon.idle_linger_ms` (1..=900000), 250 ms identity sampling from idle origin, boundary-sample survival, neutral 2 s snapshot, profile-scoped post-measurement teardown, bounded discovery EIO retry; row 65 multi-request credit only when all requests are attributable, correctly routed (all run-owned listeners) and use the selected model, zero-inference baseline ERROR with requests still exported once; claude-code exclusive terminal rules; argv prompt declarations.
+- [x] Verification and repair: gpt-5.6-sol verify-1 NO-SHIP (unbounded linger, two-point sampling, physical-count zero inference); claude-opus-5-5 verify-2 NO-SHIP (misrouted baseline ERROR, linger converting leak to ERROR); gpt-6-astra verify-3b NO-SHIP (first 2 s unobserved, initial listener unobserved, wrong model credited, claude-code duplicate terminal); gpt-6-astra verify-4 NO-SHIP (duplicate export, 2 s label); gpt-6-astra verify-5 stopped by usage limit; claude-opus-5-5 verify-5b NO-SHIP (zero-baseline export) and verify-6 NO-SHIP (+250 ms tolerance never granted) — all repaired.
+- [x] SHIP: claude-opus-5-5 verify-7 (not a gpt-6-astra verdict; owner-authorized stand-in), candidate diff `c3b1e378…`, all 33 test targets, `--lib`, `--doc`, mock-cert (0 class differences vs L11-C), full Haider 0.0.972 row-57 linger.
+- [x] Complete: committed `dc23141`, fast-forwarded and pushed. Haider 0.0.972: row 49 FAIL (all repetitions), row 57 FAIL on signal/terminal rules with no leak (a second `haiderd` from Haider's own launcher on SIGINTx2 is honest residue), row 65 PASS 0.833333; rick row 65 PASS 0.583333 (was UNSUPPORTED); codex/opencode/pi row 65 PASS; claude-code row 65 FAIL (extra `HEAD /api/hello`).
+- Routing note: GPT6-Astra flagged gpt-5.6-sol implementation against the repo's Astra-implements rule; the owner's current routing (since 2026-09-19) is Sol implements, Astra verifies/SHIP.
+
 ## L11-C `l11c-torn-tail-workspace` (landed 2026-09-28)
 
 - [x] Implement (gpt-5.6-sol, 4 passes): typed row-53 torn-tail capability (D5) with persisted receipts and strict containment (no symlinked components, no multiply linked files); row-61 structured result from the bound native tool-result in the real exec workspace, forbidden roots never opened; row-3 extraction fix + SPEC sentence; live-counter retry tuning (5 ms settle; close-delete 32 attempts).
