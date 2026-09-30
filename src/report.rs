@@ -578,6 +578,14 @@ struct InjectionVerificationCaseDetail {
     carrier: String,
     baseline_provider_requests: u64,
     perturbed_provider_requests: u64,
+    #[serde(default)]
+    baseline_semantic_roles: Vec<Value>,
+    #[serde(default)]
+    perturbed_semantic_roles: Vec<Value>,
+    #[serde(default)]
+    request_set_preserved: bool,
+    #[serde(default)]
+    attributable_requests: bool,
     expected_endpoint_reached: bool,
     unexpected_endpoint_requests: u64,
     credential_accepted: bool,
@@ -2789,6 +2797,7 @@ pub fn evaluate_latency_vs_turn_index(
     let mut last_deciles = Vec::with_capacity(expected_repetitions as usize);
     let mut slopes = Vec::with_capacity(expected_repetitions as usize);
     let mut repetition_details = Vec::with_capacity(expected_repetitions as usize);
+    let mut failed_repetitions = Vec::new();
 
     for repetition in 1..=expected_repetitions {
         let mut turns = observations
@@ -2885,6 +2894,9 @@ pub fn evaluate_latency_vs_turn_index(
         let repetition_passed = slope_ms_per_100_turns <= slope_bound_ms_per_100_turns
             && ratio.is_some_and(|value| value <= 1.25)
             && last_decile_p50_ms <= 1.25 * first_decile_p50_ms + 50.0;
+        if !repetition_passed {
+            failed_repetitions.push(repetition);
+        }
         first_deciles.push(first_decile_p50_ms);
         last_deciles.push(last_decile_p50_ms);
         slopes.push(theil_sen_ms_per_turn);
@@ -2916,20 +2928,22 @@ pub fn evaluate_latency_vs_turn_index(
     let headline_passed = latency_slope_ms_per_100_turns <= headline_bound
         && latency_last_first_decile_ratio.is_some_and(|value| value <= 1.25)
         && last_decile_p50_ms <= 1.25 * first_decile_p50_ms + 50.0;
-    let failure_detail = (!headline_passed).then(|| {
-        format!(
+    let passed = headline_passed && failed_repetitions.is_empty();
+    let failure_detail = (!passed).then(|| {
+        let headline = format!(
             "headline: slope100={latency_slope_ms_per_100_turns:.6}/{headline_bound:.6}ms ratio={} last={last_decile_p50_ms:.6}/{:.6}ms",
             latency_last_first_decile_ratio
                 .map_or_else(|| "null".to_owned(), |value| format!("{value:.6}")),
             1.25 * first_decile_p50_ms + 50.0,
-        )
+        );
+        if failed_repetitions.is_empty() {
+            headline
+        } else {
+            format!("{headline}; failed repetitions={failed_repetitions:?}")
+        }
     });
-    // SPEC-v2 publishes the median of independently computed repetition
-    // fields and applies the growth oracle to those headline fields. Every
-    // repetition must still be structurally complete; that is enforced by
-    // the fail-closed validation above. Retain each repetition's diagnostic
-    // `passed` flag in details without introducing an additional veto.
-    let passed = headline_passed;
+    // SPEC-v2 publishes median headline fields, but each independently
+    // evaluated repetition is a required conjunct for the row verdict.
     let metrics = BTreeMap::from([
         (
             "latency_vs_turn_index.first_decile_p50_ms".to_owned(),

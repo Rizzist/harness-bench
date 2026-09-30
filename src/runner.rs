@@ -62,8 +62,9 @@ use crate::wave2::{
 };
 use crate::wave2_automation::{
     ChildFailureCase, ChildFailureEvaluation, ChildFailureTrial, OfflineAttempt,
-    OfflineModeEvaluation, OfflineTrial, SignalCaseTrial, SignalMatrixEvaluation,
-    evaluate_child_failure_propagation, evaluate_offline_mode, evaluate_signal_matrix,
+    OfflineModeEvaluation, OfflineTrial, SignalCaseTrial, SignalDaemonLingerObservation,
+    SignalMatrixEvaluation, SignalResidueObservation, evaluate_child_failure_propagation,
+    evaluate_offline_mode, evaluate_signal_matrix,
 };
 use crate::wave3_concurrency::{
     FairnessActorEvidence, FairnessEvaluation, FanoutCliffEvaluation, FanoutPlan,
@@ -82,6 +83,7 @@ use crate::wave3_long_horizon::{
 };
 use crate::workflow::{Actor, Barrier, Fault, ScriptedResponse, WORKFLOW_SCHEMA_VERSION, Workflow};
 use crate::{AhrbError, Result};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,6 +99,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static CREATED_PROFILES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+#[cfg(all(test, target_os = "macos"))]
+static PRODUCTION_COLLECTOR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const ROW61_TARGET_PATH: &str = "read-only/row-61-denied.txt";
 
 type RunTeardownAudit = crate::process::RunTeardownEvidence;
@@ -115,6 +119,23 @@ enum ModelServer {
 }
 
 impl ModelServer {
+    fn physical_request_count(&self) -> u64 {
+        match self {
+            Self::Tcp(server) => server.physical_request_count(),
+            Self::Mailbox(server) => server.physical_request_count(),
+            Self::Unix { .. } | Self::Preconnected(_) | Self::Embedded => 0,
+        }
+    }
+
+    fn physical_request_records(&self) -> Vec<crate::fake_model::PhysicalHttpRequestRecord> {
+        match self {
+            Self::Tcp(server) => server.physical_request_records(),
+            Self::Unix { .. } | Self::Mailbox(_) | Self::Preconnected(_) | Self::Embedded => {
+                Vec::new()
+            }
+        }
+    }
+
     async fn shutdown(self) -> Result<()> {
         match self {
             Self::Tcp(server) => server.shutdown().await,
@@ -377,6 +398,10 @@ struct InjectionTrialEvidence {
     carrier: String,
     baseline_provider_requests: u64,
     perturbed_provider_requests: u64,
+    baseline_semantic_roles: Vec<InjectionRequestSemanticRole>,
+    perturbed_semantic_roles: Vec<InjectionRequestSemanticRole>,
+    request_set_preserved: bool,
+    attributable_requests: bool,
     baseline_initialization_catalog_requests: u64,
     initialization_catalog_requests: u64,
     initialization_catalog_credential_rejections: u64,
@@ -394,6 +419,17 @@ struct InjectionTrialEvidence {
     baseline_credential_rejected: bool,
     secret_in_argv: bool,
     component_verified: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct InjectionRequestSemanticRole {
+    scenario: String,
+    actor: String,
+    checkpoint: String,
+    role: String,
+    side_channel_kind: Option<String>,
+    semantic_ordinal: u64,
+    attempt: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -451,6 +487,10 @@ fn evaluate_injection_surface(
                 "carrier": trial.carrier,
                 "baseline_provider_requests": trial.baseline_provider_requests,
                 "perturbed_provider_requests": trial.perturbed_provider_requests,
+                "baseline_semantic_roles": trial.baseline_semantic_roles,
+                "perturbed_semantic_roles": trial.perturbed_semantic_roles,
+                "request_set_preserved": trial.request_set_preserved,
+                "attributable_requests": trial.attributable_requests,
                 "baseline_initialization_catalog_requests": trial.baseline_initialization_catalog_requests,
                 "initialization_catalog_requests": trial.initialization_catalog_requests,
                 "initialization_catalog_credential_rejections": trial.initialization_catalog_credential_rejections,
@@ -503,8 +543,6 @@ fn evaluate_injection_surface(
 #[cfg(test)]
 mod injection_surface_tests {
     use super::*;
-
-    static PRODUCTION_COLLECTOR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn initializer_perturbation_survives_driver_rendering_and_preserves_traps() {
@@ -670,7 +708,7 @@ mod injection_surface_tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn production_collector_rejects_catalog_selection_when_provider_carrier_is_ignored() {
-        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "ahrb-row65-ignored-selector-{}-{sequence}",
@@ -781,7 +819,7 @@ else:
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn production_collector_counts_catalog_request_arriving_after_initializer_exit() {
-        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "ahrb-row65-late-catalog-{}-{sequence}",
@@ -946,7 +984,7 @@ else:
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn production_collector_rejects_credential_derived_from_baseline_and_invocation_count() {
-        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "ahrb-row65-derived-credential-{}-{sequence}",
@@ -1047,7 +1085,7 @@ os.execv(sys.argv[2], sys.argv[2:])
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn production_collector_hides_provider_trial_from_nondeclared_channels() {
-        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "ahrb-r65-channels-{}-{sequence}",
@@ -1266,19 +1304,20 @@ print(json.dumps({
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn production_collector_rejects_an_endpoint_retained_across_invocations() {
-        let _guard = PRODUCTION_COLLECTOR_LOCK.lock().await;
-        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "ahrb-r65-retained-endpoint-{}-{sequence}",
-            std::process::id()
-        ));
-        let profile_root = root.join("profile");
-        let retained_endpoint = root.join("retained-endpoint.txt");
-        std::fs::create_dir_all(&root).unwrap();
-        let script = root.join("retained_endpoint_client.py");
-        std::fs::write(
-            &script,
-            r#"import json, os, pathlib, sys, time, urllib.request
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
+        for provider_first in [false, true] {
+            let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "ahrb-r65-retained-endpoint-{}-{sequence}-{provider_first}",
+                std::process::id()
+            ));
+            let profile_root = root.join("profile");
+            let retained_endpoint = root.join("retained-endpoint.txt");
+            std::fs::create_dir_all(&root).unwrap();
+            let script = root.join("retained_endpoint_client.py");
+            std::fs::write(
+                &script,
+                r#"import json, os, pathlib, sys, time, urllib.request
 
 retained_endpoint = pathlib.Path(sys.argv[2])
 if sys.argv[1] == "daemon":
@@ -1320,76 +1359,81 @@ print(json.dumps({
     "payload": {"status": "success"},
 }), flush=True)
 "#,
-        )
-        .unwrap();
-
-        let mut manifest =
-            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
-        manifest.daemon.persistent = true;
-        manifest.daemon.start = vec![
-            "/usr/bin/python3".to_owned(),
-            script.to_string_lossy().into_owned(),
-            "daemon".to_owned(),
-            retained_endpoint.to_string_lossy().into_owned(),
-        ];
-        manifest.daemon.initialize = vec!["/usr/bin/true".to_owned()];
-        manifest.daemon.readiness.kind = "file".to_owned();
-        manifest.daemon.readiness.target = profile_root
-            .join("dr65/state/retained-endpoint-ready")
-            .to_string_lossy()
-            .into_owned();
-        manifest.daemon.readiness.timeout_ms = 5_000;
-        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
-        manifest.transport.command = vec![
-            "/usr/bin/python3".to_owned(),
-            script.to_string_lossy().into_owned(),
-            "run".to_owned(),
-            retained_endpoint.to_string_lossy().into_owned(),
-            "{{prompt}}".to_owned(),
-            "{{session_id}}".to_owned(),
-            "{{marker}}".to_owned(),
-        ];
-        manifest.events.source = "stdout".to_owned();
-        manifest.events.path.clear();
-        let base_url = &mut manifest
-            .capabilities
-            .injection_surface
-            .as_mut()
-            .unwrap()
-            .base_url;
-        base_url.method = InjectionMethod::Environment;
-        base_url.environment = "L15_IGNORED_BASE_URL".to_owned();
-        base_url.argv.clear();
-        base_url.argv_position = ArgvPosition::Suffix;
-        base_url.argv_target = InjectionArgvTarget::Launch;
-        crate::manifest::validate(&manifest).unwrap();
-
-        let trials = collect_injection_surface_trials(
-            &manifest,
-            &profile_root,
-            "0123456789abcdef0123456789abcdef",
-        )
-        .await
-        .unwrap();
-        assert!(trials.evaluation.measurement_complete);
-        assert!(!trials.evaluation.passed);
-        assert_eq!(
-            trials.evaluation.metrics["injection_surface.base_url_score"],
-            0.0
-        );
-        let base_url = trials.evaluation.details["verification_cases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|case| case["component"] == "base_url")
+            )
             .unwrap();
-        assert!(base_url["unexpected_endpoint_requests"].as_u64().unwrap() > 0);
-        assert_eq!(
-            trials.requests.len(),
-            3,
-            "the retained base-URL request must be rejected before semantic routing"
-        );
-        std::fs::remove_dir_all(root).unwrap();
+
+            let mut manifest =
+                crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+            manifest.daemon.persistent = true;
+            manifest.daemon.start = vec![
+                "/usr/bin/python3".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "daemon".to_owned(),
+                retained_endpoint.to_string_lossy().into_owned(),
+            ];
+            manifest.daemon.initialize = vec!["/usr/bin/true".to_owned()];
+            manifest.daemon.readiness.kind = "file".to_owned();
+            manifest.daemon.readiness.target = profile_root
+                .join("dr65/state/retained-endpoint-ready")
+                .to_string_lossy()
+                .into_owned();
+            manifest.daemon.readiness.timeout_ms = 5_000;
+            manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+            manifest.transport.command = vec![
+                "/usr/bin/python3".to_owned(),
+                script.to_string_lossy().into_owned(),
+                "run".to_owned(),
+                retained_endpoint.to_string_lossy().into_owned(),
+                "{{prompt}}".to_owned(),
+                "{{session_id}}".to_owned(),
+                "{{marker}}".to_owned(),
+            ];
+            manifest.events.source = "stdout".to_owned();
+            manifest.events.path.clear();
+            let base_url = &mut manifest
+                .capabilities
+                .injection_surface
+                .as_mut()
+                .unwrap()
+                .base_url;
+            base_url.method = InjectionMethod::Environment;
+            base_url.environment = "L15_IGNORED_BASE_URL".to_owned();
+            base_url.argv.clear();
+            base_url.argv_position = ArgvPosition::Suffix;
+            base_url.argv_target = InjectionArgvTarget::Launch;
+            crate::manifest::validate(&manifest).unwrap();
+
+            let trials = collect_injection_surface_trials_with_order(
+                &manifest,
+                &profile_root,
+                "0123456789abcdef0123456789abcdef",
+                Some(provider_first),
+            )
+            .await
+            .unwrap();
+            assert!(
+                trials.evaluation.measurement_complete,
+                "provider_first={provider_first}: {}",
+                trials.evaluation.details
+            );
+            assert!(!trials.evaluation.passed, "provider_first={provider_first}");
+            assert_eq!(
+                trials.evaluation.metrics["injection_surface.base_url_score"],
+                0.0
+            );
+            let base_url = trials.evaluation.details["verification_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["component"] == "base_url")
+                .unwrap();
+            assert!(
+                base_url["unexpected_endpoint_requests"].as_u64().unwrap() > 0,
+                "provider_first={provider_first}: {}",
+                trials.evaluation.details
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// Opt-in carrier probe: four single-turn calls to local fake providers only.
@@ -1506,6 +1550,10 @@ print(json.dumps({
             carrier: injection_method_label(method).to_owned(),
             baseline_provider_requests: 1,
             perturbed_provider_requests: u64::from(verified),
+            baseline_semantic_roles: Vec::new(),
+            perturbed_semantic_roles: Vec::new(),
+            request_set_preserved: verified,
+            attributable_requests: verified,
             baseline_initialization_catalog_requests: 0,
             initialization_catalog_requests: 0,
             initialization_catalog_credential_rejections: 0,
@@ -1589,6 +1637,241 @@ print(json.dumps({
         );
         assert!(!evaluation.baseline_runnable);
         assert!(!evaluation.passed);
+    }
+
+    #[test]
+    fn injection_surface_credits_a_complete_two_request_set_and_rejects_mixed_routing() {
+        let role = |attempt| InjectionRequestSemanticRole {
+            scenario: "ahrb-row65-injection".to_owned(),
+            actor: "r65".to_owned(),
+            checkpoint: "start".to_owned(),
+            role: "primary".to_owned(),
+            side_channel_kind: None,
+            semantic_ordinal: 1,
+            attempt,
+        };
+        let roles = vec![role(1), role(2)];
+        let mut correct = [
+            evidence("provider", InjectionMethod::Environment, true),
+            evidence("base_url", InjectionMethod::Environment, true),
+            evidence("credential", InjectionMethod::Environment, true),
+        ];
+        for trial in &mut correct {
+            trial.baseline_provider_requests = 2;
+            trial.perturbed_provider_requests = 2;
+            trial.baseline_semantic_roles = roles.clone();
+            trial.perturbed_semantic_roles = roles.clone();
+        }
+        let complete = evaluate_injection_surface(
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            true,
+            correct.to_vec(),
+        );
+        assert!(complete.passed, "{}", complete.details);
+        assert_eq!(
+            complete.details["verification_cases"][0]["perturbed_provider_requests"],
+            2
+        );
+
+        correct[1].unexpected_endpoint_requests = 1;
+        correct[1].component_verified = false;
+        let mixed = evaluate_injection_surface(
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            InjectionMethod::Environment,
+            true,
+            correct.to_vec(),
+        );
+        assert!(!mixed.passed);
+        assert_eq!(mixed.metrics["injection_surface.base_url_score"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn declared_runnable_zero_request_baseline_is_measurement_error() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row65-zero-request-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            "import json,sys; print(json.dumps({'id':sys.argv[1]+':terminal','cursor':1,'session_id':sys.argv[1],'actor':sys.argv[2],'event':'terminal-success','payload':{'status':'success'}}),flush=True)".to_owned(),
+            "{{session_id}}".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        crate::manifest::validate(&manifest).unwrap();
+        let trials = collect_injection_surface_trials(
+            &manifest,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        assert!(!trials.evaluation.measurement_complete);
+        assert_eq!(
+            trials.evaluation.measurement_error.as_deref(),
+            Some("carrier trial did not exercise an inference request")
+        );
+        assert_eq!(
+            trials.evaluation.details["baseline"]["terminal_success"],
+            true
+        );
+        assert_eq!(
+            trials.evaluation.details["baseline"]["provider_requests"],
+            0
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_only_baseline_is_zero_inference_measurement_error() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row65-handshake-only-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            "-c".to_owned(),
+            r#"import json,os,sys,urllib.error,urllib.request
+request = urllib.request.Request(os.environ['AHRB_MOCK_BASE_URL'] + '/api/hello', method='HEAD')
+try:
+    urllib.request.urlopen(request, timeout=5).read()
+except urllib.error.HTTPError:
+    pass
+print(json.dumps({'id':sys.argv[1]+':terminal','cursor':1,'session_id':sys.argv[1],'actor':sys.argv[2],'event':'terminal-success','payload':{'status':'success'}}),flush=True)"#
+                .to_owned(),
+            "{{session_id}}".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        crate::manifest::validate(&manifest).unwrap();
+        let trials = collect_injection_surface_trials(
+            &manifest,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        assert!(!trials.evaluation.measurement_complete);
+        assert_eq!(
+            trials.evaluation.measurement_error.as_deref(),
+            Some("carrier trial did not exercise an inference request")
+        );
+        assert_eq!(
+            trials.evaluation.details["baseline"]["provider_requests"],
+            0
+        );
+        assert!(
+            trials.evaluation.details["baseline"]["physical_requests"]
+                .as_array()
+                .is_some_and(|requests| requests.iter().any(|request| {
+                    request["method"] == "HEAD" && request["path"] == "/api/hello"
+                }))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_baseline_error_exports_provider_trial_requests_in_both_orders() {
+        for provider_first in [true, false] {
+            let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "ahrb-row65-provider-only-{}-{sequence}",
+                std::process::id()
+            ));
+            let profile_root = root.join("profile");
+            let receipts = root.join("sends.jsonl");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut manifest =
+                crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+            // Only the provider-selector trial sends an inference request; the
+            // baseline (the manifest's own model) sends nothing.
+            manifest.transport.command = vec![
+                "/usr/bin/python3".to_owned(),
+                "-c".to_owned(),
+                r#"import json,os,sys,urllib.request
+model = os.environ['AHRB_MOCK_MODEL']
+if model != sys.argv[3]:
+    with open(sys.argv[4], 'a') as receipts:
+        receipts.write(json.dumps({'model': model}) + '\n')
+    body = json.dumps({'model': model, 'messages': [{'role': 'user', 'content': sys.argv[5]}], 'stream': False}).encode()
+    request = urllib.request.Request(os.environ['AHRB_MOCK_BASE_URL'] + '/v1/chat/completions', data=body, headers={'Authorization': 'Bearer ' + os.environ['AHRB_MOCK_API_KEY'], 'Content-Type': 'application/json'})
+    urllib.request.urlopen(request, timeout=10).read()
+print(json.dumps({'id':sys.argv[1]+':terminal','cursor':1,'session_id':sys.argv[1],'actor':sys.argv[2],'event':'terminal-success','payload':{'status':'success'}}),flush=True)"#
+                    .to_owned(),
+                "{{session_id}}".to_owned(),
+                "{{marker}}".to_owned(),
+                manifest.fake_model.model.clone(),
+                receipts.to_string_lossy().into_owned(),
+                "{{prompt}}".to_owned(),
+            ];
+            manifest.events.source = "stdout".to_owned();
+            manifest.events.path.clear();
+            crate::manifest::validate(&manifest).unwrap();
+            let trials = collect_injection_surface_trials_with_order(
+                &manifest,
+                &profile_root,
+                "0123456789abcdef0123456789abcdef",
+                Some(provider_first),
+            )
+            .await
+            .unwrap();
+            let details = &trials.evaluation.details;
+            assert!(
+                !trials.evaluation.measurement_complete,
+                "provider_first={provider_first}"
+            );
+            assert_eq!(
+                trials.evaluation.measurement_error.as_deref(),
+                Some("carrier trial did not exercise an inference request"),
+                "provider_first={provider_first}"
+            );
+            assert_eq!(details["baseline"]["provider_requests"], 0);
+            let sent = std::fs::read_to_string(&receipts).unwrap().lines().count();
+            assert_eq!(sent, 1, "provider_first={provider_first}");
+            assert_eq!(
+                trials.requests.len(),
+                sent,
+                "provider_first={provider_first}: {details}"
+            );
+            assert!(trials.requests[0].request.model.starts_with("ahrb-probe-"));
+            assert_eq!(details["exported_requests"], 1);
+            let executed = details["executed_trials"].as_array().unwrap();
+            assert_eq!(executed.len(), 1, "provider_first={provider_first}");
+            assert_eq!(executed[0]["component"], "provider");
+            assert_eq!(
+                executed[0]["provider_requests"].as_u64().unwrap()
+                    + executed[0]["unexpected_trial_requests"].as_u64().unwrap(),
+                1
+            );
+            assert!(
+                executed[0]["physical_requests"]
+                    .as_array()
+                    .is_some_and(|requests| requests.iter().any(|request| {
+                        request["method"] == "POST"
+                            && request["path"]
+                                .as_str()
+                                .is_some_and(|path| path.ends_with("/v1/chat/completions"))
+                    })),
+                "provider_first={provider_first}: {details}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
 
@@ -7183,9 +7466,24 @@ async fn run_inner_timed(
             crate::matrix_evidence::capability_for_row(&manifest, 65),
             crate::matrix_evidence::CapabilityStatus::Supported
         ) {
+        let initial_listener_endpoint = variables
+            .get("base_url")
+            .map(String::as_str)
+            .unwrap_or("unavailable");
+        let run_owned_listener = server.as_ref().map(|server| InjectionRunOwnedListener {
+            engine: engine.as_ref(),
+            server,
+            endpoint: initial_listener_endpoint,
+        });
         match crate::row_timing::rows(
             &[65],
-            collect_injection_surface_trials(&manifest, &profile_root, &manifest_hash),
+            collect_injection_surface_trials_with_options(
+                &manifest,
+                &profile_root,
+                &manifest_hash,
+                None,
+                run_owned_listener.as_ref(),
+            ),
         )
         .await
         {
@@ -7846,6 +8144,7 @@ async fn run_inner_timed(
             .map_or(&[][..], |trials| trials.evidence.as_slice()),
         signal_matrix_repetitions,
         manifest.daemon.grace_ms,
+        manifest.daemon.idle_linger_ms,
         manifest.resources.turn_timeout_ms.saturating_add(3_000),
     );
     let row58_evaluation = evaluate_retry_budget(row58_trials.as_ref(), &manifest, options.profile);
@@ -9968,7 +10267,13 @@ fn injection_credential_fingerprints(credential: &str) -> BTreeSet<String> {
 #[derive(Clone, Debug)]
 struct InjectionRunObservation {
     expected_records: Vec<crate::fake_model::ModelRequestRecord>,
-    unexpected_records: Vec<crate::fake_model::ModelRequestRecord>,
+    /// Records owned by row-65's isolated trap listeners. These records are
+    /// exported with the trial because no other engine owns them.
+    unexpected_trial_records: Vec<crate::fake_model::ModelRequestRecord>,
+    /// Records observed on the run's initial listener during this trial. The
+    /// initial engine remains their sole export owner; row 65 uses these
+    /// records only to evaluate wrong-listener traffic.
+    initial_listener_records: Vec<crate::fake_model::ModelRequestRecord>,
     expected_physical_requests: u64,
     unexpected_physical_requests: u64,
     credential_rejections: u64,
@@ -9984,6 +10289,12 @@ struct InjectionRunObservation {
     baseline_base_url: String,
     expected_endpoint: InjectionTrapEndpoint,
     exposed_endpoints: Vec<InjectionTrapEndpoint>,
+}
+
+struct InjectionRunOwnedListener<'a> {
+    engine: &'a FakeModelEngine,
+    server: &'a ModelServer,
+    endpoint: &'a str,
 }
 
 const INJECTION_LISTENER_CANDIDATES: usize = 2;
@@ -10315,7 +10626,19 @@ async fn collect_injection_run(
     baseline_credential: &str,
     separate_baseline_listener: bool,
     prior_endpoints: &[InjectionTrapEndpoint],
+    run_owned_listener: Option<&InjectionRunOwnedListener<'_>>,
 ) -> Result<InjectionRunObservation> {
+    let run_owned_record_offset = if let Some(listener) = run_owned_listener {
+        listener.engine.request_records().await.len()
+    } else {
+        0
+    };
+    let run_owned_physical_offset = run_owned_listener
+        .map(|listener| listener.server.physical_request_count())
+        .unwrap_or(0);
+    let run_owned_physical_record_offset = run_owned_listener
+        .map(|listener| listener.server.physical_request_records().len())
+        .unwrap_or(0);
     let profile_root = run_profile_root.join("dr65");
     match std::fs::remove_dir_all(&profile_root) {
         Ok(()) => {}
@@ -10558,10 +10881,10 @@ async fn collect_injection_run(
     let credential_rejections = expected_server.credential_rejection_count();
     let expected_endpoint = expected_server.endpoint();
     let mut exposed_endpoints = vec![expected_endpoint.clone()];
-    let mut unexpected_records = Vec::new();
+    let mut unexpected_trial_records = Vec::new();
     let mut unexpected_physical_requests = expected_path_rejections;
     for (engine, server) in unexpected {
-        unexpected_records.extend(engine.request_records().await);
+        unexpected_trial_records.extend(engine.request_records().await);
         unexpected_physical_requests += server.physical_request_count();
         physical_requests.extend(server.physical_request_records().into_iter().map(|record| {
             json!({
@@ -10581,10 +10904,42 @@ async fn collect_injection_run(
         }
         server.shutdown().await?;
     }
+    let mut initial_listener_records = Vec::new();
+    if let Some(listener) = run_owned_listener {
+        let run_owned_records = listener.engine.request_records().await;
+        initial_listener_records
+            .extend(run_owned_records.into_iter().skip(run_owned_record_offset));
+        unexpected_physical_requests = unexpected_physical_requests.saturating_add(
+            listener
+                .server
+                .physical_request_count()
+                .saturating_sub(run_owned_physical_offset),
+        );
+        physical_requests.extend(
+            listener
+                .server
+                .physical_request_records()
+                .into_iter()
+                .skip(run_owned_physical_record_offset)
+                .map(|record| {
+                    json!({
+                        "listener": "initial-run",
+                        "endpoint": listener.endpoint,
+                        "received_ns": record.received_ns,
+                        "method": record.method,
+                        "path": record.path,
+                        "catalog": record.catalog,
+                        "credential_rejected": record.credential_rejected,
+                        "path_rejected": record.path_rejected,
+                    })
+                }),
+        );
+    }
     expected_server.shutdown().await?;
     Ok(InjectionRunObservation {
         expected_records,
-        unexpected_records,
+        unexpected_trial_records,
+        initial_listener_records,
         expected_physical_requests,
         unexpected_physical_requests,
         credential_rejections,
@@ -10623,10 +10978,80 @@ fn fresh_injection_credential(label: &str) -> Result<String> {
     ))
 }
 
+fn injection_semantic_roles(
+    records: &[&crate::fake_model::ModelRequestRecord],
+) -> Vec<InjectionRequestSemanticRole> {
+    let mut roles = records
+        .iter()
+        .map(|record| InjectionRequestSemanticRole {
+            scenario: record.request.scenario.clone(),
+            actor: record.request.actor.clone(),
+            checkpoint: record.request.checkpoint.clone(),
+            role: record.role.clone(),
+            side_channel_kind: record.side_channel_kind.clone(),
+            semantic_ordinal: record.semantic_ordinal,
+            attempt: record.attempt,
+        })
+        .collect::<Vec<_>>();
+    roles.sort();
+    roles
+}
+
+fn injection_request_attributable(record: &crate::fake_model::ModelRequestRecord) -> bool {
+    record.accepted
+        && record.request.scenario == "ahrb-row65-injection"
+        && record.request.actor == "r65"
+        && record.request.checkpoint == "start"
+        && matches!(record.role.as_str(), "primary" | "side-channel")
+        && (record.role != "side-channel" || record.side_channel_kind.is_some())
+}
+
+fn injection_requests_attributable(records: &[&crate::fake_model::ModelRequestRecord]) -> bool {
+    !records.is_empty()
+        && records
+            .iter()
+            .all(|record| injection_request_attributable(record))
+}
+
+#[cfg(test)]
 async fn collect_injection_surface_trials(
     manifest: &Manifest,
     run_profile_root: &Path,
     manifest_hash: &str,
+) -> Result<InjectionSurfaceTrials> {
+    collect_injection_surface_trials_with_options(
+        manifest,
+        run_profile_root,
+        manifest_hash,
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn collect_injection_surface_trials_with_order(
+    manifest: &Manifest,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+    provider_first_override: Option<bool>,
+) -> Result<InjectionSurfaceTrials> {
+    collect_injection_surface_trials_with_options(
+        manifest,
+        run_profile_root,
+        manifest_hash,
+        provider_first_override,
+        None,
+    )
+    .await
+}
+
+async fn collect_injection_surface_trials_with_options(
+    manifest: &Manifest,
+    run_profile_root: &Path,
+    manifest_hash: &str,
+    provider_first_override: Option<bool>,
+    run_owned_listener: Option<&InjectionRunOwnedListener<'_>>,
 ) -> Result<InjectionSurfaceTrials> {
     let surface = manifest
         .capabilities
@@ -10658,8 +11083,8 @@ async fn collect_injection_surface_trials(
     // Baseline and provider runs are otherwise observationally identical. Use
     // a hidden order bit so process IDs, timing, or an external invocation
     // counter cannot stand in for the provider carrier that is under test.
-    let provider_first =
-        probe_nonce[0] & 1 == 1 && surface.provider.method != InjectionMethod::Impossible;
+    let provider_first = provider_first_override.unwrap_or(probe_nonce[0] & 1 == 1)
+        && surface.provider.method != InjectionMethod::Impossible;
     let mut prior_endpoints = Vec::new();
     let (baseline, mut provider_observation) = if provider_first {
         let provider = collect_injection_run(
@@ -10672,6 +11097,7 @@ async fn collect_injection_surface_trials(
             &baseline_credential,
             false,
             &prior_endpoints,
+            run_owned_listener,
         )
         .await?;
         retain_injection_endpoints(&mut prior_endpoints, &provider);
@@ -10685,6 +11111,7 @@ async fn collect_injection_surface_trials(
             &baseline_credential,
             false,
             &prior_endpoints,
+            run_owned_listener,
         )
         .await?;
         retain_injection_endpoints(&mut prior_endpoints, &baseline);
@@ -10700,6 +11127,7 @@ async fn collect_injection_surface_trials(
             &baseline_credential,
             false,
             &prior_endpoints,
+            run_owned_listener,
         )
         .await?;
         retain_injection_endpoints(&mut prior_endpoints, &baseline);
@@ -10716,6 +11144,7 @@ async fn collect_injection_surface_trials(
                 &baseline_credential,
                 false,
                 &prior_endpoints,
+                run_owned_listener,
             )
             .await?;
             retain_injection_endpoints(&mut prior_endpoints, &observation);
@@ -10723,15 +11152,38 @@ async fn collect_injection_surface_trials(
         };
         (baseline, provider)
     };
-    let baseline_records = baseline
-        .expected_records
-        .iter()
-        .filter(|record| record.accepted && record.request.actor == "r65")
-        .collect::<Vec<_>>();
+    let baseline_records = baseline.expected_records.iter().collect::<Vec<_>>();
+    let baseline_semantic_roles = injection_semantic_roles(&baseline_records);
+    let baseline_attributable = injection_requests_attributable(&baseline_records);
     let baseline_fingerprints = injection_credential_fingerprints(&baseline_credential);
+    let baseline_inference_requests = u64::try_from(
+        baseline_records
+            .iter()
+            .filter(|record| injection_request_attributable(record))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let baseline_has_inference_shaped_request = !baseline_records.is_empty()
+        || !baseline.unexpected_trial_records.is_empty()
+        || !baseline.initial_listener_records.is_empty()
+        || baseline.physical_requests.iter().any(|request| {
+            request["method"] == "POST"
+                && request["catalog"] == false
+                && request["path"].as_str().is_some_and(|path| {
+                    manifest
+                        .fake_model
+                        .allowed_paths
+                        .iter()
+                        .filter(|allowed| allowed.as_str() != "/v1/models")
+                        .any(|allowed| path.ends_with(allowed))
+                })
+        });
     let baseline_runnable = baseline.terminal_success
-        && baseline.expected_physical_requests == 1 + baseline.initialization_catalog_requests
-        && baseline_records.len() == 1
+        && baseline_inference_requests > 0
+        && baseline.expected_physical_requests
+            == u64::try_from(baseline_records.len()).unwrap_or(u64::MAX)
+                + baseline.initialization_catalog_requests
+        && baseline_attributable
         && baseline_records
             .iter()
             .all(|record| record.request.model == manifest.fake_model.model)
@@ -10740,13 +11192,70 @@ async fn collect_injection_surface_trials(
             .all(|record| baseline_fingerprints.contains(&record.request.credential_fingerprint))
         && baseline.unexpected_physical_requests == 0
         && !baseline.secret_in_argv;
-    let baseline_provider_requests = baseline.expected_physical_requests;
+    let baseline_provider_requests = u64::try_from(baseline_records.len()).unwrap_or(u64::MAX);
     let baseline_initialization_catalog_requests = baseline.initialization_catalog_requests;
     let baseline_catalog_count_sample_ns = baseline.catalog_count_sample_ns;
     let baseline_catalog_requests_at_session_start = baseline.catalog_requests_at_session_start;
     let baseline_physical_requests = baseline.physical_requests.clone();
     let mut requests = baseline.expected_records;
-    requests.extend(baseline.unexpected_records);
+    requests.extend(baseline.unexpected_trial_records);
+    if !baseline_has_inference_shaped_request {
+        let message = "carrier trial did not exercise an inference request".to_owned();
+        // The provider-selector trial may already have run (in either order).
+        // Its trap-listener records have no other export owner, so they are
+        // exported here with its physical diagnostics even though the row is
+        // not measured.
+        let mut executed_trials = Vec::new();
+        if let Some(provider) = provider_observation.take() {
+            let provider_records = provider.expected_records.iter().collect::<Vec<_>>();
+            executed_trials.push(json!({
+                "component": "provider",
+                "terminal_success": provider.terminal_success,
+                "provider_requests": provider_records.len(),
+                "semantic_roles": injection_semantic_roles(&provider_records),
+                "unexpected_trial_requests": provider.unexpected_trial_records.len(),
+                "initialization_catalog_requests": provider.initialization_catalog_requests,
+                "unexpected_endpoint_requests": provider.unexpected_physical_requests,
+                "physical_requests": provider.physical_requests,
+            }));
+            requests.extend(provider.expected_records);
+            requests.extend(provider.unexpected_trial_records);
+        }
+        sort_injection_requests(&mut requests);
+        return Ok(InjectionSurfaceTrials {
+            evaluation: InjectionSurfaceEvaluation {
+                metrics: BTreeMap::from([
+                    ("injection_surface.provider_score".to_owned(), 0.0),
+                    ("injection_surface.base_url_score".to_owned(), 0.0),
+                    ("injection_surface.credential_score".to_owned(), 0.0),
+                    ("injection_surface.score".to_owned(), 0.0),
+                    ("injection_surface.verified_components".to_owned(), 0.0),
+                ]),
+                details: json!({
+                    "measurement_complete": false,
+                    "measurement_error": message.clone(),
+                    "baseline": {
+                        "terminal_success": baseline.terminal_success,
+                        "provider_requests": baseline_inference_requests,
+                        "inference_shaped_request_observed": false,
+                        "initialization_catalog_requests": baseline_initialization_catalog_requests,
+                        "unexpected_endpoint_requests": baseline.unexpected_physical_requests,
+                        "physical_requests": baseline_physical_requests,
+                        "semantic_roles": baseline_semantic_roles,
+                    },
+                    "executed_trials": executed_trials,
+                    "exported_requests": requests.len(),
+                    "verification_cases": [],
+                }),
+                measurement_complete: false,
+                measurement_error: Some(message),
+                baseline_runnable: false,
+                passed: false,
+                score: 0.0,
+            },
+            requests,
+        });
+    }
     let mut evidence = Vec::new();
     for (component_name, component) in [
         ("provider", &surface.provider),
@@ -10760,6 +11269,10 @@ async fn collect_injection_surface_trials(
                 carrier: injection_carrier_label(component),
                 baseline_provider_requests,
                 perturbed_provider_requests: 0,
+                baseline_semantic_roles: baseline_semantic_roles.clone(),
+                perturbed_semantic_roles: Vec::new(),
+                request_set_preserved: false,
+                attributable_requests: false,
                 baseline_initialization_catalog_requests,
                 initialization_catalog_requests: 0,
                 initialization_catalog_credential_rejections: 0,
@@ -10805,6 +11318,7 @@ async fn collect_injection_surface_trials(
                 &baseline_credential,
                 component_name == "base_url",
                 &prior_endpoints,
+                run_owned_listener,
             )
             .await?
         };
@@ -10817,15 +11331,16 @@ async fn collect_injection_surface_trials(
         if newly_collected {
             retain_injection_endpoints(&mut prior_endpoints, &observation);
         }
-        let expected_records = observation
-            .expected_records
-            .iter()
-            .filter(|record| record.accepted && record.request.actor == "r65")
-            .collect::<Vec<_>>();
-        let expected_physical_requests = if component_name == "credential" { 2 } else { 1 };
-        let expected_endpoint_reached = expected_records.len() == 1
+        let expected_records = observation.expected_records.iter().collect::<Vec<_>>();
+        let perturbed_semantic_roles = injection_semantic_roles(&expected_records);
+        let attributable_requests = injection_requests_attributable(&expected_records);
+        let credential_control_requests = u64::from(component_name == "credential");
+        let expected_endpoint_reached = !expected_records.is_empty()
             && observation.expected_physical_requests
-                == expected_physical_requests + observation.initialization_catalog_requests;
+                == u64::try_from(expected_records.len()).unwrap_or(u64::MAX)
+                    + credential_control_requests
+                    + observation.initialization_catalog_requests;
+        let request_set_preserved = perturbed_semantic_roles == baseline_semantic_roles;
         let credential_fingerprints = injection_credential_fingerprints(credential);
         let credential_accepted = !expected_records.is_empty()
             && expected_records.iter().all(|record| {
@@ -10835,17 +11350,20 @@ async fn collect_injection_surface_trials(
             && observation.active_baseline_credential_rejected
             && observation.credential_rejections
                 == 1 + observation.initialization_catalog_credential_rejections;
+        let selected_model_used = expected_records
+            .iter()
+            .all(|record| record.request.model == provider);
         let component_verified = baseline_runnable
             && observation.terminal_success
             && expected_endpoint_reached
+            && request_set_preserved
+            && attributable_requests
             && observation.unexpected_physical_requests == 0
+            && selected_model_used
             && credential_accepted
             && !observation.secret_in_argv
             && match component_name {
-                "provider" => expected_records.iter().all(|record| {
-                    record.request.model == provider_probe
-                        && record.request.model != manifest.fake_model.model
-                }),
+                "provider" => provider_probe != manifest.fake_model.model,
                 "base_url" => true,
                 "credential" => baseline_credential_rejected,
                 _ => false,
@@ -10855,7 +11373,11 @@ async fn collect_injection_surface_trials(
             method: component.method,
             carrier: injection_carrier_label(component),
             baseline_provider_requests,
-            perturbed_provider_requests: observation.expected_physical_requests,
+            perturbed_provider_requests: u64::try_from(expected_records.len()).unwrap_or(u64::MAX),
+            baseline_semantic_roles: baseline_semantic_roles.clone(),
+            perturbed_semantic_roles,
+            request_set_preserved,
+            attributable_requests,
             baseline_initialization_catalog_requests,
             initialization_catalog_requests: observation.initialization_catalog_requests,
             initialization_catalog_credential_rejections: observation
@@ -10876,8 +11398,22 @@ async fn collect_injection_surface_trials(
             component_verified,
         });
         requests.extend(observation.expected_records);
-        requests.extend(observation.unexpected_records);
+        requests.extend(observation.unexpected_trial_records);
     }
+    sort_injection_requests(&mut requests);
+    Ok(InjectionSurfaceTrials {
+        evaluation: evaluate_injection_surface(
+            surface.provider.method,
+            surface.base_url.method,
+            surface.credential.method,
+            baseline_runnable,
+            evidence,
+        ),
+        requests,
+    })
+}
+
+fn sort_injection_requests(requests: &mut [crate::fake_model::ModelRequestRecord]) {
     requests.sort_by(|left, right| {
         (
             &left.request.scenario,
@@ -10894,16 +11430,6 @@ async fn collect_injection_surface_trials(
                 right.attempt,
             ))
     });
-    Ok(InjectionSurfaceTrials {
-        evaluation: evaluate_injection_surface(
-            surface.provider.method,
-            surface.base_url.method,
-            surface.credential.method,
-            baseline_runnable,
-            evidence,
-        ),
-        requests,
-    })
 }
 
 fn retry_budget_workflow(profile_root: &Path, profile: Profile) -> Workflow {
@@ -11876,17 +12402,15 @@ async fn wait_for_signal_terminal_receipt(
     }
 }
 
-async fn signal_matrix_residue_count(
+fn discover_signal_matrix_processes_once(
     sampler: &mut dyn Sampler,
     roots: &[u32],
     profile_root: &Path,
     executable_names: &[String],
-) -> Result<(u32, Vec<crate::process::ProcessInfo>)> {
-    // Row 57 specifies a delayed two-second audit. Do not return early on an
-    // empty parent/group sample: a detached daemon may become visible only by
-    // its disposable-profile argv after its launcher exits.
-    tokio::time::sleep(Duration::from_millis(2_000)).await;
-    let tree = sampler.discover(roots)?;
+) -> Result<Vec<crate::process::ProcessInfo>> {
+    // Row 57 observes liveness, not exited identities retained by the resource
+    // sampler for final cumulative accounting.
+    let tree = sampler.discover_live(roots)?;
     let profile_owned =
         crate::process::discover_profile_owned_processes(profile_root, executable_names)?;
     crate::process::track_profile_owned_processes(&profile_owned)?;
@@ -11894,11 +12418,396 @@ async fn signal_matrix_residue_count(
     for process in profile_owned {
         processes.insert(process.identity, process);
     }
-    let processes = processes.into_values().collect::<Vec<_>>();
-    Ok((
-        u32::try_from(processes.len()).unwrap_or(u32::MAX),
-        processes,
-    ))
+    Ok(processes.into_values().collect())
+}
+
+fn discover_signal_matrix_processes(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    profile_root: &Path,
+    executable_names: &[String],
+) -> Result<Vec<crate::process::ProcessInfo>> {
+    const MAX_ATTEMPTS: u32 = 4;
+    const RETRY_SETTLE: Duration = Duration::from_millis(2);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match discover_signal_matrix_processes_once(sampler, roots, profile_root, executable_names)
+        {
+            Ok(processes) => return Ok(processes),
+            Err(AhrbError::Io(error))
+                if attempt < MAX_ATTEMPTS
+                    && matches!(error.raw_os_error(), Some(libc::EIO) | Some(libc::EINTR)) =>
+            {
+                // Darwin's libproc enumeration can report a transient EIO while
+                // the system process table changes. Retry the entire identity
+                // snapshot immediately; a partial or substituted snapshot is
+                // never accepted, and the bounded retry remains well inside the
+                // row's 250 ms observation cadence.
+                std::thread::sleep(RETRY_SETTLE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("positive bounded signal discovery retry loop always returns")
+}
+
+#[cfg(test)]
+mod signal_process_discovery_tests {
+    use super::*;
+
+    struct TransientDiscoverySampler {
+        attempts: u32,
+        failures_remaining: u32,
+    }
+
+    impl Sampler for TransientDiscoverySampler {
+        fn discover(&mut self, _roots: &[u32]) -> Result<ProcessTree> {
+            self.attempts = self.attempts.saturating_add(1);
+            if self.failures_remaining > 0 {
+                self.failures_remaining = self.failures_remaining.saturating_sub(1);
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            Ok(ProcessTree::default())
+        }
+
+        fn sample(&mut self, _tree: &ProcessTree, _phase: &str) -> Result<Sample> {
+            unreachable!("signal discovery does not collect resource counters")
+        }
+    }
+
+    #[test]
+    fn signal_discovery_retries_transient_eio_without_accepting_a_partial_snapshot() {
+        let mut sampler = TransientDiscoverySampler {
+            attempts: 0,
+            failures_remaining: 2,
+        };
+        let processes =
+            discover_signal_matrix_processes(&mut sampler, &[1], &std::env::temp_dir(), &[])
+                .expect("transient process-table errors should be retried");
+        assert!(processes.is_empty());
+        assert_eq!(sampler.attempts, 3);
+    }
+}
+
+async fn signal_matrix_residue_observation(
+    sampler: &mut dyn Sampler,
+    roots: &[u32],
+    profile_root: &Path,
+    executable_names: &[String],
+) -> Result<Vec<crate::process::ProcessInfo>> {
+    // Do not return early on an empty parent/group sample: a detached daemon
+    // may become visible only by its disposable-profile argv after its
+    // launcher exits.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    discover_signal_matrix_processes(sampler, roots, profile_root, executable_names)
+}
+
+const SIGNAL_LINGER_SAMPLE_INTERVAL_MS: u64 = 250;
+const SIGNAL_LINGER_RESOLUTION_LIMIT: &str =
+    "processes shorter than one sample interval can be missed";
+
+struct SignalLingerCollection {
+    observation_2s: Vec<crate::process::ProcessInfo>,
+    observation: SignalDaemonLingerObservation,
+    residue: Vec<crate::process::ProcessInfo>,
+}
+
+struct SignalLingerContext<'a> {
+    roots: &'a [u32],
+    profile_root: &'a Path,
+    executable_names: &'a [String],
+    identity: crate::process::ProcIdentity,
+    idle_linger_ms: u64,
+    idle_origin: Instant,
+    idle_origin_ns: u64,
+}
+
+async fn collect_signal_linger_observation(
+    sampler: &mut dyn Sampler,
+    context: SignalLingerContext<'_>,
+) -> Result<SignalLingerCollection> {
+    let sample_interval = Duration::from_millis(SIGNAL_LINGER_SAMPLE_INTERVAL_MS);
+    let observation_2s_at = context.idle_origin + Duration::from_millis(2_000);
+    let deadline_at =
+        context.idle_origin + Duration::from_millis(context.idle_linger_ms.saturating_add(250));
+    let end_at = observation_2s_at.max(deadline_at);
+    let mut next_regular_at = context.idle_origin;
+    let mut observation_2s = None;
+    let mut deadline_sampled = false;
+    let mut sample_count = 0_u64;
+    let mut identity_disappeared = false;
+    let mut identity_continuity = true;
+    let mut sampled_residue = Vec::new();
+    // Deadline compliance is judged by each sample's scheduled instant, not by
+    // when its discovery finished: the forced boundary sample is scheduled at
+    // exactly `idle_origin + idle_linger_ms + 250 ms`, so an absence it records
+    // is an exit by the declared deadline. `None` until that sample is taken;
+    // afterwards it holds the identity process the boundary sample observed.
+    let mut deadline_identity_process: Option<Option<crate::process::ProcessInfo>> = None;
+
+    loop {
+        let sample_at = next_regular_at
+            .min(if observation_2s.is_none() {
+                observation_2s_at
+            } else {
+                end_at
+            })
+            .min(if deadline_sampled {
+                end_at
+            } else {
+                deadline_at
+            });
+        if let Some(remaining) = sample_at.checked_duration_since(Instant::now()) {
+            tokio::time::sleep(remaining).await;
+        }
+        let sample = discover_signal_matrix_processes(
+            sampler,
+            context.roots,
+            context.profile_root,
+            context.executable_names,
+        )?;
+        let observed_at = Instant::now();
+        sample_count = sample_count.saturating_add(1);
+        let identity_process = sample
+            .iter()
+            .find(|process| process.identity == context.identity)
+            .cloned();
+        let other_processes = sample
+            .iter()
+            .filter(|process| process.identity != context.identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !other_processes.is_empty() {
+            identity_continuity = false;
+            sampled_residue.extend(other_processes);
+        }
+        if let Some(process) = identity_process.as_ref() {
+            if identity_disappeared {
+                identity_continuity = false;
+                sampled_residue.push(process.clone());
+            }
+        } else {
+            identity_disappeared = true;
+        }
+        if sample_at == observation_2s_at {
+            observation_2s = Some(sample.clone());
+        }
+        if sample_at == deadline_at {
+            deadline_sampled = true;
+            deadline_identity_process = Some(identity_process);
+        }
+        if sample_at >= end_at {
+            break;
+        }
+        if sample_at == next_regular_at {
+            next_regular_at += sample_interval;
+        }
+        while next_regular_at < observed_at {
+            next_regular_at += sample_interval;
+        }
+    }
+
+    let observation_2s = observation_2s.ok_or_else(|| {
+        AhrbError::Protocol("row-57 two-second residue snapshot was not sampled".to_owned())
+    })?;
+    let identity_present_at_2s = observation_2s
+        .iter()
+        .any(|process| process.identity == context.identity);
+    let observation_2s_status = if identity_present_at_2s {
+        "identity-present-at-2s"
+    } else {
+        "identity-absent-at-2s"
+    };
+    let deadline_identity_process = deadline_identity_process.ok_or_else(|| {
+        AhrbError::Protocol("row-57 declared-deadline boundary was not sampled".to_owned())
+    })?;
+    // Only the boundary sample's own observation decides survival. An identity
+    // first observed absent in any sample scheduled at or before the boundary
+    // is absent from the boundary sample too (a reappearance is recorded above
+    // as residue and identity change), and a process already observed absent
+    // is never added to residue here.
+    let survived_declared_deadline = deadline_identity_process.is_some();
+    let deadline_outcome = if let Some(process) = deadline_identity_process {
+        sampled_residue.push(process);
+        "survived-declared-deadline"
+    } else {
+        "exited-by-declared-deadline"
+    };
+    sampled_residue.sort_by_key(|process| process.identity);
+    sampled_residue.dedup_by_key(|process| process.identity);
+
+    Ok(SignalLingerCollection {
+        observation_2s,
+        observation: SignalDaemonLingerObservation {
+            idle_linger_ms: context.idle_linger_ms,
+            identity: context.identity,
+            idle_origin_ns: context.idle_origin_ns,
+            observation_2s: observation_2s_status.to_owned(),
+            deadline_outcome: deadline_outcome.to_owned(),
+            deadline_ns: context.idle_origin_ns.saturating_add(
+                context
+                    .idle_linger_ms
+                    .saturating_add(250)
+                    .saturating_mul(1_000_000),
+            ),
+            sample_count,
+            sample_interval_ms: SIGNAL_LINGER_SAMPLE_INTERVAL_MS,
+            identity_continuity: if identity_continuity {
+                "stable-identity-or-absent"
+            } else {
+                "residue-or-identity-change"
+            }
+            .to_owned(),
+            identity_present_at_deadline: survived_declared_deadline,
+            resolution_limit: SIGNAL_LINGER_RESOLUTION_LIMIT.to_owned(),
+        },
+        residue: sampled_residue,
+    })
+}
+
+#[cfg(test)]
+mod signal_linger_boundary_tests {
+    use super::*;
+
+    const LINGER_MS: u64 = 1_000;
+
+    /// A declared daemon that is live until `exit_after` from the idle origin.
+    /// Discovery takes a few milliseconds, as real process-table scans do, so
+    /// every sample completes after its scheduled instant.
+    struct ExitingDaemonSampler {
+        idle_origin: Instant,
+        exit_after: Duration,
+        daemon: crate::process::ProcessInfo,
+    }
+
+    impl Sampler for ExitingDaemonSampler {
+        fn discover(&mut self, _roots: &[u32]) -> Result<ProcessTree> {
+            let live = self.idle_origin.elapsed() < self.exit_after;
+            std::thread::sleep(Duration::from_millis(5));
+            let mut tree = ProcessTree::default();
+            if live {
+                tree.members
+                    .insert(self.daemon.identity, self.daemon.clone());
+            }
+            Ok(tree)
+        }
+
+        fn sample(&mut self, _tree: &ProcessTree, _phase: &str) -> Result<Sample> {
+            unreachable!("linger observation does not collect resource counters")
+        }
+    }
+
+    async fn observe_exit_after(exit_after_ms: u64) -> SignalLingerCollection {
+        let daemon = crate::process::ProcessInfo {
+            identity: crate::process::ProcIdentity {
+                pid: 57,
+                start_time: 57_000,
+            },
+            ppid: 1,
+            command: "declared-daemon".to_owned(),
+            ownership: crate::process::ProcOwnership::DeclaredRoot,
+        };
+        let idle_origin = Instant::now();
+        let mut sampler = ExitingDaemonSampler {
+            idle_origin,
+            exit_after: Duration::from_millis(exit_after_ms),
+            daemon: daemon.clone(),
+        };
+        let profile_root = std::env::temp_dir();
+        collect_signal_linger_observation(
+            &mut sampler,
+            SignalLingerContext {
+                roots: &[daemon.identity.pid],
+                profile_root: &profile_root,
+                executable_names: &[],
+                identity: daemon.identity,
+                idle_linger_ms: LINGER_MS,
+                idle_origin,
+                idle_origin_ns: 1_000_000,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn evaluate(
+        collection: &SignalLingerCollection,
+    ) -> crate::wave2_automation::SignalMatrixEvaluation {
+        let residue_2s = collection
+            .observation_2s
+            .iter()
+            .filter(|process| process.identity != collection.observation.identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        let trial = |case: &str| SignalCaseTrial {
+            repetition: 1,
+            case: case.to_owned(),
+            applicable: true,
+            not_applicable_reason: None,
+            delivery_succeeded: Some(true),
+            ownership_resolved: Some(true),
+            cleanup_escalated: Some(false),
+            origin_ns: Some(1_000_000),
+            terminal_ns: Some(2_000_000),
+            terminal_type: Some("cancelled".to_owned()),
+            terminal_count: Some(1),
+            source_terminal_count: Some(1),
+            exit_code: Some(0),
+            exit_was_signal: Some(false),
+            residue: Some(crate::wave2_automation::SignalResidueObservation {
+                observed_after_ms: 2_000,
+                processes: u32::try_from(residue_2s.len()).unwrap(),
+                identities: residue_2s.clone(),
+            }),
+            declared_daemon_linger: Some(collection.observation.clone()),
+            residue_processes: Some(u32::try_from(collection.residue.len()).unwrap()),
+            residue_identities: collection.residue.clone(),
+        };
+        let trials = ["sigterm", "sigint2", "sighup", "stdin-eof"].map(trial);
+        evaluate_signal_matrix(&trials, 1, 2_000, Some(LINGER_MS), 10_000)
+    }
+
+    #[tokio::test]
+    async fn exit_inside_the_boundary_tolerance_is_exited_by_declared_deadline() {
+        // Absent from the boundary sample scheduled at linger+250 ms, present at
+        // the regular sample at linger.
+        let collection = observe_exit_after(LINGER_MS + 125).await;
+        let linger = &collection.observation;
+        assert_eq!(linger.deadline_outcome, "exited-by-declared-deadline");
+        assert!(!linger.identity_present_at_deadline);
+        assert_eq!(linger.identity_continuity, "stable-identity-or-absent");
+        assert_eq!(linger.observation_2s, "identity-absent-at-2s");
+        assert!(collection.residue.is_empty(), "{:?}", collection.residue);
+        let evaluation = evaluate(&collection);
+        assert!(evaluation.measurement_complete, "{}", evaluation.details);
+        assert!(evaluation.passed, "{}", evaluation.details);
+    }
+
+    #[tokio::test]
+    async fn identity_present_at_the_boundary_sample_survives_and_fails() {
+        let collection = observe_exit_after(60_000).await;
+        let linger = &collection.observation;
+        assert_eq!(linger.deadline_outcome, "survived-declared-deadline");
+        assert!(linger.identity_present_at_deadline);
+        assert_eq!(linger.observation_2s, "identity-present-at-2s");
+        assert_eq!(collection.residue.len(), 1);
+        assert_eq!(collection.residue[0].identity, linger.identity);
+        let evaluation = evaluate(&collection);
+        assert!(evaluation.measurement_complete, "{}", evaluation.details);
+        assert!(!evaluation.passed, "{}", evaluation.details);
+    }
+
+    #[tokio::test]
+    async fn exit_shortly_before_the_declared_linger_passes() {
+        let collection = observe_exit_after(LINGER_MS - 125).await;
+        let linger = &collection.observation;
+        assert_eq!(linger.deadline_outcome, "exited-by-declared-deadline");
+        assert!(!linger.identity_present_at_deadline);
+        assert!(collection.residue.is_empty(), "{:?}", collection.residue);
+        let evaluation = evaluate(&collection);
+        assert!(evaluation.measurement_complete, "{}", evaluation.details);
+        assert!(evaluation.passed, "{}", evaluation.details);
+    }
 }
 
 fn annotate_signal_matrix_events(
@@ -12046,6 +12955,29 @@ async fn collect_signal_matrix_case(
         )
         .await?;
         let owned_tree = sampler.discover(&roots)?;
+        let declared_daemon_identity = match manifest.daemon.idle_linger_ms {
+            Some(_) => {
+                let daemon_pid = driver.daemon_pid().ok_or_else(|| {
+                    AhrbError::Protocol(
+                        "row-57 declared idle linger has no resolved daemon PID".to_owned(),
+                    )
+                })?;
+                Some(
+                    owned_tree
+                        .members
+                        .keys()
+                        .copied()
+                        .find(|identity| identity.pid == daemon_pid)
+                        .ok_or_else(|| {
+                            AhrbError::Protocol(
+                                "row-57 declared idle linger daemon identity is outside the owned tree"
+                                    .to_owned(),
+                            )
+                        })?,
+                )
+            }
+            None => None,
+        };
         let session_roots = driver.session_pids(&session);
         let signal_roots = if session_roots.is_empty() {
             &roots
@@ -12157,6 +13089,43 @@ async fn collect_signal_matrix_case(
             deadline,
         )
         .await?;
+        let idle_origin = Instant::now();
+        let idle_origin_ns = monotonic_timestamp_ns();
+        let (observation_2s, declared_daemon_linger, final_processes) =
+            if let (Some(idle_linger_ms), Some(identity)) =
+                (manifest.daemon.idle_linger_ms, declared_daemon_identity)
+            {
+                let observation = collect_signal_linger_observation(
+                    sampler.as_mut(),
+                    SignalLingerContext {
+                        roots: &roots,
+                        profile_root: &profile_root,
+                        executable_names: &manifest.process.executable_names,
+                        identity,
+                        idle_linger_ms,
+                        idle_origin,
+                        idle_origin_ns,
+                    },
+                )
+                .await?;
+                (
+                    observation.observation_2s,
+                    Some(observation.observation),
+                    observation.residue,
+                )
+            } else {
+                (
+                    signal_matrix_residue_observation(
+                        sampler.as_mut(),
+                        &roots,
+                        &profile_root,
+                        &manifest.process.executable_names,
+                    )
+                    .await?,
+                    None,
+                    Vec::new(),
+                )
+            };
         let driver_journal = driver.durable_event_path(&session);
         let journal = read_signal_matrix_journal_at(
             manifest,
@@ -12200,13 +13169,21 @@ async fn collect_signal_matrix_case(
             .map(str::to_owned);
         let terminal_count = u32::try_from(terminals.len()).map_or(u32::MAX, |value| value);
         drop(terminals);
-        let (residue_processes, residue_identities) = signal_matrix_residue_count(
-            sampler.as_mut(),
-            &roots,
-            &profile_root,
-            &manifest.process.executable_names,
-        )
-        .await?;
+        let unexpected_residue = observation_2s
+            .iter()
+            .filter(|process| Some(process.identity) != declared_daemon_identity)
+            .cloned()
+            .collect::<Vec<_>>();
+        let residue = SignalResidueObservation {
+            observed_after_ms: 2_000,
+            processes: u32::try_from(unexpected_residue.len()).unwrap_or(u32::MAX),
+            identities: unexpected_residue.clone(),
+        };
+        let mut residue_identities = unexpected_residue;
+        residue_identities.extend(final_processes);
+        residue_identities.sort_by_key(|process| process.identity);
+        residue_identities.dedup_by_key(|process| process.identity);
+        let residue_processes = u32::try_from(residue_identities.len()).unwrap_or(u32::MAX);
         annotate_signal_matrix_events(
             &mut events,
             case,
@@ -12239,6 +13216,8 @@ async fn collect_signal_matrix_case(
                 source_terminal_count: Some(source_terminal_count),
                 exit_code,
                 exit_was_signal: Some(exit_was_signal),
+                residue: Some(residue),
+                declared_daemon_linger,
                 residue_processes: Some(residue_processes),
                 residue_identities,
             },
@@ -12247,15 +13226,20 @@ async fn collect_signal_matrix_case(
         ))
     }
     .await;
-    if collected.is_err() {
-        let _ = driver.shutdown().await;
-    }
+    // Emergency teardown for a collection error is deliberately after the
+    // row's residue/linger measurement. Successful collection leaves any
+    // recorded residue for the run-level profile teardown, which records what
+    // it observed and reaped without replacing the row verdict.
+    let teardown = if collected.is_err() {
+        driver.shutdown().await
+    } else {
+        Ok(())
+    };
     drop(driver);
     let shutdown = server.shutdown().await;
-    match (collected, shutdown) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    match (collected, teardown, shutdown) {
+        (Ok(value), Ok(()), Ok(())) => Ok(value),
+        (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
     }
 }
 
@@ -12312,6 +13296,8 @@ async fn collect_signal_matrix_trials(
                     source_terminal_count: None,
                     exit_code: None,
                     exit_was_signal: None,
+                    residue: None,
+                    declared_daemon_linger: None,
                     residue_processes: None,
                     residue_identities: Vec::new(),
                 });
@@ -12324,7 +13310,13 @@ async fn collect_signal_matrix_trials(
                 repetition,
                 case,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                AhrbError::Protocol(format!(
+                    "row-57 {} repetition {repetition} collection failed: {error}",
+                    case.label()
+                ))
+            })?;
             collected.evidence.push(trial);
             collected.events.extend(events);
             collected.requests.extend(requests);
@@ -12376,6 +13368,7 @@ mod signal_matrix_source_tests {
             &trials.evidence,
             1,
             manifest.daemon.grace_ms,
+            manifest.daemon.idle_linger_ms,
             outer_deadline_ms,
         );
         assert!(evaluation.measurement_complete);
@@ -12455,6 +13448,7 @@ with urllib.request.urlopen(request, timeout=60) as response:
 
     #[tokio::test]
     async fn production_collector_requires_a_source_backed_terminal() {
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let (manifest, silent) = collect_python_signal_fixture(false).await;
         assert!(
             silent
@@ -12468,6 +13462,7 @@ with urllib.request.urlopen(request, timeout=60) as response:
             &silent.evidence,
             1,
             manifest.daemon.grace_ms,
+            manifest.daemon.idle_linger_ms,
             outer_deadline_ms,
         );
         assert!(silent_evaluation.measurement_complete);
@@ -12487,6 +13482,7 @@ with urllib.request.urlopen(request, timeout=60) as response:
             &emitted.evidence,
             1,
             manifest.daemon.grace_ms,
+            manifest.daemon.idle_linger_ms,
             outer_deadline_ms,
         );
         assert!(emitted_evaluation.measurement_complete);
@@ -12494,7 +13490,406 @@ with urllib.request.urlopen(request, timeout=60) as response:
     }
 
     #[tokio::test]
+    async fn declared_linger_control_that_survives_deadline_fails_then_is_reaped() {
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row57-linger-control-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "trap '' TERM INT HUP; sleep 60".to_owned(),
+            "row57-daemon".to_owned(),
+            "{{profile}}".to_owned(),
+        ];
+        manifest.daemon.readiness.kind = "process".to_owned();
+        manifest.daemon.readiness.target.clear();
+        manifest.daemon.idle_linger_ms = Some(10);
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest
+            .process
+            .executable_names
+            .extend(["bash", "sh", "sleep"].into_iter().map(str::to_owned));
+        crate::manifest::validate(&manifest).unwrap();
+
+        let trials = collect_signal_matrix_trials(
+            &manifest,
+            Profile::Quick,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        let outer_deadline_ms = u64::try_from(outer_turn_timeout(&manifest).as_millis()).unwrap();
+        let evaluation = evaluate_signal_matrix(
+            &trials.evidence,
+            1,
+            manifest.daemon.grace_ms,
+            manifest.daemon.idle_linger_ms,
+            outer_deadline_ms,
+        );
+        assert!(evaluation.measurement_complete);
+        assert!(
+            !evaluation.passed,
+            "survivor evidence: {:?}",
+            trials.evidence
+        );
+        assert!(
+            trials
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .all(|trial| {
+                    trial.declared_daemon_linger.as_ref().is_some_and(|linger| {
+                        linger.observation_2s == "identity-present-at-2s"
+                            && linger.deadline_outcome == "survived-declared-deadline"
+                    })
+                })
+        );
+        assert!(
+            crate::process::discover_profile_owned_processes(
+                &profile_root,
+                &manifest.process.executable_names,
+            )
+            .unwrap()
+            .is_empty(),
+            "the post-measurement teardown must reap the ignored linger control"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_residue_fails_with_or_without_declared_linger() {
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row57-detached-residue-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let daemon_script = root.join("detach_daemon.py");
+        std::fs::write(
+            &daemon_script,
+            r#"import os,pathlib,signal,subprocess,sys,time
+mode = sys.argv[1]
+marker = pathlib.Path(sys.argv[2])
+for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(handled, signal.SIG_IGN)
+if mode == 'worker':
+    time.sleep(30)
+    raise SystemExit(0)
+while not marker.exists():
+    time.sleep(0.01)
+subprocess.Popen(
+    [sys.executable, __file__, 'worker', str(marker)],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+    start_new_session=True,
+)
+time.sleep(0.5)
+os._exit(0)
+"#,
+        )
+        .unwrap();
+        let client_script = root.join("signal_client.py");
+        std::fs::write(
+            &client_script,
+            r#"import json,os,pathlib,signal,sys,urllib.request
+marker = pathlib.Path(sys.argv[1])
+prompt, session_id, actor = sys.argv[2:5]
+def stop(signum, frame):
+    marker.write_text('detach')
+    print(json.dumps({
+        'id': session_id + ':terminal',
+        'cursor': 1,
+        'session_id': session_id,
+        'actor': actor,
+        'event': 'terminal-cancelled',
+        'payload': {'status': 'cancelled'},
+    }), flush=True)
+    raise SystemExit(0)
+for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(handled, stop)
+body = json.dumps({
+    'model': os.environ.get('AHRB_MOCK_MODEL', 'ahrb-fake-v1'),
+    'messages': [{'role': 'user', 'content': prompt}],
+    'stream': True,
+}).encode()
+request = urllib.request.Request(
+    os.environ['AHRB_MOCK_BASE_URL'] + '/v1/chat/completions',
+    data=body,
+    headers={
+        'Authorization': 'Bearer ' + os.environ['AHRB_MOCK_API_KEY'],
+        'Content-Type': 'application/json',
+    },
+)
+with urllib.request.urlopen(request, timeout=60) as response:
+    response.read()
+"#,
+        )
+        .unwrap();
+
+        let mut residue_counts = Vec::new();
+        for idle_linger_ms in [None, Some(3_000)] {
+            let label = if idle_linger_ms.is_some() {
+                "linger"
+            } else {
+                "no-linger"
+            };
+            let run_profile_root = root.join(label);
+            let mut manifest =
+                crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+            manifest.daemon.persistent = true;
+            manifest.daemon.start = vec![
+                "/usr/bin/python3".to_owned(),
+                daemon_script.to_string_lossy().into_owned(),
+                "daemon".to_owned(),
+                "{{profile}}/detach-marker".to_owned(),
+            ];
+            manifest.daemon.readiness.kind = "process".to_owned();
+            manifest.daemon.readiness.target.clear();
+            manifest.daemon.idle_linger_ms = idle_linger_ms;
+            manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+            manifest.transport.command = vec![
+                "/usr/bin/python3".to_owned(),
+                client_script.to_string_lossy().into_owned(),
+                "{{profile}}/detach-marker".to_owned(),
+                "{{prompt}}".to_owned(),
+                "{{session_id}}".to_owned(),
+                "{{marker}}".to_owned(),
+            ];
+            manifest.events.source = "stdout".to_owned();
+            manifest.events.path.clear();
+            manifest.process.executable_names.extend(
+                ["Python", "python3", "python3.9"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+            crate::manifest::validate(&manifest).unwrap();
+
+            let trials = collect_signal_matrix_trials(
+                &manifest,
+                Profile::Quick,
+                &run_profile_root,
+                "0123456789abcdef0123456789abcdef",
+            )
+            .await
+            .unwrap();
+            let outer_deadline_ms =
+                u64::try_from(outer_turn_timeout(&manifest).as_millis()).unwrap();
+            let evaluation = evaluate_signal_matrix(
+                &trials.evidence,
+                1,
+                manifest.daemon.grace_ms,
+                manifest.daemon.idle_linger_ms,
+                outer_deadline_ms,
+            );
+            assert!(
+                evaluation.measurement_complete,
+                "{label}: {}",
+                evaluation.details
+            );
+            assert!(!evaluation.passed, "{label}: {}", evaluation.details);
+            let counts = trials
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .map(|trial| trial.residue_processes.unwrap_or_default())
+                .collect::<Vec<_>>();
+            assert_eq!(counts, vec![1, 1, 1], "{label}: {:?}", trials.evidence);
+            residue_counts.push(counts);
+
+            let workers = crate::process::discover_profile_owned_processes(
+                &run_profile_root,
+                &manifest.process.executable_names,
+            )
+            .unwrap();
+            assert_eq!(
+                workers.len(),
+                3,
+                "{label}: the three measured workers must remain for run-level teardown"
+            );
+            for worker in &workers {
+                let pid = i32::try_from(worker.identity.pid).unwrap();
+                // Test-only cleanup targets only identities rediscovered under
+                // this fixture's profile. Production uses the recorded
+                // run-level profile teardown after measurement.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+            }
+            let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+            while workers
+                .iter()
+                .any(|worker| crate::process::identity_is_live(worker.identity))
+            {
+                assert!(Instant::now() < cleanup_deadline, "{label}: worker cleanup");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(residue_counts[0], residue_counts[1]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_linger_replacement_identity_is_observed_and_fails() {
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ahrb-row57-replacement-control-{}-{sequence}",
+            std::process::id()
+        ));
+        let profile_root = root.join("profile");
+        std::fs::create_dir_all(&root).unwrap();
+        let daemon_script = root.join("replace_daemon.py");
+        std::fs::write(
+            &daemon_script,
+            r#"import os,pathlib,signal,subprocess,sys,time
+mode = sys.argv[1]
+marker = pathlib.Path(sys.argv[2])
+for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(handled, signal.SIG_IGN)
+if mode == 'replacement':
+    time.sleep(0.7)
+    raise SystemExit(0)
+while not marker.exists():
+    time.sleep(0.01)
+time.sleep(2.1)
+subprocess.Popen(
+    [sys.executable, __file__, 'replacement', str(marker)],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+    start_new_session=True,
+)
+os._exit(0)
+"#,
+        )
+        .unwrap();
+        let client_script = root.join("signal_client.py");
+        std::fs::write(
+            &client_script,
+            r#"import json,os,pathlib,signal,sys,urllib.request
+marker = pathlib.Path(sys.argv[1])
+prompt, session_id, actor = sys.argv[2:5]
+def stop(signum, frame):
+    marker.write_text('replace')
+    print(json.dumps({
+        'id': session_id + ':terminal',
+        'cursor': 1,
+        'session_id': session_id,
+        'actor': actor,
+        'event': 'terminal-cancelled',
+        'payload': {'status': 'cancelled'},
+    }), flush=True)
+    raise SystemExit(0)
+for handled in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(handled, stop)
+body = json.dumps({
+    'model': os.environ.get('AHRB_MOCK_MODEL', 'ahrb-fake-v1'),
+    'messages': [{'role': 'user', 'content': prompt}],
+    'stream': True,
+}).encode()
+request = urllib.request.Request(
+    os.environ['AHRB_MOCK_BASE_URL'] + '/v1/chat/completions',
+    data=body,
+    headers={
+        'Authorization': 'Bearer ' + os.environ['AHRB_MOCK_API_KEY'],
+        'Content-Type': 'application/json',
+    },
+)
+with urllib.request.urlopen(request, timeout=60) as response:
+    response.read()
+"#,
+        )
+        .unwrap();
+
+        let mut manifest =
+            crate::manifest::load(Path::new("adapters/mock-exec/manifest.toml")).unwrap();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec![
+            "/usr/bin/python3".to_owned(),
+            daemon_script.to_string_lossy().into_owned(),
+            "daemon".to_owned(),
+            "{{profile}}/replace-marker".to_owned(),
+        ];
+        manifest.daemon.readiness.kind = "process".to_owned();
+        manifest.daemon.readiness.target.clear();
+        manifest.daemon.idle_linger_ms = Some(3_000);
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+        manifest.transport.command = vec![
+            "/usr/bin/python3".to_owned(),
+            client_script.to_string_lossy().into_owned(),
+            "{{profile}}/replace-marker".to_owned(),
+            "{{prompt}}".to_owned(),
+            "{{session_id}}".to_owned(),
+            "{{marker}}".to_owned(),
+        ];
+        manifest.events.source = "stdout".to_owned();
+        manifest.events.path.clear();
+        manifest.process.executable_names.extend(
+            ["Python", "python3", "python3.9"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        crate::manifest::validate(&manifest).unwrap();
+
+        let trials = collect_signal_matrix_trials(
+            &manifest,
+            Profile::Quick,
+            &profile_root,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        let outer_deadline_ms = u64::try_from(outer_turn_timeout(&manifest).as_millis()).unwrap();
+        let evaluation = evaluate_signal_matrix(
+            &trials.evidence,
+            1,
+            manifest.daemon.grace_ms,
+            manifest.daemon.idle_linger_ms,
+            outer_deadline_ms,
+        );
+        assert!(evaluation.measurement_complete, "{}", evaluation.details);
+        assert!(!evaluation.passed);
+        assert!(
+            trials
+                .evidence
+                .iter()
+                .filter(|trial| trial.applicable)
+                .all(
+                    |trial| trial.declared_daemon_linger.as_ref().is_some_and(|linger| {
+                        linger.sample_interval_ms == 250
+                            && linger.sample_count >= 2
+                            && linger.identity_continuity == "residue-or-identity-change"
+                            && linger.deadline_outcome == "exited-by-declared-deadline"
+                    })
+                ),
+            "replacement evidence: {:?}",
+            trials.evidence
+        );
+        assert!(
+            crate::process::discover_profile_owned_processes(
+                &profile_root,
+                &manifest.process.executable_names,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn production_collector_credits_exec_native_journal_terminals() {
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let (manifest, trials) =
             collect_native_signal_fixture("adapters/mock-exec/manifest.toml").await;
         assert_eq!(
@@ -12510,6 +13905,7 @@ with urllib.request.urlopen(request, timeout=60) as response:
 
     #[tokio::test]
     async fn production_collector_reads_daemon_native_journal_after_rpc_closes() {
+        let _guard = PRODUCTION_COLLECTOR_TEST_LOCK.lock().await;
         let (manifest, trials) = collect_native_signal_fixture("adapters/mock/manifest.toml").await;
         assert_eq!(
             trials
@@ -25288,22 +26684,6 @@ fn evaluate_rows(
                         })),
                     );
                 }
-                if !row65.baseline_runnable {
-                    let mut result = classify(
-                        definition.row,
-                        definition.id,
-                        definition.pillar,
-                        Some(false),
-                        &[],
-                        None,
-                    );
-                    result.metadata.score = Some(0.0);
-                    result.evidence.push(
-                        "fresh baseline could not prove both fake-provider routing and credential injection"
-                            .to_owned(),
-                    );
-                    return result;
-                }
                 let mut result = classify(
                     definition.row,
                     definition.id,
@@ -25313,7 +26693,8 @@ fn evaluate_rows(
                         name: definition.metric.to_owned(),
                         passed: row65.passed,
                         detail: format!(
-                            "provider={:.2}, base-url={:.2}, credential={:.2}, verified={:.0}/3, aggregate={:.6}",
+                            "baseline-runnable={}, provider={:.2}, base-url={:.2}, credential={:.2}, verified={:.0}/3, aggregate={:.6}",
+                            row65.baseline_runnable,
                             row65.metrics["injection_surface.provider_score"],
                             row65.metrics["injection_surface.base_url_score"],
                             row65.metrics["injection_surface.credential_score"],

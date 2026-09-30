@@ -737,7 +737,7 @@ fn latency_vs_turn_index_flat_growing_sessions_pass_and_publish_exact_metrics() 
 }
 
 #[test]
-fn latency_vs_turn_index_applies_growth_oracle_to_published_medians() {
+fn latency_vs_turn_index_publishes_medians_but_requires_every_repetition() {
     let mut turns = Vec::new();
     for repetition in 1..=3 {
         for turn in 1..=10 {
@@ -752,8 +752,13 @@ fn latency_vs_turn_index_applies_growth_oracle_to_published_medians() {
     let evaluation = evaluate_latency_vs_turn_index(&turns, 3, 10, false);
     assert!(evaluation.measurement_complete);
     assert_eq!(evaluation.theil_sen_ms_per_turn, 0.0);
-    assert!(evaluation.passed);
-    assert!(evaluation.failure_detail.is_none());
+    assert!(!evaluation.passed);
+    assert!(
+        evaluation
+            .failure_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("failed repetitions=[3]"))
+    );
     assert_eq!(evaluation.details["repetitions"][2]["passed"], false);
 }
 

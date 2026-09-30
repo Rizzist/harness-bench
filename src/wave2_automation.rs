@@ -205,9 +205,50 @@ pub struct SignalCaseTrial {
     pub source_terminal_count: Option<u32>,
     pub exit_code: Option<i32>,
     pub exit_was_signal: Option<bool>,
+    /// Unexpected owned processes at the fixed two-second observation. A
+    /// declared daemon with the same stable identity is excluded here.
+    pub residue: Option<SignalResidueObservation>,
+    /// Observation of the manifest-declared daemon idle-linger contract.
+    pub declared_daemon_linger: Option<SignalDaemonLingerObservation>,
+    /// Owned processes still live at the end of the applicable measurement.
     pub residue_processes: Option<u32>,
     #[serde(default)]
     pub residue_identities: Vec<crate::process::ProcessInfo>,
+}
+
+/// Unexpected owned process residue at row 57's intermediate observation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SignalResidueObservation {
+    pub observed_after_ms: u64,
+    pub processes: u32,
+    #[serde(default)]
+    pub identities: Vec<crate::process::ProcessInfo>,
+}
+
+/// Evidence for a declared persistent daemon idle-linger policy.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SignalDaemonLingerObservation {
+    pub idle_linger_ms: u64,
+    pub identity: crate::process::ProcIdentity,
+    /// External observation immediately after the signalled client exited.
+    pub idle_origin_ns: u64,
+    /// `identity-present-at-2s` or `identity-absent-at-2s`.
+    pub observation_2s: String,
+    /// `exited-by-declared-deadline` or `survived-declared-deadline`.
+    pub deadline_outcome: String,
+    pub deadline_ns: u64,
+    /// Number of owned-process samples from the idle origin through the later
+    /// of the two-second snapshot and declared deadline plus tolerance.
+    pub sample_count: u64,
+    /// Fixed interval used between scheduled owned-process samples.
+    pub sample_interval_ms: u64,
+    /// `stable-identity-or-absent` or `residue-or-identity-change`.
+    pub identity_continuity: String,
+    /// Whether the recorded stable identity was present in the sample scheduled
+    /// at the declared boundary, `idle_origin + idle_linger_ms + 250 ms`.
+    pub identity_present_at_deadline: bool,
+    /// Honest observation limit for processes that start and exit between samples.
+    pub resolution_limit: String,
 }
 
 /// Row-57 result.
@@ -225,6 +266,7 @@ pub fn evaluate_signal_matrix(
     trials: &[SignalCaseTrial],
     expected_repetitions: u32,
     grace_ms: u64,
+    idle_linger_ms: Option<u64>,
     outer_deadline_ms: u64,
 ) -> SignalMatrixEvaluation {
     let incomplete = |message: String| SignalMatrixEvaluation {
@@ -291,6 +333,77 @@ pub fn evaluate_signal_matrix(
                 trial.case
             ));
         }
+        let Some(residue) = trial.residue.as_ref() else {
+            return incomplete(format!(
+                "{} two-second residue observation is absent",
+                trial.case
+            ));
+        };
+        if residue.observed_after_ms != 2_000
+            || usize::try_from(residue.processes).ok() != Some(residue.identities.len())
+        {
+            return incomplete(format!(
+                "{} two-second residue evidence is inconsistent",
+                trial.case
+            ));
+        }
+        match (idle_linger_ms, trial.declared_daemon_linger.as_ref()) {
+            (None, None) => {}
+            (Some(expected), Some(linger))
+                if linger.idle_linger_ms == expected
+                    && linger.deadline_ns
+                        == linger.idle_origin_ns.saturating_add(
+                            expected.saturating_add(250).saturating_mul(1_000_000),
+                        )
+                    && matches!(
+                        linger.observation_2s.as_str(),
+                        "identity-present-at-2s" | "identity-absent-at-2s"
+                    )
+                    && matches!(
+                        linger.deadline_outcome.as_str(),
+                        "exited-by-declared-deadline" | "survived-declared-deadline"
+                    )
+                    && linger.sample_count > 0
+                    && (1..=250).contains(&linger.sample_interval_ms)
+                    && matches!(
+                        linger.identity_continuity.as_str(),
+                        "stable-identity-or-absent" | "residue-or-identity-change"
+                    )
+                    && linger.resolution_limit
+                        == "processes shorter than one sample interval can be missed"
+                    && linger.identity_present_at_deadline
+                        == (linger.deadline_outcome == "survived-declared-deadline") => {}
+            (Some(_), Some(_)) => {
+                return incomplete(format!(
+                    "{} declared daemon linger evidence is inconsistent",
+                    trial.case
+                ));
+            }
+            (Some(_), None) => {
+                return incomplete(format!(
+                    "{} declared daemon linger evidence is absent",
+                    trial.case
+                ));
+            }
+            (None, Some(_)) => {
+                return incomplete(format!(
+                    "{} has undeclared daemon linger evidence",
+                    trial.case
+                ));
+            }
+        }
+        if let Some(linger) = trial.declared_daemon_linger.as_ref() {
+            if residue
+                .identities
+                .iter()
+                .any(|process| process.identity == linger.identity)
+            {
+                return incomplete(format!(
+                    "{} declared daemon identity evidence is inconsistent",
+                    trial.case
+                ));
+            }
+        }
     }
     for trial in trials.iter().filter(|trial| !trial.applicable) {
         if trial.case != "stdin-eof"
@@ -303,6 +416,8 @@ pub fn evaluate_signal_matrix(
             || trial.terminal_count.is_some()
             || trial.source_terminal_count.is_some()
             || trial.exit_was_signal.is_some()
+            || trial.residue.is_some()
+            || trial.declared_daemon_linger.is_some()
             || trial.residue_processes.is_some()
             || !trial.residue_identities.is_empty()
         {
@@ -349,6 +464,14 @@ pub fn evaluate_signal_matrix(
                 && trial.cleanup_escalated == Some(false)
                 && trial.exit_was_signal == Some(false)
                 && trial.exit_code.is_some()
+                && trial
+                    .residue
+                    .as_ref()
+                    .is_some_and(|residue| residue.processes == 0)
+                && trial.declared_daemon_linger.as_ref().is_none_or(|linger| {
+                    linger.deadline_outcome == "exited-by-declared-deadline"
+                        && linger.identity_continuity == "stable-identity-or-absent"
+                })
                 && trial.residue_processes == Some(0)
                 && trial
                     .origin_ns
@@ -585,6 +708,12 @@ mod tests {
             source_terminal_count: Some(1),
             exit_code: Some(0),
             exit_was_signal: Some(false),
+            residue: Some(SignalResidueObservation {
+                observed_after_ms: 2_000,
+                processes: 0,
+                identities: Vec::new(),
+            }),
+            declared_daemon_linger: None,
             residue_processes: Some(0),
             residue_identities: Vec::new(),
         };
@@ -609,11 +738,13 @@ mod tests {
                 source_terminal_count: None,
                 exit_code: None,
                 exit_was_signal: None,
+                residue: None,
+                declared_daemon_linger: None,
                 residue_processes: None,
                 residue_identities: Vec::new(),
             },
         ];
-        let evaluated = evaluate_signal_matrix(&trials, 1, 2_000, 10_000);
+        let evaluated = evaluate_signal_matrix(&trials, 1, 2_000, None, 10_000);
         assert!(evaluated.measurement_complete);
         assert!(evaluated.passed);
         assert_eq!(evaluated.metrics["signal_matrix.applicable_cases"], 3.0);
@@ -648,6 +779,23 @@ mod tests {
             source_terminal_count: Some(1),
             exit_code: Some(0),
             exit_was_signal: Some(false),
+            residue: Some(SignalResidueObservation {
+                observed_after_ms: 2_000,
+                processes: u32::from(residue),
+                identities: residue
+                    .then_some(crate::process::ProcessInfo {
+                        identity: crate::process::ProcIdentity {
+                            pid: 41,
+                            start_time: 9001,
+                        },
+                        ppid: 1,
+                        command: "worker".to_owned(),
+                        ownership: crate::process::ProcOwnership::ProfilePath,
+                    })
+                    .into_iter()
+                    .collect(),
+            }),
+            declared_daemon_linger: None,
             residue_processes: Some(u32::from(residue)),
             residue_identities: residue
                 .then_some(crate::process::ProcessInfo {
@@ -671,6 +819,7 @@ mod tests {
             ],
             1,
             2_000,
+            None,
             10_000,
         );
         assert!(evaluated.measurement_complete);
@@ -688,6 +837,122 @@ mod tests {
             "profile-path"
         );
         assert_eq!(evaluated.metrics["signal_matrix.passed_cases"], 3.0);
+    }
+
+    #[test]
+    fn signal_matrix_credits_only_a_declared_daemon_that_exits_by_its_deadline() {
+        let daemon_identity = crate::process::ProcIdentity {
+            pid: 57,
+            start_time: 6_000,
+        };
+        let daemon_process = crate::process::ProcessInfo {
+            identity: daemon_identity,
+            ppid: 1,
+            command: "declared-daemon".to_owned(),
+            ownership: crate::process::ProcOwnership::ProfilePath,
+        };
+        let trial = |case: &str| SignalCaseTrial {
+            repetition: 1,
+            case: case.to_owned(),
+            applicable: true,
+            not_applicable_reason: None,
+            delivery_succeeded: Some(true),
+            ownership_resolved: Some(true),
+            cleanup_escalated: Some(false),
+            origin_ns: Some(1_000_000),
+            terminal_ns: Some(2_000_000),
+            terminal_type: Some("cancelled".to_owned()),
+            terminal_count: Some(1),
+            source_terminal_count: Some(1),
+            exit_code: Some(0),
+            exit_was_signal: Some(false),
+            residue: Some(SignalResidueObservation {
+                observed_after_ms: 2_000,
+                processes: 0,
+                identities: Vec::new(),
+            }),
+            declared_daemon_linger: Some(SignalDaemonLingerObservation {
+                idle_linger_ms: 4_000,
+                identity: daemon_identity,
+                idle_origin_ns: 1_000_000,
+                observation_2s: "identity-present-at-2s".to_owned(),
+                deadline_outcome: "exited-by-declared-deadline".to_owned(),
+                deadline_ns: 4_251_000_000,
+                sample_count: 10,
+                sample_interval_ms: 250,
+                identity_continuity: "stable-identity-or-absent".to_owned(),
+                identity_present_at_deadline: false,
+                resolution_limit: "processes shorter than one sample interval can be missed"
+                    .to_owned(),
+            }),
+            residue_processes: Some(0),
+            residue_identities: Vec::new(),
+        };
+        let trials = [
+            trial("sigterm"),
+            trial("sigint2"),
+            trial("sighup"),
+            trial("stdin-eof"),
+        ];
+        let exited = evaluate_signal_matrix(&trials, 1, 2_000, Some(4_000), 10_000);
+        assert!(exited.measurement_complete);
+        assert!(exited.passed, "{}", exited.details);
+        assert_eq!(
+            exited.details["cases"][0]["declared_daemon_linger"]["observation_2s"],
+            "identity-present-at-2s"
+        );
+
+        let mut late_exit = trials.to_vec();
+        for trial in &mut late_exit {
+            let linger = trial.declared_daemon_linger.as_mut().unwrap();
+            linger.observation_2s = "identity-absent-at-2s".to_owned();
+            linger.deadline_outcome = "survived-declared-deadline".to_owned();
+            linger.identity_present_at_deadline = true;
+        }
+        let late = evaluate_signal_matrix(&late_exit, 1, 2_000, Some(4_000), 10_000);
+        assert!(late.measurement_complete);
+        assert!(!late.passed);
+        assert_eq!(
+            late.details["cases"][0]["declared_daemon_linger"]["observation_2s"],
+            "identity-absent-at-2s"
+        );
+        assert_eq!(
+            late.details["cases"][0]["declared_daemon_linger"]["deadline_outcome"],
+            "survived-declared-deadline"
+        );
+
+        let mut survived = trials.to_vec();
+        survived[0]
+            .declared_daemon_linger
+            .as_mut()
+            .unwrap()
+            .deadline_outcome = "survived-declared-deadline".to_owned();
+        survived[0]
+            .declared_daemon_linger
+            .as_mut()
+            .unwrap()
+            .identity_present_at_deadline = true;
+        survived[0].residue_processes = Some(1);
+        survived[0].residue_identities = vec![daemon_process.clone()];
+        let leaked = evaluate_signal_matrix(&survived, 1, 2_000, Some(4_000), 10_000);
+        assert!(leaked.measurement_complete);
+        assert!(!leaked.passed);
+        assert_eq!(
+            leaked.metrics["signal_matrix.sigterm_residue_processes"],
+            1.0
+        );
+
+        let mut replaced = trials.to_vec();
+        replaced[0]
+            .declared_daemon_linger
+            .as_mut()
+            .unwrap()
+            .identity_continuity = "residue-or-identity-change".to_owned();
+        replaced[0].residue_processes = Some(1);
+        replaced[0].residue_identities = vec![daemon_process];
+        let changed = evaluate_signal_matrix(&replaced, 1, 2_000, Some(4_000), 10_000);
+        assert!(changed.measurement_complete);
+        assert!(!changed.passed);
     }
 
     #[test]
@@ -709,6 +974,12 @@ mod tests {
                     source_terminal_count: Some(1),
                     exit_code: None,
                     exit_was_signal: None,
+                    residue: Some(SignalResidueObservation {
+                        observed_after_ms: 2_000,
+                        processes: 0,
+                        identities: Vec::new(),
+                    }),
+                    declared_daemon_linger: None,
                     residue_processes: Some(0),
                     residue_identities: Vec::new(),
                 },
@@ -727,6 +998,12 @@ mod tests {
                     source_terminal_count: Some(1),
                     exit_code: Some(0),
                     exit_was_signal: Some(false),
+                    residue: Some(SignalResidueObservation {
+                        observed_after_ms: 2_000,
+                        processes: 0,
+                        identities: Vec::new(),
+                    }),
+                    declared_daemon_linger: None,
                     residue_processes: Some(0),
                     residue_identities: Vec::new(),
                 },
@@ -745,6 +1022,12 @@ mod tests {
                     source_terminal_count: Some(1),
                     exit_code: Some(0),
                     exit_was_signal: Some(false),
+                    residue: Some(SignalResidueObservation {
+                        observed_after_ms: 2_000,
+                        processes: 0,
+                        identities: Vec::new(),
+                    }),
+                    declared_daemon_linger: None,
                     residue_processes: Some(0),
                     residue_identities: Vec::new(),
                 },
@@ -763,12 +1046,15 @@ mod tests {
                     source_terminal_count: None,
                     exit_code: None,
                     exit_was_signal: None,
+                    residue: None,
+                    declared_daemon_linger: None,
                     residue_processes: None,
                     residue_identities: Vec::new(),
                 },
             ],
             1,
             2_000,
+            None,
             10_000,
         );
         assert!(!evaluated.measurement_complete);
@@ -852,6 +1138,12 @@ mod tests {
             source_terminal_count: Some(1),
             exit_code: Some(0),
             exit_was_signal: Some(false),
+            residue: Some(SignalResidueObservation {
+                observed_after_ms: 2_000,
+                processes: 0,
+                identities: Vec::new(),
+            }),
+            declared_daemon_linger: None,
             residue_processes: Some(0),
             residue_identities: Vec::new(),
         };
@@ -862,7 +1154,7 @@ mod tests {
             trial("stdin-eof"),
         ];
         trials[1].terminal_count = Some(2);
-        let evaluated = evaluate_signal_matrix(&trials, 1, 2_000, 10_000);
+        let evaluated = evaluate_signal_matrix(&trials, 1, 2_000, None, 10_000);
         assert!(evaluated.measurement_complete);
         assert!(!evaluated.passed);
         assert!(evaluated.measurement_error.is_none());
@@ -885,6 +1177,12 @@ mod tests {
             source_terminal_count: Some(0),
             exit_code: Some(130),
             exit_was_signal: Some(false),
+            residue: Some(SignalResidueObservation {
+                observed_after_ms: 2_000,
+                processes: 0,
+                identities: Vec::new(),
+            }),
+            declared_daemon_linger: None,
             residue_processes: Some(0),
             residue_identities: Vec::new(),
         };
@@ -897,6 +1195,7 @@ mod tests {
             ],
             1,
             2_000,
+            None,
             10_000,
         );
         assert!(evaluated.measurement_complete);

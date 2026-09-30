@@ -2,7 +2,7 @@
 schema = 1
 id = "pi"
 name = "Pi Coding Agent"
-revision = "print-json-persisted-sessions-v3"
+revision = "print-json-persisted-sessions-v4"
 
 [availability]
 exec_paths = ["pi"]
@@ -82,6 +82,9 @@ command = [
   "--no-themes", "--no-approve", "--offline", "--tools", "bash"
 ]
 timeout_ms = 30000
+
+[input]
+prompt_uses_stdin = false
 
 [sessions]
 # Pi 0.84.4 docs/json.md: first record is the persisted session header.

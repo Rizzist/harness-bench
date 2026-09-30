@@ -54,6 +54,27 @@ fn wave4_target_manifests_parse_and_declare_typed_injection_surfaces() -> Result
 }
 
 #[test]
+fn six_reference_harnesses_declare_whether_prompt_input_uses_stdin() -> Result<()> {
+    for adapter in [
+        "codex",
+        "claude-code",
+        "opencode",
+        "pi",
+        "rick",
+        "haider-agent",
+    ] {
+        let path = format!("adapters/{adapter}/manifest.toml");
+        let manifest = ahrb::manifest::load(Path::new(&path))?;
+        assert_eq!(
+            manifest.input.prompt_uses_stdin,
+            Some(false),
+            "{adapter} supplies the row-57 prompt through argv, not stdin"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn extra_adapters_use_schema_two_and_isolated_headless_profiles() -> Result<()> {
     for adapter in ["aider", "goose", "cline"] {
         let path = format!("adapters/{adapter}/manifest.toml");
@@ -565,9 +586,39 @@ fn remaining_native_adapters_pin_injection_tools_and_structured_events() -> Resu
         assert!(claude.events.rules.iter().any(|rule| {
             rule.matches == "result"
                 && rule.match_fields.get("/subtype").map(String::as_str) == Some(subtype)
+                && rule.match_fields.get("/is_error").map(String::as_str) == Some("false")
                 && rule.event == "terminal-failure"
         }));
     }
+
+    let duplicate_terminal_raw = serde_json::json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+    });
+    let matching_terminal_rules = claude
+        .events
+        .rules
+        .iter()
+        .filter(|rule| rule.event.starts_with("terminal-"))
+        .filter(|rule| {
+            rule.matches == "result"
+                && rule.match_fields.iter().all(|(pointer, expected)| {
+                    duplicate_terminal_raw
+                        .pointer(pointer)
+                        .is_some_and(|actual| match actual {
+                            serde_json::Value::String(value) => value == expected,
+                            serde_json::Value::Bool(value) => value.to_string() == *expected,
+                            serde_json::Value::Number(value) => value.to_string() == *expected,
+                            _ => false,
+                        })
+                })
+        })
+        .count();
+    assert_eq!(
+        matching_terminal_rules, 1,
+        "one Claude result record must map to one normalized terminal"
+    );
 
     let pi = ahrb::manifest::load(Path::new("adapters/pi/manifest.toml"))?;
     assert_eq!(pi.fake_model.allowed_paths, ["/v1/chat/completions"]);
@@ -1131,8 +1182,9 @@ fn versioned_haider_manifests_separate_continuation_from_legacy_controls() {
     let manifest = ahrb::manifest::load(Path::new("adapters/haider-agent/manifest.toml")).unwrap();
     assert_eq!(
         manifest.identity.revision,
-        "0.0.972-torn-tail-capability-v1"
+        "0.0.972-declared-idle-linger-v1"
     );
+    assert_eq!(manifest.daemon.idle_linger_ms, Some(600_000));
     assert_eq!(
         manifest.resources.log_paths.as_ref().unwrap(),
         &["{{profile}}/home/.haider/dev-profile/daemon.log"]

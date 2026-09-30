@@ -5,6 +5,11 @@ or event logic. `mock/manifest.toml` is the complete schema-2 reference. A docto
 means the manifest and installed version are compatible, not that benchmark rows pass.
 Missing capabilities remain ABSENT/UNSUPPORTED under the row's contract.
 
+Persistent-daemon manifests may declare `[daemon].idle_linger_ms` for row 57 only when
+the same daemon identity intentionally remains after its client exits. The value is in
+milliseconds and must be in `1..=900000` (15 minutes); zero and larger values fail
+manifest validation, so doctor reports not-ready and runs refuse to start.
+
 The nine named real adapters are `claude-code`, `codex`, `haider-agent` (`hbench haider`),
 `opencode`, `pi`, `rick`, `aider`, `goose`, and `cline`. The six older manifests retain
 their existing declarations. `oh-my-pi` and `deepseek-harness` remain legacy placeholders

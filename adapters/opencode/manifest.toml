@@ -2,7 +2,7 @@
 schema = 1
 id = "opencode"
 name = "OpenCode"
-revision = "1.17-run-format-json-native-tools-v5"
+revision = "1.17-run-format-json-native-tools-v6"
 
 [availability]
 exec_paths = ["opencode"]
@@ -78,6 +78,9 @@ command = [
   "--model", "ahrb/{{model}}", "--dir", "{{workspace}}", "{{prompt}}"
 ]
 timeout_ms = 30000
+
+[input]
+prompt_uses_stdin = false
 
 [sessions]
 resume = [

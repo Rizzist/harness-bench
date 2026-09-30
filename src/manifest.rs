@@ -267,6 +267,10 @@ pub struct DaemonLifecycle {
     /// Shutdown grace period.
     #[serde(default = "default_grace_ms")]
     pub grace_ms: u64,
+    /// Declared post-client idle lifetime for the same persistent daemon.
+    /// Row 57 observes this daemon through the deadline before teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_linger_ms: Option<u64>,
 }
 
 /// Typed JSON contract returned by a graceful daemon shutdown operation.
@@ -286,6 +290,9 @@ pub struct ShutdownResult {
 fn default_grace_ms() -> u64 {
     2_000
 }
+
+const MIN_DAEMON_IDLE_LINGER_MS: u64 = 1;
+const MAX_DAEMON_IDLE_LINGER_MS: u64 = 900_000;
 
 /// A readiness probe.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1364,6 +1371,18 @@ pub fn validate(manifest: &Manifest) -> Result<()> {
         return Err(AhrbError::Validation(
             "a detached daemon launcher requires daemon.readiness.pid_pointer".to_owned(),
         ));
+    }
+    if let Some(idle_linger_ms) = manifest.daemon.idle_linger_ms {
+        if !manifest.daemon.persistent {
+            return Err(AhrbError::Validation(
+                "daemon.idle_linger_ms requires daemon.persistent = true".to_owned(),
+            ));
+        }
+        if !(MIN_DAEMON_IDLE_LINGER_MS..=MAX_DAEMON_IDLE_LINGER_MS).contains(&idle_linger_ms) {
+            return Err(AhrbError::Validation(format!(
+                "daemon.idle_linger_ms must be in {MIN_DAEMON_IDLE_LINGER_MS}..={MAX_DAEMON_IDLE_LINGER_MS} ms"
+            )));
+        }
     }
     if !manifest.daemon.readiness.json_pointer_roots.is_empty()
         && manifest.daemon.readiness.kind != "command-json"
@@ -3293,22 +3312,58 @@ mod version_tests {
         assert!(manifest.resources.journal_paths.is_none());
         assert!(manifest.input.prompt_uses_stdin.is_none());
         assert!(manifest.capture.truncation_marker.is_none());
+        assert!(manifest.daemon.idle_linger_ms.is_none());
 
         let absent = serde_json::to_value(&manifest).expect("serialize absent fields");
         assert!(absent.get("input").is_none());
         assert!(absent["resources"].get("log_paths").is_none());
         assert!(absent["resources"].get("journal_paths").is_none());
         assert!(absent["capture"].get("truncation_marker").is_none());
+        assert!(absent["daemon"].get("idle_linger_ms").is_none());
 
         let mut explicit = manifest;
         explicit.resources.log_paths = Some(Vec::new());
         explicit.resources.journal_paths = Some(Vec::new());
         explicit.input.prompt_uses_stdin = Some(false);
+        explicit.daemon.persistent = true;
+        explicit.daemon.start = vec!["harnessd".to_owned()];
+        explicit.daemon.idle_linger_ms = Some(600_000);
         let encoded = toml::to_string(&explicit).expect("serialize explicit Wave-2 fields");
         let decoded: Manifest = toml::from_str(&encoded).expect("parse explicit Wave-2 fields");
         assert_eq!(decoded.resources.log_paths, Some(Vec::new()));
         assert_eq!(decoded.resources.journal_paths, Some(Vec::new()));
         assert_eq!(decoded.input.prompt_uses_stdin, Some(false));
+        assert_eq!(decoded.daemon.idle_linger_ms, Some(600_000));
+    }
+
+    #[test]
+    fn daemon_idle_linger_requires_a_persistent_daemon() {
+        let mut manifest = wave_2_manifest();
+        manifest.daemon.idle_linger_ms = Some(10);
+        let error = validate(&manifest).expect_err("one-shot idle linger must be rejected");
+        assert!(error.to_string().contains("idle_linger_ms"));
+    }
+
+    #[test]
+    fn daemon_idle_linger_is_bounded_to_fifteen_minutes() {
+        let mut manifest = wave_2_manifest();
+        manifest.daemon.persistent = true;
+        manifest.daemon.start = vec!["harnessd".to_owned()];
+        manifest.concurrency.topology = "shared-daemon-sessions".to_owned();
+
+        for invalid in [0, 900_001, u64::MAX] {
+            manifest.daemon.idle_linger_ms = Some(invalid);
+            let error = validate(&manifest).expect_err("out-of-range linger must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("daemon.idle_linger_ms must be in 1..=900000 ms"),
+                "unexpected diagnostic for {invalid}: {error}"
+            );
+        }
+
+        manifest.daemon.idle_linger_ms = Some(900_000);
+        validate(&manifest).expect("the inclusive upper bound must remain valid");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 schema = 1
 id = "claude-code"
 name = "Claude Code"
-revision = "print-stream-json-native-tools-v3"
+revision = "print-stream-json-native-tools-v5"
 
 [availability]
 exec_paths = ["claude"]
@@ -67,6 +67,9 @@ command = [
   "--session-id", "{{session_id}}"
 ]
 timeout_ms = 30000
+
+[input]
+prompt_uses_stdin = false
 
 [sessions]
 resume = [
@@ -184,22 +187,22 @@ event = "terminal-failure"
 
 [[events.rules]]
 matches = "result"
-match_fields = { "/subtype" = "error_max_turns" }
+match_fields = { "/subtype" = "error_max_turns", "/is_error" = "false" }
 event = "terminal-failure"
 
 [[events.rules]]
 matches = "result"
-match_fields = { "/subtype" = "error_during_execution" }
+match_fields = { "/subtype" = "error_during_execution", "/is_error" = "false" }
 event = "terminal-failure"
 
 [[events.rules]]
 matches = "result"
-match_fields = { "/subtype" = "error_max_budget_usd" }
+match_fields = { "/subtype" = "error_max_budget_usd", "/is_error" = "false" }
 event = "terminal-failure"
 
 [[events.rules]]
 matches = "result"
-match_fields = { "/subtype" = "error_max_structured_output_retries" }
+match_fields = { "/subtype" = "error_max_structured_output_retries", "/is_error" = "false" }
 event = "terminal-failure"
 
 [exit]

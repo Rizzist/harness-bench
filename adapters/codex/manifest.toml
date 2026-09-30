@@ -2,7 +2,7 @@
 schema = 1
 id = "codex"
 name = "OpenAI Codex CLI"
-revision = "exec-jsonl-native-tools-v5"
+revision = "exec-jsonl-native-tools-v6"
 
 [availability]
 exec_paths = ["codex"]
@@ -123,6 +123,9 @@ command = [
   "{{prompt}}"
 ]
 timeout_ms = 30000
+
+[input]
+prompt_uses_stdin = false
 
 [sessions]
 resume = [

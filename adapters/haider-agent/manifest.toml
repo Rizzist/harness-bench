@@ -2,7 +2,7 @@
 schema = 1
 id = "haider-agent"
 name = "Haider Agent"
-revision = "0.0.972-torn-tail-capability-v1"
+revision = "0.0.972-declared-idle-linger-v1"
 
 [availability]
 exec_paths = ["haider"]
@@ -65,6 +65,9 @@ initialize = [
 ]
 shutdown = ["haider", "daemon", "stop", "--json"]
 grace_ms = 5000
+# The 0.0.972 daemon keeps the cold-profile controller available for sparse
+# follow-up turns, then exits itself after this exact idle deadline.
+idle_linger_ms = 600000
 
 [daemon.shutdown_result]
 outcome_pointer = "/outcome"
