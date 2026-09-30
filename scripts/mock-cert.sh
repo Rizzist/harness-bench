@@ -13,7 +13,38 @@ echo "RUN_DIR=$RUN"
 mkdir -p "$ROOT" && mkdir "$RUN" || { echo "RUN_DIR=$RUN (cannot create fresh directory)"; echo "MOCK_CERT FAIL"; exit 1; }
 LOG="$RUN/mock-cert.log"
 log() { print -r -- "$*" | tee -a "$LOG"; }
-finish() { log "RUN_DIR=$RUN"; log "MOCK_CERT $1"; }
+zmodload zsh/datetime 2>/dev/null || true
+epoch_now() {
+  if [[ -n "${EPOCHSECONDS:-}" ]]; then
+    print -r -- "$EPOCHSECONDS"
+  else
+    /bin/date +%s
+  fi
+}
+load_average_1m() {
+  if [[ "$(uname -s 2>/dev/null)" == Darwin ]]; then
+    sysctl -n vm.loadavg 2>/dev/null | awk '{gsub(/[{}]/, ""); print $1}'
+  elif [[ -r /proc/loadavg ]]; then
+    awk '{print $1}' /proc/loadavg
+  else
+    print -r -- unavailable
+  fi
+}
+DEADLINE_SECONDS="${AHRB_MOCK_CERT_DEADLINE_SECONDS:-1800}"
+if [[ "$DEADLINE_SECONDS" != <-> || "$DEADLINE_SECONDS" -le 0 ]]; then
+  log "AHRB_MOCK_CERT_DEADLINE_SECONDS must be a positive integer"
+  log "MOCK_CERT FAIL"
+  exit 1
+fi
+START_EPOCH=$(epoch_now) || exit 1
+END_EPOCH=$(( START_EPOCH + DEADLINE_SECONDS ))
+log "GLOBAL_DEADLINE_SECONDS=$DEADLINE_SECONDS"
+log "LOAD_AVG_1M_START=$(load_average_1m)"
+finish() {
+  log "LOAD_AVG_1M_END=$(load_average_1m)"
+  log "RUN_DIR=$RUN"
+  log "MOCK_CERT $1"
+}
 BIN="${AHRB_BIN:-target/debug/ahrb}"
 if [[ -z "${AHRB_BIN:-}" && ! -x "$BIN" ]]; then
   cargo build --locked >> "$LOG" 2>&1
@@ -22,10 +53,38 @@ if [[ -z "${AHRB_BIN:-}" && ! -x "$BIN" ]]; then
 fi
 FAILED=0
 for m in mock mock-exec; do
+  if (( $(epoch_now) >= END_EPOCH )); then
+    log "$m NOT_RUN_GLOBAL_DEADLINE"
+    FAILED=1
+    continue
+  fi
   OUT="$RUN/$m"
   if ! mkdir "$OUT"; then log "$m OUTPUT_FAILED"; FAILED=1; continue; fi
-  "$BIN" run --manifest "adapters/$m/manifest.toml" --profile quick --output "$OUT" >> "$LOG" 2>&1
-  RC=$?; log "$m EXIT=$RC"
+  log "$m CHILD_DEADLINE_SECONDS=$DEADLINE_SECONDS"
+  "$BIN" run --manifest "adapters/$m/manifest.toml" --profile quick --deadline "$DEADLINE_SECONDS" --output "$OUT" >> "$LOG" 2>&1 &
+  COMMAND_PID=$!
+  TIMED_OUT=0
+  while kill -0 "$COMMAND_PID" 2>/dev/null; do
+    if (( $(epoch_now) >= END_EPOCH )); then
+      log "$m GLOBAL_DEADLINE_EXCEEDED pid=$COMMAND_PID"
+      kill -TERM "$COMMAND_PID" 2>/dev/null || true
+      for _ in {1..5}; do
+        kill -0 "$COMMAND_PID" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$COMMAND_PID" 2>/dev/null; then
+        log "$m GLOBAL_DEADLINE_KILL pid=$COMMAND_PID"
+        kill -KILL "$COMMAND_PID" 2>/dev/null || true
+      fi
+      TIMED_OUT=1
+      break
+    fi
+    sleep 1
+  done
+  wait "$COMMAND_PID"
+  RC=$?
+  if (( TIMED_OUT )); then RC=124; fi
+  log "$m EXIT=$RC"
   (( RC == 0 )) || FAILED=1
   REPORT="$OUT/report.json"
   if [[ ! -f "$REPORT" ]]; then log "$m MISSING_REPORT"; FAILED=1; continue; fi

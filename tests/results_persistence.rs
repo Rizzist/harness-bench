@@ -3,8 +3,67 @@ mod common;
 use ahrb::results::IndexEntry;
 use ahrb::{evaluate::TestOutcome, report::Report};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+struct StorageEvidenceRoot {
+    path: PathBuf,
+    preserve: bool,
+}
+
+impl StorageEvidenceRoot {
+    fn create() -> Self {
+        let requested = std::env::var_os("AHRB_TEST_EVIDENCE_OUTPUT").map(PathBuf::from);
+        let preserve = requested.is_some();
+        let path = requested.unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "ahrb-storage-results-{}-{}",
+                std::process::id(),
+                ahrb::fake_model::monotonic_timestamp_ns()
+            ))
+        });
+        assert!(
+            !path.exists(),
+            "storage evidence root must be fresh: {}",
+            path.display()
+        );
+        std::fs::create_dir(&path).expect("create storage evidence root");
+        Self { path, preserve }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove the root on the success path and fail the test if that fails.
+    fn finish(mut self) {
+        if !self.preserve {
+            std::fs::remove_dir_all(&self.path).unwrap_or_else(|error| {
+                panic!(
+                    "remove owned storage evidence root {}: {error}",
+                    self.path.display()
+                )
+            });
+        }
+        // Already removed (or preserved on request): nothing left for `drop`.
+        self.preserve = true;
+    }
+}
+
+impl Drop for StorageEvidenceRoot {
+    /// Best-effort removal on unwind. A failure is reported, never a panic,
+    /// because panicking while already unwinding would abort the test binary.
+    fn drop(&mut self) {
+        if !self.preserve
+            && let Err(error) = std::fs::remove_dir_all(&self.path)
+        {
+            eprintln!(
+                "could not remove owned storage evidence root {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
 
 #[test]
 fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
@@ -205,6 +264,56 @@ fn hbench_auto_saves_bundle_indexes_it_and_lists_history() {
     std::fs::remove_dir_all(root).expect("remove results fixture");
 }
 
+#[test]
+fn failed_report_write_keeps_run_root_and_names_it_in_the_error() {
+    let _subprocess_guard = common::serialize_ahrb_subprocesses();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::env::temp_dir().join(format!(
+        "ahrb-report-write-failure-{}-{}",
+        std::process::id(),
+        ahrb::fake_model::monotonic_timestamp_ns()
+    ));
+    std::fs::create_dir(&output).expect("create report failure output");
+    std::fs::create_dir(output.join("report.json.tmp"))
+        .expect("block atomic report replacement with a directory");
+    let run = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(repository)
+        .arg("run")
+        .arg("--manifest")
+        .arg("adapters/mock/manifest.toml")
+        .arg("--tests")
+        .arg("1")
+        .arg("--deadline")
+        .arg("0")
+        .arg("--no-save")
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .expect("run report-write failure control");
+    assert_eq!(run.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let marker = "report/evidence persistence was not confirmed; kept run root ";
+    let root = stderr
+        .lines()
+        .find_map(|line| line.split_once(marker).map(|(_, root)| root.trim()))
+        .expect("stderr must record the retained root path");
+    let root = PathBuf::from(root);
+    assert!(
+        root.is_dir(),
+        "retained root is missing: {}",
+        root.display()
+    );
+    assert!(
+        std::fs::read_dir(&root)
+            .expect("inspect retained run root")
+            .next()
+            .is_some(),
+        "retained root must keep its unsaved files"
+    );
+    std::fs::remove_dir_all(&root).expect("remove exact retained test root");
+    std::fs::remove_dir_all(&output).expect("remove report failure output");
+}
+
 fn bundle_hashes(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, String> {
     use sha2::{Digest, Sha256};
     fn visit(
@@ -237,16 +346,12 @@ fn bundle_hashes(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, 
 #[test]
 fn storage_auto_save_preserves_all_files_hashes_and_lifecycle_receipts() {
     let _guard = common::serialize_ahrb_subprocesses();
-    let root = std::env::temp_dir().join(format!(
-        "ahrb-storage-results-{}-{}",
-        std::process::id(),
-        ahrb::fake_model::monotonic_timestamp_ns()
-    ));
+    let evidence_root = StorageEvidenceRoot::create();
+    let root = evidence_root.path();
     let primary = root.join("primary");
-    std::fs::create_dir(&root).unwrap();
     let run = Command::new(env!("CARGO_BIN_EXE_hbench"))
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("AHRB_RESULTS_ROOT", &root)
+        .env("AHRB_RESULTS_ROOT", root)
         .env("AHRB_NO_SAVE", "0")
         .env("AHRB_MOCK_STORAGE_CLOSE_RETENTION", "capped")
         .env("AHRB_MOCK_STORAGE_SWEEP", "on")
@@ -364,7 +469,9 @@ fn storage_auto_save_preserves_all_files_hashes_and_lifecycle_receipts() {
         serde_json::to_vec_pretty(&saved_hashes).unwrap(),
     )
     .unwrap();
-    // Preserve this substantial real CLI run outside Git for failure diagnosis and audits.
+    // Removed here on success (asserted) and by `drop` on unwind, unless the
+    // explicit AHRB_TEST_EVIDENCE_OUTPUT path requested preservation.
+    evidence_root.finish();
 }
 
 // The protected version-probe executable produces real S2 loader-refusal

@@ -16,6 +16,7 @@ pub mod hbench;
 pub mod manifest;
 pub mod matrix_evidence;
 pub mod mock_harness;
+pub mod offline_guard;
 pub mod process;
 pub mod report;
 pub mod resource_certification;

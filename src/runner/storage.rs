@@ -130,6 +130,8 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
     )?;
     println!("storage deadline {}", serde_json::to_string(&budget)?);
     let persistence = crate::results::prepare(&options, &manifest)?;
+    let mut run_root_guard =
+        crate::results::RunRootGuard::new(persistence.profile_path.clone(), options.keep_run_root)?;
     options.output = persistence.output.clone();
     if let Some(parent) = options.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -532,11 +534,16 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
             &AhrbError::Timeout(format!("storage deadline after {}s", budget.seconds)),
         )?;
     }
-    if let Err(error) = ensure_owned_cleanup() {
-        let reason = format!("owned cleanup: {error}");
+    let teardown_audit = run_teardown_audit(&manifest, &persistence.profile_path);
+    if teardown_audit.status == "ERROR" {
+        let reason = format!("owned teardown: {}", teardown_audit.errors.join("; "));
         progress.report.results[0] = row(0, TestOutcome::Error(reason.clone()), &config);
         progress.report.lifecycle_notes.push(reason);
     }
+    progress.details.insert(
+        "teardown".to_owned(),
+        serde_json::to_value(&teardown_audit)?,
+    );
     capture_provider(&mut progress).await?;
     durability::preserve_partial(&mut progress)?;
     preserve_partial_trial(&mut progress, &config, "deadline");
@@ -600,8 +607,10 @@ pub async fn run_storage(mut options: RunOptions) -> Result<i32> {
         suite_exit_code(&progress.report.results, None, &manifest)
     };
     crate::results::persist_report(&persistence, &progress.report, options.junit, interrupted)?;
+    run_root_guard.confirm_persisted();
     println!("{}", contract::render_markdown(summary, &progress.report));
     println!("storage bundle {} exit {code}", options.output.display());
+    run_root_guard.cleanup()?;
     Ok(code)
 }
 

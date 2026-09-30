@@ -4,7 +4,10 @@ use ahrb::{
     hbench, manifest,
     storage::*,
 };
-use std::{path::PathBuf, process::Command as ProcessCommand};
+use std::{
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 
 #[test]
 fn storage_parser_is_independent() {
@@ -137,6 +140,12 @@ fn fresh(label: &str) -> PathBuf {
     ))
 }
 
+fn remove_profile_if_present(path: &str) {
+    if Path::new(path).exists() {
+        std::fs::remove_dir_all(path).expect("cleanup owned profile");
+    }
+}
+
 #[test]
 fn both_real_cli_forms_preserve_zero_deadline_reports() {
     let _guard = common::serialize_ahrb_subprocesses();
@@ -177,6 +186,8 @@ fn both_real_cli_forms_preserve_zero_deadline_reports() {
         let raw = std::fs::read(output.join("report.json")).expect("interrupted report");
         let report: ahrb::report::Report =
             serde_json::from_slice(&raw).expect("typed storage report");
+        assert_eq!(report.details["teardown"]["status"], "PASS");
+        assert!(!Path::new(&report.profile_path).exists());
         assert_eq!(report.schema, 4);
         assert_eq!(report.spec_version, 4);
         assert_eq!(report.pillar.as_deref(), Some("storage"));
@@ -577,9 +588,7 @@ fn insufficient_budget_preserves_partial_mock_evidence_and_null_aggregates() {
                 && !e.entry.path.ends_with("session.json"))
     );
     std::fs::remove_dir_all(output).expect("cleanup output");
-    if !report.profile_path.is_empty() {
-        std::fs::remove_dir_all(report.profile_path).expect("cleanup owned profile");
-    }
+    remove_profile_if_present(&report.profile_path);
 }
 
 #[test]
@@ -710,7 +719,7 @@ fn persistent_daemon_exec_clients_are_observed_and_retired_in_real_storage_cli()
     let audit = std::fs::read_to_string(output.join("storage-log-audit.jsonl")).expect("audit");
     assert!(audit.contains("corroborated-no-log"));
     std::fs::remove_dir_all(output).expect("cleanup output");
-    std::fs::remove_dir_all(report.profile_path).expect("cleanup owned profile");
+    remove_profile_if_present(&report.profile_path);
 }
 
 #[test]
@@ -757,7 +766,7 @@ fn exhaustive_storage_audit_reports_an_undeclared_log_contradiction() {
             .is_none()
     );
     std::fs::remove_dir_all(output).expect("cleanup output");
-    std::fs::remove_dir_all(report.profile_path).expect("cleanup profile");
+    remove_profile_if_present(&report.profile_path);
     std::fs::remove_file(path).expect("cleanup manifest");
 }
 
@@ -907,7 +916,7 @@ fn counter_loss_survives_later_deadline_without_partial_physical_or_curve_headli
     }
     assert!(report.badge.is_none());
     std::fs::remove_dir_all(root).unwrap();
-    std::fs::remove_dir_all(report.profile_path).unwrap();
+    remove_profile_if_present(&report.profile_path);
 }
 
 #[cfg(unix)]
@@ -1024,5 +1033,5 @@ fn live_descendant_across_turns_keeps_physical_error_without_aborting_task() {
         assert_eq!(report.details[slug]["trials"][0]["reason"], "deadline");
     }
     std::fs::remove_dir_all(root).unwrap();
-    std::fs::remove_dir_all(report.profile_path).unwrap();
+    remove_profile_if_present(&report.profile_path);
 }

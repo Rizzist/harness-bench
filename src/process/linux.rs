@@ -11,6 +11,62 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+/// Return a `/proc/locks` owner for the identity of the already-open lock
+/// descriptor. The outer `Option` means an entry exists; the inner value is
+/// absent for OFD/flock records whose kernel owner is not a positive PID.
+pub(crate) fn proc_lock_owner(lock_file: &std::fs::File) -> Result<Option<Option<u32>>> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `lock_file` owns a live descriptor and `status` is writable for
+    // the duration of this read-only identity query.
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(lock_file.as_raw_fd(), &mut status) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let device = status.st_dev;
+    let major = libc::major(device) as u64;
+    let minor = libc::minor(device) as u64;
+    let locks = std::fs::read_to_string("/proc/locks")?;
+    Ok(parse_proc_locks(&locks, major, minor, status.st_ino as u64))
+}
+
+fn parse_proc_locks(
+    locks: &str,
+    expected_major: u64,
+    expected_minor: u64,
+    expected_inode: u64,
+) -> Option<Option<u32>> {
+    let mut unknown_owner = false;
+    for line in locks.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 8 || fields.get(1) == Some(&"->") {
+            continue;
+        }
+        if !matches!(fields[1], "POSIX" | "FLOCK" | "OFDLCK") {
+            continue;
+        }
+        let Some((major, minor, inode)) = parse_proc_lock_identity(fields[5]) else {
+            continue;
+        };
+        if (major, minor, inode) != (expected_major, expected_minor, expected_inode) {
+            continue;
+        }
+        match fields[4].parse::<i64>() {
+            Ok(pid) if pid > 0 => return u32::try_from(pid).ok().map(Some),
+            _ => unknown_owner = true,
+        }
+    }
+    unknown_owner.then_some(None)
+}
+
+fn parse_proc_lock_identity(value: &str) -> Option<(u64, u64, u64)> {
+    let mut fields = value.split(':');
+    let major = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let minor = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let inode = fields.next()?.parse::<u64>().ok()?;
+    fields.next().is_none().then_some((major, minor, inode))
+}
+
 /// Linux sampler backed by a dedicated cgroup-v2 when configured, with a
 /// start-time-checked procfs ancestry fallback.
 #[derive(Debug)]
@@ -857,6 +913,61 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_locks_parser_covers_posix_flock_and_ofd_owners() {
+        let locks = concat!(
+            "1: POSIX  ADVISORY  WRITE 1234 08:01:41 0 EOF\n",
+            "2: FLOCK  ADVISORY  WRITE 2345 08:01:42 0 EOF\n",
+            "3: OFDLCK ADVISORY  WRITE -1 08:01:43 0 EOF\n",
+            "4: -> POSIX ADVISORY WRITE 9999 08:01:44 0 EOF\n",
+            "5: POSIX  ADVISORY  WRITE 3456 08:01:99 0 EOF\n",
+        );
+        assert_eq!(parse_proc_locks(locks, 8, 1, 41), Some(Some(1234)));
+        assert_eq!(parse_proc_locks(locks, 8, 1, 42), Some(Some(2345)));
+        assert_eq!(parse_proc_locks(locks, 8, 1, 43), Some(None));
+        assert_eq!(parse_proc_locks(locks, 8, 1, 44), None);
+        assert_eq!(parse_proc_locks(locks, 8, 2, 41), None);
+        assert_eq!(parse_proc_locks(locks, 8, 1, 99), Some(Some(3456)));
+    }
+
+    #[test]
+    fn proc_locks_fixture_uses_open_descriptor_identity() -> Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        let root = fixture_dir("proc-lock-descriptor")?;
+        let original = root.join("lock");
+        fs::write(&original, b"original")?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&original)?;
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: `file` owns a live descriptor and `status` is writable.
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut status) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        fs::rename(&original, root.join("moved"))?;
+        fs::write(&original, b"replacement")?;
+        let device = status.st_dev;
+        let fixture = format!(
+            "1: POSIX ADVISORY WRITE 4321 {:02x}:{:02x}:{} 0 EOF\n",
+            libc::major(device),
+            libc::minor(device),
+            status.st_ino
+        );
+        assert_eq!(
+            parse_proc_locks(
+                &fixture,
+                libc::major(device) as u64,
+                libc::minor(device) as u64,
+                status.st_ino as u64,
+            ),
+            Some(Some(4321))
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_dir(label: &str) -> Result<PathBuf> {

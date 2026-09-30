@@ -42,6 +42,7 @@ async fn exercise_non_resource_report_pipeline() -> Result<()> {
         junit: true,
         deadline_secs: Some(120),
         no_save: true,
+        keep_run_root: false,
         harness_version: Some("mock-harness 0.1.0".to_owned()),
     })
     .await?;

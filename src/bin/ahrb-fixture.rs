@@ -1,6 +1,7 @@
 //! Small deterministic fixture executable invoked through real harness tools.
 
 use ahrb::{AhrbError, Result};
+use sha2::{Digest as _, Sha256};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -113,6 +114,7 @@ fn run(args: &[String]) -> Result<i32> {
                         serde_json::json!({
                             "blocked":false,
                             "errno":error.raw_os_error(),
+                            "kind":format!("{:?}", error.kind()),
                             "error":error.to_string(),
                             "address":address.to_string()
                         })
@@ -120,14 +122,172 @@ fn run(args: &[String]) -> Result<i32> {
                     Ok(3)
                 }
                 Ok(stream) => {
+                    // The source address is the per-probe token row 62's
+                    // guard matches against its sentinel's recorded peer.
+                    let local = stream.local_addr().ok().map(|local| local.to_string());
                     drop(stream);
                     println!(
                         "{}",
-                        serde_json::json!({"blocked":false,"connected":true,"address":address.to_string()})
+                        serde_json::json!({
+                            "blocked":false,
+                            "connected":true,
+                            "address":address.to_string(),
+                            "local":local
+                        })
                     );
                     Ok(4)
                 }
             }
+        }
+        Some("egress-udp-probe") => {
+            use std::net::{IpAddr, SocketAddr, UdpSocket};
+            let address = required(args, "--address")?
+                .parse::<SocketAddr>()
+                .map_err(|_| AhrbError::Usage("--address must be host:port".to_owned()))?;
+            let bind_address = match address.ip() {
+                IpAddr::V4(_) => "0.0.0.0:0",
+                IpAddr::V6(_) => "[::]:0",
+            };
+            let socket = UdpSocket::bind(bind_address)?;
+            match socket.send_to(b"ahrb-row62-udp-control", address) {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) =>
+                {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "blocked":true,
+                            "errno":error.raw_os_error(),
+                            "protocol":"udp",
+                            "address":address.to_string()
+                        })
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "blocked":false,
+                            "errno":error.raw_os_error(),
+                            "error":error.to_string(),
+                            "protocol":"udp",
+                            "address":address.to_string()
+                        })
+                    );
+                    Ok(3)
+                }
+                Ok(bytes_sent) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "blocked":false,
+                            "bytes_sent":bytes_sent,
+                            "protocol":"udp",
+                            "address":address.to_string()
+                        })
+                    );
+                    Ok(4)
+                }
+            }
+        }
+        Some("egress-probe-child") => {
+            let executable = std::env::current_exe()?;
+            let status = std::process::Command::new(executable)
+                .arg("egress-probe")
+                .args(&args[1..])
+                .stdin(std::process::Stdio::null())
+                .status()?;
+            Ok(status.code().unwrap_or(2))
+        }
+        Some("guarded-launch") => {
+            let profile = PathBuf::from(required(args, "--profile")?);
+            let expected = required(args, "--profile-sha256")?;
+            let launcher = required(args, "--launcher")?;
+            let actual = format!("{:x}", Sha256::digest(std::fs::read(&profile)?));
+            if actual != expected {
+                return Err(AhrbError::Protocol(format!(
+                    "offline guard profile hash mismatch before launch: expected {expected}, found {actual}"
+                )));
+            }
+            let separator = args.iter().position(|argument| argument == "--").ok_or_else(|| {
+                AhrbError::Usage("guarded-launch requires -- before the command".to_owned())
+            })?;
+            let command = args.get(separator + 1..).unwrap_or_default();
+            if command.is_empty() {
+                return Err(AhrbError::Usage(
+                    "guarded-launch requires a command after --".to_owned(),
+                ));
+            }
+            let mut launch = std::process::Command::new(launcher);
+            launch.arg("-f").arg(&profile).args(command);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                Err(launch.exec().into())
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(launch.status()?.code().unwrap_or(2))
+            }
+        }
+        Some("profile-write-probe") => {
+            let profile = PathBuf::from(required(args, "--path")?);
+            let result = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&profile)
+                .and_then(|mut file| file.write_all(b"\n; ahrb profile mutation probe\n"));
+            match result {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) =>
+                {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "profile_write_blocked":true,
+                            "errno":error.raw_os_error(),
+                            "path":profile,
+                        })
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "profile_write_blocked":false,
+                            "errno":error.raw_os_error(),
+                            "error":error.to_string(),
+                            "path":profile,
+                        })
+                    );
+                    Ok(3)
+                }
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"profile_write_blocked":false,"modified":true,"path":profile})
+                    );
+                    Ok(4)
+                }
+            }
+        }
+        Some("abort-stale-identity") => {
+            let pid = required(args, "--pid")?
+                .parse::<u32>()
+                .map_err(|_| AhrbError::Usage("--pid must be an unsigned integer".to_owned()))?;
+            let mut process = ahrb::process::live_process_info(pid)?.ok_or_else(|| {
+                AhrbError::Protocol(format!("abort identity fixture PID {pid} is not live"))
+            })?;
+            let actual_start = process.identity.start_time;
+            process.identity.start_time = actual_start.saturating_add(1);
+            eprintln!(
+                "ahrb-fixture: abort control PID {pid} actual start {actual_start}, registered stale start {}",
+                process.identity.start_time
+            );
+            ahrb::process::install_cleanup_handlers();
+            ahrb::process::track_profile_owned_processes(&[process])?;
+            std::process::abort();
         }
         Some("process-tree") => {
             let child_pid = required(args, "--child-pid")?;
@@ -227,7 +387,7 @@ fn run(args: &[String]) -> Result<i32> {
             "unknown fixture command {other:?}"
         ))),
         None => Err(AhrbError::Usage(
-            "expected write, read, fail, emit, egress-probe, or process-tree fixture command"
+            "expected write, read, fail, emit, egress-probe, egress-udp-probe, guarded-launch, profile-write-probe, abort-stale-identity, or process-tree fixture command"
                 .to_owned(),
         )),
     }
@@ -261,11 +421,13 @@ fn lock_fixture_file(path: PathBuf, flock: bool) -> Result<std::fs::File> {
         }
         return Ok(file);
     }
+    let write_lock_type =
+        libc::c_short::try_from(libc::F_WRLCK).expect("F_WRLCK must fit the platform flock type");
     let lock = libc::flock {
         l_start: 0,
         l_len: 0,
         l_pid: 0,
-        l_type: libc::F_WRLCK,
+        l_type: write_lock_type,
         l_whence: libc::SEEK_SET as i16,
     };
     // SAFETY: `file` is open and `lock` is a valid flock input structure.

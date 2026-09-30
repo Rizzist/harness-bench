@@ -169,6 +169,16 @@ fn signature(m: &Metadata) -> (u64, u64, u64, u64, u32, i64, i64, i64, i64) {
     )
 }
 
+#[cfg(all(unix, target_os = "linux"))]
+fn raw_device_id(device: libc::dev_t) -> u64 {
+    device
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn raw_device_id(device: libc::dev_t) -> u64 {
+    u64::try_from(device).expect("kernel device identifiers are non-negative")
+}
+
 #[cfg(unix)]
 fn open_child(parent: &File, name: &std::ffi::CStr, directory: bool) -> Result<File> {
     let flags = libc::O_RDONLY
@@ -287,7 +297,7 @@ fn walk(
                 "storage symlink/escape at {path}"
             )));
         }
-        let identity = (stat.st_dev as u64, stat.st_ino);
+        let identity = (raw_device_id(stat.st_dev), stat.st_ino);
         if identity.0 != device || !seen.insert(identity) {
             return Err(AhrbError::Protocol(format!(
                 "storage device escape or repeated identity at {path}"
@@ -387,7 +397,7 @@ fn walk(
             return Err(capture_io(std::io::Error::last_os_error(), &path, config));
         }
         let final_stat = unsafe { final_stat.assume_init() };
-        let final_identity = (final_stat.st_dev as u64, final_stat.st_ino);
+        let final_identity = (raw_device_id(final_stat.st_dev), final_stat.st_ino);
         if final_stat.st_mode & libc::S_IFMT != kind
             || final_identity.0 != device
             || (final_identity != identity && seen.contains(&final_identity))
@@ -397,7 +407,7 @@ fn walk(
             )));
         }
         if signature(&initial) != signature(&final_metadata)
-            || (final_stat.st_dev as u64, final_stat.st_ino) != identity
+            || (raw_device_id(final_stat.st_dev), final_stat.st_ino) != identity
             || final_stat.st_size as u64 != initial.size()
             || final_stat.st_blocks as u64 != initial.blocks()
         {

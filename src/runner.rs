@@ -21,8 +21,9 @@ use crate::evaluate::{
 use crate::events::{EventVocab, NormalizedEvent, rule_matches};
 use crate::fake_model::{
     FakeModelEngine, FakeModelMailboxServer, FakeModelPreconnectedServer, FakeModelServer,
-    FakeModelUnixServer, PacedResponseLedger, ProviderMailboxRequest, ProviderMailboxResponse,
-    is_transient_bind_error, monotonic_timestamp_ns,
+    FakeModelUnixServer, OfflineProviderConnectionAttempt, OfflineProviderObservations,
+    PacedResponseLedger, ProviderMailboxRequest, ProviderMailboxResponse, is_transient_bind_error,
+    monotonic_timestamp_ns,
 };
 use crate::manifest::{
     ArgvPosition, InjectionArgvTarget, InjectionComponent, InjectionMethod, Manifest, TransportKind,
@@ -136,6 +137,13 @@ impl ModelServer {
         }
     }
 
+    fn provider_bind_address(&self) -> Option<String> {
+        match self {
+            Self::Tcp(server) => Some(server.local_addr().to_string()),
+            _ => None,
+        }
+    }
+
     async fn shutdown(self) -> Result<()> {
         match self {
             Self::Tcp(server) => server.shutdown().await,
@@ -147,6 +155,25 @@ impl ModelServer {
             Self::Mailbox(server) => server.shutdown().await,
             Self::Preconnected(server) => server.shutdown().await,
             Self::Embedded => Ok(()),
+        }
+    }
+
+    fn offline_delivery_oracle(
+        &self,
+    ) -> Option<Arc<dyn crate::offline_guard::LocalDeliveryOracle>> {
+        match self {
+            Self::Tcp(server) => server.offline_delivery_oracle(),
+            _ => None,
+        }
+    }
+
+    async fn shutdown_with_offline_provider_attempts(self) -> Result<OfflineProviderObservations> {
+        match self {
+            Self::Tcp(server) => server.shutdown_with_offline_provider_attempts().await,
+            other => {
+                other.shutdown().await?;
+                Ok(OfflineProviderObservations::default())
+            }
         }
     }
 }
@@ -3900,6 +3927,8 @@ fn per_invocation_topology(manifest: &Manifest) -> bool {
 pub async fn run(mut options: RunOptions) -> Result<i32> {
     let manifest = crate::manifest::load(&options.manifest)?;
     let persistence = crate::results::prepare(&options, &manifest)?;
+    let mut run_root_guard =
+        crate::results::RunRootGuard::new(persistence.profile_path.clone(), options.keep_run_root)?;
     options.output = persistence.output.clone();
     let selected = selected_definitions(&options)?;
     let deadline_secs = crate::cli::deadline_secs(&options)?;
@@ -3937,11 +3966,13 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
                 &error.to_string(),
                 Some(&teardown_audit),
             )?;
+            run_root_guard.confirm_persisted();
             eprintln!(
                 "ahrb: run aborted for manifest {}: {error}; wrote {}",
                 options.manifest.display(),
                 options.output.join("report.json").display()
             );
+            run_root_guard.cleanup()?;
             return Ok(2);
         }
         Err(_) => {
@@ -3965,6 +3996,7 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
                 &detail,
                 Some(&teardown_audit),
             )?;
+            run_root_guard.confirm_persisted();
             eprintln!(
                 "ahrb: run deadline reached after {:.3}s; stopped launching rows and wrote {}",
                 started.elapsed().as_secs_f64(),
@@ -3973,16 +4005,20 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
             Ok(2)
         }
     };
+    if outcome.is_ok() {
+        run_root_guard.confirm_persisted();
+    }
     let final_audit = run_teardown_audit(&manifest, &persistence.profile_path);
     let cleanup = if final_audit.errors.is_empty() {
         Ok(())
     } else {
         Err(AhrbError::Protocol(final_audit.errors.join("; ")))
     };
-    match (outcome, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(code), Ok(())) => Ok(code),
+    let root_cleanup = run_root_guard.cleanup();
+    match (outcome, cleanup, root_cleanup) {
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+        (Ok(code), Ok(()), Ok(())) => Ok(code),
     }
 }
 
@@ -3990,27 +4026,71 @@ pub async fn run(mut options: RunOptions) -> Result<i32> {
 pub async fn run_economy(mut options: RunOptions) -> Result<i32> {
     let manifest = crate::manifest::load(&options.manifest)?;
     let persistence = crate::results::prepare(&options, &manifest)?;
+    let mut run_root_guard =
+        crate::results::RunRootGuard::new(persistence.profile_path.clone(), options.keep_run_root)?;
     options.output = persistence.output.clone();
     let deadline_secs = crate::cli::deadline_secs(&options)?;
     let outcome = tokio::time::timeout(
         Duration::from_secs(deadline_secs),
-        run_economy_inner(options.clone(), manifest, persistence),
+        run_economy_inner(options.clone(), manifest.clone(), persistence.clone()),
     )
     .await;
     let outcome = match outcome {
-        Ok(result) => result,
+        Ok(Ok(code)) => Ok(code),
+        Ok(Err(error)) => {
+            let teardown = run_teardown_audit(&manifest, &persistence.profile_path);
+            write_pillar_failure_report(
+                &options,
+                &manifest,
+                &persistence,
+                "economy",
+                &error.to_string(),
+                &teardown,
+            )?;
+            Err(error)
+        }
         Err(_) => {
             let detail = format!("economy deadline after {deadline_secs}s");
             let error = AhrbError::Timeout(detail);
             crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
+            let teardown = run_teardown_audit(&manifest, &persistence.profile_path);
+            write_pillar_failure_report(
+                &options,
+                &manifest,
+                &persistence,
+                "economy",
+                &error.to_string(),
+                &teardown,
+            )?;
             Err(error)
         }
     };
-    let cleanup = ensure_owned_cleanup();
-    match (outcome, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(code), Ok(())) => Ok(code),
+    let final_audit = run_teardown_audit(&manifest, &persistence.profile_path);
+    let cleanup = final_audit.errors.is_empty().then_some(()).ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "economy final teardown failed: {}",
+            final_audit.errors.join("; ")
+        ))
+    });
+    let report = finalize_pillar_teardown_report(
+        &options,
+        &persistence,
+        "economy",
+        &final_audit,
+        outcome.is_err(),
+    );
+    if report.is_ok() {
+        run_root_guard.confirm_persisted();
+    }
+    let root_cleanup = run_root_guard.cleanup();
+    match (outcome, cleanup, report, root_cleanup) {
+        (_, _, Err(report_error), Err(root_error)) => {
+            Err(AhrbError::Protocol(format!("{report_error}; {root_error}")))
+        }
+        (_, _, Err(error), _) | (_, _, _, Err(error)) => Err(error),
+        (Err(error), _, _, _) => Err(error),
+        (Ok(_), Err(error), _, _) => Err(error),
+        (Ok(code), Ok(()), Ok(()), Ok(())) => Ok(code),
     }
 }
 
@@ -4291,8 +4371,18 @@ async fn run_economy_inner(
         }
     }
     driver.shutdown().await?;
-    let lifecycle_notes = driver.lifecycle_notes();
+    let mut lifecycle_notes = driver.lifecycle_notes();
     server.shutdown().await?;
+    let teardown_audit = run_teardown_audit(&manifest, &profile_root);
+    lifecycle_notes.push(format!(
+        "economy teardown {}: observed={} reaped={} survivors={} locks={}",
+        teardown_audit.status,
+        teardown_audit.observed_owned_processes.len(),
+        teardown_audit.reaped_processes.len(),
+        teardown_audit.surviving_processes.len(),
+        teardown_audit.profile_locks.len()
+    ));
+    let teardown_failed = teardown_audit.status == "ERROR";
     let records = engine.request_records().await;
     let profile = format!("{:?}", options.profile).to_lowercase();
     let turn_budget = match options.profile {
@@ -4329,9 +4419,10 @@ async fn run_economy_inner(
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let report = Report {
+    let mut report = Report {
         schema: 3,
         spec_version: 3,
+        pillar: Some("economy".to_owned()),
         run_id: format!("ahrb-economy-{run_prefix}"),
         profile_path: profile_root.to_string_lossy().into_owned(),
         fingerprint: Fingerprint {
@@ -4433,29 +4524,80 @@ async fn run_economy_inner(
         filesystem_snapshots,
         ..Report::default()
     };
-    crate::results::persist_report(&persistence, &report, options.junit, false)?;
+    report.details.insert(
+        "teardown".to_owned(),
+        serde_json::to_value(&teardown_audit)?,
+    );
+    // The outer runner performs the authoritative final teardown immediately
+    // before run-root removal, rewrites this provisional report with that
+    // audit, and only then publishes/indexes the bundle.
+    crate::report::write_bundle(&report, &persistence.output, options.junit)?;
     if let Some(summary) = &report.economy_summary {
         println!("{}", crate::economy::render_summary(summary));
     }
-    Ok(0)
+    Ok(if teardown_failed { 2 } else { 0 })
 }
 
 /// Execute the isolated long-horizon context-fidelity task and persist its report.
 pub async fn run_fidelity(mut options: RunOptions) -> Result<i32> {
     let manifest = crate::manifest::load(&options.manifest)?;
     let persistence = crate::results::prepare(&options, &manifest)?;
+    let mut run_root_guard =
+        crate::results::RunRootGuard::new(persistence.profile_path.clone(), options.keep_run_root)?;
     options.output = persistence.output.clone();
     let deadline_secs = crate::cli::deadline_secs(&options)?;
     let started = tokio::time::Instant::now();
     let deadline_at = started
         .checked_add(Duration::from_secs(deadline_secs))
         .ok_or_else(|| AhrbError::Validation("fidelity deadline overflows Instant".to_owned()))?;
-    let outcome = run_fidelity_inner(options, manifest, persistence, deadline_at).await;
-    let cleanup = ensure_owned_cleanup();
-    match (outcome, cleanup) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(code), Ok(())) => Ok(code),
+    let outcome = run_fidelity_inner(
+        options.clone(),
+        manifest.clone(),
+        persistence.clone(),
+        deadline_at,
+    )
+    .await;
+    let outcome = match outcome {
+        Ok(code) => Ok(code),
+        Err(error) => {
+            let teardown = run_teardown_audit(&manifest, &persistence.profile_path);
+            write_pillar_failure_report(
+                &options,
+                &manifest,
+                &persistence,
+                "fidelity",
+                &error.to_string(),
+                &teardown,
+            )?;
+            Err(error)
+        }
+    };
+    let final_audit = run_teardown_audit(&manifest, &persistence.profile_path);
+    let cleanup = final_audit.errors.is_empty().then_some(()).ok_or_else(|| {
+        AhrbError::Protocol(format!(
+            "fidelity final teardown failed: {}",
+            final_audit.errors.join("; ")
+        ))
+    });
+    let report = finalize_pillar_teardown_report(
+        &options,
+        &persistence,
+        "fidelity",
+        &final_audit,
+        outcome.is_err(),
+    );
+    if report.is_ok() {
+        run_root_guard.confirm_persisted();
+    }
+    let root_cleanup = run_root_guard.cleanup();
+    match (outcome, cleanup, report, root_cleanup) {
+        (_, _, Err(report_error), Err(root_error)) => {
+            Err(AhrbError::Protocol(format!("{report_error}; {root_error}")))
+        }
+        (_, _, Err(error), _) | (_, _, _, Err(error)) => Err(error),
+        (Err(error), _, _, _) => Err(error),
+        (Ok(_), Err(error), _, _) => Err(error),
+        (Ok(code), Ok(()), Ok(()), Ok(())) => Ok(code),
     }
 }
 
@@ -5014,6 +5156,16 @@ async fn run_fidelity_inner(
             ));
         }
     }
+    let teardown_audit = run_teardown_audit(&manifest, &profile_root);
+    lifecycle_notes.push(format!(
+        "fidelity teardown {}: observed={} reaped={} survivors={} locks={}",
+        teardown_audit.status,
+        teardown_audit.observed_owned_processes.len(),
+        teardown_audit.reaped_processes.len(),
+        teardown_audit.surviving_processes.len(),
+        teardown_audit.profile_locks.len()
+    ));
+    let teardown_failed = teardown_audit.status == "ERROR";
     let workspace_state = if before_receipt.sha256 == after_receipt.sha256 {
         crate::fidelity::WorkspaceState::Untouched
     } else {
@@ -5079,9 +5231,10 @@ async fn run_fidelity_inner(
             )),
         ),
     ]);
-    let report = Report {
+    let mut report = Report {
         schema: 3,
         spec_version: 3,
+        pillar: Some("fidelity".to_owned()),
         run_id: format!("ahrb-fidelity-{run_prefix}"),
         profile_path: profile_root.to_string_lossy().into_owned(),
         fingerprint: Fingerprint {
@@ -5110,11 +5263,17 @@ async fn run_fidelity_inner(
         filesystem_snapshots,
         ..Report::default()
     };
-    crate::results::persist_report(&persistence, &report, options.junit, false)?;
+    report.details.insert(
+        "teardown".to_owned(),
+        serde_json::to_value(&teardown_audit)?,
+    );
+    // Publication is delayed until the outer final teardown audit has replaced
+    // this provisional audit in the report.
+    crate::report::write_bundle(&report, &persistence.output, options.junit)?;
     if let Some(summary) = &report.fidelity_summary {
         println!("{}", crate::fidelity::render_summary(summary));
     }
-    Ok(0)
+    Ok(if teardown_failed { 2 } else { 0 })
 }
 
 fn fidelity_turn_budget(profile: Profile) -> u64 {
@@ -5579,6 +5738,104 @@ fn run_teardown_audit(manifest: &Manifest, run_root: &Path) -> RunTeardownAudit 
         audit.status = "ERROR";
     }
     audit
+}
+
+fn write_pillar_failure_report(
+    options: &RunOptions,
+    manifest: &Manifest,
+    persistence: &crate::results::RunPersistence,
+    pillar: &str,
+    failure: &str,
+    teardown: &RunTeardownAudit,
+) -> Result<()> {
+    let error = AhrbError::Protocol(failure.to_owned());
+    crate::report::write_failure_diagnostic(&options.output, &options.manifest, &error)?;
+    let profile = format!("{:?}", options.profile).to_lowercase();
+    let mut report = Report {
+        schema: 3,
+        spec_version: 3,
+        pillar: Some(pillar.to_owned()),
+        run_id: format!("ahrb-{pillar}-{}-aborted", persistence.timestamp),
+        profile_path: persistence.profile_path.to_string_lossy().into_owned(),
+        fingerprint: Fingerprint {
+            harness: manifest.identity.id.clone(),
+            harness_version: persistence.harness_version.clone(),
+            manifest: crate::manifest::hash(manifest)?,
+            workflows: "unavailable-aborted-before-complete-workflow".to_owned(),
+            fake_model: env!("CARGO_PKG_VERSION").to_owned(),
+            normalizer: env!("CARGO_PKG_VERSION").to_owned(),
+            ahrb_revision: crate::results::ahrb_revision(),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            host_memory_bytes: host_memory_bytes(),
+            profile: profile.clone(),
+        },
+        lifecycle_notes: vec![format!(
+            "{pillar} aborted: {failure}; teardown {}",
+            teardown.status
+        )],
+        resource_summary: ResourceSummary {
+            topology: manifest.concurrency.topology.clone(),
+            profile,
+            comparison_scope: format!("cross-topology-{pillar}-only"),
+            ..ResourceSummary::default()
+        },
+        ..Report::default()
+    };
+    report.details.insert(
+        "pillar-failure".to_owned(),
+        json!({"measurement_complete":false,"measurement_error":failure}),
+    );
+    report
+        .details
+        .insert("teardown".to_owned(), serde_json::to_value(teardown)?);
+    crate::report::write_bundle(&report, &options.output, options.junit)
+}
+
+/// Replace the provisional inner teardown with the authoritative audit taken
+/// immediately before run-root removal, then publish/index that exact report.
+fn finalize_pillar_teardown_report(
+    options: &RunOptions,
+    persistence: &crate::results::RunPersistence,
+    pillar: &str,
+    teardown: &RunTeardownAudit,
+    include_run_error: bool,
+) -> Result<()> {
+    let report_path = persistence.output.join("report.json");
+    let mut report: Report =
+        serde_json::from_slice(&std::fs::read(&report_path).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "read provisional {pillar} report {}: {error}",
+                report_path.display()
+            ))
+        })?)?;
+    if report.pillar.as_deref() != Some(pillar) {
+        return Err(AhrbError::Protocol(format!(
+            "provisional report pillar {:?} did not match {pillar:?}",
+            report.pillar
+        )));
+    }
+    report
+        .details
+        .insert("teardown".to_owned(), serde_json::to_value(teardown)?);
+    report.lifecycle_notes.push(format!(
+        "{pillar} authoritative final teardown {}: observed={} reaped={} survivors={} locks={} errors={}",
+        teardown.status,
+        teardown.observed_owned_processes.len(),
+        teardown.reaped_processes.len(),
+        teardown.surviving_processes.len(),
+        teardown.profile_locks.len(),
+        teardown.errors.len()
+    ));
+    if !teardown.errors.is_empty() {
+        report.details.insert(
+            "final-teardown-error".to_owned(),
+            json!({
+                "measurement_complete": false,
+                "measurement_error": teardown.errors.join("; "),
+            }),
+        );
+    }
+    crate::results::persist_report(persistence, &report, options.junit, include_run_error)
 }
 
 fn selected_definitions(
@@ -9053,16 +9310,18 @@ fn prepare_profile(manifest: &Manifest, profile_root: &Path) -> Result<()> {
         ))
     })?;
     std::fs::create_dir_all(parent)?;
-    std::fs::create_dir(profile_root).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            AhrbError::Validation(format!(
-                "refusing to reuse non-cold profile {}; choose a fresh output directory",
-                profile_root.display()
-            ))
-        } else {
-            error.into()
-        }
-    })?;
+    if !crate::results::claim_reserved_run_root(profile_root)? {
+        std::fs::create_dir(profile_root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AhrbError::Validation(format!(
+                    "refusing to reuse non-cold profile {}; choose a fresh output directory",
+                    profile_root.display()
+                ))
+            } else {
+                error.into()
+            }
+        })?;
+    }
     set_owner_private(profile_root)?;
     CREATED_PROFILES
         .get_or_init(|| Mutex::new(BTreeSet::new()))
@@ -9249,6 +9508,18 @@ async fn start_model(
             })
         }
     }
+}
+
+async fn start_offline_model(
+    engine: Arc<FakeModelEngine>,
+    base_url_env: &str,
+) -> Result<(ModelServer, BTreeMap<String, String>)> {
+    let server = FakeModelServer::bind_offline_provider(engine).await?;
+    let base_url = server.offline_provider_base_url()?;
+    Ok((
+        ModelServer::Tcp(server),
+        BTreeMap::from([(base_url_env.to_owned(), base_url)]),
+    ))
 }
 
 async fn start_streaming_model(
@@ -9468,6 +9739,11 @@ fn make_driver_with_timeout(
             rendered_managed_daemon_config(manifest, environment, variables, profile_root)?,
         ));
     }
+    let managed_daemon_commands = manifest.daemon.persistent
+        && matches!(
+            manifest.transport.kind,
+            TransportKind::SocketJsonrpc | TransportKind::Http
+        );
     let optional = |values: &[String]| values.first().cloned().unwrap_or_default();
     let operations = DriverOperations {
         create_session: optional(&manifest.sessions.create),
@@ -9486,7 +9762,11 @@ fn make_driver_with_timeout(
         agent_collect_events_pointer: manifest.agents.collect_events_pointer.clone(),
         cancel: optional(&manifest.agents.cancel),
         close: optional(&manifest.sessions.close_delete),
-        shutdown: optional(&manifest.daemon.shutdown),
+        shutdown: if managed_daemon_commands {
+            String::new()
+        } else {
+            optional(&manifest.daemon.shutdown)
+        },
         wait_ready: optional(&manifest.sessions.wait_ready),
         shutdown_result: manifest.daemon.shutdown_result.clone(),
     };
@@ -23826,6 +24106,11 @@ struct ReviewedOwnedEgressBoundary {
     nonce: String,
 }
 
+enum Row62Guard {
+    Owned(ReviewedOwnedEgressBoundary),
+    Os(Box<crate::offline_guard::OfflineGuard>),
+}
+
 fn reference_mock_executable() -> Result<PathBuf> {
     let current = std::env::current_exe()?;
     let parent = current
@@ -24048,6 +24333,121 @@ mod owned_egress_record_tests {
     }
 }
 
+/// Record one row-62 trial and mirror its attempts into the report's egress
+/// attempt list.
+fn push_offline_trial(trials: &mut OfflineModeTrials, trial: OfflineTrial) {
+    trials
+        .egress_attempts
+        .extend(trial.attempts.iter().map(|attempt| EgressAttempt {
+            repetition: attempt.repetition,
+            monotonic_ns: monotonic_timestamp_ns(),
+            destination: attempt.destination.clone(),
+            category: attempt.category.clone(),
+            allowed: attempt.allowed,
+            outcome: attempt.outcome.clone(),
+            enforcement: trial.egress_enforcement.clone(),
+            confinement_identity: trial.harness_confinement_identity.clone(),
+        }));
+    trials.evidence.push(trial);
+}
+
+/// Row-62 trial evidence for the macOS Seatbelt guard. Any connection that
+/// reached the provider listener or a sentinel through a destination other
+/// than `127.0.0.1` (guard-setup delivery probes excluded) is an observed
+/// guard escape even though the listener rejects it before HTTP handling.
+fn seatbelt_offline_trial(
+    repetition: u32,
+    evidence: &crate::offline_guard::GuardEvidence,
+    unexpected: &[OfflineProviderConnectionAttempt],
+    provider_requests: u64,
+    terminal_success: bool,
+    terminal_failure: Option<String>,
+) -> OfflineTrial {
+    let identity = evidence.confinement_identity.clone();
+    let mut attempts = vec![OfflineAttempt {
+        repetition,
+        destination: evidence.control_destination.clone(),
+        category: "control-probe".to_owned(),
+        outcome: "blocked-permission-denied".to_owned(),
+        allowed: false,
+        confinement_identity: identity.clone(),
+    }];
+    attempts.extend(unexpected.iter().map(|attempt| OfflineAttempt {
+        repetition,
+        destination: attempt.destination.clone(),
+        category: "other".to_owned(),
+        outcome: format!("{} peer={}", attempt.outcome, attempt.peer),
+        allowed: true,
+        confinement_identity: identity.clone(),
+    }));
+    OfflineTrial {
+        repetition,
+        provider_requests,
+        terminal_success,
+        terminal_failure,
+        control_probe_blocked: evidence.control_probe_blocked,
+        harness_confinement_identity: identity.clone(),
+        probe_confinement_identity: identity,
+        egress_enforcement: evidence.enforcement.clone(),
+        guard_profile_sha256: Some(evidence.profile_sha256.clone()),
+        guard_rendered_profile: Some(evidence.rendered_profile.clone()),
+        guard_launcher_sha256: Some(evidence.launcher_sha256.clone()),
+        provider_rule: Some(evidence.provider_rule.clone()),
+        provider_destination: Some(evidence.provider_destination.clone()),
+        provider_bind_address: Some(evidence.provider_bind_address.clone()),
+        owned_ipv4_addresses: evidence.owned_ipv4_addresses.clone(),
+        provider_port_owned: Some(evidence.provider_port_owned),
+        provider_probe_allowed: Some(evidence.provider_probe_allowed),
+        udp_probe_destinations: evidence.udp_probe_destinations.clone(),
+        udp_probes_blocked: Some(evidence.udp_probes_blocked),
+        alternate_ipv4_probe_blocked: Some(evidence.alternate_ipv4_probe_blocked),
+        alternate_loopback_probe_blocked: Some(evidence.alternate_loopback_probe_blocked),
+        child_inheritance_proven: Some(evidence.child_inheritance_proven),
+        profile_write_blocked: Some(evidence.profile_write_blocked),
+        launch_hash_verified: Some(evidence.launch_hash_verified),
+        local_ipv4_monitor: Some(evidence.local_ipv4_monitor.clone()),
+        local_delivery_probes: evidence.local_delivery_probes.clone(),
+        local_delivery_proven: Some(evidence.local_delivery_proven),
+        attempts,
+    }
+}
+
+/// The sentinels' separate setup-probe record must contain exactly the
+/// arrivals the guard credited as delivered, and nothing else.
+fn verify_setup_probe_arrivals(
+    probes: &[crate::offline_guard::LocalDeliveryProbe],
+    arrivals: &[OfflineProviderConnectionAttempt],
+) -> Result<()> {
+    let credited = probes
+        .iter()
+        .filter(|probe| probe.sentinel_recorded)
+        .map(|probe| {
+            (
+                probe.destination.clone(),
+                probe.probe_local_address.clone().unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let recorded = arrivals
+        .iter()
+        .map(|arrival| (arrival.destination.clone(), arrival.peer.clone()))
+        .collect::<BTreeSet<_>>();
+    if credited.len()
+        == probes
+            .iter()
+            .filter(|probe| probe.sentinel_recorded)
+            .count()
+        && recorded.len() == arrivals.len()
+        && credited == recorded
+    {
+        Ok(())
+    } else {
+        Err(AhrbError::Protocol(format!(
+            "row-62 sentinel setup-probe record {recorded:?} does not match the guard's credited delivery probes {credited:?}"
+        )))
+    }
+}
+
 async fn collect_offline_mode_trials(
     manifest: &Manifest,
     profile: Profile,
@@ -24078,14 +24478,22 @@ async fn collect_offline_mode_trials(
             &manifest.model_roles,
             &manifest.request_role_rules,
         )?);
-        let (server, model_environment) = start_model(
-            Arc::clone(&engine),
-            &workflow,
-            &profile_root,
-            false,
-            &manifest.fake_model.base_url_env,
-        )
-        .await?;
+        let is_owned_mock = matches!(
+            manifest.identity.id.as_str(),
+            "ahrb-mock" | "ahrb-mock-exec"
+        );
+        let (server, model_environment) = if is_owned_mock {
+            start_model(
+                Arc::clone(&engine),
+                &workflow,
+                &profile_root,
+                false,
+                &manifest.fake_model.base_url_env,
+            )
+            .await?
+        } else {
+            start_offline_model(Arc::clone(&engine), &manifest.fake_model.base_url_env).await?
+        };
         let mut variables = BTreeMap::from([
             (
                 "profile".to_owned(),
@@ -24118,33 +24526,93 @@ async fn collect_offline_mode_trials(
         variables.insert("credential".to_owned(), credential);
         variables.insert("model".to_owned(), manifest.fake_model.model.clone());
         write_generated_files(manifest, &variables, &profile_root)?;
-        let command = if manifest.transport.kind == TransportKind::Exec {
-            manifest.transport.command.clone()
+        let base_url = variables.get("base_url").cloned().ok_or_else(|| {
+            AhrbError::Protocol("row-62 fake-provider base URL disappeared".to_owned())
+        })?;
+        let mut guarded_manifest = manifest.clone();
+        let mut guard = if is_owned_mock {
+            let unguarded_command = if manifest.transport.kind == TransportKind::Exec {
+                manifest.transport.command.clone()
+            } else {
+                render_argv(&manifest.transport.command, &variables)?
+            };
+            let boundary = reviewed_owned_egress_boundary(
+                manifest,
+                &unguarded_command,
+                &profile_root,
+                manifest_hash,
+                repetition,
+            )?;
+            environment.insert(
+                "AHRB_MOCK_OWNED_EGRESS_LEDGER".to_owned(),
+                boundary.ledger_path.to_string_lossy().into_owned(),
+            );
+            environment.insert(
+                "AHRB_MOCK_OWNED_EGRESS_NONCE".to_owned(),
+                boundary.nonce.clone(),
+            );
+            environment.insert(
+                "AHRB_MOCK_OWNED_EGRESS_FORBIDDEN".to_owned(),
+                ROW62_FORBIDDEN_ADDRESS.to_owned(),
+            );
+            Row62Guard::Owned(boundary)
         } else {
-            render_argv(&manifest.transport.command, &variables)?
+            let provider_bind_address = server.provider_bind_address().ok_or_else(|| {
+                AhrbError::Protocol(
+                    "row-62 OS guard requires an owned TCP provider port".to_owned(),
+                )
+            })?;
+            let delivery = server.offline_delivery_oracle().ok_or_else(|| {
+                AhrbError::Protocol(
+                    "row-62 OS guard requires the provider's sentinel record".to_owned(),
+                )
+            })?;
+            let guard_profile_root = profile_root.clone();
+            let guard_base_url = base_url.clone();
+            // Guard setup blocks on guarded probe processes while the
+            // provider's sentinels accept on the async runtime, so the setup
+            // delivery proof runs on the blocking pool.
+            let mut os_guard = tokio::task::spawn_blocking(move || {
+                crate::offline_guard::OfflineGuard::new(
+                    &guard_profile_root,
+                    &guard_base_url,
+                    &provider_bind_address,
+                    delivery.as_ref(),
+                )
+            })
+            .await
+            .map_err(|error| AhrbError::Protocol(format!("row-62 guard setup task: {error}")))??;
+            if let Some(failure) = os_guard.local_delivery_failure().map(str::to_owned) {
+                // Fail closed before any harness launch. The guard evidence,
+                // including every per-address delivery probe, is retained.
+                let observations = server.shutdown_with_offline_provider_attempts().await?;
+                os_guard.finish_trial_address_monitor();
+                push_offline_trial(
+                    &mut trials,
+                    seatbelt_offline_trial(
+                        repetition,
+                        os_guard.evidence(),
+                        &observations.unexpected,
+                        0,
+                        false,
+                        Some(format!(
+                            "guard setup refused to launch the harness: {failure}"
+                        )),
+                    ),
+                );
+                return Ok(trials);
+            }
+            guarded_manifest = os_guard.apply_to_manifest(manifest)?;
+            Row62Guard::Os(Box::new(os_guard))
         };
-        let boundary = reviewed_owned_egress_boundary(
-            manifest,
-            &command,
-            &profile_root,
-            manifest_hash,
-            repetition,
-        )?;
-        environment.insert(
-            "AHRB_MOCK_OWNED_EGRESS_LEDGER".to_owned(),
-            boundary.ledger_path.to_string_lossy().into_owned(),
-        );
-        environment.insert(
-            "AHRB_MOCK_OWNED_EGRESS_NONCE".to_owned(),
-            boundary.nonce.clone(),
-        );
-        environment.insert(
-            "AHRB_MOCK_OWNED_EGRESS_FORBIDDEN".to_owned(),
-            ROW62_FORBIDDEN_ADDRESS.to_owned(),
-        );
-        let per_invocation = per_invocation_topology(manifest);
+        let command = if guarded_manifest.transport.kind == TransportKind::Exec {
+            guarded_manifest.transport.command.clone()
+        } else {
+            render_argv(&guarded_manifest.transport.command, &variables)?
+        };
+        let per_invocation = per_invocation_topology(&guarded_manifest);
         let mut driver = make_driver_with_timeout(
-            manifest,
+            &guarded_manifest,
             &command,
             &environment,
             &variables,
@@ -24172,7 +24640,7 @@ async fn collect_offline_mode_trials(
         } else {
             let mut ownership_sampler = platform_sampler();
             verified_process_roots(
-                manifest,
+                &guarded_manifest,
                 ownership_sampler.as_mut(),
                 driver.owned_pids(),
                 driver.daemon_pid(),
@@ -24200,49 +24668,85 @@ async fn collect_offline_mode_trials(
                 .filter(|event| is_terminal(&event.event))
                 .count()
                 == 1;
-        let ledger_records = read_owned_egress_ledger(&boundary.ledger_path)?;
-        let probe = verify_owned_egress_records(
-            &ledger_records,
-            &boundary,
-            &owned_root_pids,
-            provider_requests,
-        )?;
-        let identity = boundary.confinement_identity.clone();
-        let attempt = OfflineAttempt {
-            repetition,
-            destination: probe.destination.clone(),
-            category: "control-probe".to_owned(),
-            outcome: probe.outcome.clone(),
-            allowed: false,
-            confinement_identity: identity.clone(),
-        };
-        trials.egress_attempts.push(EgressAttempt {
-            repetition,
-            monotonic_ns: monotonic_timestamp_ns(),
-            destination: probe.destination.clone(),
-            category: "control-probe".to_owned(),
-            allowed: false,
-            outcome: attempt.outcome.clone(),
-            enforcement: "reviewed reference-mock owned loopback connector".to_owned(),
-            confinement_identity: identity.clone(),
-        });
-        trials.evidence.push(OfflineTrial {
-            repetition,
-            provider_requests,
-            terminal_success,
-            control_probe_blocked: true,
-            harness_confinement_identity: identity.clone(),
-            probe_confinement_identity: identity,
-            egress_enforcement: "reviewed reference-mock owned loopback connector".to_owned(),
-            attempts: vec![attempt],
-        });
-        if manifest.transport.kind == TransportKind::Exec
-            || !manifest.sessions.close_delete.is_empty()
+        let terminal_failure = events
+            .iter()
+            .find(|event| event.event == EventVocab::TerminalFailure)
+            .map(|event| format!("terminal-failure {}", event.payload));
+        if guarded_manifest.transport.kind == TransportKind::Exec
+            || !guarded_manifest.sessions.close_delete.is_empty()
         {
             driver.close(&session).await?;
         }
         driver.shutdown().await?;
-        server.shutdown().await?;
+        let observations = server.shutdown_with_offline_provider_attempts().await?;
+        if let Row62Guard::Os(guard) = &mut guard {
+            guard.finish_trial_address_monitor();
+        }
+        let trial = match &guard {
+            Row62Guard::Owned(boundary) => {
+                let ledger_records = read_owned_egress_ledger(&boundary.ledger_path)?;
+                let probe = verify_owned_egress_records(
+                    &ledger_records,
+                    boundary,
+                    &owned_root_pids,
+                    provider_requests,
+                )?;
+                let identity = boundary.confinement_identity.clone();
+                OfflineTrial {
+                    repetition,
+                    provider_requests,
+                    terminal_success,
+                    terminal_failure,
+                    control_probe_blocked: true,
+                    harness_confinement_identity: identity.clone(),
+                    probe_confinement_identity: identity.clone(),
+                    egress_enforcement:
+                        crate::wave2_automation::OFFLINE_OWNED_CONNECTOR_ENFORCEMENT.to_owned(),
+                    guard_profile_sha256: None,
+                    guard_rendered_profile: None,
+                    guard_launcher_sha256: None,
+                    provider_rule: None,
+                    provider_destination: None,
+                    provider_bind_address: None,
+                    owned_ipv4_addresses: Vec::new(),
+                    provider_port_owned: None,
+                    provider_probe_allowed: None,
+                    udp_probe_destinations: Vec::new(),
+                    udp_probes_blocked: None,
+                    alternate_ipv4_probe_blocked: None,
+                    alternate_loopback_probe_blocked: None,
+                    child_inheritance_proven: None,
+                    profile_write_blocked: None,
+                    launch_hash_verified: None,
+                    local_ipv4_monitor: None,
+                    local_delivery_probes: Vec::new(),
+                    local_delivery_proven: None,
+                    attempts: vec![OfflineAttempt {
+                        repetition,
+                        destination: probe.destination.clone(),
+                        category: "control-probe".to_owned(),
+                        outcome: probe.outcome.clone(),
+                        allowed: false,
+                        confinement_identity: identity,
+                    }],
+                }
+            }
+            Row62Guard::Os(guard) => {
+                verify_setup_probe_arrivals(
+                    &guard.evidence().local_delivery_probes,
+                    &observations.setup_probe_arrivals,
+                )?;
+                seatbelt_offline_trial(
+                    repetition,
+                    guard.evidence(),
+                    &observations.unexpected,
+                    provider_requests,
+                    terminal_success,
+                    terminal_failure,
+                )
+            }
+        };
+        push_offline_trial(&mut trials, trial);
         trials.events.extend(events);
         trials.requests.extend(requests);
     }
@@ -30011,7 +30515,7 @@ fn stable_evidence_hash(value: &str) -> String {
 fn host_memory_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        return std::fs::read_to_string("/proc/meminfo")
+        std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|text| {
                 text.lines().find_map(|line| {
@@ -30021,7 +30525,7 @@ fn host_memory_bytes() -> u64 {
                         .map(|kib| kib.saturating_mul(1024))
                 })
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
     }
     #[cfg(target_os = "macos")]
     {
@@ -30501,6 +31005,7 @@ mod resource_sampler_tests {
             junit: false,
             deadline_secs: Some(1),
             no_save: true,
+            keep_run_root: false,
             harness_version: Some("mock-harness 0.1.0".to_owned()),
         };
         let manifest = crate::manifest::load(&options.manifest).expect("load mock manifest");
@@ -30565,6 +31070,72 @@ mod resource_sampler_tests {
         assert_eq!(report.details["teardown"]["status"], "PASS");
         assert_eq!(report.details["teardown"]["reaped_processes"][0]["pid"], 41);
         std::fs::remove_dir_all(output).expect("remove partial deadline output");
+    }
+
+    #[test]
+    fn final_pillar_teardown_replaces_inner_audit_and_records_errors() {
+        let output = std::env::temp_dir().join(format!(
+            "ahrb-final-teardown-report-{}-{}",
+            std::process::id(),
+            monotonic_timestamp_ns()
+        ));
+        let options = RunOptions {
+            manifest: PathBuf::from("adapters/mock/manifest.toml"),
+            output: output.clone(),
+            profile: Profile::Quick,
+            tests: Vec::new(),
+            junit: false,
+            deadline_secs: Some(1),
+            no_save: true,
+            keep_run_root: false,
+            harness_version: Some("mock-harness 0.1.0".to_owned()),
+        };
+        let manifest = crate::manifest::load(&options.manifest).expect("load mock manifest");
+        let persistence =
+            crate::results::prepare(&options, &manifest).expect("prepare test persistence");
+        let mut provisional = Report {
+            pillar: Some("economy".to_owned()),
+            ..Report::default()
+        };
+        provisional.details.insert(
+            "teardown".to_owned(),
+            json!({"status":"PASS","reaped_processes":[]}),
+        );
+        crate::report::write_bundle(&provisional, &output, false)
+            .expect("write provisional pillar report");
+        let late = crate::process::ProcIdentity {
+            pid: 88,
+            start_time: 9900,
+        };
+        let final_audit = RunTeardownAudit {
+            status: "ERROR",
+            observed_owned_processes: Vec::new(),
+            reaped_processes: vec![late],
+            surviving_processes: vec![crate::process::ProcIdentity {
+                pid: 89,
+                start_time: 9901,
+            }],
+            profile_locks: Vec::new(),
+            lock_holders: Vec::new(),
+            errors: vec!["late audit fixture error".to_owned()],
+        };
+        finalize_pillar_teardown_report(&options, &persistence, "economy", &final_audit, false)
+            .expect("finalize pillar teardown report");
+        let report: Report = serde_json::from_slice(
+            &std::fs::read(output.join("report.json")).expect("read final report"),
+        )
+        .expect("parse final report");
+        assert_eq!(report.details["teardown"]["status"], "ERROR");
+        assert_eq!(report.details["teardown"]["reaped_processes"][0]["pid"], 88);
+        assert_eq!(
+            report.details["teardown"]["surviving_processes"][0]["pid"],
+            89
+        );
+        assert_eq!(
+            report.details["final-teardown-error"]["measurement_error"],
+            "late audit fixture error"
+        );
+        std::fs::remove_dir_all(output).expect("remove final teardown report fixture");
     }
 
     #[test]

@@ -528,12 +528,59 @@ pub struct OfflineTrial {
     pub repetition: u32,
     pub provider_requests: u64,
     pub terminal_success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_failure: Option<String>,
     pub control_probe_blocked: bool,
     pub harness_confinement_identity: String,
     pub probe_confinement_identity: String,
     pub egress_enforcement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_profile_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_rendered_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_launcher_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_bind_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_ipv4_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_port_owned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_probe_allowed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_probe_destinations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probes_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternate_ipv4_probe_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternate_loopback_probe_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_inheritance_proven: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_write_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_hash_verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_ipv4_monitor: Option<crate::offline_guard::LocalIpv4MonitorEvidence>,
+    /// Guard-setup TCP delivery probes, one per non-loopback owned address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_delivery_probes: Vec<crate::offline_guard::LocalDeliveryProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_delivery_proven: Option<bool>,
     pub attempts: Vec<OfflineAttempt>,
 }
+
+/// Row-62 enforcement identity of the reviewed reference-mock owned connector.
+pub(crate) const OFFLINE_OWNED_CONNECTOR_ENFORCEMENT: &str =
+    "reviewed reference-mock owned loopback connector";
+/// Row-62 enforcement identity of the reviewed macOS Seatbelt TCP-only guard.
+pub(crate) const OFFLINE_SEATBELT_ENFORCEMENT: &str = "macos-seatbelt-owned-local-tcp-port-v3";
 
 /// Row-62 PASS/ERROR-only evaluation.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -545,6 +592,54 @@ pub struct OfflineModeEvaluation {
     pub measurement_error: Option<String>,
 }
 
+/// Row 62 requires every local IPv4 address the Seatbelt `localhost` rule
+/// permits to be owned by AHRB: each non-loopback owned address must have
+/// exactly one setup delivery probe at the provider port that AHRB's sentinel
+/// recorded (or that Seatbelt denied).
+fn seatbelt_local_delivery_error(trial: &OfflineTrial) -> Option<String> {
+    use crate::offline_guard::{LOCAL_DELIVERY_FAILURE_PREFIX, local_delivery_failure};
+    if let Some(reason) = local_delivery_failure(&trial.local_delivery_probes) {
+        return Some(reason);
+    }
+    let port = trial
+        .provider_destination
+        .as_deref()
+        .and_then(|destination| destination.rsplit_once(':'))
+        .map(|(_, port)| port)
+        .unwrap_or_default();
+    let expected = trial
+        .owned_ipv4_addresses
+        .iter()
+        .filter(|address| {
+            !address
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|address| address.is_loopback())
+        })
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let probed = trial
+        .local_delivery_probes
+        .iter()
+        .map(|probe| probe.address.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if trial.local_delivery_proven != Some(true)
+        || port.is_empty()
+        || probed != expected
+        || trial.local_delivery_probes.len() != expected.len()
+        || trial
+            .local_delivery_probes
+            .iter()
+            .any(|probe| probe.destination != format!("{}:{port}", probe.address))
+    {
+        return Some(format!(
+            "{LOCAL_DELIVERY_FAILURE_PREFIX}: setup delivery probes do not cover every non-loopback owned address (owned [{}], probed [{}])",
+            expected.into_iter().collect::<Vec<_>>().join(", "),
+            probed.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    None
+}
+
 /// Evaluate reviewed same-confinement evidence. An observed escape invalidates
 /// the guard and is therefore an infrastructure error rather than harness FAIL.
 pub fn evaluate_offline_mode(
@@ -552,10 +647,24 @@ pub fn evaluate_offline_mode(
     expected_repetitions: u32,
 ) -> OfflineModeEvaluation {
     let incomplete = |message: String| OfflineModeEvaluation {
-        details: json!({"measurement_complete":false,"measurement_error":message}),
+        details: json!({
+            "measurement_complete": false,
+            "measurement_error": message,
+            "trials": trials,
+        }),
         measurement_error: Some(message),
         ..OfflineModeEvaluation::default()
     };
+    // A guard whose setup could not prove local delivery refuses to launch
+    // the harness and ends the row early, so this reason takes precedence
+    // over the trial count.
+    if let Some(reason) = trials
+        .iter()
+        .filter(|trial| trial.egress_enforcement == OFFLINE_SEATBELT_ENFORCEMENT)
+        .find_map(seatbelt_local_delivery_error)
+    {
+        return incomplete(format!("egress enforcement unavailable: {reason}"));
+    }
     if u32::try_from(trials.len()).ok() != Some(expected_repetitions) {
         return incomplete("egress enforcement unavailable: incomplete trials".to_owned());
     }
@@ -571,15 +680,154 @@ pub fn evaluate_offline_mode(
             || trial.harness_confinement_identity != trial.probe_confinement_identity
             || trial.egress_enforcement.is_empty()
             || !trial.control_probe_blocked
-            || trial.provider_requests == 0
         {
             return incomplete(
                 "egress enforcement unavailable: same-confinement proof failed".to_owned(),
             );
         }
+        // Only reviewed guard identities are accepted; an unknown or retired
+        // identity would otherwise bypass the guard-specific evidence checks.
+        if trial.egress_enforcement != OFFLINE_OWNED_CONNECTOR_ENFORCEMENT
+            && trial.egress_enforcement != OFFLINE_SEATBELT_ENFORCEMENT
+        {
+            return incomplete(format!(
+                "egress enforcement unavailable: unreviewed enforcement identity {:?}",
+                trial.egress_enforcement
+            ));
+        }
+        if trial.egress_enforcement == OFFLINE_SEATBELT_ENFORCEMENT {
+            let profile_hash = trial.guard_profile_sha256.as_deref().unwrap_or_default();
+            let launcher_hash = trial.guard_launcher_sha256.as_deref().unwrap_or_default();
+            let provider_destination = trial.provider_destination.as_deref().unwrap_or_default();
+            let provider_port = provider_destination
+                .rsplit_once(':')
+                .map(|(_, port)| port)
+                .unwrap_or_default();
+            let expected_provider_rule = format!(
+                "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:{provider_port}\")))"
+            );
+            let expected_provider_bind = provider_destination.to_owned();
+            let monitor = trial.local_ipv4_monitor.as_ref();
+            if trial.udp_probes_blocked != Some(true) {
+                return incomplete(format!(
+                    "egress enforcement unavailable: guarded UDP probes to {} were not all denied",
+                    trial.udp_probe_destinations.join(", ")
+                ));
+            }
+            if let Some(monitor) = monitor {
+                if monitor.change_detected
+                    || !monitor.first_change_old_addresses.is_empty()
+                    || !monitor.first_change_new_addresses.is_empty()
+                {
+                    return incomplete(format!(
+                        "egress enforcement unavailable: local IPv4 address set changed during the trial (old [{}], new [{}]); sentinel coverage no longer matches",
+                        monitor.first_change_old_addresses.join(", "),
+                        monitor.first_change_new_addresses.join(", ")
+                    ));
+                }
+                if let Some(error) = &monitor.error {
+                    return incomplete(format!(
+                        "egress enforcement unavailable: local IPv4 address monitor failed: {error}"
+                    ));
+                }
+            }
+            // The retained profile must be the exact hashed bytes and contain
+            // only the TCP provider rule plus the profile-root Unix-socket
+            // allowance as network allowances.
+            let rendered_profile = trial.guard_rendered_profile.as_deref().unwrap_or_default();
+            let rendered_hash = {
+                use sha2::Digest as _;
+                format!("{:x}", sha2::Sha256::digest(rendered_profile.as_bytes()))
+            };
+            let network_allowances = rendered_profile
+                .lines()
+                .filter(|line| line.starts_with("(allow network"))
+                .collect::<Vec<_>>();
+            if rendered_profile.is_empty()
+                || rendered_hash != profile_hash
+                || !rendered_profile
+                    .lines()
+                    .any(|line| line == "(deny network-outbound)")
+                || network_allowances.len() != 2
+                || !network_allowances.contains(&expected_provider_rule.as_str())
+                || !network_allowances.iter().any(|line| {
+                    line.starts_with("(allow network-outbound (subpath ")
+                        && !line.contains("(remote ")
+                })
+                || rendered_profile.contains("(remote ip ")
+                || rendered_profile.contains("(remote udp ")
+            {
+                return incomplete(
+                    "egress enforcement unavailable: retained Seatbelt profile does not match its hash or the TCP-only provider rule"
+                        .to_owned(),
+                );
+            }
+            if profile_hash.is_empty()
+                || launcher_hash.is_empty()
+                || provider_destination.is_empty()
+                || trial.provider_bind_address.as_deref() != Some(expected_provider_bind.as_str())
+                || trial.owned_ipv4_addresses.is_empty()
+                || trial.provider_port_owned != Some(true)
+                || trial.provider_rule.as_deref() != Some(expected_provider_rule.as_str())
+                || !provider_destination.starts_with("127.0.0.1:")
+                || !trial
+                    .harness_confinement_identity
+                    .contains(&format!("profile-sha256:{profile_hash}"))
+                || !trial
+                    .harness_confinement_identity
+                    .contains(&format!("launcher-sha256:{launcher_hash}"))
+                || !trial
+                    .harness_confinement_identity
+                    .contains(&format!("bind:{expected_provider_bind}"))
+                || !trial
+                    .owned_ipv4_addresses
+                    .iter()
+                    .any(|address| address == "127.0.0.1")
+                || trial.provider_probe_allowed != Some(true)
+                || trial.udp_probe_destinations.is_empty()
+                || trial.udp_probes_blocked != Some(true)
+                || trial.udp_probe_destinations.len() != trial.owned_ipv4_addresses.len()
+                || !trial.owned_ipv4_addresses.iter().all(|address| {
+                    trial
+                        .udp_probe_destinations
+                        .iter()
+                        .any(|destination| destination == &format!("{address}:{provider_port}"))
+                })
+                || trial.alternate_ipv4_probe_blocked != Some(true)
+                || trial.alternate_loopback_probe_blocked != Some(true)
+                || trial.child_inheritance_proven != Some(true)
+                || trial.profile_write_blocked != Some(true)
+                || trial.launch_hash_verified != Some(true)
+                || monitor.is_none_or(|monitor| {
+                    monitor.sample_interval_ms == 0
+                        || monitor.sample_interval_ms > 1_000
+                        || monitor.samples_completed < 2
+                        || monitor.final_addresses != trial.owned_ipv4_addresses
+                        || monitor.change_detected
+                        || !monitor.first_change_old_addresses.is_empty()
+                        || !monitor.first_change_new_addresses.is_empty()
+                        || monitor.error.is_some()
+                })
+            {
+                return incomplete(
+                    "egress enforcement unavailable: Seatbelt identity/probe evidence incomplete"
+                        .to_owned(),
+                );
+            }
+        }
         if !trial.terminal_success {
+            let failure = trial
+                .terminal_failure
+                .as_deref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default();
+            return incomplete(format!(
+                "egress enforcement unavailable: guarded harness workflow did not complete successfully{failure}"
+            ));
+        }
+        if trial.provider_requests == 0 {
             return incomplete(
-                "egress enforcement unavailable: offline workflow did not complete successfully"
+                "egress enforcement unavailable: guarded harness made no provider request"
                     .to_owned(),
             );
         }
@@ -640,6 +888,25 @@ pub fn evaluate_offline_mode(
             "measurement_complete":true,
             "egress_enforcement":trials.first().map(|trial|trial.egress_enforcement.as_str()),
             "confinement_identity":trials.first().map(|trial|trial.harness_confinement_identity.as_str()),
+            "guard_profile_sha256":trials.first().and_then(|trial|trial.guard_profile_sha256.as_deref()),
+            "guard_rendered_profile":trials.first().and_then(|trial|trial.guard_rendered_profile.as_deref()),
+            "guard_launcher_sha256":trials.first().and_then(|trial|trial.guard_launcher_sha256.as_deref()),
+            "provider_rule":trials.first().and_then(|trial|trial.provider_rule.as_deref()),
+            "provider_destination":trials.first().and_then(|trial|trial.provider_destination.as_deref()),
+            "provider_bind_address":trials.first().and_then(|trial|trial.provider_bind_address.as_deref()),
+            "owned_ipv4_addresses":trials.first().map(|trial|trial.owned_ipv4_addresses.as_slice()),
+            "provider_port_owned":trials.first().and_then(|trial|trial.provider_port_owned),
+            "provider_probe_allowed":trials.first().and_then(|trial|trial.provider_probe_allowed),
+            "udp_probe_destinations":trials.first().map(|trial|trial.udp_probe_destinations.as_slice()),
+            "udp_probes_blocked":trials.first().and_then(|trial|trial.udp_probes_blocked),
+            "alternate_ipv4_probe_blocked":trials.first().and_then(|trial|trial.alternate_ipv4_probe_blocked),
+            "alternate_loopback_probe_blocked":trials.first().and_then(|trial|trial.alternate_loopback_probe_blocked),
+            "child_inheritance_proven":trials.first().and_then(|trial|trial.child_inheritance_proven),
+            "profile_write_blocked":trials.first().and_then(|trial|trial.profile_write_blocked),
+            "launch_hash_verified":trials.first().and_then(|trial|trial.launch_hash_verified),
+            "local_ipv4_monitor":trials.first().and_then(|trial|trial.local_ipv4_monitor.as_ref()),
+            "local_delivery_probes":trials.first().map(|trial|trial.local_delivery_probes.as_slice()),
+            "local_delivery_proven":trials.first().and_then(|trial|trial.local_delivery_proven),
             "attempts_total":attempts.len(),
             "blocked_by_category":blocked_by_category,
             "attempts":attempts,
@@ -653,6 +920,35 @@ pub fn evaluate_offline_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A setup delivery probe to `address:43123` recorded by AHRB's sentinel.
+    fn delivered_probe(address: &str) -> crate::offline_guard::LocalDeliveryProbe {
+        crate::offline_guard::LocalDeliveryProbe {
+            address: address.to_owned(),
+            interfaces: vec!["en0".to_owned()],
+            destination: format!("{address}:43123"),
+            outcome: crate::offline_guard::LOCAL_DELIVERY_OWNED.to_owned(),
+            probe_local_address: Some(format!("{address}:50000")),
+            sentinel_recorded: true,
+            detail: "AHRB sentinel recorded the probe".to_owned(),
+        }
+    }
+
+    /// A rendered TCP-only Seatbelt profile for port 43123 and its SHA-256.
+    fn seatbelt_test_profile() -> (String, String) {
+        use sha2::Digest as _;
+        let rendered = concat!(
+            "(version 1)\n",
+            "(allow default)\n",
+            "(deny file-write* (subpath \"/tmp/ahrb-offline-guard-1-1\"))\n",
+            "(deny network-outbound)\n",
+            "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:43123\")))\n",
+            "(allow network-outbound (subpath \"/tmp/profile\"))\n"
+        )
+        .to_owned();
+        let hash = format!("{:x}", sha2::Sha256::digest(rendered.as_bytes()));
+        (rendered, hash)
+    }
 
     #[test]
     fn hang_deadline_is_measured_from_parent_operation_start() {
@@ -1073,10 +1369,30 @@ mod tests {
                 repetition: 1,
                 provider_requests: 1,
                 terminal_success: true,
+                terminal_failure: None,
                 control_probe_blocked: true,
                 harness_confinement_identity: "guard-1".to_owned(),
                 probe_confinement_identity: "guard-1".to_owned(),
-                egress_enforcement: "reviewed-test-guard".to_owned(),
+                egress_enforcement: OFFLINE_OWNED_CONNECTOR_ENFORCEMENT.to_owned(),
+                guard_profile_sha256: None,
+                guard_rendered_profile: None,
+                guard_launcher_sha256: None,
+                provider_rule: None,
+                provider_destination: None,
+                provider_bind_address: None,
+                owned_ipv4_addresses: Vec::new(),
+                provider_port_owned: None,
+                provider_probe_allowed: None,
+                udp_probe_destinations: Vec::new(),
+                udp_probes_blocked: None,
+                alternate_ipv4_probe_blocked: None,
+                alternate_loopback_probe_blocked: None,
+                child_inheritance_proven: None,
+                profile_write_blocked: None,
+                launch_hash_verified: None,
+                local_ipv4_monitor: None,
+                local_delivery_probes: Vec::new(),
+                local_delivery_proven: None,
                 attempts: vec![OfflineAttempt {
                     repetition: 1,
                     destination: "forbidden".to_owned(),
@@ -1100,10 +1416,30 @@ mod tests {
                 repetition: 1,
                 provider_requests: 2,
                 terminal_success: true,
+                terminal_failure: None,
                 control_probe_blocked: true,
                 harness_confinement_identity: identity.clone(),
                 probe_confinement_identity: identity.clone(),
-                egress_enforcement: "reviewed reference-mock owned loopback connector".to_owned(),
+                egress_enforcement: OFFLINE_OWNED_CONNECTOR_ENFORCEMENT.to_owned(),
+                guard_profile_sha256: None,
+                guard_rendered_profile: None,
+                guard_launcher_sha256: None,
+                provider_rule: None,
+                provider_destination: None,
+                provider_bind_address: None,
+                owned_ipv4_addresses: Vec::new(),
+                provider_port_owned: None,
+                provider_probe_allowed: None,
+                udp_probe_destinations: Vec::new(),
+                udp_probes_blocked: None,
+                alternate_ipv4_probe_blocked: None,
+                alternate_loopback_probe_blocked: None,
+                child_inheritance_proven: None,
+                profile_write_blocked: None,
+                launch_hash_verified: None,
+                local_ipv4_monitor: None,
+                local_delivery_probes: Vec::new(),
+                local_delivery_proven: None,
                 attempts: vec![OfflineAttempt {
                     repetition: 1,
                     destination: "203.0.113.1:9".to_owned(),
@@ -1119,6 +1455,500 @@ mod tests {
         assert!(evaluated.passed);
         assert_eq!(evaluated.metrics["offline_mode.provider_requests"], 2.0);
         assert_eq!(evaluated.metrics["offline_mode.control_probe_blocked"], 1.0);
+    }
+
+    #[test]
+    fn offline_seatbelt_owned_port_passes_without_unexpected_arrivals() {
+        let (rendered, profile_hash) = seatbelt_test_profile();
+        let launcher_hash = "b".repeat(64);
+        let identity = format!(
+            "macos-seatbelt-v3:profile-sha256:{profile_hash}:launcher-sha256:{launcher_hash}:provider:127.0.0.1:43123:bind:127.0.0.1:43123"
+        );
+        let evaluated = evaluate_offline_mode(
+            &[OfflineTrial {
+                repetition: 1,
+                provider_requests: 2,
+                terminal_success: true,
+                terminal_failure: None,
+                control_probe_blocked: true,
+                harness_confinement_identity: identity.clone(),
+                probe_confinement_identity: identity.clone(),
+                egress_enforcement: OFFLINE_SEATBELT_ENFORCEMENT.to_owned(),
+                guard_profile_sha256: Some(profile_hash),
+                guard_rendered_profile: Some(rendered.clone()),
+                guard_launcher_sha256: Some(launcher_hash),
+                provider_rule: Some(
+                    "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:43123\")))".to_owned(),
+                ),
+                provider_destination: Some("127.0.0.1:43123".to_owned()),
+                provider_bind_address: Some("127.0.0.1:43123".to_owned()),
+                owned_ipv4_addresses: vec![
+                    "127.0.0.1".to_owned(),
+                    "192.168.10.80".to_owned(),
+                ],
+                provider_port_owned: Some(true),
+                provider_probe_allowed: Some(true),
+                udp_probe_destinations: vec![
+                    "127.0.0.1:43123".to_owned(),
+                    "192.168.10.80:43123".to_owned(),
+                ],
+                udp_probes_blocked: Some(true),
+                alternate_ipv4_probe_blocked: Some(true),
+                alternate_loopback_probe_blocked: Some(true),
+                child_inheritance_proven: Some(true),
+                profile_write_blocked: Some(true),
+                launch_hash_verified: Some(true),
+                local_ipv4_monitor: Some(crate::offline_guard::LocalIpv4MonitorEvidence {
+                    sample_interval_ms: 500,
+                    samples_completed: 3,
+                    final_addresses: vec![
+                        "127.0.0.1".to_owned(),
+                        "192.168.10.80".to_owned(),
+                    ],
+                    change_detected: false,
+                    first_change_old_addresses: Vec::new(),
+                    first_change_new_addresses: Vec::new(),
+                    error: None,
+                }),
+                local_delivery_probes: vec![delivered_probe("192.168.10.80")],
+                local_delivery_proven: Some(true),
+                attempts: vec![OfflineAttempt {
+                    repetition: 1,
+                    destination: "203.0.113.1:9".to_owned(),
+                    category: "control-probe".to_owned(),
+                    outcome: "blocked-permission-denied".to_owned(),
+                    allowed: false,
+                    confinement_identity: identity,
+                }],
+            }],
+            1,
+        );
+        assert!(evaluated.measurement_complete);
+        assert!(evaluated.passed);
+    }
+
+    #[test]
+    fn offline_seatbelt_rejects_udp_escape_and_address_set_change() {
+        let (rendered, profile_hash) = seatbelt_test_profile();
+        let launcher_hash = "b".repeat(64);
+        let identity = format!(
+            "macos-seatbelt-v3:profile-sha256:{profile_hash}:launcher-sha256:{launcher_hash}:provider:127.0.0.1:43123:bind:127.0.0.1:43123"
+        );
+        let mut trial = OfflineTrial {
+            repetition: 1,
+            provider_requests: 2,
+            terminal_success: true,
+            terminal_failure: None,
+            control_probe_blocked: true,
+            harness_confinement_identity: identity.clone(),
+            probe_confinement_identity: identity.clone(),
+            egress_enforcement: OFFLINE_SEATBELT_ENFORCEMENT.to_owned(),
+            guard_profile_sha256: Some(profile_hash.clone()),
+            guard_rendered_profile: Some(rendered.clone()),
+            guard_launcher_sha256: Some(launcher_hash),
+            provider_rule: Some(
+                "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:43123\")))".to_owned(),
+            ),
+            provider_destination: Some("127.0.0.1:43123".to_owned()),
+            provider_bind_address: Some("127.0.0.1:43123".to_owned()),
+            owned_ipv4_addresses: vec!["127.0.0.1".to_owned(), "192.0.2.10".to_owned()],
+            provider_port_owned: Some(true),
+            provider_probe_allowed: Some(true),
+            udp_probe_destinations: vec![
+                "127.0.0.1:43123".to_owned(),
+                "192.0.2.10:43123".to_owned(),
+            ],
+            udp_probes_blocked: Some(false),
+            alternate_ipv4_probe_blocked: Some(true),
+            alternate_loopback_probe_blocked: Some(true),
+            child_inheritance_proven: Some(true),
+            profile_write_blocked: Some(true),
+            launch_hash_verified: Some(true),
+            local_ipv4_monitor: Some(crate::offline_guard::LocalIpv4MonitorEvidence {
+                sample_interval_ms: 500,
+                samples_completed: 4,
+                final_addresses: vec!["127.0.0.1".to_owned(), "192.0.2.10".to_owned()],
+                change_detected: false,
+                first_change_old_addresses: Vec::new(),
+                first_change_new_addresses: Vec::new(),
+                error: None,
+            }),
+            local_delivery_probes: vec![delivered_probe("192.0.2.10")],
+            local_delivery_proven: Some(true),
+            attempts: vec![OfflineAttempt {
+                repetition: 1,
+                destination: "203.0.113.1:9".to_owned(),
+                category: "control-probe".to_owned(),
+                outcome: "blocked-permission-denied".to_owned(),
+                allowed: false,
+                confinement_identity: identity,
+            }],
+        };
+        let udp_escape = evaluate_offline_mode(&[trial.clone()], 1);
+        assert!(!udp_escape.measurement_complete);
+        assert!(!udp_escape.passed);
+        assert!(
+            udp_escape
+                .measurement_error
+                .as_deref()
+                .is_some_and(|error| error.contains("UDP probes"))
+        );
+
+        trial.udp_probes_blocked = Some(true);
+        let monitor = trial.local_ipv4_monitor.as_mut().expect("monitor evidence");
+        monitor.change_detected = true;
+        monitor.first_change_old_addresses = vec!["127.0.0.1".to_owned(), "192.0.2.10".to_owned()];
+        monitor.first_change_new_addresses = vec![
+            "127.0.0.1".to_owned(),
+            "192.0.2.10".to_owned(),
+            "198.18.0.9".to_owned(),
+        ];
+        let address_change = evaluate_offline_mode(&[trial.clone()], 1);
+        assert!(!address_change.measurement_complete);
+        assert!(!address_change.passed);
+        assert_eq!(
+            address_change.measurement_error.as_deref(),
+            Some(
+                "egress enforcement unavailable: local IPv4 address set changed during the trial (old [127.0.0.1, 192.0.2.10], new [127.0.0.1, 192.0.2.10, 198.18.0.9]); sentinel coverage no longer matches"
+            )
+        );
+        assert_eq!(
+            address_change.details["trials"][0]["local_ipv4_monitor"]["first_change_new_addresses"]
+                [2],
+            "198.18.0.9"
+        );
+
+        // A removed address is also a change, even if a later sample reverts.
+        let monitor = trial.local_ipv4_monitor.as_mut().expect("monitor evidence");
+        monitor.first_change_new_addresses = vec!["127.0.0.1".to_owned()];
+        let removal = evaluate_offline_mode(&[trial.clone()], 1);
+        assert!(!removal.passed);
+        assert!(
+            removal
+                .measurement_error
+                .as_deref()
+                .is_some_and(|error| error.contains("new [127.0.0.1])"))
+        );
+
+        let monitor = trial.local_ipv4_monitor.as_mut().expect("monitor evidence");
+        monitor.change_detected = false;
+        monitor.first_change_old_addresses.clear();
+        monitor.first_change_new_addresses.clear();
+        monitor.error = Some("final local IPv4 address enumeration failed: test".to_owned());
+        let monitor_error = evaluate_offline_mode(&[trial.clone()], 1);
+        assert!(!monitor_error.passed);
+        assert!(
+            monitor_error
+                .measurement_error
+                .as_deref()
+                .is_some_and(|error| error.contains("address monitor failed"))
+        );
+
+        // With complete UDP and address evidence the trial passes; the
+        // retained profile must then match its hash and stay TCP-only.
+        trial
+            .local_ipv4_monitor
+            .as_mut()
+            .expect("monitor evidence")
+            .error = None;
+        assert!(evaluate_offline_mode(&[trial.clone()], 1).passed);
+        let profile_rejected = |trial: &OfflineTrial| {
+            let evaluated = evaluate_offline_mode(std::slice::from_ref(trial), 1);
+            !evaluated.passed
+                && evaluated
+                    .measurement_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("retained Seatbelt profile"))
+        };
+        let mut tampered = trial.clone();
+        tampered.guard_rendered_profile =
+            Some(rendered.replace("(allow default)", "(allow default) "));
+        assert!(
+            profile_rejected(&tampered),
+            "hash mismatch must be rejected"
+        );
+        let mut missing = trial.clone();
+        missing.guard_rendered_profile = None;
+        assert!(
+            profile_rejected(&missing),
+            "missing profile must be rejected"
+        );
+        for broadened in [
+            rendered.replace("(remote tcp ", "(remote ip "),
+            rendered.replace("(remote tcp ", "(remote udp "),
+            format!("{rendered}(allow network-outbound (remote udp \"localhost:43123\"))\n"),
+        ] {
+            use sha2::Digest as _;
+            let mut widened = trial.clone();
+            widened.guard_profile_sha256 =
+                Some(format!("{:x}", sha2::Sha256::digest(broadened.as_bytes())));
+            widened.harness_confinement_identity = widened.harness_confinement_identity.replace(
+                &profile_hash,
+                widened.guard_profile_sha256.as_deref().unwrap(),
+            );
+            widened.probe_confinement_identity = widened.harness_confinement_identity.clone();
+            for attempt in &mut widened.attempts {
+                attempt.confinement_identity = widened.harness_confinement_identity.clone();
+            }
+            widened.guard_rendered_profile = Some(broadened);
+            assert!(
+                profile_rejected(&widened),
+                "widened profile must be rejected"
+            );
+        }
+    }
+
+    /// A complete Seatbelt trial for owned addresses 127.0.0.1 and
+    /// 192.0.2.10 whose setup delivery probe reached AHRB's sentinel.
+    fn passing_seatbelt_trial() -> OfflineTrial {
+        let (rendered, profile_hash) = seatbelt_test_profile();
+        let launcher_hash = "b".repeat(64);
+        let identity = format!(
+            "macos-seatbelt-v3:profile-sha256:{profile_hash}:launcher-sha256:{launcher_hash}:provider:127.0.0.1:43123:bind:127.0.0.1:43123"
+        );
+        OfflineTrial {
+            repetition: 1,
+            provider_requests: 2,
+            terminal_success: true,
+            terminal_failure: None,
+            control_probe_blocked: true,
+            harness_confinement_identity: identity.clone(),
+            probe_confinement_identity: identity.clone(),
+            egress_enforcement: OFFLINE_SEATBELT_ENFORCEMENT.to_owned(),
+            guard_profile_sha256: Some(profile_hash),
+            guard_rendered_profile: Some(rendered),
+            guard_launcher_sha256: Some(launcher_hash),
+            provider_rule: Some(
+                "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:43123\")))".to_owned(),
+            ),
+            provider_destination: Some("127.0.0.1:43123".to_owned()),
+            provider_bind_address: Some("127.0.0.1:43123".to_owned()),
+            owned_ipv4_addresses: vec!["127.0.0.1".to_owned(), "192.0.2.10".to_owned()],
+            provider_port_owned: Some(true),
+            provider_probe_allowed: Some(true),
+            udp_probe_destinations: vec![
+                "127.0.0.1:43123".to_owned(),
+                "192.0.2.10:43123".to_owned(),
+            ],
+            udp_probes_blocked: Some(true),
+            alternate_ipv4_probe_blocked: Some(true),
+            alternate_loopback_probe_blocked: Some(true),
+            child_inheritance_proven: Some(true),
+            profile_write_blocked: Some(true),
+            launch_hash_verified: Some(true),
+            local_ipv4_monitor: Some(crate::offline_guard::LocalIpv4MonitorEvidence {
+                sample_interval_ms: 500,
+                samples_completed: 3,
+                final_addresses: vec!["127.0.0.1".to_owned(), "192.0.2.10".to_owned()],
+                ..Default::default()
+            }),
+            local_delivery_probes: vec![delivered_probe("192.0.2.10")],
+            local_delivery_proven: Some(true),
+            attempts: vec![OfflineAttempt {
+                repetition: 1,
+                destination: "203.0.113.1:9".to_owned(),
+                category: "control-probe".to_owned(),
+                outcome: "blocked-permission-denied".to_owned(),
+                allowed: false,
+                confinement_identity: identity,
+            }],
+        }
+    }
+
+    #[test]
+    fn offline_seatbelt_requires_sentinel_delivery_for_every_non_loopback_address() {
+        let trial = passing_seatbelt_trial();
+        let passed = evaluate_offline_mode(std::slice::from_ref(&trial), 1);
+        assert!(passed.passed, "{:?}", passed.measurement_error);
+        assert_eq!(
+            passed.details["local_delivery_probes"][0]["outcome"],
+            "delivered-to-ahrb-sentinel"
+        );
+
+        // A tunnel/proxy interface answered the setup connect: the guard
+        // refused the launch after one trial, and this reason (naming the
+        // address and interface) outranks the cert trial count.
+        let mut tunnel = trial.clone();
+        tunnel.owned_ipv4_addresses.push("198.18.0.1".to_owned());
+        tunnel
+            .local_delivery_probes
+            .push(crate::offline_guard::LocalDeliveryProbe {
+                address: "198.18.0.1".to_owned(),
+                interfaces: vec!["utun4".to_owned()],
+                destination: "198.18.0.1:43123".to_owned(),
+                outcome: crate::offline_guard::LOCAL_DELIVERY_ANSWERED_BY_OTHER.to_owned(),
+                probe_local_address: Some("198.18.0.1:50001".to_owned()),
+                sentinel_recorded: false,
+                detail: "no sentinel arrival".to_owned(),
+            });
+        tunnel.local_delivery_proven = Some(false);
+        tunnel.provider_requests = 0;
+        tunnel.terminal_success = false;
+        let refused = evaluate_offline_mode(std::slice::from_ref(&tunnel), 3);
+        assert!(!refused.passed);
+        assert!(!refused.measurement_complete);
+        assert_eq!(
+            refused.measurement_error.as_deref(),
+            Some(
+                "egress enforcement unavailable: guard boundary includes a local address AHRB does not own: 198.18.0.1 (utun4) answered-by-other: no sentinel arrival"
+            )
+        );
+        assert_eq!(
+            refused.details["trials"][0]["local_delivery_probes"][1]["interfaces"][0],
+            "utun4"
+        );
+
+        // Every other outcome except a Seatbelt denial is also ERROR.
+        for (outcome, recorded) in [
+            (crate::offline_guard::LOCAL_DELIVERY_REFUSED, false),
+            (crate::offline_guard::LOCAL_DELIVERY_TIMEOUT, false),
+            (crate::offline_guard::LOCAL_DELIVERY_AMBIGUOUS, false),
+            (crate::offline_guard::LOCAL_DELIVERY_OWNED, false),
+            (crate::offline_guard::LOCAL_DELIVERY_BLOCKED, true),
+        ] {
+            let mut failed = trial.clone();
+            failed.local_delivery_probes[0].outcome = outcome.to_owned();
+            failed.local_delivery_probes[0].sentinel_recorded = recorded;
+            let evaluated = evaluate_offline_mode(std::slice::from_ref(&failed), 1);
+            assert!(!evaluated.passed, "{outcome}");
+            assert!(
+                evaluated.measurement_error.as_deref().is_some_and(|error| error
+                    .contains("guard boundary includes a local address AHRB does not own: 192.0.2.10 (en0)")),
+                "{outcome}: {:?}",
+                evaluated.measurement_error
+            );
+        }
+        let mut blocked = trial.clone();
+        blocked.local_delivery_probes[0].outcome =
+            crate::offline_guard::LOCAL_DELIVERY_BLOCKED.to_owned();
+        blocked.local_delivery_probes[0].sentinel_recorded = false;
+        assert!(evaluate_offline_mode(&[blocked], 1).passed);
+
+        // Missing, extra, misaddressed, or unproven coverage is ERROR.
+        let mut missing = trial.clone();
+        missing.local_delivery_probes.clear();
+        let mut extra = trial.clone();
+        extra
+            .local_delivery_probes
+            .push(delivered_probe("192.0.2.99"));
+        let mut misaddressed = trial.clone();
+        misaddressed.local_delivery_probes[0].destination = "192.0.2.10:9".to_owned();
+        let mut unproven = trial;
+        unproven.local_delivery_proven = None;
+        for (name, case) in [
+            ("missing", missing),
+            ("extra", extra),
+            ("misaddressed", misaddressed),
+            ("unproven", unproven),
+        ] {
+            let evaluated = evaluate_offline_mode(&[case], 1);
+            assert!(!evaluated.passed, "{name}");
+            assert!(
+                evaluated
+                    .measurement_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(
+                        "setup delivery probes do not cover every non-loopback owned address"
+                    )),
+                "{name}: {:?}",
+                evaluated.measurement_error
+            );
+        }
+    }
+
+    #[test]
+    fn offline_probe_under_different_guard_is_rejected() {
+        let (rendered, _) = seatbelt_test_profile();
+        let evaluated = evaluate_offline_mode(
+            &[OfflineTrial {
+                repetition: 1,
+                provider_requests: 1,
+                terminal_success: true,
+                terminal_failure: None,
+                control_probe_blocked: true,
+                harness_confinement_identity: "guard-profile-a".to_owned(),
+                probe_confinement_identity: "guard-profile-b".to_owned(),
+                egress_enforcement: OFFLINE_SEATBELT_ENFORCEMENT.to_owned(),
+                guard_profile_sha256: Some("a".repeat(64)),
+                guard_rendered_profile: Some(rendered.clone()),
+                guard_launcher_sha256: Some("b".repeat(64)),
+                provider_rule: Some(
+                    "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:43123\")))".to_owned(),
+                ),
+                provider_destination: Some("127.0.0.1:43123".to_owned()),
+                provider_bind_address: Some("127.0.0.1:43123".to_owned()),
+                owned_ipv4_addresses: vec!["127.0.0.1".to_owned()],
+                provider_port_owned: Some(true),
+                provider_probe_allowed: Some(true),
+                udp_probe_destinations: Vec::new(),
+                udp_probes_blocked: None,
+                alternate_ipv4_probe_blocked: Some(true),
+                alternate_loopback_probe_blocked: Some(true),
+                child_inheritance_proven: Some(true),
+                profile_write_blocked: Some(true),
+                launch_hash_verified: Some(true),
+                local_ipv4_monitor: None,
+                local_delivery_probes: Vec::new(),
+                local_delivery_proven: Some(true),
+                attempts: Vec::new(),
+            }],
+            1,
+        );
+        assert!(!evaluated.measurement_complete);
+        assert!(!evaluated.passed);
+    }
+
+    #[test]
+    fn offline_seatbelt_identity_must_bind_profile_and_launcher_hashes() {
+        let (rendered, profile_hash) = seatbelt_test_profile();
+        let launcher_hash = "b".repeat(64);
+        let evaluated = evaluate_offline_mode(
+            &[OfflineTrial {
+                repetition: 1,
+                provider_requests: 1,
+                terminal_success: true,
+                terminal_failure: None,
+                control_probe_blocked: true,
+                harness_confinement_identity: "macos-seatbelt-v1:wrong".to_owned(),
+                probe_confinement_identity: "macos-seatbelt-v1:wrong".to_owned(),
+                egress_enforcement: OFFLINE_SEATBELT_ENFORCEMENT.to_owned(),
+                guard_profile_sha256: Some(profile_hash),
+                guard_rendered_profile: Some(rendered.clone()),
+                guard_launcher_sha256: Some(launcher_hash),
+                provider_rule: Some(
+                    "(allow network-outbound (require-all (socket-domain AF_INET) (remote tcp \"localhost:43123\")))".to_owned(),
+                ),
+                provider_destination: Some("127.0.0.1:43123".to_owned()),
+                provider_bind_address: Some("127.0.0.1:43123".to_owned()),
+                owned_ipv4_addresses: vec!["127.0.0.1".to_owned()],
+                provider_port_owned: Some(true),
+                provider_probe_allowed: Some(true),
+                udp_probe_destinations: vec!["127.0.0.1:43123".to_owned()],
+                udp_probes_blocked: Some(true),
+                alternate_ipv4_probe_blocked: Some(true),
+                alternate_loopback_probe_blocked: Some(true),
+                child_inheritance_proven: Some(true),
+                profile_write_blocked: Some(true),
+                launch_hash_verified: Some(true),
+                local_ipv4_monitor: Some(crate::offline_guard::LocalIpv4MonitorEvidence {
+                    sample_interval_ms: 500,
+                    samples_completed: 2,
+                    final_addresses: vec!["127.0.0.1".to_owned()],
+                    ..Default::default()
+                }),
+                local_delivery_probes: Vec::new(),
+                local_delivery_proven: Some(true),
+                attempts: Vec::new(),
+            }],
+            1,
+        );
+        assert!(!evaluated.measurement_complete);
+        assert!(
+            evaluated
+                .measurement_error
+                .as_deref()
+                .is_some_and(|error| error.contains("identity/probe evidence"))
+        );
     }
 
     #[test]
@@ -1205,16 +2035,93 @@ mod tests {
     }
 
     #[test]
+    fn offline_unreviewed_or_retired_enforcement_identity_is_rejected() {
+        let identity = "guard-1".to_owned();
+        for enforcement in ["reviewed-test-guard", "macos-seatbelt-owned-local-port-v2"] {
+            let evaluated = evaluate_offline_mode(
+                &[OfflineTrial {
+                    repetition: 1,
+                    provider_requests: 1,
+                    terminal_success: true,
+                    terminal_failure: None,
+                    control_probe_blocked: true,
+                    harness_confinement_identity: identity.clone(),
+                    probe_confinement_identity: identity.clone(),
+                    egress_enforcement: enforcement.to_owned(),
+                    guard_profile_sha256: None,
+                    guard_rendered_profile: None,
+                    guard_launcher_sha256: None,
+                    provider_rule: None,
+                    provider_destination: None,
+                    provider_bind_address: None,
+                    owned_ipv4_addresses: Vec::new(),
+                    provider_port_owned: None,
+                    provider_probe_allowed: None,
+                    udp_probe_destinations: Vec::new(),
+                    udp_probes_blocked: None,
+                    alternate_ipv4_probe_blocked: None,
+                    alternate_loopback_probe_blocked: None,
+                    child_inheritance_proven: None,
+                    profile_write_blocked: None,
+                    launch_hash_verified: None,
+                    local_ipv4_monitor: None,
+                    local_delivery_probes: Vec::new(),
+                    local_delivery_proven: None,
+                    attempts: vec![OfflineAttempt {
+                        repetition: 1,
+                        destination: "203.0.113.1:9".to_owned(),
+                        category: "control-probe".to_owned(),
+                        outcome: "blocked-permission-denied".to_owned(),
+                        allowed: false,
+                        confinement_identity: identity.clone(),
+                    }],
+                }],
+                1,
+            );
+            assert!(!evaluated.passed, "{enforcement}");
+            assert!(
+                evaluated
+                    .measurement_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("unreviewed enforcement identity")),
+                "{enforcement}"
+            );
+        }
+    }
+
+    #[test]
     fn offline_workflow_failure_is_error_not_fail() {
         let evaluated = evaluate_offline_mode(
             &[OfflineTrial {
                 repetition: 1,
                 provider_requests: 1,
                 terminal_success: false,
+                terminal_failure: Some(
+                    "terminal-failure {\"exit_code\":71,\"category\":\"unmapped-exit\"}".to_owned(),
+                ),
                 control_probe_blocked: true,
                 harness_confinement_identity: "guard-1".to_owned(),
                 probe_confinement_identity: "guard-1".to_owned(),
-                egress_enforcement: "reviewed-test-guard".to_owned(),
+                egress_enforcement: OFFLINE_OWNED_CONNECTOR_ENFORCEMENT.to_owned(),
+                guard_profile_sha256: None,
+                guard_rendered_profile: None,
+                guard_launcher_sha256: None,
+                provider_rule: None,
+                provider_destination: None,
+                provider_bind_address: None,
+                owned_ipv4_addresses: Vec::new(),
+                provider_port_owned: None,
+                provider_probe_allowed: None,
+                udp_probe_destinations: Vec::new(),
+                udp_probes_blocked: None,
+                alternate_ipv4_probe_blocked: None,
+                alternate_loopback_probe_blocked: None,
+                child_inheritance_proven: None,
+                profile_write_blocked: None,
+                launch_hash_verified: None,
+                local_ipv4_monitor: None,
+                local_delivery_probes: Vec::new(),
+                local_delivery_proven: None,
                 attempts: vec![OfflineAttempt {
                     repetition: 1,
                     destination: "forbidden".to_owned(),
@@ -1228,11 +2135,10 @@ mod tests {
         );
         assert!(!evaluated.measurement_complete);
         assert!(!evaluated.passed);
-        assert!(
-            evaluated
-                .measurement_error
-                .as_deref()
-                .is_some_and(|error| error.contains("workflow did not complete"))
-        );
+        assert!(evaluated.measurement_error.as_deref().is_some_and(|error| {
+            error.contains("workflow did not complete")
+                && error.contains("exit_code")
+                && error.contains("71")
+        }));
     }
 }

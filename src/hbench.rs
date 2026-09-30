@@ -22,6 +22,8 @@ pub struct Options {
     pub deadline_secs: Option<u64>,
     /// Do not persist a copy under the repository `results/` directory.
     pub no_save: bool,
+    /// Preserve the disposable run root after recorded teardown.
+    pub keep_run_root: bool,
 }
 
 /// Parse the thin shorthand, including matrix row filters.
@@ -34,14 +36,15 @@ pub fn parse(args: &[String]) -> Result<Options> {
     let mut values = BTreeMap::new();
     let mut junit = false;
     let mut no_save = false;
+    let mut keep_run_root = false;
     let mut index = 1;
     while index < args.len() {
         let flag = args[index].as_str();
-        if matches!(flag, "--junit" | "--no-save") {
-            let seen = if flag == "--junit" {
-                &mut junit
-            } else {
-                &mut no_save
+        if matches!(flag, "--junit" | "--no-save" | "--keep-run-root") {
+            let seen = match flag {
+                "--junit" => &mut junit,
+                "--no-save" => &mut no_save,
+                _ => &mut keep_run_root,
             };
             if *seen {
                 return Err(AhrbError::Usage(format!("duplicate {flag}")));
@@ -99,6 +102,7 @@ pub fn parse(args: &[String]) -> Result<Options> {
             })
             .transpose()?,
         no_save,
+        keep_run_root,
     })
 }
 
@@ -176,6 +180,7 @@ async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
         junit: options.junit,
         deadline_secs: options.deadline_secs,
         no_save: options.no_save,
+        keep_run_root: options.keep_run_root,
         harness_version: doctor.version,
     };
     match pillar {
@@ -191,7 +196,7 @@ async fn execute_pillar(options: Options, pillar: Option<&str>) -> Result<i32> {
 
 /// One-line command synopsis.
 pub fn usage() -> &'static str {
-    "hbench <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] | hbench economy|fidelity|storage <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
+    "hbench <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline> [--output DIR] [--profile quick|cert] [--tests ROWS] [--deadline SECS] [--junit] [--no-save] [--keep-run-root] | hbench economy|fidelity|storage <codex|claude-code|opencode|pi|rick|haider|aider|goose|cline|mock> [--output DIR] [--profile quick|cert] [--deadline SECS] [--no-save] [--keep-run-root] | hbench results [HARNESS] [--all] | hbench diff LEFT RIGHT | hbench diff --latest HARNESS"
 }
 
 fn unavailable_error(name: &str, detail: &str) -> AhrbError {
@@ -266,6 +271,7 @@ mod tests {
         assert!(parsed.junit);
         assert_eq!(parsed.deadline_secs, None);
         assert!(!parsed.no_save);
+        assert!(!parsed.keep_run_root);
         assert_eq!(adapter_directory(&parsed.name)?, "haider-agent");
         Ok(())
     }
@@ -279,6 +285,7 @@ mod tests {
         assert!(!parsed.junit);
         assert_eq!(parsed.deadline_secs, None);
         assert!(!parsed.no_save);
+        assert!(!parsed.keep_run_root);
         Ok(())
     }
 

@@ -68,6 +68,8 @@ pub struct RunOptions {
     pub deadline_secs: Option<u64>,
     /// Do not persist a copy under the repository `results/` directory.
     pub no_save: bool,
+    /// Preserve the disposable `/tmp/ahrb-*` run root after teardown.
+    pub keep_run_root: bool,
     /// Availability-probe version already captured by a shorthand caller.
     pub harness_version: Option<String>,
 }
@@ -88,7 +90,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 &[
                     "manifest", "output", "profile", "tests", "deadline", "pillar",
                 ],
-                &["junit", "no-save"],
+                &["junit", "no-save", "keep-run-root"],
             )?;
             let profile = match values.get("profile").map(String::as_str).unwrap_or("quick") {
                 "quick" => Profile::Quick,
@@ -126,6 +128,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     .map(|value| parse_seconds("deadline", value))
                     .transpose()?,
                 no_save: values.contains_key("no-save"),
+                keep_run_root: values.contains_key("keep-run-root"),
                 harness_version: None,
             };
             match pillar {
@@ -455,12 +458,23 @@ mod tests {
                 assert!(options.junit);
                 assert_eq!(options.deadline_secs, None);
                 assert!(!options.no_save);
+                assert!(!options.keep_run_root);
                 Ok(())
             }
             other => Err(AhrbError::Protocol(format!(
                 "unexpected parsed command: {other:?}"
             ))),
         }
+    }
+
+    #[test]
+    fn parses_explicit_run_root_preservation() -> Result<()> {
+        let args = ["run", "--manifest", "mock.toml", "--keep-run-root"].map(str::to_owned);
+        let Command::Run(options) = parse(&args)? else {
+            return Err(AhrbError::Protocol("expected run command".to_owned()));
+        };
+        assert!(options.keep_run_root);
+        Ok(())
     }
 
     #[test]

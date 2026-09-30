@@ -1925,6 +1925,114 @@ struct HttpRequestCounters {
     records: StdMutex<Vec<PhysicalHttpRequestRecord>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct OfflineProviderConnectionAttempt {
+    pub destination: String,
+    pub peer: String,
+    pub outcome: String,
+}
+
+/// Row-62 connections seen by the provider and its sentinels. Guard-setup
+/// delivery probes are kept apart from connections made during the trial.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OfflineProviderObservations {
+    pub unexpected: Vec<OfflineProviderConnectionAttempt>,
+    pub setup_probe_arrivals: Vec<OfflineProviderConnectionAttempt>,
+}
+
+const OFFLINE_NON_PROVIDER_LOCAL: &str = "non-provider-local-destination-rejected";
+const OFFLINE_SETUP_DELIVERY_PROBE: &str = "guard-setup-delivery-probe";
+
+#[derive(Debug)]
+struct OfflineProviderAudit {
+    local_ipv4_addresses: BTreeSet<std::net::Ipv4Addr>,
+    unexpected: StdMutex<Vec<OfflineProviderConnectionAttempt>>,
+    setup_probe_arrivals: StdMutex<Vec<OfflineProviderConnectionAttempt>>,
+}
+
+impl crate::offline_guard::LocalDeliveryOracle for OfflineProviderAudit {
+    fn claim_setup_arrival(
+        &self,
+        destination: std::net::SocketAddrV4,
+        peer: std::net::SocketAddrV4,
+    ) -> bool {
+        let destination = destination.to_string();
+        let peer = peer.to_string();
+        let mut unexpected = self
+            .unexpected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(index) = unexpected.iter().position(|attempt| {
+            attempt.destination == destination
+                && attempt.peer == peer
+                && attempt.outcome == OFFLINE_NON_PROVIDER_LOCAL
+        }) else {
+            return false;
+        };
+        let mut arrival = unexpected.remove(index);
+        drop(unexpected);
+        arrival.outcome = OFFLINE_SETUP_DELIVERY_PROBE.to_owned();
+        self.setup_probe_arrivals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(arrival);
+        true
+    }
+}
+
+impl OfflineProviderAudit {
+    fn record_unexpected(&self, destination: SocketAddr, peer: SocketAddr) {
+        let peer_is_local = match peer.ip() {
+            std::net::IpAddr::V4(address) => self.local_ipv4_addresses.contains(&address),
+            std::net::IpAddr::V6(_) => false,
+        };
+        let outcome = if !peer_is_local {
+            "non-local-peer-rejected"
+        } else {
+            OFFLINE_NON_PROVIDER_LOCAL
+        };
+        self.unexpected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(OfflineProviderConnectionAttempt {
+                destination: destination.to_string(),
+                peer: peer.to_string(),
+                outcome: outcome.to_owned(),
+            });
+    }
+
+    fn accept(&self, destination: SocketAddr, peer: SocketAddr) -> bool {
+        let peer_is_local = match peer.ip() {
+            std::net::IpAddr::V4(address) => self.local_ipv4_addresses.contains(&address),
+            std::net::IpAddr::V6(_) => false,
+        };
+        let provider_destination = destination.ip() == std::net::Ipv4Addr::LOCALHOST;
+        if provider_destination && peer_is_local {
+            return true;
+        }
+        self.record_unexpected(destination, peer);
+        false
+    }
+
+    fn unexpected(&self) -> Vec<OfflineProviderConnectionAttempt> {
+        self.unexpected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn observations(&self) -> OfflineProviderObservations {
+        OfflineProviderObservations {
+            unexpected: self.unexpected(),
+            setup_probe_arrivals: self
+                .setup_probe_arrivals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        }
+    }
+}
+
 /// A running local fake-model HTTP server.
 #[derive(Debug)]
 pub struct FakeModelServer {
@@ -1933,12 +2041,112 @@ pub struct FakeModelServer {
     task: JoinHandle<Result<()>>,
     engine: Arc<FakeModelEngine>,
     counters: Arc<HttpRequestCounters>,
+    offline_provider_audit: Option<Arc<OfflineProviderAudit>>,
+    offline_sentinel_shutdown: Vec<oneshot::Sender<()>>,
+    offline_sentinel_tasks: Vec<JoinHandle<Result<()>>>,
 }
 
 impl FakeModelServer {
     /// Bind a loopback/local address and start serving all built-in protocol frontends.
     pub async fn bind(addr: SocketAddr, engine: Arc<FakeModelEngine>) -> Result<Self> {
         Self::bind_with_request_policy(addr, engine, None, None).await
+    }
+
+    /// Bind row 62's provider on 127.0.0.1 and hold an exclusive sentinel on
+    /// every other local IPv4 address at the same port. Each socket verifies
+    /// that both reuse options are off before binding.
+    pub(crate) async fn bind_offline_provider(engine: Arc<FakeModelEngine>) -> Result<Self> {
+        let local_ipv4_addresses = crate::offline_guard::local_ipv4_addresses()?;
+        let mut last_error = None;
+        for attempt in 1..=BIND_MAX_ATTEMPTS {
+            let provider = match bind_exclusive_ipv4_listener(std::net::Ipv4Addr::LOCALHOST, 0) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < BIND_MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(
+                            BIND_BACKOFF_MS.saturating_mul(attempt as u64),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let port = provider.local_addr()?.port();
+            let mut sentinels = Vec::new();
+            let mut bind_error = None;
+            for address in local_ipv4_addresses
+                .iter()
+                .copied()
+                .filter(|address| *address != std::net::Ipv4Addr::LOCALHOST)
+            {
+                match bind_exclusive_ipv4_listener(address, port) {
+                    Ok(listener) => sentinels.push(listener),
+                    Err(error) => {
+                        bind_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = bind_error {
+                last_error = Some(error);
+                drop(sentinels);
+                drop(provider);
+                if attempt < BIND_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        BIND_BACKOFF_MS.saturating_mul(attempt as u64),
+                    ))
+                    .await;
+                    continue;
+                }
+                break;
+            }
+            let audit = Arc::new(OfflineProviderAudit {
+                local_ipv4_addresses: local_ipv4_addresses.clone(),
+                unexpected: StdMutex::new(Vec::new()),
+                setup_probe_arrivals: StdMutex::new(Vec::new()),
+            });
+            let mut server =
+                Self::serve_listener(provider, engine, None, None, Some(Arc::clone(&audit)))?;
+            server.attach_offline_sentinels(sentinels, audit);
+            return Ok(server);
+        }
+        Err(AhrbError::Protocol(format!(
+            "row-62 could not exclusively own every permitted local IPv4 destination after {BIND_MAX_ATTEMPTS} attempts: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no bind result".to_owned())
+        )))
+    }
+
+    fn attach_offline_sentinels(
+        &mut self,
+        sentinels: Vec<TcpListener>,
+        audit: Arc<OfflineProviderAudit>,
+    ) {
+        for listener in sentinels {
+            let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
+            let sentinel_audit = Arc::clone(&audit);
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_receiver => break,
+                        accepted = listener.accept() => {
+                            let (stream, peer) = match accepted {
+                                Ok(accepted) => accepted,
+                                Err(error) if transient_listener_accept_error(&error) => continue,
+                                Err(error) => return Err(error.into()),
+                            };
+                            sentinel_audit.record_unexpected(stream.local_addr()?, peer);
+                        }
+                    }
+                }
+                Ok(())
+            });
+            self.offline_sentinel_shutdown.push(shutdown_sender);
+            self.offline_sentinel_tasks.push(task);
+        }
     }
 
     /// Bind a fake provider that rejects every provider request whose API
@@ -1980,21 +2188,44 @@ impl FakeModelServer {
         required_path_prefix: Option<Arc<str>>,
     ) -> Result<Self> {
         let listener = retry_transient_bind(|| TcpListener::bind(addr)).await?;
+        Self::serve_listener(
+            listener,
+            engine,
+            required_credential,
+            required_path_prefix,
+            None,
+        )
+    }
+
+    fn serve_listener(
+        listener: TcpListener,
+        engine: Arc<FakeModelEngine>,
+        required_credential: Option<Arc<str>>,
+        required_path_prefix: Option<Arc<str>>,
+        offline_provider_audit: Option<Arc<OfflineProviderAudit>>,
+    ) -> Result<Self> {
         let local_addr = listener.local_addr()?;
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let task_engine = Arc::clone(&engine);
         let counters = Arc::new(HttpRequestCounters::default());
         let task_counters = Arc::clone(&counters);
+        let task_offline_provider_audit = offline_provider_audit.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = &mut shutdown_receiver => break,
                     accepted = listener.accept() => {
-                        let (stream, _) = match accepted {
+                        let (stream, peer) = match accepted {
                             Ok(accepted) => accepted,
                             Err(error) if transient_listener_accept_error(&error) => continue,
                             Err(error) => return Err(error.into()),
                         };
+                        if let Some(audit) = &task_offline_provider_audit {
+                            let destination = stream.local_addr()?;
+                            if !audit.accept(destination, peer) {
+                                continue;
+                            }
+                        }
                         let connection_engine = Arc::clone(&task_engine);
                         let connection_counters = Arc::clone(&task_counters);
                         let connection_required_credential = required_credential.clone();
@@ -2027,6 +2258,9 @@ impl FakeModelServer {
             task,
             engine,
             counters,
+            offline_provider_audit,
+            offline_sentinel_shutdown: Vec::new(),
+            offline_sentinel_tasks: Vec::new(),
         })
     }
 
@@ -2038,6 +2272,39 @@ impl FakeModelServer {
     /// Loopback base URL suitable for adapter environment binding.
     pub fn base_url(&self) -> String {
         format!("http://{}", self.local_addr)
+    }
+
+    /// Literal loopback URL advertised for an owned row-62 port.
+    pub(crate) fn offline_provider_base_url(&self) -> Result<String> {
+        if self.offline_provider_audit.is_none()
+            || self.local_addr.ip() != std::net::Ipv4Addr::LOCALHOST
+        {
+            return Err(AhrbError::Protocol(
+                "fake-model server is not an owned row-62 provider".to_owned(),
+            ));
+        }
+        Ok(format!("http://127.0.0.1:{}", self.local_addr.port()))
+    }
+
+    /// Sentinel record used by the row-62 guard's setup delivery proof.
+    pub(crate) fn offline_delivery_oracle(
+        &self,
+    ) -> Option<Arc<dyn crate::offline_guard::LocalDeliveryOracle>> {
+        self.offline_provider_audit
+            .clone()
+            .map(|audit| audit as Arc<dyn crate::offline_guard::LocalDeliveryOracle>)
+    }
+
+    pub(crate) async fn shutdown_with_offline_provider_attempts(
+        self,
+    ) -> Result<OfflineProviderObservations> {
+        let audit = self.offline_provider_audit.clone();
+        self.shutdown().await?;
+        Ok(
+            audit.map_or_else(OfflineProviderObservations::default, |audit| {
+                audit.observations()
+            }),
+        )
     }
 
     /// Shared engine, including barrier controls and request evidence.
@@ -2085,13 +2352,55 @@ impl FakeModelServer {
 
     /// Gracefully stop accepting connections and wait for the listener task.
     pub async fn shutdown(mut self) -> Result<()> {
+        for sender in self.offline_sentinel_shutdown.drain(..) {
+            let _sent = sender.send(());
+        }
         if let Some(sender) = self.shutdown.take() {
             let _sent = sender.send(());
         }
         self.task
             .await
-            .map_err(|error| AhrbError::Protocol(format!("fake-model server task: {error}")))?
+            .map_err(|error| AhrbError::Protocol(format!("fake-model server task: {error}")))??;
+        for task in self.offline_sentinel_tasks {
+            task.await.map_err(|error| {
+                AhrbError::Protocol(format!("fake-model sentinel task: {error}"))
+            })??;
+        }
+        Ok(())
     }
+}
+
+fn bind_exclusive_ipv4_listener(
+    address: std::net::Ipv4Addr,
+    port: u16,
+) -> std::io::Result<TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(false)?;
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin")
+    ))]
+    socket.set_reuseport(false)?;
+    if socket.reuseaddr()? {
+        return Err(std::io::Error::other(
+            "row-62 provider SO_REUSEADDR remained enabled",
+        ));
+    }
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin")
+    ))]
+    if socket.reuseport()? {
+        return Err(std::io::Error::other(
+            "row-62 provider SO_REUSEPORT remained enabled",
+        ));
+    }
+    socket.bind(SocketAddr::from((address, port)))?;
+    socket.listen(1024)
 }
 
 fn transient_listener_accept_error(error: &std::io::Error) -> bool {
@@ -4517,6 +4826,108 @@ mod tests {
     use crate::workflow::{Actor, Barrier};
     use std::cell::Cell;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn offline_provider_rejects_and_records_wrong_destination_or_peer() {
+        let audit = OfflineProviderAudit {
+            local_ipv4_addresses: BTreeSet::from([
+                std::net::Ipv4Addr::LOCALHOST,
+                std::net::Ipv4Addr::new(192, 168, 10, 80),
+            ]),
+            unexpected: StdMutex::new(Vec::new()),
+            setup_probe_arrivals: StdMutex::new(Vec::new()),
+        };
+        assert!(audit.accept(
+            "127.0.0.1:43123".parse().unwrap(),
+            "127.0.0.1:50000".parse().unwrap()
+        ));
+        assert!(!audit.accept(
+            "192.168.10.80:43123".parse().unwrap(),
+            "192.168.10.80:50001".parse().unwrap()
+        ));
+        assert!(!audit.accept(
+            "127.0.0.1:43123".parse().unwrap(),
+            "198.51.100.7:50002".parse().unwrap()
+        ));
+        assert_eq!(
+            audit.unexpected(),
+            vec![
+                OfflineProviderConnectionAttempt {
+                    destination: "192.168.10.80:43123".to_owned(),
+                    peer: "192.168.10.80:50001".to_owned(),
+                    outcome: "non-provider-local-destination-rejected".to_owned(),
+                },
+                OfflineProviderConnectionAttempt {
+                    destination: "127.0.0.1:43123".to_owned(),
+                    peer: "198.51.100.7:50002".to_owned(),
+                    outcome: "non-local-peer-rejected".to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// A guard-setup delivery probe is claimed only by its exact destination
+    /// and source; once claimed it moves to the separate setup record and no
+    /// longer counts as a trial connection.
+    #[test]
+    fn offline_sentinel_setup_probe_is_claimed_by_exact_peer_and_kept_apart() {
+        use crate::offline_guard::LocalDeliveryOracle as _;
+        let audit = OfflineProviderAudit {
+            local_ipv4_addresses: BTreeSet::from([
+                std::net::Ipv4Addr::LOCALHOST,
+                std::net::Ipv4Addr::new(192, 168, 10, 80),
+            ]),
+            unexpected: StdMutex::new(Vec::new()),
+            setup_probe_arrivals: StdMutex::new(Vec::new()),
+        };
+        audit.record_unexpected(
+            "192.168.10.80:43123".parse().unwrap(),
+            "192.168.10.80:50001".parse().unwrap(),
+        );
+        audit.record_unexpected(
+            "192.168.10.80:43123".parse().unwrap(),
+            "192.168.10.80:50002".parse().unwrap(),
+        );
+        // Wrong source port, wrong destination, and an address with no arrival.
+        assert!(!audit.claim_setup_arrival(
+            "192.168.10.80:43123".parse().unwrap(),
+            "192.168.10.80:50009".parse().unwrap()
+        ));
+        assert!(!audit.claim_setup_arrival(
+            "192.168.10.80:43124".parse().unwrap(),
+            "192.168.10.80:50001".parse().unwrap()
+        ));
+        assert!(!audit.claim_setup_arrival(
+            "198.18.0.1:43123".parse().unwrap(),
+            "198.18.0.1:50003".parse().unwrap()
+        ));
+        assert!(audit.claim_setup_arrival(
+            "192.168.10.80:43123".parse().unwrap(),
+            "192.168.10.80:50001".parse().unwrap()
+        ));
+        // The same arrival cannot be claimed twice.
+        assert!(!audit.claim_setup_arrival(
+            "192.168.10.80:43123".parse().unwrap(),
+            "192.168.10.80:50001".parse().unwrap()
+        ));
+        let observations = audit.observations();
+        assert_eq!(
+            observations.setup_probe_arrivals,
+            vec![OfflineProviderConnectionAttempt {
+                destination: "192.168.10.80:43123".to_owned(),
+                peer: "192.168.10.80:50001".to_owned(),
+                outcome: "guard-setup-delivery-probe".to_owned(),
+            }]
+        );
+        assert_eq!(
+            observations.unexpected,
+            vec![OfflineProviderConnectionAttempt {
+                destination: "192.168.10.80:43123".to_owned(),
+                peer: "192.168.10.80:50002".to_owned(),
+                outcome: "non-provider-local-destination-rejected".to_owned(),
+            }]
+        );
+    }
 
     #[tokio::test]
     async fn storage_context_gate_precedes_error_and_requires_explicit_release() -> Result<()> {

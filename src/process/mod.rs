@@ -551,40 +551,6 @@ static CLEANUP_INSTALL: Once = Once::new();
 static CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CLEANUP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
-const SIGNAL_TARGET_CAPACITY: usize = 4_096;
-static SIGNAL_GROUPS: [AtomicI32; SIGNAL_TARGET_CAPACITY] =
-    [const { AtomicI32::new(0) }; SIGNAL_TARGET_CAPACITY];
-static SIGNAL_PIDS: [AtomicI32; SIGNAL_TARGET_CAPACITY] =
-    [const { AtomicI32::new(0) }; SIGNAL_TARGET_CAPACITY];
-
-fn record_signal_target(targets: &[AtomicI32; SIGNAL_TARGET_CAPACITY], value: u32) {
-    let Ok(value) = i32::try_from(value) else {
-        return;
-    };
-    if targets
-        .iter()
-        .any(|target| target.load(Ordering::Relaxed) == value)
-    {
-        return;
-    }
-    if let Some(target) = targets
-        .iter()
-        .find(|target| target.load(Ordering::Relaxed) == 0)
-    {
-        target.store(value, Ordering::Release);
-    }
-}
-
-fn clear_signal_target(targets: &[AtomicI32; SIGNAL_TARGET_CAPACITY], value: u32) {
-    let Ok(value) = i32::try_from(value) else {
-        return;
-    };
-    for target in targets {
-        if target.load(Ordering::Acquire) == value {
-            target.store(0, Ordering::Release);
-        }
-    }
-}
 
 fn owned_registry() -> &'static Mutex<OwnedRegistry> {
     OWNED_REGISTRY.get_or_init(|| Mutex::new(OwnedRegistry::default()))
@@ -618,8 +584,6 @@ fn register_process_identity(identity: ProcIdentity, process_group: u32) -> Resu
     registry.observed.insert(identity);
     registry.identity_groups.insert(identity, process_group);
     registry.trees.entry(identity).or_default().insert(identity);
-    record_signal_target(&SIGNAL_GROUPS, process_group);
-    record_signal_target(&SIGNAL_PIDS, identity.pid);
     Ok(())
 }
 
@@ -667,10 +631,10 @@ pub(crate) fn signal_registered_tree(identity: ProcIdentity, signal: i32) -> Res
                 identity.pid
             ))
         })?;
-    if let Some(leader) = snapshot.groups.get(&process_group)
-        && !verified_group_members(&snapshot, process_group, *leader)?.is_empty()
-    {
-        signal_group(process_group, signal)?;
+    if let Some(leader) = snapshot.groups.get(&process_group) {
+        for member in verified_group_members(&snapshot, process_group, *leader)? {
+            signal_identity(member, signal)?;
+        }
     }
     if let Some(members) = snapshot.trees.get(&identity) {
         for member in members {
@@ -712,26 +676,15 @@ pub(crate) fn deliver_registered_tree_signal(identity: ProcIdentity, signal: i32
             "owned process group {process_group} disappeared before signal delivery"
         )));
     }
-    let group_target = i32::try_from(process_group)
-        .map_err(|_| AhrbError::Protocol("owned process group exceeds pid_t range".to_owned()))?;
-    // SAFETY: the group leader and membership were revalidated immediately above.
-    if unsafe { libc::kill(-group_target, signal) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    for member in &group_members {
+        signal_identity(*member, signal)?;
     }
     if let Some(members) = snapshot.trees.get(&identity) {
         for member in members {
-            let Some((current, current_group)) = process_identity_and_group(member.pid)? else {
-                continue;
-            };
-            if current != *member || current_group == process_group {
+            if group_members.contains(member) {
                 continue;
             }
-            let pid = i32::try_from(member.pid)
-                .map_err(|_| AhrbError::Protocol("owned PID exceeds pid_t range".to_owned()))?;
-            // SAFETY: the stable PID identity was revalidated immediately above.
-            if unsafe { libc::kill(pid, signal) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
+            signal_identity(*member, signal)?;
         }
     }
     Ok(())
@@ -776,21 +729,13 @@ pub fn retire_process(pid: u32) -> Result<()> {
         let members = process_group_members(process_group, leader.start_time)?;
         if members.is_empty() {
             registry.groups.remove(&process_group);
-            clear_signal_target(&SIGNAL_GROUPS, process_group);
         } else {
             registry.observed.extend(members.iter().copied());
-            for member in members {
-                record_signal_target(&SIGNAL_PIDS, member.pid);
-            }
         }
     }
-    registry.observed.retain(|identity| {
-        let keep = identity.pid != pid || identity_is_live(*identity);
-        if !keep {
-            clear_signal_target(&SIGNAL_PIDS, identity.pid);
-        }
-        keep
-    });
+    registry
+        .observed
+        .retain(|identity| identity.pid != pid || identity_is_live(*identity));
     Ok(())
 }
 
@@ -827,9 +772,6 @@ pub fn track_process_tree(tree: &ProcessTree) -> Result<()> {
             .entry(*root)
             .or_default()
             .extend(tree.members.keys().copied());
-    }
-    for identity in tree.members.keys() {
-        record_signal_target(&SIGNAL_PIDS, identity.pid);
     }
     Ok(())
 }
@@ -973,42 +915,177 @@ pub fn track_profile_owned_processes(processes: &[ProcessInfo]) -> Result<()> {
     let mut registry = registry_lock()?;
     for process in processes {
         registry.observed.insert(process.identity);
-        record_signal_target(&SIGNAL_PIDS, process.identity.pid);
     }
     Ok(())
 }
 
-/// Query a profile lock without acquiring it. `F_GETLK` reports conflicting
-/// owners and does not disturb either the lock file or the owning process.
+#[cfg(unix)]
+fn securely_open_profile_lock(profile: &Path, lock_path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    if !profile.is_absolute() || !lock_path.is_absolute() {
+        return Err(AhrbError::Validation(format!(
+            "profile lock audit requires absolute paths: profile={} lock={}",
+            profile.display(),
+            lock_path.display()
+        )));
+    }
+    let relative = lock_path.strip_prefix(profile).map_err(|_| {
+        AhrbError::Validation(format!(
+            "profile lock {} is not lexically contained under {}",
+            lock_path.display(),
+            profile.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(AhrbError::Validation(format!(
+            "profile lock path has unsafe components: {}",
+            lock_path.display()
+        )));
+    }
+    let mut profile_cursor = PathBuf::from("/");
+    let profile_relative = profile.strip_prefix("/").map_err(|_| {
+        AhrbError::Validation(format!(
+            "declared profile is not absolute: {}",
+            profile.display()
+        ))
+    })?;
+    let mut inside_owned_root = false;
+    for component in profile_relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(AhrbError::Validation(format!(
+                "declared profile has unsafe components: {}",
+                profile.display()
+            )));
+        };
+        profile_cursor.push(component);
+        inside_owned_root |= component
+            .to_str()
+            .is_some_and(|name| name.starts_with("ahrb-"));
+        if !inside_owned_root {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&profile_cursor).map_err(|error| {
+            AhrbError::Protocol(format!(
+                "inspect declared profile ancestry {}: {error}",
+                profile_cursor.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(AhrbError::Validation(format!(
+                "declared profile ancestry contains a symlink: {}",
+                profile_cursor.display()
+            )));
+        }
+    }
+    let profile_metadata = std::fs::symlink_metadata(profile)?;
+    if profile_metadata.file_type().is_symlink() || !profile_metadata.is_dir() {
+        return Err(AhrbError::Validation(format!(
+            "declared profile must be a directory: {}",
+            profile.display()
+        )));
+    }
+    let mut cursor = profile.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(AhrbError::Validation(format!(
+                "profile lock path has unsafe components: {}",
+                lock_path.display()
+            )));
+        };
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(AhrbError::Validation(format!(
+                    "profile lock ancestry contains a symlink: {}",
+                    cursor.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let before = std::fs::symlink_metadata(lock_path)?;
+    if !before.is_file() {
+        return Err(AhrbError::Validation(format!(
+            "declared profile lock is not a regular file: {}",
+            lock_path.display()
+        )));
+    }
+    if before.nlink() != 1 {
+        return Err(AhrbError::Validation(format!(
+            "declared profile lock has {} hard links; refusing ambiguous identity: {}",
+            before.nlink(),
+            lock_path.display()
+        )));
+    }
+    let canonical_profile = std::fs::canonicalize(profile)?;
+    let canonical_lock = std::fs::canonicalize(lock_path)?;
+    if !canonical_lock.starts_with(&canonical_profile) {
+        return Err(AhrbError::Validation(format!(
+            "declared profile lock resolves outside its profile: {}",
+            lock_path.display()
+        )));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)?;
+    let after = file.metadata()?;
+    if (before.dev(), before.ino()) != (after.dev(), after.ino()) || after.nlink() != 1 {
+        return Err(AhrbError::Protocol(format!(
+            "declared profile lock identity changed during audit: {}",
+            lock_path.display()
+        )));
+    }
+    Ok(Some(file))
+}
+
+/// Query a profile lock without acquiring it. Linux combines `F_GETLK` with
+/// `/proc/locks`, because `F_GETLK` alone cannot observe `flock`/OFD owners.
+/// The query does not disturb either the lock file or the owning process.
 #[cfg(unix)]
 pub fn audit_profile_lock(profile: &Path, lock_path: &Path) -> Result<ProfileLockAudit> {
     use std::os::fd::AsRawFd as _;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lock_path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let file = match securely_open_profile_lock(profile, lock_path)? {
+        Some(file) => file,
+        None => {
             return Ok(ProfileLockAudit::Absent {
                 profile: profile.to_path_buf(),
                 lock_path: lock_path.to_path_buf(),
             });
         }
-        Err(error) => return Err(error.into()),
     };
+    #[cfg(target_os = "linux")]
+    if let Some(holder_pid) = linux::proc_lock_owner(&file)? {
+        return Ok(ProfileLockAudit::Held {
+            profile: profile.to_path_buf(),
+            lock_path: lock_path.to_path_buf(),
+            holder_pid,
+        });
+    }
+    let write_lock_type =
+        libc::c_short::try_from(libc::F_WRLCK).expect("F_WRLCK must fit the platform flock type");
+    let unlock_type =
+        libc::c_short::try_from(libc::F_UNLCK).expect("F_UNLCK must fit the platform flock type");
     let mut lock = libc::flock {
         l_start: 0,
         l_len: 0,
         l_pid: 0,
-        l_type: libc::F_WRLCK,
+        l_type: write_lock_type,
         l_whence: libc::SEEK_SET as i16,
     };
     // SAFETY: `file` remains open and `lock` is a valid writable `flock`.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    if lock.l_type == libc::F_UNLCK {
+    if lock.l_type == unlock_type {
         return Ok(ProfileLockAudit::Unlocked {
             profile: profile.to_path_buf(),
             lock_path: lock_path.to_path_buf(),
@@ -1218,6 +1295,16 @@ fn teardown_discover(
     })
 }
 
+fn identity_is_registered_owned(identity: ProcIdentity) -> bool {
+    registry_lock().is_ok_and(|registry| {
+        registry.observed.contains(&identity)
+            || registry
+                .trees
+                .values()
+                .any(|members| members.contains(&identity))
+    })
+}
+
 fn audit_declared_profile_locks(
     locks: &[(PathBuf, PathBuf)],
 ) -> (Vec<ProfileLockAudit>, Vec<String>) {
@@ -1304,8 +1391,8 @@ pub fn teardown_owned_processes(
             let mut holders = Vec::new();
             let mut unowned_holders = Vec::new();
             for candidate in &candidates {
-                if names.contains(&candidate.command)
-                    || owned_identities.contains(&candidate.identity)
+                if owned_identities.contains(&candidate.identity)
+                    || identity_is_registered_owned(candidate.identity)
                 {
                     to_reap.push(candidate.clone());
                 } else {
@@ -1434,22 +1521,16 @@ pub(crate) fn identity_is_live(identity: ProcIdentity) -> bool {
 }
 
 #[cfg(unix)]
-fn signal_group(process_group: u32, signal: i32) -> Result<()> {
-    let process_group = i32::try_from(process_group)
-        .map_err(|_| AhrbError::Protocol("owned process group exceeds pid_t range".to_owned()))?;
-    // SAFETY: a negative PID targets exactly the previously verified owned group.
-    if unsafe { libc::kill(-process_group, signal) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error.into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
 fn signal_identity(identity: ProcIdentity, signal: i32) -> Result<()> {
-    if !identity_is_live(identity) {
+    let current = process_identity_and_group(identity.pid)?;
+    let Some((current, _)) = current else {
+        return Ok(());
+    };
+    if current != identity {
+        eprintln!(
+            "ahrb: skipped signal {signal} for stale PID {} identity: registered start {}, current start {}",
+            identity.pid, identity.start_time, current.start_time
+        );
         return Ok(());
     }
     let pid = i32::try_from(identity.pid)
@@ -1597,8 +1678,8 @@ pub fn cleanup_owned_processes_with_evidence(grace: Duration) -> Result<ProcessT
             );
         }
         for (process_group, leader) in &snapshot.groups {
-            if !verified_group_members(&snapshot, *process_group, *leader)?.is_empty() {
-                signal_group(*process_group, libc::SIGTERM)?;
+            for member in verified_group_members(&snapshot, *process_group, *leader)? {
+                signal_identity(member, libc::SIGTERM)?;
             }
         }
         for identity in &snapshot.observed {
@@ -1609,8 +1690,8 @@ pub fn cleanup_owned_processes_with_evidence(grace: Duration) -> Result<ProcessT
             std::thread::sleep(Duration::from_millis(10));
         }
         for (process_group, leader) in &snapshot.groups {
-            if !verified_group_members(&snapshot, *process_group, *leader)?.is_empty() {
-                signal_group(*process_group, libc::SIGKILL)?;
+            for member in verified_group_members(&snapshot, *process_group, *leader)? {
+                signal_identity(member, libc::SIGKILL)?;
             }
         }
         for identity in &snapshot.observed {
@@ -1640,12 +1721,6 @@ pub fn cleanup_owned_processes_with_evidence(grace: Duration) -> Result<ProcessT
             registry.observed.clear();
             registry.identity_groups.clear();
             registry.trees.clear();
-            for target in &SIGNAL_GROUPS {
-                target.store(0, Ordering::Release);
-            }
-            for target in &SIGNAL_PIDS {
-                target.store(0, Ordering::Release);
-            }
         } else {
             registry.observed = survivors.clone();
             registry
@@ -1659,18 +1734,6 @@ pub fn cleanup_owned_processes_with_evidence(grace: Duration) -> Result<ProcessT
                 process_group_members(*process_group, leader.start_time)
                     .is_ok_and(|members| !members.is_empty())
             });
-            for target in &SIGNAL_GROUPS {
-                target.store(0, Ordering::Release);
-            }
-            for target in &SIGNAL_PIDS {
-                target.store(0, Ordering::Release);
-            }
-            for process_group in registry.groups.keys() {
-                record_signal_target(&SIGNAL_GROUPS, *process_group);
-            }
-            for identity in &registry.observed {
-                record_signal_target(&SIGNAL_PIDS, identity.pid);
-            }
         }
         let survivors = survivors.into_iter().collect::<Vec<_>>();
         let survivor_set = survivors.iter().copied().collect::<BTreeSet<_>>();
@@ -1714,28 +1777,21 @@ impl Drop for CleanupPhase {
 extern "C" fn remember_termination_signal(signal: i32) {
     RECEIVED_SIGNAL.store(signal, Ordering::SeqCst);
     if signal == libc::SIGABRT {
-        kill_signal_targets();
-        // SAFETY: `_exit` is async-signal-safe. Returning from SIGABRT would
-        // allow abort(3) to force termination before a watchdog cleanup pass.
+        // Returning from a SIGABRT handler permits abort(3) to terminate the
+        // process before cleanup. Wait for the watchdog, which re-reads every
+        // registered start time before it sends a signal. If cleanup itself is
+        // wedged, exit after a bounded wait without signalling raw PIDs.
+        let interval = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        for _ in 0..500 {
+            // SAFETY: nanosleep is async-signal-safe and `interval` is a valid
+            // immutable duration. The watchdog normally exits the process.
+            let _ = unsafe { libc::nanosleep(&interval, std::ptr::null_mut()) };
+        }
+        // SAFETY: `_exit` is async-signal-safe and sends no process signal.
         unsafe { libc::_exit(128_i32.saturating_add(signal)) };
-    }
-}
-
-fn kill_signal_targets() {
-    for target in &SIGNAL_GROUPS {
-        let process_group = target.load(Ordering::Acquire);
-        if process_group > 0 {
-            // SAFETY: kill is async-signal-safe and the negative target is a
-            // group recorded immediately after an owned spawn.
-            let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-        }
-    }
-    for target in &SIGNAL_PIDS {
-        let pid = target.load(Ordering::Acquire);
-        if pid > 0 {
-            // SAFETY: kill is async-signal-safe and targets a recorded owned PID.
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
     }
 }
 
@@ -1871,7 +1927,9 @@ pub struct CpuAccountingWarning {
 #[derive(Debug)]
 pub(crate) struct TreeCpuUpdate {
     pub(crate) cumulative_ns: u64,
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) newly_missing: Vec<ProcIdentity>,
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) readmitted_after_miss: Vec<(ProcIdentity, u64)>,
     pub(crate) warnings: Vec<CpuAccountingWarning>,
 }
@@ -1882,6 +1940,7 @@ impl TreeCpuTracker {
         current: &BTreeMap<ProcIdentity, u64>,
     ) -> Result<TreeCpuUpdate> {
         let mut warnings = Vec::new();
+        #[cfg(any(target_os = "macos", test))]
         let mut readmitted_after_miss = Vec::new();
         for (identity, cpu_ns) in current {
             if let Some(state) = self.identities.get_mut(identity) {
@@ -1900,6 +1959,7 @@ impl TreeCpuTracker {
                         observed_cpu_ns: *cpu_ns,
                     });
                 }
+                #[cfg(any(target_os = "macos", test))]
                 if state.consecutive_misses > 0 {
                     readmitted_after_miss.push((*identity, state.accounted_ns));
                 }
@@ -1918,12 +1978,14 @@ impl TreeCpuTracker {
             }
         }
 
+        #[cfg(any(target_os = "macos", test))]
         let mut newly_missing = Vec::new();
         for (identity, state) in &mut self.identities {
             if current.contains_key(identity) || state.retired {
                 continue;
             }
             state.consecutive_misses = state.consecutive_misses.saturating_add(1);
+            #[cfg(any(target_os = "macos", test))]
             if state.consecutive_misses == 1 {
                 newly_missing.push(*identity);
             }
@@ -1936,7 +1998,9 @@ impl TreeCpuTracker {
             cumulative_ns: self.identities.values().fold(0_u64, |total, state| {
                 total.saturating_add(state.accounted_ns)
             }),
+            #[cfg(any(target_os = "macos", test))]
             newly_missing,
+            #[cfg(any(target_os = "macos", test))]
             readmitted_after_miss,
             warnings,
         })

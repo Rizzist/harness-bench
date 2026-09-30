@@ -44,6 +44,8 @@ fn run_fidelity(
         .expect("serialize complete fidelity summary block");
     let report: Report = serde_json::from_slice(&report_bytes).expect("parse fidelity report");
     assert!(report.economy_summary.is_none());
+    assert_eq!(report.details["teardown"]["status"], "PASS");
+    assert!(!Path::new(&report.profile_path).exists());
     FidelityRun {
         summary: report.fidelity_summary.expect("fidelity summary"),
         serialized_summary,

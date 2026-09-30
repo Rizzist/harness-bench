@@ -120,8 +120,11 @@ impl Drop for Fixture {
 
 const STUB: &str = r##"#!/usr/bin/env python3
 import hashlib, json, os, pathlib, subprocess, sys
+import time
 args = sys.argv
 mode = os.environ['STUB_MODE']
+if os.environ.get('STUB_SLEEP_SECONDS'):
+    time.sleep(float(os.environ['STUB_SLEEP_SECONDS']))
 if 'doctor' in args:
     manifest = pathlib.Path(args[args.index('--manifest')+1])
     print(json.dumps({'ready': mode != 'doctor', 'manifest_sha256': hashlib.sha256(b'canonical-fixture:' + manifest.read_bytes()).hexdigest()}))
@@ -597,6 +600,53 @@ fn mock_expectations_require_complete_rows_correct_classes_and_exec_badge() {
         assert!(!output.status.success(), "{mode}: {log}");
         assert!(log.contains("EXPECTATION=FAIL"), "{mode}: {log}");
         assert!(log.ends_with("MOCK_CERT FAIL\n"));
+    }
+}
+
+#[test]
+fn mock_cert_global_deadline_and_load_receipts_are_explicit() {
+    let f = Fixture::new();
+    let output = f.run(
+        "mock-cert",
+        "pass",
+        &[
+            ("AHRB_MOCK_CERT_DEADLINE_SECONDS", "5"),
+            ("STUB_SLEEP_SECONDS", "10"),
+        ],
+    );
+    let log = f.log("mock-cert", &output);
+    assert!(!output.status.success(), "{log}");
+    assert!(log.contains("GLOBAL_DEADLINE_SECONDS=5"), "{log}");
+    assert!(log.contains("LOAD_AVG_1M_START="), "{log}");
+    assert!(log.contains("LOAD_AVG_1M_END="), "{log}");
+    assert!(log.contains("mock GLOBAL_DEADLINE_EXCEEDED"), "{log}");
+    assert!(log.contains("mock EXIT=124"), "{log}");
+    assert!(log.contains("mock CHILD_DEADLINE_SECONDS=5"), "{log}");
+}
+
+#[test]
+fn mock_cert_passes_configured_deadline_to_each_child() {
+    let f = Fixture::new();
+    let output = f.run(
+        "mock-cert",
+        "pass",
+        &[("AHRB_MOCK_CERT_DEADLINE_SECONDS", "37")],
+    );
+    let log = f.log("mock-cert", &output);
+    assert!(output.status.success(), "{log}");
+    assert!(log.contains("mock CHILD_DEADLINE_SECONDS=37"), "{log}");
+    assert!(log.contains("mock-exec CHILD_DEADLINE_SECONDS=37"), "{log}");
+    let calls = fs::read_to_string(f.run_dir(&output).join("calls.jsonl")).unwrap();
+    let calls: Vec<serde_json::Value> = calls
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        let args = call["args"].as_array().unwrap();
+        let deadline = args.iter().position(|arg| arg == "--deadline").unwrap();
+        assert_eq!(args[deadline + 1], "37");
+        assert_eq!(call["deadline_env"], serde_json::Value::Null);
     }
 }
 

@@ -31,6 +31,7 @@ fn run_certification(manifest: &Path, output: &Path) -> (ExitStatus, Report, Str
         .arg(output)
         .arg("--profile")
         .arg("quick")
+        .arg("--keep-run-root")
         // Keep this regression test scoped around the established reference
         // matrix plus Wave 4. Wave-2/3 rows have focused evidence tests, and
         // row 62 may correctly be an infrastructure ERROR when no reviewed OS

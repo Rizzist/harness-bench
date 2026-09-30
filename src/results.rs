@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static RESULT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(unix)]
+static RESERVED_RUN_ROOTS: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<PathBuf, DirectoryIdentity>>,
+> = std::sync::OnceLock::new();
 
 /// Per-run persistence information captured before workload execution.
 #[derive(Clone, Debug)]
@@ -230,6 +234,415 @@ pub fn prepare(options: &RunOptions, manifest: &Manifest) -> Result<RunPersisten
         load_avg_1m: load_average_1m(),
         results_dir_field: (!no_save).then(|| path_string(&relative_results)),
     })
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+#[cfg(unix)]
+fn directory_identity(status: &libc::stat) -> DirectoryIdentity {
+    DirectoryIdentity {
+        device: status.st_dev,
+        inode: status.st_ino,
+    }
+}
+
+#[cfg(unix)]
+fn path_cstring(path: &Path) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| AhrbError::Validation(format!("path contains a NUL byte: {}", path.display())))
+}
+
+#[cfg(unix)]
+fn name_cstring(name: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| AhrbError::Validation("directory entry contains a NUL byte".to_owned()))
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    let path = path_cstring(path)?;
+    // SAFETY: `path` is NUL terminated and the returned descriptor is
+    // immediately transferred to `OwnedFd` on success.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `fd` is a fresh, uniquely owned descriptor from `open`.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn descriptor_status(fd: std::os::fd::RawFd) -> Result<libc::stat> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `fd` is open and `status` is writable.
+    if unsafe { libc::fstat(fd, &mut status) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(status)
+}
+
+#[cfg(unix)]
+fn entry_status(parent: std::os::fd::RawFd, name: &std::ffi::CStr) -> Result<libc::stat> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `parent` is an open directory descriptor, `name` is NUL
+    // terminated, and `status` is writable. `AT_SYMLINK_NOFOLLOW` preserves
+    // the entry identity instead of following a link target.
+    if unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            &mut status,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(status)
+}
+
+#[cfg(unix)]
+fn directory_names(fd: std::os::fd::RawFd) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+    use std::os::unix::ffi::OsStringExt as _;
+
+    // `fdopendir` owns and closes its descriptor, so duplicate the caller's
+    // stable identity-bound descriptor for enumeration.
+    // SAFETY: `fd` is live; `dup` returns a new owned descriptor.
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `duplicate` is freshly owned by this function.
+    let duplicate = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+    // SAFETY: `duplicate` refers to a directory opened by `open_directory`.
+    let duplicate = duplicate.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed and therefore did not take ownership.
+        unsafe { libc::close(duplicate) };
+        return Err(error.into());
+    }
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        // SAFETY: `__error` returns this thread's writable errno location.
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: `__errno_location` returns this thread's writable errno location.
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: `stream` remains valid until the matching `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                // SAFETY: `stream` was returned by `fdopendir` and has not
+                // been closed; preserve the `readdir` error after cleanup.
+                unsafe { libc::closedir(stream) };
+                return Err(error.into());
+            }
+            break;
+        }
+        // SAFETY: POSIX guarantees a NUL-terminated `d_name` for this live
+        // `dirent` until the next `readdir` call.
+        let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+    }
+    // SAFETY: `stream` was returned by `fdopendir` and has not been closed.
+    if unsafe { libc::closedir(stream) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn remove_directory_contents(fd: std::os::fd::RawFd) -> Result<()> {
+    use std::os::fd::FromRawFd as _;
+
+    for name in directory_names(fd)? {
+        let name = name_cstring(&name)?;
+        let before = entry_status(fd, &name)?;
+        if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            // SAFETY: `fd` is a directory descriptor and `name` is NUL
+            // terminated. `O_NOFOLLOW` rejects a symlink replacement.
+            let child = unsafe {
+                libc::openat(
+                    fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: `child` is a fresh descriptor from `openat`.
+            let child = unsafe { std::os::fd::OwnedFd::from_raw_fd(child) };
+            let opened = descriptor_status(std::os::fd::AsRawFd::as_raw_fd(&child))?;
+            if directory_identity(&before) != directory_identity(&opened) {
+                return Err(AhrbError::Protocol(
+                    "run-root child directory identity changed during cleanup".to_owned(),
+                ));
+            }
+            remove_directory_contents(std::os::fd::AsRawFd::as_raw_fd(&child))?;
+            let after = entry_status(fd, &name)?;
+            if directory_identity(&after) != directory_identity(&opened) {
+                return Err(AhrbError::Protocol(
+                    "run-root child directory was replaced during cleanup".to_owned(),
+                ));
+            }
+            drop(child);
+            // SAFETY: `fd` and `name` still identify the verified empty child.
+            if unsafe { libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        } else {
+            // SAFETY: `fd` anchors removal inside the owned directory. A
+            // symlink is unlinked as an entry and is never followed.
+            if unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Owns one exactly recorded disposable run root. Deletion remains disarmed
+/// until the caller confirms that the report and declared evidence were
+/// persisted successfully.
+#[derive(Debug)]
+pub struct RunRootGuard {
+    path: PathBuf,
+    canonical_parent: PathBuf,
+    keep: bool,
+    active: bool,
+    persistence_confirmed: bool,
+    #[cfg(unix)]
+    identity: DirectoryIdentity,
+}
+
+impl RunRootGuard {
+    pub fn new(path: PathBuf, keep: bool) -> Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            AhrbError::Validation(format!("run root has no parent: {}", path.display()))
+        })?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.is_empty() || !name.starts_with("ahrb-") {
+            return Err(AhrbError::Validation(format!(
+                "refusing to manage non-AHRB run root {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        let temp = std::fs::canonicalize("/tmp")?;
+        #[cfg(not(unix))]
+        let temp = std::fs::canonicalize(std::env::temp_dir())?;
+        let actual_parent = std::fs::canonicalize(parent)?;
+        if actual_parent != temp {
+            return Err(AhrbError::Validation(format!(
+                "refusing to manage run root outside the system temporary directory: {}",
+                path.display()
+            )));
+        }
+        std::fs::create_dir(&path).map_err(|error| {
+            AhrbError::Validation(format!(
+                "create fresh owned run root {}: {error}",
+                path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(unix)]
+        let identity = {
+            use std::os::fd::AsRawFd as _;
+            let directory = open_directory(&path)?;
+            directory_identity(&descriptor_status(directory.as_raw_fd())?)
+        };
+        #[cfg(unix)]
+        RESERVED_RUN_ROOTS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| AhrbError::Protocol("run-root reservation lock was poisoned".to_owned()))?
+            .insert(path.clone(), identity);
+        Ok(Self {
+            path,
+            canonical_parent: actual_parent,
+            keep,
+            active: true,
+            persistence_confirmed: false,
+            #[cfg(unix)]
+            identity,
+        })
+    }
+
+    /// Arm deletion after the complete report/evidence bundle has been
+    /// persisted successfully outside this disposable root.
+    pub fn confirm_persisted(&mut self) {
+        self.persistence_confirmed = true;
+    }
+
+    pub fn cleanup(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        if self.keep {
+            self.active = false;
+            self.clear_reservation();
+            return Ok(());
+        }
+        if !self.persistence_confirmed {
+            self.active = false;
+            self.clear_reservation();
+            return Err(AhrbError::Protocol(format!(
+                "report/evidence persistence was not confirmed; kept run root {}",
+                self.path.display()
+            )));
+        }
+        #[cfg(unix)]
+        self.cleanup_unix()?;
+        #[cfg(not(unix))]
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(AhrbError::Validation(format!(
+                    "refusing to remove replaced run root {}",
+                    self.path.display()
+                )));
+            }
+            Ok(_) => std::fs::remove_dir_all(&self.path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.active = false;
+        self.clear_reservation();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn clear_reservation(&self) {
+        if let Some(reservations) = RESERVED_RUN_ROOTS.get()
+            && let Ok(mut reservations) = reservations.lock()
+        {
+            reservations.remove(&self.path);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn clear_reservation(&self) {}
+
+    #[cfg(unix)]
+    fn cleanup_unix(&self) -> Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        let root = match open_directory(&self.path) {
+            Ok(root) => root,
+            Err(AhrbError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let opened_identity = directory_identity(&descriptor_status(root.as_raw_fd())?);
+        if opened_identity != self.identity {
+            return Err(AhrbError::Validation(format!(
+                "refusing to remove replaced run root {}: expected ({},{}), found ({},{})",
+                self.path.display(),
+                self.identity.device,
+                self.identity.inode,
+                opened_identity.device,
+                opened_identity.inode
+            )));
+        }
+        remove_directory_contents(root.as_raw_fd())?;
+
+        let name = self.path.file_name().ok_or_else(|| {
+            AhrbError::Validation(format!("run root has no name: {}", self.path.display()))
+        })?;
+        let parent = open_directory(&self.canonical_parent)?;
+        let name = name_cstring(name)?;
+        let parent_entry = entry_status(parent.as_raw_fd(), &name)?;
+        if directory_identity(&parent_entry) != self.identity {
+            return Err(AhrbError::Validation(format!(
+                "refusing to unlink replaced run-root entry {}",
+                self.path.display()
+            )));
+        }
+        drop(root);
+        // SAFETY: the parent entry was just verified against the recorded root
+        // identity and the root descriptor was never used through a path.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+/// Consume the exact pre-created run-root reservation established by
+/// [`RunRootGuard::new`]. Callers may then populate the directory while the
+/// guard retains its original `(dev, ino)` cleanup identity.
+#[cfg(unix)]
+pub(crate) fn claim_reserved_run_root(path: &Path) -> Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let Some(reservations) = RESERVED_RUN_ROOTS.get() else {
+        return Ok(false);
+    };
+    let mut reservations = reservations
+        .lock()
+        .map_err(|_| AhrbError::Protocol("run-root reservation lock was poisoned".to_owned()))?;
+    let Some(expected) = reservations.get(path).copied() else {
+        return Ok(false);
+    };
+    let directory = open_directory(path)?;
+    let actual = directory_identity(&descriptor_status(directory.as_raw_fd())?);
+    if actual != expected {
+        return Err(AhrbError::Protocol(format!(
+            "reserved run-root identity changed before initialization: {}",
+            path.display()
+        )));
+    }
+    reservations.remove(path);
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn claim_reserved_run_root(_path: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+impl Drop for RunRootGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!(
+                "ahrb: could not remove owned run root {}: {error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 /// Resolve a path against the CLI's current directory without requiring the
@@ -1100,6 +1513,7 @@ mod tests {
             junit: false,
             deadline_secs: Some(120),
             no_save: true,
+            keep_run_root: false,
             harness_version: Some("mock 1".to_owned()),
         }
     }
@@ -1111,6 +1525,90 @@ mod tests {
             utc_timestamp(UNIX_EPOCH + std::time::Duration::from_secs(951_827_696))?,
             "2000-02-29T12:34:56Z"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn run_root_guard_removes_exact_root_unless_kept() -> Result<()> {
+        let suffix = RESULT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let removed = PathBuf::from("/tmp").join(format!(
+            "ahrb-run-root-guard-{}-{suffix}",
+            std::process::id()
+        ));
+        let mut guard = RunRootGuard::new(removed.clone(), false)?;
+        std::fs::write(
+            removed.join("owned"),
+            b"evidence already persisted elsewhere",
+        )?;
+        guard.confirm_persisted();
+        guard.cleanup()?;
+        assert!(!removed.exists());
+
+        let kept = PathBuf::from("/tmp").join(format!(
+            "ahrb-run-root-kept-{}-{suffix}",
+            std::process::id()
+        ));
+        let mut guard = RunRootGuard::new(kept.clone(), true)?;
+        guard.cleanup()?;
+        assert!(kept.is_dir());
+        std::fs::remove_dir(kept)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_root_guard_refuses_rename_and_replace() -> Result<()> {
+        let suffix = RESULT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from("/tmp").join(format!(
+            "ahrb-run-root-replaced-{}-{suffix}",
+            std::process::id()
+        ));
+        let moved = PathBuf::from("/tmp").join(format!(
+            "ahrb-run-root-moved-{}-{suffix}",
+            std::process::id()
+        ));
+        let mut guard = RunRootGuard::new(root.clone(), false)?;
+        guard.confirm_persisted();
+        std::fs::write(root.join("original"), b"owned")?;
+        std::fs::rename(&root, &moved)?;
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("replacement"), b"preserve")?;
+        let error = guard
+            .cleanup()
+            .expect_err("replacement must not be removed");
+        assert!(error.to_string().contains("replaced run root"));
+        assert_eq!(std::fs::read(root.join("replacement"))?, b"preserve");
+        std::fs::remove_dir_all(root)?;
+        std::fs::remove_dir_all(moved)?;
+        // Prevent Drop from retrying after this test deliberately removed both
+        // paths following the asserted refusal.
+        guard.clear_reservation();
+        guard.active = false;
+        Ok(())
+    }
+
+    #[test]
+    fn run_root_guard_keeps_unsaved_evidence() -> Result<()> {
+        let suffix = RESULT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from("/tmp").join(format!(
+            "ahrb-run-root-unsaved-{}-{suffix}",
+            std::process::id()
+        ));
+        let mut guard = RunRootGuard::new(root.clone(), false)?;
+        std::fs::write(root.join("unsaved-evidence.txt"), b"preserve")?;
+        let error = guard
+            .cleanup()
+            .expect_err("unpersisted evidence must keep the run root");
+        assert!(error.to_string().contains("persistence was not confirmed"));
+        assert!(
+            error
+                .to_string()
+                .contains(&root.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            std::fs::read(root.join("unsaved-evidence.txt"))?,
+            b"preserve"
+        );
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -1182,6 +1680,7 @@ mod tests {
             junit: false,
             deadline_secs: None,
             no_save: true,
+            keep_run_root: false,
             harness_version: Some("0.0.967".to_owned()),
         };
         let persistence = prepare(&options, &manifest)?;

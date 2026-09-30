@@ -34,6 +34,7 @@ fn run_matrix(output: &Path, tests: Option<&str>) -> (std::process::ExitStatus, 
     if let Some(tests) = tests {
         command.arg("--tests").arg(tests);
     }
+    command.arg("--keep-run-root");
     let result = command
         .output()
         .expect("execute AHRB against its built-in mock harness");
@@ -390,5 +391,7 @@ fn derived_latency_trials_do_not_delay_cancel_cleanup() {
     ));
     assert_eq!(report.turns.len(), 300);
 
+    std::fs::remove_dir_all(&report.profile_path)
+        .expect("remove cancellation-latency retained profile");
     std::fs::remove_dir_all(&output).expect("remove isolated cancellation-latency report");
 }

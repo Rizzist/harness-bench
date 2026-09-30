@@ -5,6 +5,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
+fn remove_profile_if_present(path: &str) {
+    if Path::new(path).exists() {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
 fn run_mock_rows(test_name: &str, rows: &str) -> (std::path::PathBuf, Command, Report) {
     let output = std::env::temp_dir().join(format!("ahrb-l10-{test_name}-{}", std::process::id()));
     let mut command = Command::new(env!("CARGO_BIN_EXE_ahrb"));
@@ -144,7 +150,7 @@ fn daemon_exec_rows25_and46_include_short_lived_client_cpu_and_process_evidence(
         }
         assert!(at_boundary.values().any(|ids| ids.len() >= 2));
     }
-    std::fs::remove_dir_all(&report.profile_path).unwrap();
+    remove_profile_if_present(&report.profile_path);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -181,7 +187,7 @@ fn daemon_signal_row_clock_ends_at_its_durable_terminal_receipt() {
     assert_eq!(row.row, 57);
     assert!(row.metadata.wall_duration_s > 0.0);
     assert_eq!(row.metadata.wall_duration_scope, "submit-to-terminal");
-    std::fs::remove_dir_all(&report.profile_path).unwrap();
+    remove_profile_if_present(&report.profile_path);
     std::fs::remove_dir_all(output).unwrap();
 }
 
@@ -213,7 +219,7 @@ fn daemon_rows50_and53_ignore_retained_zombies_for_live_cleanup() {
             .wall_duration_scope,
         "submit-to-terminal"
     );
-    std::fs::remove_dir_all(&report.profile_path).unwrap();
+    remove_profile_if_present(&report.profile_path);
     std::fs::remove_dir_all(output).unwrap();
 }
 
@@ -255,8 +261,8 @@ fn recovery_row_durations_are_frozen_before_unrelated_streaming_work() {
             long_result.metadata.wall_duration_s
         );
     }
-    std::fs::remove_dir_all(&short.profile_path).unwrap();
-    std::fs::remove_dir_all(&with_later_row.profile_path).unwrap();
+    remove_profile_if_present(&short.profile_path);
+    remove_profile_if_present(&with_later_row.profile_path);
     std::fs::remove_dir_all(short_output).unwrap();
     std::fs::remove_dir_all(long_output).unwrap();
 }
@@ -308,6 +314,6 @@ fn mock_exec_row50_live_counter_retry_survives_combined_load() {
     );
     assert!(row50.metadata.measurement_complete);
     assert_eq!(row50.metadata.wall_duration_scope, "submit-to-terminal");
-    std::fs::remove_dir_all(&report.profile_path).unwrap();
+    remove_profile_if_present(&report.profile_path);
     std::fs::remove_dir_all(output).unwrap();
 }

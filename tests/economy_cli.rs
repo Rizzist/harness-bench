@@ -69,6 +69,8 @@ fn reference_mock_pins_all_six_economy_columns() {
         &std::fs::read(output.join("report.json")).expect("read economy report"),
     )
     .expect("parse economy report");
+    assert_eq!(report.details["teardown"]["status"], "PASS");
+    assert!(!Path::new(&report.profile_path).exists());
     assert_eq!(report.filesystem_snapshots.len(), 1);
     let filesystem_snapshot = &report.filesystem_snapshots[0];
     assert_eq!(filesystem_snapshot.boundary, "economy-after");
@@ -135,6 +137,42 @@ fn reference_mock_pins_all_six_economy_columns() {
     );
     assert!(String::from_utf8_lossy(&command.stdout).contains("economy_summary"));
     std::fs::remove_dir_all(output).expect("remove economy output");
+}
+
+#[test]
+fn economy_deadline_records_teardown_and_removes_run_root() {
+    let _guard = common::serialize_ahrb_subprocesses();
+    let output = std::env::temp_dir().join(format!("ahrb-economy-deadline-{}", std::process::id()));
+    let command = Command::new(env!("CARGO_BIN_EXE_ahrb"))
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args([
+            "run",
+            "--pillar",
+            "economy",
+            "--manifest",
+            "adapters/mock/manifest.toml",
+            "--profile",
+            "quick",
+            "--deadline",
+            "0",
+            "--no-save",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .expect("run deadline fixture");
+    assert_eq!(command.status.code(), Some(2));
+    let report: Report = serde_json::from_slice(
+        &std::fs::read(output.join("report.json")).expect("deadline report"),
+    )
+    .expect("parse deadline report");
+    assert_eq!(report.details["teardown"]["status"], "PASS");
+    assert_eq!(
+        report.details["pillar-failure"]["measurement_complete"],
+        false
+    );
+    assert!(!Path::new(&report.profile_path).exists());
+    std::fs::remove_dir_all(output).expect("remove deadline output");
 }
 
 #[test]
@@ -441,6 +479,9 @@ fn late_native_tool_arguments_complete_economy_without_duplicate_events() {
         assert!(span.get("arguments").is_none());
         assert!(span.get("prompt").is_none());
     }
-    std::fs::remove_dir_all(&report.profile_path).unwrap();
+    assert!(
+        !Path::new(&report.profile_path).exists(),
+        "economy run root should be removed by default"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

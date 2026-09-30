@@ -348,6 +348,112 @@ specific.
 | **61 `workspace-fault`** | NEW; ToolCallCorrectness; **CORE** | Measured for both. Session state roots and the actor workspace root remain writable; only the target's child directory is faulted so sandboxed harnesses can still launch. No N/A. | Create a child directory under the actor workspace with mode 0555, then have AHRB itself attempt the exact target creation under the same uid/gid/ACL context before launching the harness. The control must fail with EACCES/EROFS. Only then ask the ordinary declared write fixture to write that exact relative path; a platform fixture may instead provide a separately proven ENOSPC mount. Quick one; cert three. | `details.workspace-fault.kind`, `.call_id`, `.target_path`, `.result_path`, `.structured_result`, `.native_result_carrier`, `.write_errno`, `.control_write_errno`; `metrics.workspace_fault.structured_failure`, `.terminal_count`, `.terminal_ms`, `.outside_writes`, `.residue_processes`. The exact structured fixture JSON is recovered only from the protocol-native tool-result carrier correlated to the exact call ID/path and is retained unmodified. It is cross-checked against target/workspace/disposable-profile snapshots and forbidden-root declaration receipts; owner forbidden roots are never opened. Argument echoes, assistant narration, and inferred errno are not evidence. | If AHRB's post-chmod control write succeeds, or fails for an unrelated reason, the fixture is ineffective and the row is infrastructure `ERROR` without judging the harness. Otherwise PASS iff the ordinary fixture's structured result reports EACCES, EROFS, or proven ENOSPC and snapshots independently confirm no target/outside effect; exactly one structured tool failure and one structural terminal occur within the turn deadline; there is no result/path success contradiction, crash, or hang; no target/outside write occurs; residue is zero. A uniquely mapped readable native result that claims success or the wrong path is `FAIL`; missing/ambiguous call-result mapping, missing native carrier/structured errno, or incomplete snapshot evidence is `ERROR`, never a favorable zero. | No new manifest key. Existing write fixture and workspace hashes are reusable, but the runner must make the target child directory read-only and prove that restriction with the control write. Privileges/ACLs that bypass 0555 produce `ERROR`, never harness `FAIL`. No preload/syscall instrumentation of the harness is permitted. |
 | **62 `offline-mode`** | NEW; AutomationReadiness; **CORE** | Measured for both under either (1) a reviewed same-confinement OS guard or (2) a reviewed owned connector boundary for a harness/fixture whose complete process and network implementation AHRB controls. If neither proof is available, the sole outcome is `ERROR: egress enforcement unavailable`, never harness `UNSUPPORTED`, `ABSENT`, or `FAIL`. | Ordinary successful tool workflow. Deny every egress destination except the injected provider endpoint. Under an OS guard, the AHRB probe process is outside the owned harness tree but uses the **exact same** namespace/sandbox/rule set. Under the owned-boundary mode, AHRB injects a per-trial 256-bit challenge and `203.0.113.1:9`; the challenged harness root invokes its real connector `connect` operation from inside the owned tree, and that same connector is the only code path allowed to open its provider IP socket. Quick one; cert three. | `metrics.offline_mode.provider_requests`, `.blocked_egress_attempts`, `.successful_non_provider_connections`, `.offline_run_success`, `.control_probe_blocked`; `details.offline-mode.egress_enforcement`, `.confinement_identity`, `.attempts[]` with destination, category (`update-check`, `model-catalog`, `telemetry`, `other`, or `control-probe`), and outcome. Totals and category counts are reported; blocked count may validly be zero only when the harness makes no auxiliary attempt. Owned-boundary evidence additionally binds the challenge, monotonically sequenced fsync-backed decision ledger, root PID, resolved executable SHA-256, provider connects, and refused control connect to `reference-mock-loopback-connector-v1`. | PASS iff provider requests>=1, terminal success occurs, non-provider successful connections=0, the independently challenged same-confinement probe is blocked, all observed auxiliary attempts are denied, and evidence binds probe/harness to one reviewed guard identity. In owned-boundary mode the public connect must return `PermissionDenied` at the connector before any OS connect, every successful provider request must have one allowed loopback/local-IPC record, and the ledger PID must be the independently captured owned root. Any inability to establish those observations is infrastructure `ERROR`; proxy compliance, declaration-only evidence, or a probe under different confinement is never proof, and an observed escape is also `ERROR` because the purported guard is untrustworthy for certification. | No adapter key beyond allowed fake paths. `runner::isolated_environment` constructs environment only and is not socket confinement. The owned-boundary mode is deliberately restricted to the compiled-in `ahrb-mock`/`ahrb-mock-exec`: AHRB resolves the exact sibling executable, records its SHA-256 in the confinement identity, captures its root PID before releasing an exec launch, and audits the challenge ledger after the terminal. The reference mock's reviewed network surface accepts only the injected literal loopback provider (or local Unix/mailbox IPC), while the row-62 workflow cannot invoke its native shell. Other adapters still require a reviewed OS guard; Linux may use a user/network namespace plus syscall/cgroup evidence, while macOS PF/NetworkExtension commonly requires privileges and nested Seatbelt may be unavailable. |
 
+For the reviewed macOS OS-guard mode, AHRB renders a fresh Seatbelt profile
+which denies outbound network by default and permits only TCP to
+`localhost:PORT` in `AF_INET` using a `remote tcp` rule. UDP remains denied,
+including datagrams addressed to the provider port. The only other outbound
+allowance is to Unix-domain socket paths under the disposable harness profile
+root, for harness-local IPC. On the reviewed macOS
+release, this Seatbelt host filter covers the host's local IPv4 interface
+addresses at that port; it is not an exact
+`127.0.0.1` restriction. The compiler rejects a numeric host in this rule, so
+AHRB closes the broader boundary by binding the fake provider exclusively on
+`127.0.0.1:PORT` and exclusive sentinel listeners on every other local IPv4
+interface address returned by `getifaddrs`, all without `SO_REUSEADDR` or
+`SO_REUSEPORT`, for the complete trial. It advertises only the provider address
+to the harness. After binding, AHRB proves that no enumerated specific address
+can be rebound at that port. The complete provider plus sentinel set is retried
+on a different port after any bind failure, for a
+bounded number of attempts; inability to establish exclusive ownership is
+guard-setup `ERROR`. The provider accepts HTTP only at `127.0.0.1` from an
+enumerated local peer. A sentinel immediately rejects and records any arrival
+on another local destination; the arrival is a successful non-provider
+connection and makes row 62 `ERROR`. A non-local peer is rejected before HTTP
+handling, recorded, and also prevents PASS. Thus the row's exact-provider
+boundary is the composition of Seatbelt and AHRB's exclusive provider-port
+ownership, not a claim that Seatbelt alone confines the destination to
+`127.0.0.1`.
+
+Row 62 therefore requires every local IPv4 address permitted by the Seatbelt
+`localhost` rule to be owned by AHRB, and exclusive binding alone does not prove
+that: a tunnel or proxy interface (common with VPN software, for example a
+`utun` interface holding `198.18.0.1`) can answer TCP connections to its own
+address itself, so a connection to that address never reaches the process bound
+there. At guard setup, after the other guard probes, AHRB makes one TCP connection
+from inside the row-62 profile to every enumerated non-loopback local IPv4
+address at the provider port. The probe reports its own source address and
+port, and AHRB's sentinel on that address must record an arrival from exactly
+that source within 2 s. The sentinel moves a matched arrival to a separate
+setup-probe record, so it is never counted as a harness connection; after the
+trial AHRB checks that this record contains exactly the arrivals credited to the
+guard. Each probe is retained with its address, interface names, destination,
+source, outcome (`delivered-to-ahrb-sentinel`, `blocked-by-profile`,
+`answered-by-other`, `refused`, `timeout`, or `ambiguous`) and detail. Only a
+recorded arrival, or a Seatbelt denial (`EPERM`/`EACCES`, which puts the
+address outside the permitted set), keeps an address inside the boundary.
+Any other outcome, including a connect that succeeds without a matching sentinel
+arrival, a refusal, a timeout, or an unattributable result, makes row 62 an
+infrastructure `ERROR` with the reason `guard boundary includes a local address
+AHRB does not own`, naming each such address and its interfaces. The guard then
+refuses to launch the harness, the row ends after that trial, and the trial
+evidence retains every per-address probe; this reason takes precedence over the
+trial count. On a host with an active tunnel/proxy interface of this kind, row 62
+is therefore `ERROR` for every OS-guarded harness until that interface is
+removed; AHRB does not change the host's network configuration to avoid it.
+
+AHRB records the local IPv4 address set (`getifaddrs`) at guard setup,
+re-enumerates it every 500 ms from setup through the guard probes and the
+challenged trial, and re-enumerates once more at trial end. The interval is a
+sampling limit rather than continuous interface-event observation: an address
+which appears and disappears entirely between two samples (under 500 ms) may not
+be observed, and no claim is made about such a transient address. Any observed
+set change (an added or removed address), including one that later reverts,
+makes row 62 an infrastructure `ERROR` because the original sentinel coverage
+no longer proves the whole trial; so does a failed enumeration or fewer than a
+setup and an end sample. Evidence retains the final set, sample interval/count,
+and the old/new sets from the first observed change, and the `ERROR` message
+names both sets.
+
+The literal advertised destination, enumerated owned addresses and sentinels,
+complete rendered rule, the complete rendered profile bytes, exclusive-ownership
+proof, address-set samples, and a
+denied second listener on IPv6 loopback at the same port are retained as
+evidence. Guarded TCP probes to `127.0.0.2:PORT` and `203.0.113.1:9` must be
+denied. Guarded UDP probes to every setup-time local IPv4 address at `PORT`
+must return `EPERM` or `EACCES`; any successful datagram send invalidates the
+guard and makes row 62 `ERROR`. The row is judged only if the retained profile
+bytes hash to the recorded profile SHA-256, contain `(deny network-outbound)`,
+and have exactly two network allowances: the TCP provider rule and the
+profile-root Unix-socket subpath; a `remote ip` or `remote udp` rule is `ERROR`.
+Only the two reviewed enforcement identities (this Seatbelt guard and the
+owned reference-mock connector) are accepted; any other or retired identity is
+`ERROR`. The confinement
+identity binds the SHA-256 of the exact profile bytes, the SHA-256 of
+`/usr/bin/sandbox-exec`, and the advertised provider destination. The harness
+root and an independent challenged control are launched
+through one AHRB launch wrapper which re-hashes the profile immediately before
+each `sandbox-exec -f PROFILE` exec. The profile is stored in a separate
+AHRB-owned temporary directory, outside the disposable harness profile and
+HOME, and the profile itself denies writes to that directory and file. Every
+driver-launched executable surface used by the challenged trial is inventoried
+through one guard function: transport, daemon start/initialization/readiness/
+shutdown, and every applicable per-invocation continuation, recovery, replay,
+release, cancellation, close/delete, and wait command. Hook commands run only
+as descendants of an already-confined harness. A surface which cannot use the
+same guard, or any launch-time profile hash mismatch, is guard-setup `ERROR`.
+Before the harness is judged, an allowed connection to that provider, a
+child-inherited `EPERM`/`EACCES` denial for `203.0.113.1:9`, and a denied guarded
+attempt to modify the profile must all succeed. A different profile hash,
+different launcher hash, missing inheritance or profile-integrity proof,
+nested-sandbox rejection, or failed positive/negative probe is guard-setup
+`ERROR`, never PASS evidence.
+Linux certification requires its separate reviewed network-namespace/cgroup
+identity and `/proc/locks` evidence; the macOS identity is not portable proof.
+The current Linux implementation parses POSIX, FLOCK, and OFDLCK ownership from
+`/proc/locks`, but does not yet provide that reviewed network guard. It therefore
+fails row 62 closed with a guard-setup `ERROR`; native Linux runtime proof remains
+required follow-up work and is not inferred from cross-target compilation.
+
 ### E. Determinism scoring
 
 | Row / stable ID | Type, pillar, badge impact | Topology handling | Fixture and profile | Exact evidence | Oracle | Manifest and feasibility |
