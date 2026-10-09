@@ -288,6 +288,29 @@ fn sparse_files_and_aliases_use_blocks_and_no_follow() {
     std::fs::remove_dir_all(root).expect("cleanup");
 }
 
+#[cfg(unix)]
+#[test]
+fn haider_daemon_log_hardlink_remains_an_honest_repeated_identity_error() {
+    let root = std::env::temp_dir().join(format!(
+        "ahrb-haider-log-alias-{}-{}",
+        std::process::id(),
+        ahrb::fake_model::monotonic_timestamp_ns()
+    ));
+    let profile = root.join("home/.haider/dev-profile");
+    let archived = profile.join("daemon-logs/haiderd-123-456-0.log");
+    std::fs::create_dir_all(archived.parent().expect("daemon log parent")).expect("profile");
+    std::fs::write(&archived, b"haider daemon log\n").expect("active daemon log");
+    std::fs::hard_link(&archived, profile.join("daemon.log")).expect("stable daemon.log alias");
+
+    let error = inventory(&root, &StorageConfig::default(), true)
+        .expect_err("a hard-linked stable log alias must not be deduplicated");
+    let detail = error.to_string();
+    assert!(detail.contains("storage device escape or repeated identity"));
+    assert!(detail.contains("home/.haider/dev-profile/daemon.log"));
+
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
 #[test]
 fn pinned_seed_contract_matches_economy_bytes() {
     fixture::validate_renderer_pins().expect("dialect response/read-call pins");

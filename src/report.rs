@@ -2296,6 +2296,16 @@ pub fn evaluate_memory_time_integral(
     if evidence.sampler_cadence_ns == 0 {
         return incomplete("memory-time-integral sampler cadence is zero".to_owned());
     }
+    if evidence.samples.iter().any(|sample| {
+        sample
+            .cpu_accounting_warnings
+            .iter()
+            .any(|warning| warning.contains("cpu-counter-unreadable"))
+    }) {
+        return incomplete(
+            "memory-time-integral CPU counter was unreadable after bounded retries".to_owned(),
+        );
+    }
     let expected_turns = expected_repetitions.saturating_mul(turns_per_repetition) as usize;
     if evidence.turns.len() != expected_turns {
         return incomplete(format!(

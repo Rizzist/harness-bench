@@ -1,6 +1,6 @@
 //! Phase-aware resource series, stability checks, and sweep metrics.
 
-use crate::process::Sample;
+use crate::process::{CpuAccountingWarning, Sample};
 use crate::{AhrbError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -143,8 +143,36 @@ impl SampleSeries {
         })
     }
 
+    /// First CPU counter in `phase` that stayed unreadable after bounded re-reads.
+    ///
+    /// Such a sample retains the identity's last trustworthy cumulative value,
+    /// so any CPU delta, fraction or burst pattern derived from the phase would
+    /// silently undercount; callers must treat the phase CPU as incomplete.
+    pub fn unreadable_cpu_counter(&self, phase: &str) -> Option<&CpuAccountingWarning> {
+        self.samples
+            .iter()
+            .filter(|sample| sample.phase == phase)
+            .flat_map(|sample| sample.cpu_accounting_warnings.iter())
+            .find(|warning| warning.is_unreadable_counter())
+    }
+
+    /// Return a row-local incompleteness error when `phase` has unreadable CPU.
+    pub fn require_readable_cpu(&self, phase: &str) -> Result<()> {
+        match self.unreadable_cpu_counter(phase) {
+            Some(warning) => Err(AhrbError::Validation(format!(
+                "phase {phase:?} CPU evidence is incomplete: {}",
+                warning.unreadable_counter_reason()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Calculate the whole-tree CPU delta and fraction of one core for a phase.
+    ///
+    /// A phase containing any CPU counter that stayed unreadable after bounded
+    /// re-reads is rejected rather than measured from partial counters.
     pub fn phase_cpu(&self, phase: &str) -> Result<PhaseCpu> {
+        self.require_readable_cpu(phase)?;
         let mut samples = self.samples.iter().filter(|sample| sample.phase == phase);
         let first = samples
             .next()
@@ -851,6 +879,53 @@ mod tests {
         regressed.push(first)?;
         regressed.push(second)?;
         assert!(regressed.phase_cpu("steady").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn phase_cpu_rejects_counters_unreadable_after_bounded_retries() -> Result<()> {
+        let mut series = SampleSeries::default();
+        series.push(sample(0, 100, 1))?;
+        let mut retained = sample(100, 100, 1);
+        retained.cpu_ns = 0;
+        retained
+            .cpu_accounting_warnings
+            .push(crate::process::CpuAccountingWarning {
+                kind: "macos-cpu-counter-unreadable".to_owned(),
+                identity: ProcIdentity {
+                    pid: 1,
+                    start_time: 1,
+                },
+                consecutive_misses: 3,
+                previous_cpu_ns: 0,
+                observed_cpu_ns: 0,
+            });
+        series.push(retained)?;
+        let error = series
+            .phase_cpu("steady")
+            .expect_err("partial CPU must not be measured");
+        assert!(error.to_string().contains(
+            "CPU counter for process (1,1) was unreadable after 3 bounded read attempts"
+        ));
+
+        // A clamped sub-millisecond jitter warning is not an unreadable counter.
+        let mut jitter = SampleSeries::default();
+        jitter.push(sample(0, 100, 1))?;
+        let mut clamped = sample(100, 100, 1);
+        clamped
+            .cpu_accounting_warnings
+            .push(crate::process::CpuAccountingWarning {
+                kind: "macos-self-cpu-jitter-clamped".to_owned(),
+                identity: ProcIdentity {
+                    pid: 1,
+                    start_time: 1,
+                },
+                consecutive_misses: 0,
+                previous_cpu_ns: 2,
+                observed_cpu_ns: 1,
+            });
+        jitter.push(clamped)?;
+        assert!(jitter.phase_cpu("steady").is_ok());
         Ok(())
     }
 

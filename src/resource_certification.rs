@@ -330,11 +330,15 @@ pub struct IdleObservation {
 /// active samples are coalesced into one burst, then at least three consecutive
 /// burst intervals must fall within 500 ms +/- 150 ms. Continuous CPU activity is
 /// handled by the independent idle-CPU ceiling rather than mislabeled as polling.
+///
+/// Returns `None` when any idle phase contains a CPU counter that stayed
+/// unreadable after bounded re-reads: a retained counter flattens bursts, so the
+/// signature can be neither confirmed nor excluded and row 21 is incomplete.
 pub fn detect_busy_polling(
     series: &SampleSeries,
     repetitions: &[IdlePhaseRepetition],
     counter_cadence_ns: u64,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     if counter_cadence_ns == 0 {
         return Err(AhrbError::Validation(
             "busy-poll detector cadence must be nonzero".to_owned(),
@@ -354,6 +358,12 @@ pub fn detect_busy_polling(
         return Err(AhrbError::Validation(
             "busy-poll detector has no idle phases".to_owned(),
         ));
+    }
+    if phases
+        .iter()
+        .any(|phase| series.unreadable_cpu_counter(phase).is_some())
+    {
+        return Ok(None);
     }
     let coalesce_ns = counter_cadence_ns.saturating_mul(2);
     const NOMINAL_POLL_NS: u64 = 500_000_000;
@@ -395,10 +405,10 @@ pub fn detect_busy_polling(
             .filter(|gap| gap.abs_diff(NOMINAL_POLL_NS) <= POLL_TOLERANCE_NS)
             .count();
         if matching >= 3 && matching.saturating_mul(4) >= gaps.len().saturating_mul(3) {
-            return Ok(true);
+            return Ok(Some(true));
         }
     }
-    Ok(false)
+    Ok(Some(false))
 }
 
 /// Phase references and membership requirements for one fresh-profile N point.
@@ -700,11 +710,18 @@ pub struct PerInvocationObservation {
     pub cold_peak_bytes: u64,
     /// Whole-tree cumulative CPU for the scripted turn group.
     pub cpu_ns: u64,
+    /// Whether every CPU sample used by this trial had readable cumulative counters.
+    #[serde(default = "complete_historical_cpu_counter")]
+    pub cpu_counter_complete: bool,
     /// Processes that reached terminal exit.
     pub completed_processes: u32,
     /// Owned process-group members still alive after launcher terminal exit.
     #[serde(default)]
     pub residual_processes: u32,
+}
+
+fn complete_historical_cpu_counter() -> bool {
+    true
 }
 
 /// Evaluate transient, one-process-per-turn resource evidence without folding a
@@ -884,10 +901,13 @@ pub fn evaluate_per_invocation_resources(
         .collect::<Vec<_>>();
     let n1_peak =
         median_u64_values(&n1.iter().map(|item| item.peak_bytes).collect::<Vec<_>>()).unwrap_or(0);
+    let n1_cpu_complete = !n1.is_empty() && n1.iter().all(|item| item.cpu_counter_complete);
     let n1_cpu = median_u64_values(&n1.iter().map(|item| item.cpu_ns).collect::<Vec<_>>())
         .unwrap_or(u64::MAX);
     metrics.insert("single_process_peak_bytes".to_owned(), n1_peak as f64);
-    metrics.insert("single_process_cpu_ns".to_owned(), n1_cpu as f64);
+    if n1_cpu_complete {
+        metrics.insert("single_process_cpu_ns".to_owned(), n1_cpu as f64);
+    }
     rows.push(classify(
         25,
         resource_row_id(25),
@@ -905,7 +925,11 @@ pub fn evaluate_per_invocation_resources(
                 format!("{n1_cpu} ns/scripted turn"),
             ),
         ],
-        incomplete.clone(),
+        incomplete.clone().or_else(|| {
+            (!n1_cpu_complete).then(|| {
+                "single-process CPU counter sample was unreadable after bounded retries".to_owned()
+            })
+        }),
     ));
 
     if let Some(metrics_value) = &sweep_metrics {
@@ -1278,9 +1302,19 @@ impl<'a> Analysis<'a> {
         let mut cpu_checks = Vec::new();
         let mut cpu_error = None;
         for repetition in &repetitions {
-            let result = self
-                .require_phase_coverage(&repetition.idle_cpu, self.timing.idle_cpu_ms)
-                .and_then(|()| self.evidence.series.phase_cpu(&repetition.idle_cpu));
+            // Busy-poll detection reads CPU across all three idle phases, so an
+            // unreadable counter in any of them leaves row 21 incomplete.
+            let result = [
+                &repetition.warm_idle,
+                &repetition.idle_cpu,
+                &repetition.idle_drift,
+            ]
+            .into_iter()
+            .try_for_each(|phase| self.evidence.series.require_readable_cpu(phase))
+            .and_then(|()| {
+                self.require_phase_coverage(&repetition.idle_cpu, self.timing.idle_cpu_ms)
+            })
+            .and_then(|()| self.evidence.series.phase_cpu(&repetition.idle_cpu));
             match result {
                 Ok(cpu) => {
                     cpu_values.push(cpu.one_core_fraction);
@@ -5590,6 +5624,118 @@ mod tests {
         Ok(())
     }
 
+    /// Inject the macOS exhausted-retry shape into every sample of `phase` after
+    /// its first: identity (1,1) stayed unreadable for three read attempts, so
+    /// the sampler retained the last valid cumulative counter.
+    fn inject_unreadable_cpu(evidence: &mut ResourceEvidence, phase: &str) -> Result<()> {
+        let retained = evidence
+            .series
+            .samples
+            .iter()
+            .find(|sample| sample.phase == phase)
+            .map(|sample| sample.cpu_ns)
+            .ok_or_else(|| AhrbError::Validation(format!("phase {phase:?} is absent")))?;
+        for sample in evidence
+            .series
+            .samples
+            .iter_mut()
+            .filter(|sample| sample.phase == phase)
+            .skip(1)
+        {
+            sample.cpu_ns = retained;
+            sample
+                .cpu_accounting_warnings
+                .push(crate::process::CpuAccountingWarning {
+                    kind: "macos-self-cpu-counter-unreadable".to_owned(),
+                    identity: ProcIdentity {
+                        pid: 1,
+                        start_time: 1,
+                    },
+                    consecutive_misses: 3,
+                    previous_cpu_ns: retained,
+                    observed_cpu_ns: 0,
+                });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_unreadable_cpu_makes_rows_21_and_25_incomplete_not_pass() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        let idle_drift = evidence
+            .phases
+            .repetitions
+            .first()
+            .map(|repetition| repetition.idle_drift.clone())
+            .ok_or_else(|| AhrbError::Validation("idle repetition is absent".to_owned()))?;
+        let turn_phase = evidence
+            .single_agent
+            .as_ref()
+            .and_then(|observations| observations.first())
+            .map(|observation| observation.turn_phase.clone())
+            .ok_or_else(|| AhrbError::Validation("single-agent phase is absent".to_owned()))?;
+        // The idle-drift phase is outside row 21's idle-CPU ceiling window; it
+        // is covered only through the busy-poll detector's CPU evidence.
+        inject_unreadable_cpu(&mut evidence, &idle_drift)?;
+        inject_unreadable_cpu(&mut evidence, &turn_phase)?;
+        let detected =
+            detect_busy_polling(&evidence.series, &evidence.phases.repetitions, 20_000_000)?;
+        assert_eq!(detected, None, "unreadable idle CPU cannot exclude polling");
+        if let Some(idle) = evidence.idle.as_mut() {
+            idle.busy_polling_detected = detected;
+        }
+        let certification = evaluate_resources(
+            ResourceProfile::Quick,
+            &evidence,
+            &ResourceEnvelope::default(),
+        );
+        for row in [21, 25] {
+            let result = certification
+                .rows
+                .iter()
+                .find(|result| result.row == row)
+                .ok_or_else(|| AhrbError::Validation(format!("row {row} is absent")))?;
+            assert!(
+                matches!(&result.outcome, TestOutcome::Error(detail)
+                    if detail.contains("CPU counter for process (1,1) was unreadable after 3 bounded read attempts")
+                        && detail.contains("macos-self-cpu-counter-unreadable")),
+                "row {row}: {:?}",
+                result.outcome
+            );
+        }
+        for row in [20, 22, 23, 24] {
+            assert!(
+                certification
+                    .rows
+                    .iter()
+                    .any(|result| result.row == row && matches!(result.outcome, TestOutcome::Pass)),
+                "memory row {row} must remain usable"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn busy_poll_detector_is_inconclusive_for_any_unreadable_idle_phase() -> Result<()> {
+        let mut evidence = passing_evidence(ResourceProfile::Quick)?;
+        assert_eq!(
+            detect_busy_polling(&evidence.series, &evidence.phases.repetitions, 20_000_000)?,
+            Some(false)
+        );
+        let warm_idle = evidence
+            .phases
+            .repetitions
+            .last()
+            .map(|repetition| repetition.warm_idle.clone())
+            .ok_or_else(|| AhrbError::Validation("idle repetition is absent".to_owned()))?;
+        inject_unreadable_cpu(&mut evidence, &warm_idle)?;
+        assert_eq!(
+            detect_busy_polling(&evidence.series, &evidence.phases.repetitions, 20_000_000)?,
+            None
+        );
+        Ok(())
+    }
+
     #[test]
     fn periodic_idle_store_poll_signature_forces_row_21_failure() -> Result<()> {
         let mut evidence = passing_evidence(ResourceProfile::Quick)?;
@@ -5619,9 +5765,9 @@ mod tests {
         }
         let detected =
             detect_busy_polling(&evidence.series, &evidence.phases.repetitions, 20_000_000)?;
-        assert!(detected);
+        assert_eq!(detected, Some(true));
         if let Some(idle) = evidence.idle.as_mut() {
-            idle.busy_polling_detected = Some(detected);
+            idle.busy_polling_detected = detected;
         }
         let certification = evaluate_resources(
             ResourceProfile::Quick,
@@ -6159,6 +6305,7 @@ mod tests {
                     peak_bytes: u64::from(*agents) * 20 * MIB,
                     cold_peak_bytes: u64::from(*agents) * 21 * MIB,
                     cpu_ns: u64::from(*agents) * 10_000_000,
+                    cpu_counter_complete: true,
                     completed_processes: *agents,
                     residual_processes: 0,
                 })
@@ -6181,6 +6328,10 @@ mod tests {
         assert_eq!(
             certification.metrics.get("parallel_beta_mib_per_agent"),
             Some(&20.0)
+        );
+        assert_eq!(
+            certification.metrics.get("single_process_cpu_ns"),
+            Some(&10_000_000.0)
         );
         for row in [20_u8, 21, 22, 23, 28, 29] {
             let evidence = certification
@@ -6206,6 +6357,7 @@ mod tests {
                     peak_bytes: u64::from(*agents) * 20 * MIB,
                     cold_peak_bytes: u64::from(*agents) * 20 * MIB,
                     cpu_ns: 10_000_000,
+                    cpu_counter_complete: true,
                     completed_processes: *agents,
                     residual_processes: 0,
                 })
@@ -6226,6 +6378,50 @@ mod tests {
     }
 
     #[test]
+    fn per_invocation_unreadable_cpu_marks_only_cpu_row_incomplete() {
+        let timing = ResourceTimingPlan::for_profile(ResourceProfile::Quick);
+        let observations = timing
+            .sweep_widths
+            .iter()
+            .flat_map(|agents| {
+                (0..timing.repetitions).map(move |repetition| PerInvocationObservation {
+                    repetition,
+                    agents: *agents,
+                    peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cold_peak_bytes: u64::from(*agents) * 20 * MIB,
+                    cpu_ns: 10_000_000,
+                    cpu_counter_complete: *agents != 1 || repetition != 0,
+                    completed_processes: *agents,
+                    residual_processes: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let certification = evaluate_per_invocation_resources(
+            ResourceProfile::Quick,
+            &observations,
+            &ResourceEnvelope::default(),
+        );
+        assert!(certification.rows.iter().any(|result| {
+            result.row == 25
+                && matches!(&result.outcome, TestOutcome::Error(detail) if detail.contains("unreadable after bounded retries"))
+        }));
+        assert!(
+            !certification.metrics.contains_key("single_process_cpu_ns"),
+            "incomplete N=1 CPU must not be published as a numeric aggregate"
+        );
+        assert_eq!(
+            certification
+                .metrics
+                .get("single_process_peak_bytes")
+                .copied(),
+            Some((20 * MIB) as f64)
+        );
+        assert!(certification.rows.iter().filter(|result| result.row != 25).all(|result| {
+            !matches!(&result.outcome, TestOutcome::Error(detail) if detail.contains("CPU counter"))
+        }));
+    }
+
+    #[test]
     fn per_invocation_residual_child_fails_zero_idle_and_automatic_trials() {
         let timing = ResourceTimingPlan::for_profile(ResourceProfile::Quick);
         let mut observations = timing
@@ -6238,6 +6434,7 @@ mod tests {
                     peak_bytes: u64::from(*agents) * 20 * MIB,
                     cold_peak_bytes: u64::from(*agents) * 20 * MIB,
                     cpu_ns: 10_000_000,
+                    cpu_counter_complete: true,
                     completed_processes: *agents,
                     residual_processes: 0,
                 })

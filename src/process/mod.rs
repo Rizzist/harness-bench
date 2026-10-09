@@ -13,6 +13,37 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+const DISCOVERY_MAX_ATTEMPTS: u32 = 4;
+const DISCOVERY_RETRY_SETTLE: Duration = Duration::from_millis(2);
+
+fn transient_discovery_error(error: &AhrbError) -> bool {
+    matches!(
+        error,
+        AhrbError::Io(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EIO) | Some(libc::EINTR) | Some(libc::EINVAL)
+            )
+    )
+}
+
+/// Retry a complete process-discovery snapshot after transient kernel errors.
+///
+/// Callers must build the result from scratch inside `snapshot`; a failed
+/// attempt is never returned or merged into a later attempt.
+pub(crate) fn retry_transient_discovery<T>(mut snapshot: impl FnMut() -> Result<T>) -> Result<T> {
+    for attempt in 1..=DISCOVERY_MAX_ATTEMPTS {
+        match snapshot() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < DISCOVERY_MAX_ATTEMPTS && transient_discovery_error(&error) => {
+                std::thread::sleep(DISCOVERY_RETRY_SETTLE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("positive bounded discovery retry loop always returns")
+}
+
 /// PID plus process start time, safe against PID reuse.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ProcIdentity {
@@ -896,14 +927,22 @@ pub fn discover_profile_owned_processes(
         return Ok(Vec::new());
     }
     let roots = profile_root_aliases(profile_root);
-    #[cfg(target_os = "macos")]
-    let mut processes = macos::profile_owned_processes(&roots, executable_names)?;
-    #[cfg(target_os = "linux")]
-    let mut processes = linux::profile_owned_processes(&roots, executable_names)?;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let mut processes = return Err(AhrbError::Unsupported(
-        "profile-owned process discovery is implemented only on macOS and Linux".to_owned(),
-    ));
+    let mut processes = retry_transient_discovery(|| {
+        #[cfg(target_os = "macos")]
+        {
+            macos::profile_owned_processes(&roots, executable_names)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::profile_owned_processes(&roots, executable_names)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(AhrbError::Unsupported(
+                "profile-owned process discovery is implemented only on macOS and Linux".to_owned(),
+            ))
+        }
+    })?;
     processes.sort_by_key(|process| process.identity);
     processes.dedup_by_key(|process| process.identity);
     Ok(processes)
@@ -1924,6 +1963,28 @@ pub struct CpuAccountingWarning {
     pub observed_cpu_ns: u64,
 }
 
+impl CpuAccountingWarning {
+    /// Whether this identity's CPU counter stayed unreadable after the bounded
+    /// platform re-reads. For these warnings `consecutive_misses` is the number
+    /// of read attempts, and the sample retains no trustworthy counter for it.
+    pub fn is_unreadable_counter(&self) -> bool {
+        self.kind.contains("cpu-counter-unreadable")
+    }
+
+    /// Row-evidence explanation for an exhausted unreadable-counter warning.
+    pub fn unreadable_counter_reason(&self) -> String {
+        format!(
+            "CPU counter for process ({},{}) was unreadable after {} bounded read attempts ({}: previous {} ns, observed {} ns)",
+            self.identity.pid,
+            self.identity.start_time,
+            self.consecutive_misses,
+            self.kind,
+            self.previous_cpu_ns,
+            self.observed_cpu_ns
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TreeCpuUpdate {
     pub(crate) cumulative_ns: u64,
@@ -2204,6 +2265,44 @@ fn normalize_max_rss(value: libc::c_long) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_discovery_retry_restarts_complete_snapshots_for_eio_and_einval() {
+        for errno in [libc::EIO, libc::EINVAL] {
+            let mut attempts = 0_u32;
+            let snapshot = retry_transient_discovery(|| {
+                attempts = attempts.saturating_add(1);
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(errno).into())
+                } else {
+                    Ok(vec![attempts])
+                }
+            })
+            .expect("transient discovery should retry");
+            assert_eq!(snapshot, vec![3]);
+            assert_eq!(attempts, 3);
+        }
+    }
+
+    #[test]
+    fn shared_discovery_retry_is_bounded_and_does_not_retry_permanent_errors() {
+        let mut transient_attempts = 0_u32;
+        let error = retry_transient_discovery::<()>(|| {
+            transient_attempts = transient_attempts.saturating_add(1);
+            Err(std::io::Error::from_raw_os_error(libc::EIO).into())
+        })
+        .expect_err("persistent discovery failure must remain visible");
+        assert!(matches!(error, AhrbError::Io(_)));
+        assert_eq!(transient_attempts, DISCOVERY_MAX_ATTEMPTS);
+
+        let mut permanent_attempts = 0_u32;
+        retry_transient_discovery::<()>(|| {
+            permanent_attempts = permanent_attempts.saturating_add(1);
+            Err(AhrbError::Protocol("permanent".to_owned()))
+        })
+        .expect_err("permanent discovery failure must not retry");
+        assert_eq!(permanent_attempts, 1);
+    }
 
     fn identity(pid: u32) -> ProcIdentity {
         ProcIdentity {

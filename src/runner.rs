@@ -30,8 +30,8 @@ use crate::manifest::{
 };
 use crate::mock_harness::OwnedEgressLedgerRecord;
 use crate::process::{
-    DiskIdentityStatus, ProcessSample, ProcessTree, Sample, Sampler, TreeDiskTracker,
-    sample_live_with_counter_retries,
+    CpuAccountingWarning, DiskIdentityStatus, ProcessSample, ProcessTree, Sample, Sampler,
+    TreeDiskTracker, sample_live_with_counter_retries,
 };
 use crate::report::{
     EgressAttempt, FilesystemSnapshot, Fingerprint, LatencyVsTurnIndexEvaluation, MembershipSample,
@@ -12707,28 +12707,9 @@ fn discover_signal_matrix_processes(
     profile_root: &Path,
     executable_names: &[String],
 ) -> Result<Vec<crate::process::ProcessInfo>> {
-    const MAX_ATTEMPTS: u32 = 4;
-    const RETRY_SETTLE: Duration = Duration::from_millis(2);
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        match discover_signal_matrix_processes_once(sampler, roots, profile_root, executable_names)
-        {
-            Ok(processes) => return Ok(processes),
-            Err(AhrbError::Io(error))
-                if attempt < MAX_ATTEMPTS
-                    && matches!(error.raw_os_error(), Some(libc::EIO) | Some(libc::EINTR)) =>
-            {
-                // Darwin's libproc enumeration can report a transient EIO while
-                // the system process table changes. Retry the entire identity
-                // snapshot immediately; a partial or substituted snapshot is
-                // never accepted, and the bounded retry remains well inside the
-                // row's 250 ms observation cadence.
-                std::thread::sleep(RETRY_SETTLE);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("positive bounded signal discovery retry loop always returns")
+    crate::process::retry_transient_discovery(|| {
+        discover_signal_matrix_processes_once(sampler, roots, profile_root, executable_names)
+    })
 }
 
 #[cfg(test)]
@@ -22292,14 +22273,25 @@ fn sample_streaming_cpu_with_final_retirements(
     let sample = sampler.sample(&tree, "model-wait")?;
     let sample_finished_ns = monotonic_timestamp_ns();
     let expected_identities = tree.members.keys().copied().collect::<Vec<_>>();
+    let unreadable_cpu_counters = sample
+        .cpu_accounting_warnings
+        .into_iter()
+        .filter(CpuAccountingWarning::is_unreadable_counter)
+        .collect::<Vec<_>>();
+    let unreadable_identities = unreadable_cpu_counters
+        .iter()
+        .map(|warning| warning.identity)
+        .collect::<BTreeSet<_>>();
     Ok(ModelWaitCpuSample {
         sample_started_ns,
         sample_finished_ns,
         cpu_ns: sample.cpu_ns,
         expected_identities,
+        unreadable_cpu_counters,
         cpu_ns_by_identity: sample
             .process_samples
             .into_iter()
+            .filter(|process| !unreadable_identities.contains(&process.process.identity))
             .map(|process| ModelWaitCpuIdentitySample {
                 identity: process.process.identity,
                 cpu_ns: process.cpu_ns,
@@ -22307,6 +22299,138 @@ fn sample_streaming_cpu_with_final_retirements(
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod row48_unreadable_cpu_tests {
+    use super::*;
+
+    /// Replays one daemon identity's per-boundary counter reads. `None` is the
+    /// macOS exhausted-retry shape: the retained last valid cumulative counter
+    /// plus a typed unreadable warning carrying the attempt count.
+    struct UnreadableCounterSampler {
+        identity: crate::process::ProcIdentity,
+        reads: std::collections::VecDeque<Option<u64>>,
+        last_cpu_ns: u64,
+    }
+
+    impl Sampler for UnreadableCounterSampler {
+        fn discover(&mut self, _roots: &[u32]) -> Result<ProcessTree> {
+            let mut tree = ProcessTree::default();
+            tree.roots.insert(self.identity);
+            tree.members.insert(
+                self.identity,
+                crate::process::ProcessInfo {
+                    identity: self.identity,
+                    ppid: 1,
+                    command: "row48-fixture-daemon".to_owned(),
+                    ownership: crate::process::ProcOwnership::DeclaredRoot,
+                },
+            );
+            Ok(tree)
+        }
+
+        fn sample(&mut self, tree: &ProcessTree, phase: &str) -> Result<Sample> {
+            let read = self.reads.pop_front().ok_or_else(|| {
+                AhrbError::Validation("counter fixture sequence exhausted".to_owned())
+            })?;
+            let mut warnings = Vec::new();
+            match read {
+                Some(cpu_ns) => self.last_cpu_ns = cpu_ns,
+                None => warnings.push(CpuAccountingWarning {
+                    kind: "macos-self-cpu-counter-unreadable".to_owned(),
+                    identity: self.identity,
+                    consecutive_misses: 3,
+                    previous_cpu_ns: self.last_cpu_ns,
+                    observed_cpu_ns: 0,
+                }),
+            }
+            let wall_time = std::time::SystemTime::now();
+            let elapsed_ns = monotonic_timestamp_ns();
+            let process_samples = tree
+                .members
+                .values()
+                .map(|process| ProcessSample {
+                    elapsed_ns,
+                    wall_time,
+                    phase: phase.to_owned(),
+                    process: process.clone(),
+                    rss_bytes: 1,
+                    pss_bytes: None,
+                    private_bytes: None,
+                    footprint_bytes: None,
+                    rss_crosscheck_bytes: None,
+                    cpu_ns: self.last_cpu_ns,
+                    open_fds: None,
+                    thread_count: None,
+                })
+                .collect();
+            Ok(Sample {
+                elapsed_ns,
+                wall_time,
+                phase: phase.to_owned(),
+                rss_bytes: 1,
+                pss_bytes: None,
+                private_bytes: None,
+                footprint_bytes: None,
+                rss_crosscheck_bytes: None,
+                cgroup_memory_bytes: None,
+                cgroup_peak_bytes: None,
+                cpu_ns: self.last_cpu_ns,
+                open_fds: None,
+                thread_count: None,
+                collection_ns: 1,
+                collection_wall_ns: 1,
+                processes: tree.members.values().cloned().collect(),
+                process_samples,
+                cpu_accounting_warnings: warnings,
+            })
+        }
+    }
+
+    #[test]
+    fn row48_collector_carries_unreadable_warning_instead_of_retained_counter() {
+        let identity = crate::process::ProcIdentity {
+            pid: 4_242,
+            start_time: 77,
+        };
+        let mut sampler = UnreadableCounterSampler {
+            identity,
+            reads: [Some(1_000), Some(2_000), None, Some(9_000)]
+                .into_iter()
+                .collect(),
+            last_cpu_ns: 0,
+        };
+        let samples = (0..4)
+            .map(|_| sample_streaming_cpu(&mut sampler, &[identity.pid]))
+            .collect::<Result<Vec<_>>>()
+            .expect("fixture samples");
+
+        assert!(samples[1].unreadable_cpu_counters.is_empty());
+        assert_eq!(samples[1].cpu_ns_by_identity.len(), 1);
+        // The retained counter is not presented as a fresh observation; the
+        // typed warning keeps identity, counters and attempt count instead.
+        assert_eq!(samples[2].expected_identities, vec![identity]);
+        assert!(samples[2].cpu_ns_by_identity.is_empty());
+        assert_eq!(
+            samples[2].unreadable_cpu_counters,
+            vec![CpuAccountingWarning {
+                kind: "macos-self-cpu-counter-unreadable".to_owned(),
+                identity,
+                consecutive_misses: 3,
+                previous_cpu_ns: 2_000,
+                observed_cpu_ns: 0,
+            }]
+        );
+        let headers_ns = samples[0].sample_finished_ns;
+        let final_ns = samples[3].sample_started_ns;
+        let error = interpolated_model_wait_cpu_ns(&samples, headers_ns, final_ns)
+            .expect_err("unreadable identity must not produce a CPU value");
+        assert!(
+            error.contains("(4242,77) has no counter: CPU counter for process (4242,77) was unreadable after 3 bounded read attempts"),
+            "{error}"
+        );
+    }
 }
 
 async fn cleanup_streaming_outer_kill(
@@ -25026,8 +25150,21 @@ async fn collect_streaming_case(
             .ok_or_else(|| {
                 AhrbError::Protocol("model-wait final scheduler boundary disappeared".to_owned())
             })?;
-        interpolated_model_wait_cpu_ns(&cpu_samples, response_headers_ns, cpu_end_ns)
-            .map_err(AhrbError::Protocol)?
+        match interpolated_model_wait_cpu_ns(&cpu_samples, response_headers_ns, cpu_end_ns) {
+            Ok(cpu_ns) => cpu_ns,
+            // An identity whose counter stayed unreadable after bounded re-reads
+            // is incomplete row evidence, not a collector failure: keep the
+            // samples and their typed warnings so the row-48 evaluator reports
+            // the exact identity, counters and attempt count.
+            Err(_)
+                if cpu_samples
+                    .iter()
+                    .any(|sample| !sample.unreadable_cpu_counters.is_empty()) =>
+            {
+                0
+            }
+            Err(error) => return Err(AhrbError::Protocol(error)),
+        }
     } else {
         0
     };
@@ -28848,12 +28985,19 @@ async fn collect_per_invocation_resource_observations(
                 .first()
                 .zip(phase_samples.last())
                 .map_or(0, |(first, last)| last.cpu_ns.saturating_sub(first.cpu_ns));
+            let cpu_counter_complete = phase_samples.iter().all(|sample| {
+                sample
+                    .cpu_accounting_warnings
+                    .iter()
+                    .all(|warning| !warning.is_unreadable_counter())
+            });
             observations.push(PerInvocationObservation {
                 repetition,
                 agents: *agents,
                 peak_bytes,
                 cold_peak_bytes: peak_bytes,
                 cpu_ns,
+                cpu_counter_complete,
                 completed_processes,
                 residual_processes,
             });
@@ -29300,7 +29444,7 @@ async fn collect_resource_evidence(
             } else {
                 IdleProcessModel::ZeroProcessBetweenTurns
             },
-            busy_polling_detected: Some(busy_polling_detected),
+            busy_polling_detected,
             initial_workers: initial_idle_workers.unwrap_or(0),
             final_workers: final_idle_workers.unwrap_or(0),
             initial_threads: initial_idle_threads,

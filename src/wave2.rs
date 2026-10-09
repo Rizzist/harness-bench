@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::fake_model::{ModelFrameObservation, PacedResponseLedger};
-use crate::process::ProcIdentity;
+use crate::process::{CpuAccountingWarning, ProcIdentity};
 
 /// How the row-47 log-path declaration was supplied and verified.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -316,6 +316,11 @@ pub struct ModelWaitCpuSample {
     /// lifetime from being mistaken for a zero or an absent process.
     #[serde(default)]
     pub expected_identities: Vec<ProcIdentity>,
+    /// Typed sampler warnings for identities whose CPU counter stayed
+    /// unreadable after bounded re-reads (`consecutive_misses` is the attempt
+    /// count). Those identities have no entry in `cpu_ns_by_identity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_cpu_counters: Vec<CpuAccountingWarning>,
     /// Cumulative counters keyed by the full process lifetime identity.
     #[serde(default)]
     pub cpu_ns_by_identity: Vec<ModelWaitCpuIdentitySample>,
@@ -703,6 +708,18 @@ pub fn interpolated_model_wait_cpu_ns(
             return Err("model-wait CPU sample contains a duplicate process lifetime".to_owned());
         }
         if let Some(identity) = expected.difference(&identities).next() {
+            if let Some(warning) = sample
+                .unreadable_cpu_counters
+                .iter()
+                .find(|warning| warning.identity == *identity)
+            {
+                return Err(format!(
+                    "model-wait CPU expected lifetime ({},{}) has no counter: {}",
+                    identity.pid,
+                    identity.start_time,
+                    warning.unreadable_counter_reason()
+                ));
+            }
             return Err(format!(
                 "model-wait CPU expected lifetime ({},{}) has no counter",
                 identity.pid, identity.start_time
@@ -926,23 +943,52 @@ fn validate_trickle_frames(
     })
 }
 
+fn model_wait_unreadable_cpu_evidence(trials: &[ModelWaitCpuTrialEvidence]) -> Vec<Value> {
+    trials
+        .iter()
+        .filter_map(|trial| {
+            let unreadable_cpu_counters = trial
+                .cpu_samples
+                .iter()
+                .flat_map(|sample| sample.unreadable_cpu_counters.iter())
+                .collect::<Vec<_>>();
+            (!unreadable_cpu_counters.is_empty()).then(|| {
+                json!({
+                    "repetition": trial.repetition,
+                    "unreadable_cpu_counters": unreadable_cpu_counters,
+                    "cpu_samples": trial.cpu_samples,
+                })
+            })
+        })
+        .collect()
+}
+
 /// Evaluate row 48. Frame/pacing defects are infrastructure errors; complete
-/// CPU or terminal violations are measured harness failures.
+/// CPU or terminal violations are measured harness failures. Every incomplete
+/// result retains typed unreadable-CPU evidence from all collected trials, even
+/// when an earlier pacing or ledger oracle determines the row outcome first.
 pub fn evaluate_model_wait_cpu(
     trials: &[ModelWaitCpuTrialEvidence],
     expected_repetitions: u32,
     expected_count: u32,
     idle_timeout_ms: u64,
 ) -> ModelWaitCpuEvaluation {
-    let incomplete = |message: String| ModelWaitCpuEvaluation {
-        metrics: BTreeMap::new(),
-        details: json!({"measurement_complete":false,"measurement_error":message}),
-        cpu_p50_ms: 0.0,
-        wall_p50_ms: 0.0,
-        one_core_max_ratio: 0.0,
-        measurement_complete: false,
-        passed: false,
-        measurement_error: Some(message),
+    let unreadable_cpu_evidence = model_wait_unreadable_cpu_evidence(trials);
+    let incomplete = |message: String| {
+        let mut details = json!({"measurement_complete":false,"measurement_error":message});
+        if !unreadable_cpu_evidence.is_empty() {
+            details["unreadable_cpu_evidence"] = json!(&unreadable_cpu_evidence);
+        }
+        ModelWaitCpuEvaluation {
+            metrics: BTreeMap::new(),
+            details,
+            cpu_p50_ms: 0.0,
+            wall_p50_ms: 0.0,
+            one_core_max_ratio: 0.0,
+            measurement_complete: false,
+            passed: false,
+            measurement_error: Some(message),
+        }
     };
     if trials.len() != expected_repetitions as usize {
         return incomplete(format!(
@@ -2113,6 +2159,7 @@ mod tests {
             sample_finished_ns: sample_ns,
             cpu_ns,
             expected_identities: vec![identity],
+            unreadable_cpu_counters: Vec::new(),
             cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
                 identity,
                 cpu_ns,
@@ -2251,6 +2298,7 @@ mod tests {
                 sample_finished_ns: 900,
                 cpu_ns: 10,
                 expected_identities: vec![old],
+                unreadable_cpu_counters: Vec::new(),
                 cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
                     identity: old,
                     cpu_ns: 10,
@@ -2262,6 +2310,7 @@ mod tests {
                 sample_finished_ns: 1_100,
                 cpu_ns: 20,
                 expected_identities: vec![old],
+                unreadable_cpu_counters: Vec::new(),
                 cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
                     identity: old,
                     cpu_ns: 20,
@@ -2273,6 +2322,7 @@ mod tests {
                 sample_finished_ns: 1_500,
                 cpu_ns: 25,
                 expected_identities: vec![reused],
+                unreadable_cpu_counters: Vec::new(),
                 cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
                     identity: reused,
                     cpu_ns: 5,
@@ -2284,6 +2334,7 @@ mod tests {
                 sample_finished_ns: 1_700,
                 cpu_ns: 35,
                 expected_identities: vec![reused],
+                unreadable_cpu_counters: Vec::new(),
                 cpu_ns_by_identity: vec![ModelWaitCpuIdentitySample {
                     identity: reused,
                     cpu_ns: 15,
@@ -2295,6 +2346,7 @@ mod tests {
                 sample_finished_ns: 2_100,
                 cpu_ns: 35,
                 expected_identities: Vec::new(),
+                unreadable_cpu_counters: Vec::new(),
                 cpu_ns_by_identity: Vec::new(),
             },
         ];
@@ -2369,6 +2421,7 @@ mod tests {
                     .map(|counter| counter.cpu_ns)
                     .sum(),
                 expected_identities,
+                unreadable_cpu_counters: Vec::new(),
                 cpu_ns_by_identity,
             }
         };
@@ -2416,6 +2469,139 @@ mod tests {
         assert_eq!(
             interpolated_model_wait_cpu_ns(&retired_before_headers, 1_000, 2_000),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn row48_unreadable_identity_error_is_explained_and_persisted() {
+        let headers_ns = 1_000_000_000;
+        let frames = paced_frames(headers_ns, 5);
+        let final_ns = frames[4].frame_yielded_ns;
+        let mut samples = cpu_samples(headers_ns, final_ns, 10_000_000);
+        // Injected sequence: the identity's counter read regressed to zero on
+        // all three bounded attempts at the third sampling boundary, so the
+        // collector carries the typed warning and omits the counter.
+        let identity = samples[2].expected_identities[0];
+        samples[2].cpu_ns_by_identity.clear();
+        samples[2].unreadable_cpu_counters = vec![CpuAccountingWarning {
+            kind: "macos-self-cpu-counter-unreadable".to_owned(),
+            identity,
+            consecutive_misses: 3,
+            previous_cpu_ns: 4_000_000,
+            observed_cpu_ns: 0,
+        }];
+        let round_trip: ModelWaitCpuSample =
+            serde_json::from_value(serde_json::to_value(&samples[2]).expect("serialize sample"))
+                .expect("deserialize sample");
+        assert_eq!(round_trip, samples[2]);
+        let trial = ModelWaitCpuTrialEvidence {
+            repetition: 1,
+            response_headers_ns: headers_ns,
+            terminal_ns: Some(headers_ns + 5_100_000_000),
+            cpu_ns: 0,
+            cpu_samples: samples,
+            paced_ledger: paced_ledger(headers_ns, &frames),
+            frames,
+            terminal_count: 1,
+            success_terminals: 1,
+            outer_kill_used: false,
+            outer_kill_ns: None,
+            outer_deadline_ms: 10_500,
+        };
+
+        let evaluation = evaluate_model_wait_cpu(&[trial], 1, 5, 2_500);
+        assert!(!evaluation.measurement_complete);
+        assert!(!evaluation.passed);
+        let error = evaluation.measurement_error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("expected lifetime (42,7) has no counter"),
+            "{error}"
+        );
+        assert!(
+            error.contains("was unreadable after 3 bounded read attempts (macos-self-cpu-counter-unreadable: previous 4000000 ns, observed 0 ns)"),
+            "{error}"
+        );
+        let warning_evidence = &evaluation.details["unreadable_cpu_evidence"][0];
+        let warning = &warning_evidence["unreadable_cpu_counters"][0];
+        assert_eq!(warning["identity"]["pid"], 42);
+        assert_eq!(warning["identity"]["start_time"], 7);
+        assert_eq!(warning["consecutive_misses"], 3);
+        assert_eq!(warning["previous_cpu_ns"], 4_000_000);
+        assert_eq!(warning["observed_cpu_ns"], 0);
+        assert_eq!(warning_evidence["repetition"], 1);
+        assert_eq!(
+            warning_evidence["cpu_samples"][2]["unreadable_cpu_counters"][0]["kind"],
+            "macos-self-cpu-counter-unreadable"
+        );
+    }
+
+    #[test]
+    fn row48_pacing_error_preserves_unreadable_cpu_from_every_collected_repetition() {
+        let headers_ns = 1_000_000_000;
+        let frames = paced_frames(headers_ns, 5);
+        let final_ns = frames[4].frame_yielded_ns;
+        let mut samples = cpu_samples(headers_ns, final_ns, 10_000_000);
+        let identity = samples[2].expected_identities[0];
+        samples[2].cpu_ns_by_identity.clear();
+        samples[2].unreadable_cpu_counters = vec![CpuAccountingWarning {
+            kind: "first-repetition-unreadable".to_owned(),
+            identity,
+            consecutive_misses: 3,
+            previous_cpu_ns: 4_000_000,
+            observed_cpu_ns: 0,
+        }];
+        let base = ModelWaitCpuTrialEvidence {
+            repetition: 1,
+            response_headers_ns: headers_ns,
+            terminal_ns: Some(headers_ns + 5_100_000_000),
+            cpu_ns: 0,
+            cpu_samples: samples,
+            paced_ledger: paced_ledger(headers_ns, &frames),
+            frames,
+            terminal_count: 1,
+            success_terminals: 1,
+            outer_kill_used: false,
+            outer_kill_ns: None,
+            outer_deadline_ms: 10_500,
+        };
+
+        let mut pacing_error = base.clone();
+        let delayed_ns = pacing_error.paced_ledger.frames[0].timer_fired_ns + 1_300_000_000;
+        pacing_error.paced_ledger.frames[1].timer_fired_ns = delayed_ns;
+        pacing_error.paced_ledger.frames[1].yielded_ns = Some(delayed_ns);
+        pacing_error.frames[1].frame_yielded_ns = delayed_ns;
+
+        let mut later_unreadable = base;
+        later_unreadable.repetition = 2;
+        later_unreadable.cpu_samples[2].unreadable_cpu_counters[0].kind =
+            "later-repetition-unreadable".to_owned();
+
+        let evaluation = evaluate_model_wait_cpu(&[pacing_error, later_unreadable], 2, 5, 2_500);
+        assert!(!evaluation.measurement_complete);
+        assert!(!evaluation.passed);
+        assert!(
+            evaluation
+                .measurement_error
+                .as_deref()
+                .is_some_and(|error| error.contains("paced scheduler gap 1300.000 ms"))
+        );
+        let warning_evidence = evaluation.details["unreadable_cpu_evidence"]
+            .as_array()
+            .expect("typed warning evidence must be an array");
+        assert_eq!(warning_evidence.len(), 2);
+        assert_eq!(warning_evidence[0]["repetition"], 1);
+        assert_eq!(
+            warning_evidence[0]["unreadable_cpu_counters"][0]["kind"],
+            "first-repetition-unreadable"
+        );
+        assert_eq!(warning_evidence[1]["repetition"], 2);
+        assert_eq!(
+            warning_evidence[1]["unreadable_cpu_counters"][0]["kind"],
+            "later-repetition-unreadable"
+        );
+        assert_eq!(
+            warning_evidence[1]["cpu_samples"][2]["unreadable_cpu_counters"][0]["identity"]["pid"],
+            42
         );
     }
 

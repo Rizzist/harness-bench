@@ -23,36 +23,62 @@ const MAXCOMLEN: usize = 16;
 // Darwin's two cumulative libproc CPU fields can be observed a few
 // microseconds lower on an adjacent read under scheduler migration. Keep the
 // generic tracker strict, but clamp this documented platform-local sampling
-// jitter while retaining a raw warning. Larger regressions remain fatal.
+// jitter while retaining a raw warning. Larger regressions trigger bounded
+// platform re-reads and become incomplete counter evidence if they persist.
 const CPU_COUNTER_JITTER_NS: u64 = 1_000_000;
+const CPU_COUNTER_READ_ATTEMPTS: u32 = 3;
+const CPU_COUNTER_RETRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
+
+enum CpuCounterNormalization {
+    Accepted(u64),
+    Warning(u64, CpuAccountingWarning),
+    Unreadable(CpuAccountingWarning),
+}
+
+enum CpuCounterRead {
+    Complete {
+        usage: RusageInfoV4,
+        self_cpu_ns: u64,
+        child_cpu_ns: u64,
+        warnings: Vec<CpuAccountingWarning>,
+    },
+    Unreadable {
+        usage: Option<RusageInfoV4>,
+        previous_self_cpu_ns: Option<u64>,
+        previous_child_cpu_ns: Option<u64>,
+        warnings: Vec<CpuAccountingWarning>,
+    },
+}
 
 fn normalize_cpu_counter(
     identity: ProcIdentity,
     observed_ns: u64,
     previous_ns: Option<u64>,
-    kind: &str,
-    warnings: &mut Vec<CpuAccountingWarning>,
-) -> Result<u64> {
+    jitter_kind: &str,
+    unreadable_kind: &str,
+) -> CpuCounterNormalization {
     let Some(previous_ns) = previous_ns else {
-        return Ok(observed_ns);
+        return CpuCounterNormalization::Accepted(observed_ns);
     };
     if observed_ns >= previous_ns {
-        return Ok(observed_ns);
+        return CpuCounterNormalization::Accepted(observed_ns);
     }
-    if previous_ns.saturating_sub(observed_ns) > CPU_COUNTER_JITTER_NS {
-        return Err(AhrbError::Protocol(format!(
-            "process ({},{}) cumulative CPU regressed from {previous_ns} to {observed_ns}",
-            identity.pid, identity.start_time
-        )));
-    }
-    warnings.push(CpuAccountingWarning {
-        kind: kind.to_owned(),
+    let warning = CpuAccountingWarning {
+        kind: if previous_ns.saturating_sub(observed_ns) > CPU_COUNTER_JITTER_NS {
+            unreadable_kind.to_owned()
+        } else {
+            jitter_kind.to_owned()
+        },
         identity,
         consecutive_misses: 0,
         previous_cpu_ns: previous_ns,
         observed_cpu_ns: observed_ns,
-    });
-    Ok(previous_ns)
+    };
+    if previous_ns.saturating_sub(observed_ns) > CPU_COUNTER_JITTER_NS {
+        CpuCounterNormalization::Unreadable(warning)
+    } else {
+        CpuCounterNormalization::Warning(previous_ns, warning)
+    }
 }
 
 #[repr(C)]
@@ -167,6 +193,7 @@ struct CounterReadTestFault {
     replacement_task: ProcTaskInfo,
     rusage_unavailable: bool,
     replacement_visible: bool,
+    rusage_cpu_sequence: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -271,6 +298,158 @@ impl Default for MacOsSampler {
 }
 
 impl MacOsSampler {
+    fn read_cpu_counters(
+        &self,
+        identity: ProcIdentity,
+        include_zombies: bool,
+    ) -> Result<Option<CpuCounterRead>> {
+        let previous_self = self.last_self_cpu.get(&identity).copied();
+        let previous_children = self.child_rollup_cpu.get(&identity).copied();
+        let mut final_warnings = Vec::new();
+        let mut final_usage = None;
+        for attempt in 1..=CPU_COUNTER_READ_ATTEMPTS {
+            let Some(usage) = rusage_for_sample(identity.pid)? else {
+                let Some(after) = read_bsd_info(identity.pid, include_zombies)? else {
+                    return Ok(None);
+                };
+                let observed_identity = identity_of(&after);
+                if observed_identity != identity {
+                    return Err(AhrbError::Protocol(format!(
+                        "CPU counter PID {} changed start-time identity from {} to {}",
+                        identity.pid, identity.start_time, observed_identity.start_time
+                    )));
+                }
+                final_warnings = vec![CpuAccountingWarning {
+                    kind: "macos-cpu-counter-unreadable".to_owned(),
+                    identity,
+                    consecutive_misses: attempt,
+                    previous_cpu_ns: previous_self.unwrap_or(0),
+                    observed_cpu_ns: 0,
+                }];
+                if attempt < CPU_COUNTER_READ_ATTEMPTS {
+                    std::thread::sleep(CPU_COUNTER_RETRY_SETTLE);
+                    continue;
+                }
+                return Ok(Some(CpuCounterRead::Unreadable {
+                    usage: None,
+                    previous_self_cpu_ns: previous_self,
+                    previous_child_cpu_ns: previous_children,
+                    warnings: final_warnings,
+                }));
+            };
+            let Some(after) = read_bsd_info(identity.pid, include_zombies)? else {
+                return Ok(None);
+            };
+            let observed_identity = identity_of(&after);
+            if observed_identity != identity {
+                return Err(AhrbError::Protocol(format!(
+                    "CPU counter PID {} changed start-time identity from {} to {}",
+                    identity.pid, identity.start_time, observed_identity.start_time
+                )));
+            }
+            let self_cpu = usage.ri_user_time.saturating_add(usage.ri_system_time);
+            let child_cpu = usage
+                .ri_child_user_time
+                .saturating_add(usage.ri_child_system_time);
+            let self_normalized = normalize_cpu_counter(
+                identity,
+                self_cpu,
+                previous_self,
+                "macos-self-cpu-jitter-clamped",
+                "macos-self-cpu-counter-unreadable",
+            );
+            let child_normalized = normalize_cpu_counter(
+                identity,
+                child_cpu,
+                previous_children,
+                "macos-child-cpu-jitter-clamped",
+                "macos-child-cpu-counter-unreadable",
+            );
+            let mut warnings = Vec::new();
+            let normalized_self = match self_normalized {
+                CpuCounterNormalization::Accepted(value) => Some(value),
+                CpuCounterNormalization::Warning(value, warning) => {
+                    warnings.push(warning);
+                    Some(value)
+                }
+                CpuCounterNormalization::Unreadable(warning) => {
+                    warnings.push(warning);
+                    None
+                }
+            };
+            let normalized_children = match child_normalized {
+                CpuCounterNormalization::Accepted(value) => Some(value),
+                CpuCounterNormalization::Warning(value, warning) => {
+                    warnings.push(warning);
+                    Some(value)
+                }
+                CpuCounterNormalization::Unreadable(warning) => {
+                    warnings.push(warning);
+                    None
+                }
+            };
+            if let (Some(self_cpu), Some(child_cpu)) = (normalized_self, normalized_children) {
+                return Ok(Some(CpuCounterRead::Complete {
+                    usage,
+                    self_cpu_ns: self_cpu,
+                    child_cpu_ns: child_cpu,
+                    warnings,
+                }));
+            }
+            final_warnings = warnings;
+            final_usage = Some(usage);
+            if attempt < CPU_COUNTER_READ_ATTEMPTS {
+                std::thread::sleep(CPU_COUNTER_RETRY_SETTLE);
+            }
+        }
+        for warning in &mut final_warnings {
+            warning.consecutive_misses = CPU_COUNTER_READ_ATTEMPTS;
+        }
+        Ok(Some(CpuCounterRead::Unreadable {
+            usage: final_usage,
+            previous_self_cpu_ns: previous_self,
+            previous_child_cpu_ns: previous_children,
+            warnings: final_warnings,
+        }))
+    }
+
+    fn discover_once(&mut self, roots: &[u32]) -> Result<ProcessTree> {
+        let mut by_pid = BTreeMap::new();
+        let mut pending: BTreeSet<u32> = roots.iter().copied().collect();
+        let mut process_groups: BTreeSet<u32> = self.verified_groups.values().copied().collect();
+        for pid in roots {
+            if let Some(info) = counter_bsd_info(*pid)? {
+                if info.pbi_pgid != 0 {
+                    process_groups.insert(info.pbi_pgid);
+                }
+                by_pid.insert(*pid, info);
+            }
+        }
+        for process_group in process_groups {
+            pending.extend(list_pids_for(PROC_PGRP_ONLY, process_group)?);
+        }
+        pending.extend(self.known.iter().map(|identity| identity.pid));
+        pending.extend(self.excluded_roots.iter().map(|identity| identity.pid));
+        while let Some(pid) = pending.pop_first() {
+            if by_pid.contains_key(&pid) {
+                continue;
+            }
+            if let Some(info) = counter_bsd_info(pid)? {
+                by_pid.insert(pid, info);
+                pending.extend(list_pids_for(PROC_PPID_ONLY, pid)?);
+            }
+        }
+        let live_in_discovery: BTreeSet<ProcIdentity> = by_pid
+            .values()
+            .filter(|info| info.pbi_status != libc::SZOMB)
+            .map(identity_of)
+            .collect();
+        let tree = self.discover_from_table(roots, &by_pid)?;
+        self.live_in_last_discovery = live_in_discovery;
+        crate::process::track_process_tree(&tree)?;
+        Ok(tree)
+    }
+
     fn sample_with_liveness(
         &mut self,
         tree: &ProcessTree,
@@ -313,30 +492,46 @@ impl MacOsSampler {
                 continue;
             };
             if identity_of(&current) != *identity {
-                complete_open_fds = false;
-                complete_thread_count = false;
-                complete_crosscheck = false;
-                continue;
+                return Err(AhrbError::Protocol(format!(
+                    "sampled PID {} changed start-time identity from {} to {}",
+                    identity.pid,
+                    identity.start_time,
+                    identity_of(&current).start_time
+                )));
             }
 
-            let Some(usage) = rusage_for_sample(identity.pid)? else {
+            let Some(counter_read) = self.read_cpu_counters(*identity, include_zombies)? else {
                 complete_open_fds = false;
                 complete_thread_count = false;
                 complete_crosscheck = false;
-
-                // ESRCH can be the expected live-to-exit transition. If BSD
-                // identity lookup still proves that the same process is live,
-                // however, this counter read is internally contradictory and
-                // must not be hidden by accepting a later retry.
-                if read_bsd_info(identity.pid, include_zombies)?
-                    .is_some_and(|after| identity_of(&after) == *identity)
-                {
-                    return Err(AhrbError::Protocol(format!(
-                        "rusage reported PID {} unavailable while identity ({},{}) remained live",
-                        identity.pid, identity.pid, identity.start_time
-                    )));
-                }
                 continue;
+            };
+            let (usage, process_cpu_ns, child_cpu_ns) = match counter_read {
+                CpuCounterRead::Complete {
+                    usage,
+                    self_cpu_ns,
+                    child_cpu_ns,
+                    warnings,
+                } => {
+                    platform_cpu_warnings.extend(warnings);
+                    (usage, self_cpu_ns, child_cpu_ns)
+                }
+                CpuCounterRead::Unreadable {
+                    usage: Some(usage),
+                    previous_self_cpu_ns: Some(self_cpu_ns),
+                    previous_child_cpu_ns: Some(child_cpu_ns),
+                    warnings,
+                } => {
+                    platform_cpu_warnings.extend(warnings);
+                    (usage, self_cpu_ns, child_cpu_ns)
+                }
+                CpuCounterRead::Unreadable { warnings, .. } => {
+                    platform_cpu_warnings.extend(warnings);
+                    complete_open_fds = false;
+                    complete_thread_count = false;
+                    complete_crosscheck = false;
+                    continue;
+                }
             };
             let process_open_fds = u64::from(current.pbi_nfiles);
             let (process_threads, proc_crosscheck) = match task_details_for_sample(identity.pid)? {
@@ -364,28 +559,14 @@ impl MacOsSampler {
                 continue;
             };
             if identity_of(&after) != *identity {
-                complete_open_fds = false;
-                complete_thread_count = false;
-                complete_crosscheck = false;
-                continue;
+                return Err(AhrbError::Protocol(format!(
+                    "sampled PID {} changed start-time identity from {} to {}",
+                    identity.pid,
+                    identity.start_time,
+                    identity_of(&after).start_time
+                )));
             }
 
-            let process_cpu_ns = normalize_cpu_counter(
-                *identity,
-                usage.ri_user_time.saturating_add(usage.ri_system_time),
-                self.last_self_cpu.get(identity).copied(),
-                "macos-self-cpu-jitter-clamped",
-                &mut platform_cpu_warnings,
-            )?;
-            let child_cpu_ns = normalize_cpu_counter(
-                *identity,
-                usage
-                    .ri_child_user_time
-                    .saturating_add(usage.ri_child_system_time),
-                self.child_rollup_cpu.get(identity).copied(),
-                "macos-child-cpu-jitter-clamped",
-                &mut platform_cpu_warnings,
-            )?;
             rss_bytes = rss_bytes.saturating_add(usage.ri_resident_size);
             footprint_bytes = footprint_bytes.saturating_add(usage.ri_phys_footprint);
             live_cpu.insert(*identity, process_cpu_ns);
@@ -660,42 +841,9 @@ impl MacOsSampler {
 impl Sampler for MacOsSampler {
     fn discover(&mut self, roots: &[u32]) -> Result<ProcessTree> {
         let discovery_started = Instant::now();
-        let mut by_pid = BTreeMap::new();
-        let mut pending: BTreeSet<u32> = roots.iter().copied().collect();
-        let mut process_groups: BTreeSet<u32> = self.verified_groups.values().copied().collect();
-        for pid in roots {
-            if let Some(info) = counter_bsd_info(*pid)? {
-                if info.pbi_pgid != 0 {
-                    process_groups.insert(info.pbi_pgid);
-                }
-                by_pid.insert(*pid, info);
-            }
-        }
-        for process_group in process_groups {
-            pending.extend(list_pids_for(PROC_PGRP_ONLY, process_group)?);
-        }
-        pending.extend(self.known.iter().map(|identity| identity.pid));
-        pending.extend(self.excluded_roots.iter().map(|identity| identity.pid));
-        while let Some(pid) = pending.pop_first() {
-            if by_pid.contains_key(&pid) {
-                continue;
-            }
-            if let Some(info) = counter_bsd_info(pid)? {
-                by_pid.insert(pid, info);
-                pending.extend(list_pids_for(PROC_PPID_ONLY, pid)?);
-            }
-        }
-        let live_in_discovery: BTreeSet<ProcIdentity> = by_pid
-            .values()
-            .filter(|info| info.pbi_status != libc::SZOMB)
-            .map(identity_of)
-            .collect();
-        let result = self.discover_from_table(roots, &by_pid);
+        let result = crate::process::retry_transient_discovery(|| self.discover_once(roots));
         self.discovery_ns = duration_ns(discovery_started.elapsed());
-        let tree = result?;
-        self.live_in_last_discovery = live_in_discovery;
-        crate::process::track_process_tree(&tree)?;
-        Ok(tree)
+        result
     }
 
     fn discover_live(&mut self, roots: &[u32]) -> Result<ProcessTree> {
@@ -1073,6 +1221,13 @@ fn rusage_for_sample(pid: u32) -> Result<Option<RusageInfoV4>> {
                 return None;
             }
             fault.rusage_calls = fault.rusage_calls.saturating_add(1);
+            if !fault.rusage_cpu_sequence.is_empty() {
+                let cpu_ns = fault.rusage_cpu_sequence.remove(0);
+                let mut usage = fault.replacement_usage;
+                usage.ri_user_time = cpu_ns;
+                usage.ri_system_time = 0;
+                return Some(Some(usage));
+            }
             if fault.rusage_calls == fault.replace_on_rusage_call {
                 if fault.rusage_unavailable {
                     return Some(None);
@@ -1313,6 +1468,7 @@ mod tests {
                 replacement_task,
                 rusage_unavailable,
                 replacement_visible: false,
+                rusage_cpu_sequence: Vec::new(),
             });
         });
         CounterReadTestFaultGuard
@@ -1333,6 +1489,38 @@ mod tests {
 
     fn inject_counter_read_rusage_disappearance(target_pid: u32) -> CounterReadTestFaultGuard {
         inject_counter_read_fault(target_pid, 0, 0, true)
+    }
+
+    fn inject_cpu_counter_sequence(
+        target_pid: u32,
+        sequence: Vec<u64>,
+    ) -> CounterReadTestFaultGuard {
+        // SAFETY: all-zero is valid for both C output structures before the
+        // fields used by this deterministic test seam are assigned.
+        let mut replacement_usage: RusageInfoV4 = unsafe { zeroed() };
+        replacement_usage.ri_resident_size = 91_000_000;
+        replacement_usage.ri_phys_footprint = 92_000_000;
+        // SAFETY: see the comment above.
+        let mut replacement_task: ProcTaskInfo = unsafe { zeroed() };
+        replacement_task.pti_threadnum = 17;
+        replacement_task.pti_resident_size = 93_000_000;
+        COUNTER_READ_TEST_FAULT.with(|fault| {
+            let mut fault = fault.borrow_mut();
+            assert!(fault.is_none(), "counter-read test fault already installed");
+            *fault = Some(CounterReadTestFault {
+                target_pid,
+                omit_task_details: 0,
+                replace_on_rusage_call: u32::MAX,
+                rusage_calls: 0,
+                replacement_start_time: 0,
+                replacement_usage,
+                replacement_task,
+                rusage_unavailable: false,
+                replacement_visible: false,
+                rusage_cpu_sequence: sequence,
+            });
+        });
+        CounterReadTestFaultGuard
     }
 
     fn fixture_process(pid: u32, ppid: u32, start_time: u64, name: &str) -> ProcBsdInfo {
@@ -1526,7 +1714,8 @@ mod tests {
     }
 
     #[test]
-    fn live_counter_retry_rejects_rusage_disappearance_while_identity_remains_live() -> Result<()> {
+    fn live_counter_retry_recovers_rusage_disappearance_while_identity_remains_live() -> Result<()>
+    {
         use std::os::unix::process::CommandExt as _;
 
         let mut command = std::process::Command::new("/bin/sleep");
@@ -1554,14 +1743,12 @@ mod tests {
         child.kill()?;
         child.wait()?;
 
-        let error = sampled.expect_err(
-            "a live identity omitted after rusage disappearance must not become zero evidence",
+        let (_, sample) = sampled.expect("a transient rusage omission should be re-read");
+        assert_eq!(sample.process_samples.len(), 1);
+        assert_eq!(
+            rusage_calls, 3,
+            "rusage must be re-read after disappearance"
         );
-        assert!(
-            error.to_string().contains("rusage reported PID ")
-                && error.to_string().contains(" remained live")
-        );
-        assert_eq!(rusage_calls, 2, "rusage must disappear on the retry read");
         assert!(!replacement_visible);
         Ok(())
     }
@@ -1614,34 +1801,83 @@ mod tests {
     }
 
     #[test]
-    fn bounded_libproc_cpu_jitter_is_clamped_but_larger_regressions_fail() -> Result<()> {
+    fn bounded_libproc_cpu_jitter_is_clamped_but_larger_regressions_are_unreadable() {
         let identity = ProcIdentity {
             pid: 123,
             start_time: 456,
         };
-        let mut warnings = Vec::new();
-        assert_eq!(
+        assert!(matches!(
             normalize_cpu_counter(
                 identity,
                 995_000,
                 Some(1_000_000),
                 "macos-self-cpu-jitter-clamped",
-                &mut warnings,
-            )?,
-            1_000_000
-        );
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].observed_cpu_ns, 995_000);
-        assert!(
+                "macos-self-cpu-counter-unreadable",
+            ),
+            CpuCounterNormalization::Warning(1_000_000, _)
+        ));
+        assert!(matches!(
             normalize_cpu_counter(
                 identity,
                 0,
                 Some(CPU_COUNTER_JITTER_NS + 1),
                 "macos-self-cpu-jitter-clamped",
-                &mut warnings,
-            )
-            .is_err()
-        );
+                "macos-self-cpu-counter-unreadable",
+            ),
+            CpuCounterNormalization::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn injected_cpu_counter_sequence_is_reread_and_persistent_regression_is_incomplete()
+    -> Result<()> {
+        let pid = std::process::id();
+        let identity = identity_of(&counter_bsd_info(pid)?.expect("current identity"));
+        let mut sampler = MacOsSampler::default();
+        sampler.last_self_cpu.insert(identity, 2_000_000);
+        sampler.child_rollup_cpu.insert(identity, 0);
+
+        let recovered_fault = inject_cpu_counter_sequence(pid, vec![0, 0, 2_100_000]);
+        let recovered = sampler
+            .read_cpu_counters(identity, true)?
+            .expect("current process counter");
+        drop(recovered_fault);
+        match recovered {
+            CpuCounterRead::Complete {
+                self_cpu_ns,
+                warnings,
+                ..
+            } => {
+                assert_eq!(self_cpu_ns, 2_100_000);
+                assert!(warnings.is_empty());
+            }
+            CpuCounterRead::Unreadable { .. } => panic!("third counter should recover"),
+        }
+
+        let unreadable_fault = inject_cpu_counter_sequence(pid, vec![0, 0, 0]);
+        let unreadable = sampler
+            .read_cpu_counters(identity, true)?
+            .expect("current process counter");
+        let attempts = COUNTER_READ_TEST_FAULT.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .expect("counter-read test fault state")
+                .rusage_calls
+        });
+        drop(unreadable_fault);
+        match unreadable {
+            CpuCounterRead::Unreadable { warnings, .. } => {
+                assert_eq!(attempts, CPU_COUNTER_READ_ATTEMPTS);
+                assert!(warnings.iter().any(|warning| {
+                    warning.kind == "macos-self-cpu-counter-unreadable"
+                        && warning.previous_cpu_ns == 2_000_000
+                        && warning.observed_cpu_ns == 0
+                }));
+            }
+            CpuCounterRead::Complete { .. } => panic!("persistent regression must be incomplete"),
+        }
+        assert_eq!(sampler.last_self_cpu[&identity], 2_000_000);
         Ok(())
     }
 
