@@ -274,6 +274,13 @@ Consequence: haider 0.0.971 now has scaling characterisation it could not previo
 
 Record: verified tree = `1753bbb` + diff sha256 `f3836aee77fa4859…`; landed tree `edf4c0fe737b…` at `5698ea8`. Raw evidence: harness `state/lanes/l14-sweep-baseline-tolerance/` and `state/analysis/haider-971-regressions-2026-09-13.md` (outside Git).
 
+## L21 `l21-load-robustness` (landed 2026-10-10)
+
+- [x] Found by the L8 loaded reference run: codex matrix (73 rows) and storage aborted on `cumulative CPU regressed … to 0` (transient macOS read under load); intermittent discovery EIO/EINVAL.
+- [x] Implement (gpt-5.6-sol impl-1, impl-3; claude-opus-5-5 impl-2 while Codex models were unavailable): bounded same-identity CPU re-reads with typed `CpuAccountingWarning`; row-local incompleteness (daemon rows 21/25 + busy-poll, per-invocation 25/46, row 48) instead of run abort; CPU aggregates omitted when incomplete; row-48 warnings preserved for every repetition; shared whole-snapshot discovery retry (EIO/EINTR/EINVAL); Haider `daemon.log` hard-link ERROR pinned by regression (SPEC-v4 §2 behaviour, not an AHRB false positive).
+- [x] Verification: gpt-6-astra verify-1 (stopped by host low memory), verify-1b (ended by expired Codex login; F1/F2 found), verify-3 NO-SHIP (row-48 evidence lost on earlier oracle; incomplete CPU published as 0) — repaired; gpt-6-astra verify-4 **SHIP** (diff `415fab3a…`; lib 490, 32 targets, mock-cert, native + Linux-target clippy; real codex matrix/storage complete without abort, Haider storage, rick matrix unchanged vs L8).
+- [x] Complete: committed `dbbafa2`, fast-forwarded and pushed.
+
 ## L11-E `l11e-guard` (landed 2026-09-30)
 
 - [x] Implement (gpt-5.6-sol impl-1..5; claude-opus-5-5 impl-6b, 6c, 7 and integrate-1 as owner-authorized stand-in during the Codex usage limit): row-62 macOS Seatbelt guard with exact ownership of every permitted local address (provider on 127.0.0.1 + exclusive sentinels), TCP-only allowance, in-profile UDP denial and local-delivery proofs, per-launch profile re-hash with write-deny, all harness surfaces wrapped, 500 ms address monitor; fail-closed ERROR when a local address is answered by another process (VPN/proxy tunnel); Linux fail-closed. Teardown: symlink/hardlink-safe lock reaping, (pid, start time) re-binding on every signal path, `/proc/locks` from the open descriptor, economy/fidelity shared recorded teardown with final audit in the report; identity-bound fd-relative run-root removal after persisted evidence (`--keep-run-root`); fixture-daemon drop guards; mock-cert global budget passed to child runs with load receipts.
@@ -388,6 +395,8 @@ Follow-up (non-blocking, from the review): stale "Row 60 remains ERROR" comment 
 Record: verified tree = `c361807` + diff sha256 `f7ebf0e1817b37882e65fe2f09282bc40db73caa751d33a10d354c8927748578`. Raw evidence: harness `state/lanes/l16-reclaim-ratio-honesty/` (outside Git).
 
 ## L8 `l8-references-macmini`
+
+- 2026-10-08: owner-directed per-harness loaded run (load guard off, VPN on, Haider 0.0.972): six harnesses measured one at a time, core results kept in `state/lanes/l8-references-macmini/` (outside Git), run folders deleted. Codex rerun after L21.
 
 - [ ] Worktree
 - [ ] Pre-flight: all nine harness binaries, versions and hashes recorded, `ahrb doctor` clean for all nine adapters, mock self-certification (quiet machine)
